@@ -114,9 +114,21 @@ re-arms `markOwnAnthropicExhausted()` with a fresh cooldown, same as any other f
 
 `lastRateLimitInfo` (crash-attribution memory for a silent stream death, see its own doc comment)
 is cleared whenever a deliberate chat-source switch happens — before this fix it survived the
-switch to sw-proxy and misattributed that source's own, unrelated failures (confirmed live: a
-`Prompt is too long` turn) to "still exhausted on own-Anthropic", which was wrong information even
-though the resulting chatSource choice happened to still be correct.
+switch to sw-proxy and misattributed that source's own, unrelated failures to "still exhausted on
+own-Anthropic" in the logs/status text, which was wrong information even though the resulting
+chatSource choice happened to still be correct.
+
+**"Prompt is too long" under sw-proxy/own-anthropic-key**: traced (2026-09-08) to the CLI's own
+automatic-compaction feature, which needs the real OAuth ("firstParty") auth path specifically --
+under an env-overridden `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` (every chatSource except
+own-anthropic-oauth) it fails outright with "Not logged in -- Please run /login", even though the
+main chat completion works fine through that very same override; when compaction can't then shrink
+a big prompt, the turn fails with "Prompt is too long" instead. Confirmed live: every occurrence
+that day traced back to a session on `sw-proxy`. Fixed by passing
+`settings: { autoCompactEnabled: false }` in `Options` for every chatSource except
+own-anthropic-oauth (untouched -- not known broken there) -- Caroline already has its own
+context-aging mechanism (`compaction.ts`) independent of the CLI's native one, so this isn't a bare
+gap for the sources it's turned off for.
 
 A depleted **SW** balance (`handleBalanceExhausted`, source `"sw"`) never retries against a
 different source — there isn't one — so it explains what happened (status-bar/system_notice UI

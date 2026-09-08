@@ -1091,6 +1091,20 @@ class ChatSession {
         console.error(`[caroline] runLoop: about to create query() -- resume=${resumeSessionId ?? "(none)"} tab=${this.tabId} descendantProcesses=${await countDescendantProcesses(process.pid)}`);
         const options: Options = {
           ...(anthropicEnv ? { env: anthropicEnv } : {}),
+          // Confirmed live (2026-09-08): the CLI's own automatic-compaction feature
+          // fails outright under an env-overridden ANTHROPIC_API_KEY/BASE_URL (every
+          // chatSource other than own-anthropic-oauth) -- it needs the real OAuth
+          // ("firstParty") auth path specifically, not just A valid credential, so
+          // the compaction call itself dies with "Not logged in -- Please run
+          // /login" even though the main chat completion works fine through the
+          // very same override. When compaction then can't shrink a big prompt, the
+          // turn fails with "Prompt is too long" instead -- traced to every single
+          // occurrence of that today, all on sw-proxy. Caroline already has its own
+          // context-aging mechanism (compaction.ts) independent of this, so turning
+          // the CLI's native one off for the sources where it's actually broken has
+          // a real fallback, not a bare gap. own-anthropic-oauth is untouched --
+          // native auto-compact isn't known broken there, so no reason to change it.
+          ...(mode.chatSource !== "own-anthropic-oauth" ? { settings: { autoCompactEnabled: false } } : {}),
           // Diagnostic-only (2026-09-05): capture the underlying claude.exe
           // process's own stderr instead of only inferring failure from the
           // message stream going silent. Confirmed live that a resumed
