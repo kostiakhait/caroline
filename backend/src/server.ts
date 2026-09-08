@@ -58,7 +58,7 @@ console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js 
 
 configureIsolatedGitBash();
 import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
-import { compactSessionIfDue } from "./compaction.js";
+import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
 import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, countDescendantProcesses } from "./processReaper.js";
 import { readRecentHistory } from "./history.js";
 
@@ -163,15 +163,16 @@ function logSdkMessage(message: SDKMessage): void {
 const HANG_ESCALATION_GRACE_MS = 20_000;
 // Threshold for "restarts are happening too fast" -- beyond this many within
 // RESTART_WINDOW_MS, handleFailure starts backing off between attempts (see
-// RESTART_BACKOFF_BASE_MS below) instead of restarting instantly every time.
-// It never gives up entirely: per explicit instruction (2026-09-05), a
-// blocking dialog is only ever warranted when the user has something real to
-// fix (e.g. a depleted balance) -- a generic repeating stream death never is,
-// so this just means "retry forever, slower, and say so in the status bar."
+// RESTART_BACKOFF_MS below) instead of restarting instantly every time. It
+// never gives up entirely: per explicit instruction (2026-09-05), a blocking
+// dialog is only ever warranted when the user has something real to fix
+// (e.g. a depleted balance) -- a generic repeating stream death never is, so
+// this just means "retry forever, slower, and say so in the status bar."
 const MAX_RESTARTS_PER_WINDOW = 5;
 const RESTART_WINDOW_MS = 10 * 60_000;
-const RESTART_BACKOFF_BASE_MS = 15_000;
-const RESTART_BACKOFF_MAX_MS = 5 * 60_000;
+// Flat, not exponential -- per explicit instruction (2026-09-08): once over
+// budget, just retry once a minute until it recovers, no escalating delay.
+const RESTART_BACKOFF_MS = 60_000;
 // How long an abandoned query()'s CLI process gets to exit on its own before
 // processReaper force-kills its whole tree -- see that module's own doc
 // comment for the confirmed live leak this covers. Long on purpose (per
@@ -235,6 +236,32 @@ const ANTHROPIC_BALANCE_ERROR_PATTERN = /credit balance is too low/i;
 // monthly/weekly/usage/whatever wording the CLI uses next), not just the one
 // specific phrasing seen so far.
 const CC_CLI_LIMIT_PATTERN = /hit your .*\blimit\b|monthly spend limit|cc_cli_limit_message/i;
+
+// Confirmed live (2026-09-08): the CLI's own automatic-compaction feature fails
+// outright under an env-overridden ANTHROPIC_API_KEY/BASE_URL (every chatSource
+// except own-anthropic-oauth) with "Not logged in -- Please run /login" -- it
+// needs the real OAuth ("firstParty") path specifically, not just a valid
+// credential (`claude auth status` confirms loggedIn:true throughout). When
+// compaction can't then shrink an oversized resumed session, the turn fails
+// with this instead of a real reply -- observed as the CLI's very first
+// response after 'init' on a big resumed session, with no real processing in
+// between (init alone took 71s once). Per explicit instruction: never let
+// this reach the chat -- run Caroline's own algorithmic compaction (works
+// with or without tokens, see compaction.ts) immediately instead of waiting
+// for the hourly schedule, and replay the turn that hit it once the
+// now-smaller session is back up.
+const PROMPT_TOO_LONG_PATTERN = /^Prompt is too long\b/i;
+// Standalone occurrences of the SAME underlying compaction-auth failure (no
+// "Prompt is too long" prefix this time) -- per explicit instruction: just
+// suppress it, no action needed (the account's real login state is fine;
+// this is specifically the CLI's own internal compaction call complaining).
+const NOT_LOGGED_IN_PATTERN = /Not logged in/i;
+// The one confirmed-failing session on 2026-09-08 was 12.2MB (barely
+// shrunk by routine hourly compaction's age-based rules, since most of its
+// bloat was recent). Set a bit below that to catch it before the resume
+// attempt, not after -- a starting point, not a precisely derived number;
+// revisit if it turns out to trip too early/late in practice.
+const URGENT_COMPACTION_SIZE_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8MB
 
 function detectBalanceExhaustion(text: string): "sw" | "anthropic" | null {
   if (SW_BALANCE_ERROR_PATTERN.test(text)) return "sw";
@@ -483,6 +510,18 @@ class ChatSession {
    *  this deliberate, expected restart -- no restart-budget cost, no
    *  misattribution to a generic hang/crash. Cleared as soon as it's acted on. */
   private restartForChatSourceSwitch = false;
+  /** Same restart-without-cost mechanism as restartForChatSourceSwitch above,
+   *  for the urgent-compaction path (see PROMPT_TOO_LONG_PATTERN's own doc
+   *  comment): runUrgentCompaction() sets this right before force-closing
+   *  activeQuery so runLoop's catch block recognizes the resulting failure as
+   *  this deliberate restart -- no restart-budget cost, no misattribution.
+   *  urgentCompactionReplay* carries the turn that hit "Prompt is too long"
+   *  across that restart so it can be resubmitted once the now-smaller
+   *  session is back up, instead of just silently dropping the user's actual
+   *  question. */
+  private restartForUrgentCompaction = false;
+  private urgentCompactionReplayText: string | null = null;
+  private urgentCompactionReplayAttachments: Attachment[] = [];
   // Was 10 minutes; shortened per explicit instruction (2026-09-03) -- the
   // subscription/balance this is retrying against can recover at any moment
   // (the user re-logging in, a monthly cap resetting, a top-up landing), and
@@ -711,6 +750,63 @@ class ChatSession {
       // 2026-09-05) -- any failure here must never affect the live
       // conversation. Log and retry next hour, nothing more.
       console.error(`[caroline] compaction failed for tab ${this.tabId} (ignored, will retry next hour):`, err);
+    } finally {
+      this.compactionInProgress = false;
+    }
+  }
+
+  /**
+   * Urgent counterpart to runCompaction() -- triggered the moment a
+   * "Prompt is too long" turn is detected (see PROMPT_TOO_LONG_PATTERN's own
+   * doc comment), not on the hourly schedule: the live session is already
+   * too big to even load, so waiting isn't an option. Purely algorithmic
+   * (compactSessionIfDue does local file work only, no model call), so this
+   * runs identically whether or not any chat source currently has usable
+   * tokens -- per explicit instruction, that's the whole point of using
+   * Caroline's own compaction here instead of leaning on the CLI's.
+   * `replayText`/`replayAttachments` are the turn that hit the failure
+   * (server.ts's caller captures them from this.pendingUserText/
+   * pendingAttachments before they're cleared) -- resubmitted once the
+   * now-smaller session is back up, via restartForUrgentCompaction's own
+   * catch-block handling in runLoop, so the user's actual question still
+   * gets answered instead of silently dropped.
+   */
+  private async runUrgentCompaction(replayText: string | null, replayAttachments: Attachment[]): Promise<void> {
+    if (this.compactionInProgress) {
+      console.error(`[caroline] urgent compaction: tab ${this.tabId} already has a compaction in progress -- skipping (the in-flight one will still land)`);
+      return;
+    }
+    const sessionId = loadTabSessionId(workspaceDir, this.tabId);
+    if (!sessionId) {
+      console.error(`[caroline] urgent compaction: tab ${this.tabId} has no resumed session to compact -- nothing to do`);
+      return;
+    }
+    this.compactionInProgress = true;
+    try {
+      const result = await compactSessionIfDue(workspaceDir, sessionId, this.lastCompactedAt, true);
+      if (!result) {
+        // Only happens if compactSessionIfDue itself decided there was
+        // nothing to do despite force=true -- not currently a real code
+        // path, but handled rather than silently stranding the user.
+        console.error(`[caroline] urgent compaction: tab ${this.tabId} compactSessionIfDue returned null despite force=true`);
+        return;
+      }
+      this.lastCompactedAt = result.compactedAt;
+      saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
+      console.error(`[caroline] urgent compaction: tab ${this.tabId} forked ${sessionId} -> ${result.newSessionId}, restarting session`);
+      this.urgentCompactionReplayText = replayText;
+      this.urgentCompactionReplayAttachments = replayAttachments;
+      this.restartForUrgentCompaction = true;
+      this.activeQuery?.close();
+    } catch (err) {
+      // Unlike routine runCompaction(), this can't just "log and retry next
+      // hour" -- the user is actively waiting on this turn. Fall back to the
+      // generic recovery nudge (same one billing/rate-limit paths use) so
+      // Caroline at least keeps trying instead of leaving the status bar
+      // stuck on "Urgent compaction..." forever.
+      console.error(`[caroline] urgent compaction: tab ${this.tabId} failed -- falling back to generic retry:`, err);
+      this.setConnState("restarting", "Compaction failed, retrying...");
+      this.scheduleApiRetry("urgent_compaction_failed", this.turnIsVoice);
     } finally {
       this.compactionInProgress = false;
     }
@@ -1086,7 +1182,42 @@ class ChatSession {
         // MCP servers come from user scope (registered once by
         // ensureWorkspace()), not this cwd's .mcp.json -- see workspace.ts
         // for why. cwd still matters for CLAUDE.md / Skills/ discovery.
-        const resumeSessionId = this.resolveResumeSessionId();
+        let resumeSessionId = this.resolveResumeSessionId();
+        // Proactive, SDK-INDEPENDENT compaction check -- per explicit instruction
+        // (2026-09-08): our own compaction is our own decision, not something that
+        // should wait on or depend on any signal from the SDK/CLI. A plain fs.stat
+        // on the transcript we're about to resume, before query() is ever created --
+        // see getSessionFileSizeBytes's own doc comment for the confirmed-live
+        // silent-stall incident (326s, zero SDK output) this specifically guards
+        // against, which the reactive PROMPT_TOO_LONG_PATTERN detection further
+        // down can't catch on its own since it depends on a message that isn't
+        // guaranteed to ever arrive.
+        if (resumeSessionId) {
+          const sizeBytes = await getSessionFileSizeBytes(workspaceDir, resumeSessionId);
+          console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume size check: session=${resumeSessionId} sizeBytes=${sizeBytes ?? "unknown"} thresholdBytes=${URGENT_COMPACTION_SIZE_THRESHOLD_BYTES}`);
+          if (sizeBytes !== null && sizeBytes >= URGENT_COMPACTION_SIZE_THRESHOLD_BYTES) {
+            console.error(`[caroline] [urgent-compaction] tab=${this.tabId} session ${resumeSessionId} is ${sizeBytes} bytes, over threshold -- compacting BEFORE attempting to resume, no query() created yet`);
+            this.setConnState("restarting", "Urgent compaction...");
+            try {
+              const result = await compactSessionIfDue(workspaceDir, resumeSessionId, this.lastCompactedAt, true);
+              if (result) {
+                this.lastCompactedAt = result.compactedAt;
+                saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
+                console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction done: ${resumeSessionId} -> ${result.newSessionId}`);
+                resumeSessionId = result.newSessionId;
+              } else {
+                console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction returned null despite force=true -- resuming the original session as-is`);
+              }
+            } catch (err) {
+              // Same "never take down the live conversation" guarantee as
+              // compactSessionIfDue's own doc comment -- log and resume the
+              // original session anyway; the reactive PROMPT_TOO_LONG_PATTERN
+              // path further down is still there as a backstop if this
+              // particular attempt turns out to still be too big.
+              console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction failed (resuming original session as-is):`, err);
+            }
+          }
+        }
         const queryStartedAt = Date.now();
         console.error(`[caroline] runLoop: about to create query() -- resume=${resumeSessionId ?? "(none)"} tab=${this.tabId} descendantProcesses=${await countDescendantProcesses(process.pid)}`);
         const options: Options = {
@@ -1287,6 +1418,37 @@ class ChatSession {
               this.activeQuery?.close();
             }
             continue; // don't forward the raw/substituted message as a chat bubble
+          }
+
+          // See PROMPT_TOO_LONG_PATTERN's own doc comment. Checked before
+          // CC_CLI_LIMIT_PATTERN below since this is a different failure
+          // class entirely (a too-big resumed session, not a usage-window
+          // cap) that needs its own handling, not just a status-bar message.
+          if (message.type === "assistant") {
+            const textBlocks = message.message.content
+              .filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
+              .map((b) => b.text);
+            const promptTooLong = textBlocks.find((t) => PROMPT_TOO_LONG_PATTERN.test(t));
+            if (promptTooLong) {
+              console.error(`[caroline] [urgent-compaction] tab=${this.tabId} "Prompt is too long" detected, suppressing and triggering urgent compaction: ${truncateForLog(promptTooLong)}`);
+              this.setConnState("restarting", "Urgent compaction...");
+              const replayText = this.pendingUserText;
+              const replayAttachments = this.pendingAttachments;
+              console.error(`[caroline] [urgent-compaction] tab=${this.tabId} captured turn for replay: pendingUserText=${replayText !== null ? "set" : "null"} attachments=${replayAttachments.length}`);
+              void this.runUrgentCompaction(replayText, replayAttachments);
+              continue; // never forward "Prompt is too long" as a chat bubble
+            }
+            // Per explicit instruction: a STANDALONE occurrence of the same
+            // underlying compaction-auth failure (see PROMPT_TOO_LONG_PATTERN's
+            // doc comment) -- no "Prompt is too long" prefix this time, so no
+            // urgent-compaction action, just suppress it. The account's real
+            // login state is fine (claude auth status confirms it); this is
+            // specifically the CLI's own internal compaction call complaining.
+            const notLoggedIn = textBlocks.find((t) => NOT_LOGGED_IN_PATTERN.test(t));
+            if (notLoggedIn) {
+              console.error(`[caroline] [urgent-compaction] tab=${this.tabId} standalone "Not logged in" detected, suppressing (no action per explicit instruction): ${truncateForLog(notLoggedIn)}`);
+              continue; // never forward as a chat bubble
+            }
           }
 
           // Same treatment for Claude Code's own CLI subscription usage-cap message
@@ -1544,6 +1706,33 @@ class ChatSession {
           clearPendingTurn(workspaceDir, this.tabId);
           continue; // fresh query() below, no restart-budget cost, no replay
         }
+        // This session was deliberately closed above (in-stream) by
+        // runUrgentCompaction() -- see PROMPT_TOO_LONG_PATTERN's own doc
+        // comment. Checked right alongside restartForChatSourceSwitch, same
+        // reasoning: this expected, deliberate restart must never be
+        // misattributed to a generic hang/crash or cost restart budget.
+        // Unlike that path, THIS one DOES replay -- the turn that hit
+        // "Prompt is too long" never got a real answer, so the user's actual
+        // question would just be silently dropped otherwise.
+        if (this.restartForUrgentCompaction) {
+          this.restartForUrgentCompaction = false;
+          const replayText = this.urgentCompactionReplayText;
+          const replayAttachments = this.urgentCompactionReplayAttachments;
+          this.urgentCompactionReplayText = null;
+          this.urgentCompactionReplayAttachments = [];
+          console.error(`[caroline] [urgent-compaction] runLoop catch: tab=${this.tabId} session closed for urgent compaction -- fresh query() will resume the compacted session, replayText=${replayText !== null ? "set" : "null"}`);
+          this.turnPending = false;
+          this.pendingUserText = null;
+          this.pendingAttachments = [];
+          clearPendingTurn(workspaceDir, this.tabId);
+          if (replayText !== null) {
+            console.error(`[caroline] [urgent-compaction] tab=${this.tabId} replaying the turn that hit "Prompt is too long": ${truncateForLog(replayText)}`);
+            this.submit(replayText, replayAttachments, true, false, this.turnIsVoice);
+          } else {
+            console.error(`[caroline] [urgent-compaction] tab=${this.tabId} no captured turn to replay (pendingUserText was already null) -- nothing queued`);
+          }
+          continue; // fresh query() below, no restart-budget cost
+        }
         // Fallback path for handleBalanceExhausted: covers a billing failure that
         // surfaced as a thrown error instead of an in-stream assistant message
         // with .error === 'billing_error' (the primary detection point, above in
@@ -1710,12 +1899,10 @@ class ChatSession {
     this.restartTimestamps.push(now);
     console.error(`[caroline] handleFailure: restartTimestamps now has ${this.restartTimestamps.length}/${MAX_RESTARTS_PER_WINDOW} entries within the ${RESTART_WINDOW_MS / 60_000}min window`);
     if (this.restartTimestamps.length > MAX_RESTARTS_PER_WINDOW) {
-      const overBudgetBy = this.restartTimestamps.length - MAX_RESTARTS_PER_WINDOW;
-      const backoffMs = Math.min(RESTART_BACKOFF_BASE_MS * 2 ** (overBudgetBy - 1), RESTART_BACKOFF_MAX_MS);
-      console.error(`[caroline] handleFailure: restart budget exceeded (${this.restartTimestamps.length}/${MAX_RESTARTS_PER_WINDOW} in ${RESTART_WINDOW_MS / 60_000}min) -- backing off ${backoffMs}ms instead of giving up`);
+      console.error(`[caroline] handleFailure: restart budget exceeded (${this.restartTimestamps.length}/${MAX_RESTARTS_PER_WINDOW} in ${RESTART_WINDOW_MS / 60_000}min) -- backing off ${RESTART_BACKOFF_MS}ms (flat, not exponential) instead of giving up`);
       this.setConnState(
         "restart_backoff",
-        `Trouble reconnecting (failed ${this.restartTimestamps.length} times in ${RESTART_WINDOW_MS / 60_000}min) -- retrying in ${Math.round(backoffMs / 1000)}s`,
+        `Trouble reconnecting (failed ${this.restartTimestamps.length} times in ${RESTART_WINDOW_MS / 60_000}min) -- retrying in ${Math.round(RESTART_BACKOFF_MS / 1000)}s`,
       );
       // hasLiveDialog() now reads restart_backoff as "not live" (see its own doc
       // comment) -- check right away instead of waiting for the next hourly tick,
@@ -1724,7 +1911,7 @@ class ChatSession {
       // hour later. No-op if there's nothing to compact yet or a run is already
       // in progress (see runCompaction's own guards).
       this.maybeCompact();
-      await sleep(backoffMs);
+      await sleep(RESTART_BACKOFF_MS);
     }
     console.error(`[caroline] handleFailure: sending caroline_status=restarting, will loop back into runLoop's while() for a fresh query()`);
     this.setConnState("restarting", String(err));

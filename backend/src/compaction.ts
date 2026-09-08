@@ -1,5 +1,5 @@
 import { forkSession } from "@anthropic-ai/claude-agent-sdk";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { claudeProjectDir } from "./durability.js";
 
@@ -104,7 +104,11 @@ export interface CompactionResult {
 }
 
 /**
- * Returns null if it's not yet due (lastCompactedAt within the last hour).
+ * Returns null if it's not yet due (lastCompactedAt within the last hour) --
+ * unless `force` is set, which skips that recency check entirely. `force` is
+ * for server.ts's urgent-compaction path (a "Prompt is too long" turn: the
+ * live session is already too big to even load, so waiting for the hourly
+ * schedule isn't an option -- see that call site's own doc comment).
  * lastCompactedAt === null (nothing recorded yet, e.g. this process just
  * started) always runs immediately -- covers "also on every app startup".
  *
@@ -113,15 +117,20 @@ export interface CompactionResult {
  * the live conversation. The caller (runCompaction in server.ts) still
  * wraps this in its own try/catch as a second layer, but every real failure
  * mode already known (a bad fork, a delete that fails) is handled inline
- * instead of being allowed to propagate.
+ * instead of being allowed to propagate. Purely algorithmic throughout --
+ * local file reads/rewrites only, no model/API call anywhere in this
+ * function -- so it works exactly the same whether or not any chat source
+ * currently has usable tokens (per explicit instruction, 2026-09-08): the
+ * urgent case above is specifically for when tokens are the problem.
  */
 export async function compactSessionIfDue(
   workspaceDir: string,
   currentSessionId: string,
   lastCompactedAt: number | null,
+  force = false,
 ): Promise<CompactionResult | null> {
   const now = Date.now();
-  if (lastCompactedAt !== null && now - lastCompactedAt < ONE_HOUR_MS) return null;
+  if (!force && lastCompactedAt !== null && now - lastCompactedAt < ONE_HOUR_MS) return null;
 
   const parentPath = join(claudeProjectDir(workspaceDir), `${currentSessionId}.jsonl`);
   const forkStartedAt = Date.now();
@@ -158,4 +167,28 @@ export async function compactSessionIfDue(
   await writeFile(forkPath, rewritten.join("\n") + "\n", "utf-8");
 
   return { newSessionId, compactedAt: now };
+}
+
+/**
+ * Plain filesystem stat -- no SDK call, no model call, nothing that can hang
+ * or depend on any chat source having tokens. Per explicit instruction
+ * (2026-09-08): urgent compaction must trigger on OUR OWN signal, not on
+ * whatever the SDK does or doesn't say -- a session that's too big to even
+ * reach 'init' may never produce a "Prompt is too long" message (or any
+ * message) at all, confirmed live as a 326-SECOND silent stall with zero
+ * SDK output before the stream just ended with nothing to detect. Checking
+ * the transcript's own size on disk, before ever creating query(), catches
+ * that case too. Returns null if the file doesn't exist yet (a session
+ * that's never been resumed/persisted) -- not an error, just "nothing to
+ * measure".
+ */
+export async function getSessionFileSizeBytes(workspaceDir: string, sessionId: string): Promise<number | null> {
+  try {
+    const filePath = join(claudeProjectDir(workspaceDir), `${sessionId}.jsonl`);
+    const stats = await stat(filePath);
+    return stats.size;
+  } catch (err) {
+    console.error(`[caroline] compaction: getSessionFileSizeBytes(${sessionId}) failed (treating as unknown/no file):`, err);
+    return null;
+  }
 }
