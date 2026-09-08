@@ -5,8 +5,8 @@ SMS, scheduling — driven by natural-language chat, as a tray app with a global
 window, no terminal or IDE required. Built on the Claude Agent SDK, with a persistent identity
 (persona), voice, and its own SquirrelWisdom-backed feature set.
 
-This file is the detailed, code-derived companion to `README.md` (portability/build basics) and
-`TODO.md` (open items/known gaps). It describes what's actually implemented, not the roadmap.
+This file is the detailed, code-derived companion to `README.md` (portability/build basics). It
+describes what's actually implemented, not the roadmap.
 
 ## Three layers
 
@@ -206,5 +206,3 @@ target copies fresh `backend/dist/*.js` into the build output on every `dotnet b
 `build_installer.bat` builds `CarolineInstaller.exe`; `deploy.bat` uploads
 `Caroline.zip`/`.sha256`/`.version`/`CarolineInstaller.exe` to
 `downloader.multi-portal.org/apps/caroline/` over scp/ssh.
-
-See `TODO.md` for what's implemented-but-unverified-live vs. genuinely open.
