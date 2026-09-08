@@ -1,0 +1,593 @@
+:root {
+  --brand: #5066C9;
+  --brand-light: #88AADD;
+  --bg: #f3f4fb;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  background: var(--brand);
+  color: white;
+  border-bottom: 3px solid var(--brand-light);
+  flex: none;
+}
+
+.header-title {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: white;
+  font-size: 17px;
+  cursor: pointer;
+  opacity: 0.9;
+  padding: 2px 4px;
+  line-height: 1;
+}
+
+.icon-btn:hover { opacity: 1; }
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bubble {
+  max-width: 82%;
+  padding: 10px 13px;
+  border-radius: 14px;
+  line-height: 1.4;
+  font-size: 14px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.bubble.user {
+  align-self: flex-end;
+  background: var(--brand);
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+.bubble.assistant {
+  align-self: flex-start;
+  background: white;
+  color: #222;
+  border: 1px solid #e2e4f0;
+  border-bottom-left-radius: 4px;
+}
+
+.bubble.assistant a {
+  color: var(--brand);
+  text-decoration: underline;
+}
+
+.bubble-time {
+  font-size: 10px;
+  margin-top: 4px;
+  opacity: 0.6;
+}
+
+.bubble.user .bubble-time {
+  color: white;
+  text-align: right;
+}
+
+.bubble.assistant .bubble-time {
+  color: #6b7290;
+}
+
+.bubble.assistant ul {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+
+.bubble.assistant li {
+  margin: 2px 0;
+}
+
+.bubble.assistant h2,
+.bubble.assistant h3,
+.bubble.assistant h4 {
+  margin: 6px 0 4px;
+  line-height: 1.3;
+}
+
+.bubble.assistant code {
+  background: #f0f1fa;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+}
+
+.bubble.assistant pre {
+  background: #f0f1fa;
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+
+.bubble.assistant pre code {
+  background: none;
+  padding: 0;
+}
+
+.bubble.assistant table.md-table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 13px;
+  white-space: normal;
+  max-width: 100%;
+}
+
+.bubble.assistant table.md-table th,
+.bubble.assistant table.md-table td {
+  border: 1px solid #e2e4f0;
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.bubble.assistant table.md-table th {
+  background: #f0f1fa;
+  font-weight: 600;
+}
+
+.bubble.assistant table.md-table tbody tr:nth-child(even) {
+  background: #f8f9fd;
+}
+
+.chat-photo {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 10px;
+  margin: 6px 0;
+}
+
+img.attachment-preview {
+  cursor: pointer;
+}
+
+a.attachment-chip {
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.attachment-thumb {
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex: none;
+}
+
+.status-line {
+  align-self: flex-start;
+  font-size: 12px;
+  color: #6b7290;
+  padding: 2px 4px;
+  font-style: italic;
+}
+
+/* System messages/statuses (former .system-banner/.tool-status/header
+   connection text) now all live in .statusbar at the very bottom of the
+   window instead -- one consolidated place, per explicit design ask. */
+.statusbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 14px;
+  font-size: 12px;
+  color: #6b7290;
+  background: var(--bg);
+  border-top: 1px solid #e2e4f0;
+}
+
+.statusbar-text {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.statusbar-lamps {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* Lamp colors: red = error, yellow = connecting/not configured/not
+   monitored, green = connected/monitoring (solid = idle, blinking = actively
+   working -- see chat.js's updateBackendLamp/updateChannelLamp). */
+.lamp {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.08) inset;
+}
+
+.lamp-red { background: #e0453f; }
+.lamp-yellow { background: #e0b23f; }
+.lamp-green { background: #3fb95a; }
+
+.lamp-green-blink {
+  background: #3fb95a;
+  animation: lamp-blink 1s ease-in-out infinite;
+}
+
+@keyframes lamp-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.voice-controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 14px;
+  font-size: 12px;
+  color: #3A3F8F;
+  background: #eef0fb;
+  border-top: 1px solid #e2e4f0;
+}
+
+.voice-controls[hidden] { display: none; }
+
+.voice-controls-label {
+  flex: 1;
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.voice-controls button {
+  border: none;
+  background: white;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  color: #3A3F8F;
+}
+
+.voice-controls button:hover { background: #dde0f7; }
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 10px;
+  background: white;
+}
+
+.attachments:empty { display: none; }
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid #d3d6ea;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #333;
+  max-width: 220px;
+}
+
+.attachment-chip .name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attachment-chip button {
+  background: none;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0;
+}
+
+.bubble .attachment-chip {
+  background: rgba(255,255,255,0.15);
+  border-color: rgba(255,255,255,0.3);
+  color: inherit;
+  margin-bottom: 4px;
+}
+
+.bubble.assistant .attachment-chip {
+  background: var(--bg);
+  border-color: #d3d6ea;
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px;
+  background: white;
+  border-top: 1px solid #e2e4f0;
+  flex: none;
+}
+
+.composer #attachBtn,
+.composer #micBtn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  flex: none;
+  padding: 6px;
+  color: #6b7290;
+  border-radius: 8px;
+}
+
+.composer #micBtn.recording {
+  color: #d92c2c;
+  background: #ffe9e9;
+  animation: mic-pulse 1s infinite;
+}
+
+.composer #micBtn.transcribing {
+  /* Steady red (no pulse) -- distinct from .recording's pulsing red, but
+     still a clear "something is happening" signal. Previously used the
+     plain brand color at reduced opacity, which read as barely different
+     from idle -- confirmed live the user couldn't tell STT was in
+     progress at all. */
+  color: #d92c2c;
+  background: #ffe9e9;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.bubble .speak-btn.speaking {
+  animation: mic-pulse 1s infinite;
+}
+
+.bubble .speak-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0;
+  margin-top: 6px;
+  opacity: 0.7;
+  display: block;
+}
+
+.bubble .speak-btn:hover { opacity: 1; }
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  max-height: 120px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid #d3d6ea;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.composer textarea:focus {
+  border-color: var(--brand);
+}
+
+.composer button {
+  background: var(--brand);
+  color: white;
+  border: none;
+  border-radius: 10px;
+  width: 38px;
+  height: 38px;
+  font-size: 16px;
+  cursor: pointer;
+  flex: none;
+}
+
+.composer button:disabled {
+  background: #b7bfe6;
+  cursor: default;
+}
+
+.composer #stopBtn {
+  background: #d92c2c;
+}
+
+/* --- Settings --- */
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 24, 50, 0.45);
+  display: none;
+  align-items: stretch;
+  justify-content: flex-end;
+  z-index: 10;
+}
+
+.settings-overlay.open { display: flex; }
+
+.settings-panel {
+  width: 100%;
+  max-width: 360px;
+  background: var(--bg);
+  height: 100%;
+  overflow-y: auto;
+  box-shadow: -4px 0 16px rgba(0,0,0,0.15);
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  background: var(--brand);
+  color: white;
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.settings-header .icon-btn { font-size: 15px; }
+
+.settings-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid #e2e4f0;
+}
+
+.settings-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #444;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.settings-status {
+  font-size: 13px;
+  color: #333;
+  margin-bottom: 8px;
+}
+
+.settings-hint {
+  font-size: 12px;
+  color: #777;
+  margin: 0 0 10px;
+  line-height: 1.4;
+}
+
+.settings-field {
+  margin-bottom: 8px;
+}
+
+.settings-field label {
+  display: block;
+  font-size: 11px;
+  color: #777;
+  margin-bottom: 2px;
+}
+
+.settings-field input,
+.settings-field textarea {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid #d3d6ea;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.settings-field-row {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-field-row .settings-field { flex: 1; }
+
+.settings-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  color: #333;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.settings-checkbox input { margin-top: 2px; }
+
+.settings-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.settings-section button {
+  background: var(--brand);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.settings-section button.secondary {
+  background: white;
+  color: var(--brand);
+  border: 1px solid var(--brand);
+}
+
+.settings-log {
+  background: white;
+  border: 1px solid #e2e4f0;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 11px;
+  font-family: Consolas, "Courier New", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 0 0 8px;
+}
+
+.mcp-form {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.mcp-form input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #d3d6ea;
+  font-size: 12px;
+}

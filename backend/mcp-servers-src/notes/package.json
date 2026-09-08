@@ -1,0 +1,23 @@
+{
+  "name": "mcp-notes",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server for Squirrel Wisdom notes (create/read/update/delete/move/folders/attachments) as long-term memory for Claude",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-notes": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

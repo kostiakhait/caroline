@@ -1,0 +1,23 @@
+{
+  "name": "mcp-windows-window-mouse",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server that clicks at window-relative coordinates inside a specific Windows window without moving the real cursor or stealing focus (posts mouse messages directly to the window)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-windows-window-mouse": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && dotnet build native -c Release -o dist",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

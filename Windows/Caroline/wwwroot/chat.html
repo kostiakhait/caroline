@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Caroline</title>
+<link rel="stylesheet" href="chat.css" />
+</head>
+<body>
+  <div class="header">
+    <div class="header-title">Caroline</div>
+    <div class="header-right">
+      <button id="settingsBtn" class="icon-btn" title="Settings">⚙</button>
+    </div>
+  </div>
+
+  <div class="messages" id="messages"></div>
+
+  <div class="voice-controls" id="voiceControls" hidden>
+    <span class="voice-controls-label">🔊 Speaking…</span>
+    <button id="voicePauseBtn" title="Pause">⏸</button>
+    <button id="voiceRestartBtn" title="Restart from the beginning">⟲</button>
+    <button id="voiceStopBtn" title="Stop">⏹</button>
+  </div>
+
+  <div class="attachments" id="attachments"></div>
+
+  <div class="composer">
+    <button id="attachBtn" title="Attach file">📎</button>
+    <input id="fileInput" type="file" multiple style="display:none"
+           accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.js,.ts,.py,.cs,.java,.cpp,.c,.h,.go,.rs,.html,.css,.xml,.yaml,.yml" />
+    <textarea id="input" placeholder="Message Caroline…" rows="1"></textarea>
+    <button id="micBtn" title="Voice input">🎙️</button>
+    <button id="stopBtn" title="Stop" style="display:none">⏹</button>
+    <button id="sendBtn" title="Send">➤</button>
+  </div>
+
+  <div class="statusbar" id="statusBar">
+    <div class="statusbar-text" id="statusBarText">connecting…</div>
+    <div class="statusbar-lamps">
+      <span class="lamp lamp-yellow" id="lampBackend" title="Backend connection"></span>
+      <span class="lamp lamp-yellow" id="lampChannel" title="Ratatosk channel"></span>
+    </div>
+  </div>
+
+  <div class="settings-overlay" id="settingsOverlay">
+    <div class="settings-panel">
+      <div class="settings-header">
+        <span>Settings</span>
+        <button id="closeSettingsBtn" class="icon-btn" title="Close">✕</button>
+      </div>
+
+      <section class="settings-section">
+        <h4>Personality</h4>
+        <p class="settings-hint">How Caroline refers to and describes herself. Applies the next time a chat session (re)starts.</p>
+        <div class="settings-field">
+          <label>Profile</label>
+          <select id="personaProfile">
+            <option value="custom">Custom (edit below)</option>
+            <option value="caroline">Caroline (standard)</option>
+            <option value="peter">Peter (standard)</option>
+          </select>
+        </div>
+        <div id="personaCustomFields">
+          <div class="settings-field"><label>Name</label><input id="personaName" value="Caroline" /></div>
+          <div class="settings-field-row">
+            <div class="settings-field"><label>Gender</label><input id="personaGender" value="female" /></div>
+            <div class="settings-field"><label>Age</label><input id="personaAge" value="middle-aged" /></div>
+          </div>
+          <div class="settings-field"><label>Bio</label><textarea id="personaBio" rows="3">An independent-minded personal secretary -- efficient, direct, and willing to push back, not just agreeable.</textarea></div>
+        </div>
+        <div id="personaStandardFields" style="display:none">
+          <p class="settings-hint">Overrides below apply on top of the standard profile -- leave a field as-is to keep the built-in value.</p>
+          <div class="settings-field"><label>Biography</label><textarea id="personaBiography" rows="4"></textarea></div>
+          <div class="settings-field"><label>Photos folder</label><input id="personaPhotosDir" placeholder="Absolute path to a folder of images, e.g. C:\Photos\Caroline" /></div>
+        </div>
+        <div class="settings-row">
+          <button id="personaSaveBtn">Save personality</button>
+          <button id="personaResetBtn" class="secondary" style="display:none">Reset to standard</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h4>Window</h4>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="alwaysOnTop" checked />
+          Keep the chat window on top of other windows
+        </label>
+      </section>
+
+      <section class="settings-section">
+        <h4>Voice</h4>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="voiceAutoSend" checked />
+          Send voice messages automatically (uncheck to review/edit the transcribed text first)
+        </label>
+      </section>
+
+      <section class="settings-section">
+        <h4>Visual mode</h4>
+        <p class="settings-hint">Instead of just playing voice replies aloud, shows a small animated talking-head window instead. Caroline/Peter profiles only.</p>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="visualModeEnabled" checked />
+          Enable visual mode for voice replies
+        </label>
+        <div id="visualModeUnavailableHint" class="settings-hint" style="display:none">Unavailable for a custom profile -- switch to the Caroline or Peter standard profile above to use it.</div>
+      </section>
+
+      <section class="settings-section">
+        <h4>Claude account</h4>
+        <p class="settings-hint">Caroline uses your own Claude subscription — no separate API key.</p>
+        <div id="authStatusText" class="settings-status">Checking…</div>
+        <div class="settings-row">
+          <button id="loginBtn">Log in to Claude</button>
+          <button id="logoutBtn" class="secondary">Log out</button>
+        </div>
+        <pre id="authLoginOutput" class="settings-log" style="display:none"></pre>
+      </section>
+
+      <section class="settings-section">
+        <h4>Account &amp; Billing</h4>
+        <p class="settings-hint">Which account is paying for chat right now, and your SquirrelWisdom balance for the voice/other features it also backs.</p>
+        <div id="modeStatusText" class="settings-status">Checking…</div>
+
+        <div class="settings-field">
+          <label>Own Anthropic API key (optional)</label>
+          <input id="ownAnthropicKeyInput" type="password" placeholder="sk-ant-..." />
+        </div>
+        <div class="settings-row">
+          <button id="ownAnthropicKeySaveBtn">Save key</button>
+          <button id="ownAnthropicKeyClearBtn" class="secondary">Clear</button>
+        </div>
+        <div id="ownAnthropicKeyStatus" class="settings-status"></div>
+
+        <div id="swAccountStatus" class="settings-status">Checking…</div>
+        <div id="swUpsellHint" class="settings-hint" style="display:none">Connect SquirrelWisdom too to unlock Notes, Ratatosk messaging, and other features.</div>
+        <div class="settings-row">
+          <button id="swLoginBtn">Log in / Register with SquirrelWisdom</button>
+          <button id="swTopUpBtn" class="secondary">Top up</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h4>Ratatosk messenger</h4>
+        <p class="settings-hint">Lets Caroline read/send messages on your Ratatosk (SquirrelWisdom messenger) account, and optionally register her own separate account so you can message her there directly.</p>
+        <div id="ratatoskStatusText" class="settings-status">Checking…</div>
+        <div class="settings-row">
+          <button id="ratatoskRegisterBtn">Register Caroline's own account</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h4>SMS account</h4>
+        <p class="settings-hint">Send/receive SMS through your own SMTP2GO account (your own API key, your own number) — not a shared one. Get an API key at app.smtp2go.com (or app-eu/app-au) → Sending → API Keys.</p>
+        <div id="smsAccountStatus" class="settings-status">Checking…</div>
+        <div class="settings-field">
+          <label>SMTP2GO API key</label>
+          <input id="smsApiKeyInput" type="password" placeholder="api-..." />
+        </div>
+        <div class="settings-field">
+          <label>Dedicated sending number (optional, E.164)</label>
+          <input id="smsSenderInput" type="text" placeholder="+12025550123" />
+        </div>
+        <div class="settings-row">
+          <button id="smsAccountSaveBtn">Save account</button>
+          <button id="smsAccountRemoveBtn" class="secondary">Remove</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h4>MCP servers</h4>
+        <p class="settings-hint">Tools Caroline can use (email, notes, browser, etc). Advanced — add a server by its exact run command; remove by its exact name shown below.</p>
+        <div id="mcpListOutput" class="settings-log">Loading…</div>
+        <div class="settings-row">
+          <button id="mcpRefreshBtn" class="secondary">Refresh</button>
+        </div>
+        <div class="mcp-form">
+          <input id="mcpName" placeholder="name" />
+          <input id="mcpCommand" placeholder="command" />
+          <input id="mcpArgs" placeholder="args (space-separated)" />
+          <button id="mcpAddBtn">Add</button>
+        </div>
+        <div class="mcp-form">
+          <input id="mcpRemoveName" placeholder="name to remove" />
+          <button id="mcpRemoveBtn" class="secondary">Remove</button>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script src="chat.js"></script>
+</body>
+</html>

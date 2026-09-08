@@ -1,0 +1,44 @@
+# --- Build output --------------------------------------------------------
+backend/node_modules/
+backend/dist/
+backend/mcp-servers/
+backend/vault-client/dist/
+backend/vault-client/node_modules/
+backend/mcp-servers-src/*/node_modules/
+backend/mcp-servers-src/*/dist/
+dist/
+dist_installer/
+
+# --- .NET / Visual Studio -------------------------------------------------
+.vs/
+Windows/Caroline/bin/
+Windows/Caroline/obj/
+Windows/CarolineInstaller/bin/
+Windows/CarolineInstaller/obj/
+vendor/XcfaRenderer/bin/
+vendor/XcfaRenderer/obj/
+vendor/XcfaRenderer/Demo/bin/
+vendor/XcfaRenderer/Demo/obj/
+vendor/XcfaRenderer/XcfaRenderer.Tests/bin/
+vendor/XcfaRenderer/XcfaRenderer.Tests/obj/
+
+# --- Visual Mode talking-head models --------------------------------------
+# Tens of GB each -- too large to keep in git, and the app doesn't need them
+# in the checkout anyway (ModelsInstaller downloads them straight from the
+# release server at install time). Kept locally for dev/testing only.
+art/models/*.xcfa
+art/models/*.cfa
+
+# --- Python ----------------------------------------------------------------
+art/__pycache__/
+**/__pycache__/
+
+# --- Deploy tooling / secrets (maintainer-only, never public) --------------
+# See deploy.mk's own header comment: split out of the public Makefile,
+# gitignored the same as these two scripts always were.
+deploy.bat
+deploy_models.bat
+deploy.mk
+
+# --- Misc build/debug artifacts --------------------------------------------
+*.log

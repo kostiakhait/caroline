@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>CarolineInstaller</AssemblyName>
+    <RootNamespace>CarolineInstaller</RootNamespace>
+    <ApplicationIcon>..\Caroline\Resources\app.ico</ApplicationIcon>
+    <Platforms>x64</Platforms>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Product>Caroline</Product>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 24 banner illustrations, embedded straight into the EXE and cycled by
+         ProgressWindow every few seconds during setup. -->
+    <EmbeddedResource Include="Assets\Banners\*.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- WMI, to read another (already-running) process's command line: Process.MainModule
+         alone gives no way to see a process's *arguments*, only its exe path, and that's
+         exactly what's needed to identify a straggling WebView2 browser/renderer process as
+         genuinely Caroline's own (see Autostart.cs's KillStrayWebView2Processes). -->
+    <PackageReference Include="System.Management" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

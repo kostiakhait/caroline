@@ -1,0 +1,23 @@
+{
+  "name": "mcp-sms",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server for SMS send/receive via each user's own SMTP2GO account (Camerlengo v2 sms:* commands)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-sms": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

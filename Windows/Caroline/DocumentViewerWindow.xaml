@@ -1,0 +1,48 @@
+<Window x:Class="Caroline.DocumentViewerWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Caroline Viewer"
+        Width="900" Height="700"
+        WindowStartupLocation="CenterScreen"
+        Closing="OnClosing">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" Background="#3A3F8F" LastChildFill="True">
+            <StackPanel x:Name="OfficeButtons" Orientation="Horizontal" DockPanel.Dock="Right" Margin="0,0,8,0" Visibility="Collapsed">
+                <Button x:Name="OfficeDoneButton" Content="Done" Margin="4,6" Padding="12,4" Click="OnOfficeDoneClicked" />
+            </StackPanel>
+            <StackPanel x:Name="ViewButtons" Orientation="Horizontal" DockPanel.Dock="Right" Margin="0,0,8,0" Visibility="Collapsed">
+                <Button x:Name="CloseViewButton" Content="Close" Margin="4,6" Padding="12,4" Click="OnCloseViewClicked" />
+            </StackPanel>
+            <StackPanel x:Name="LoginButtons" Orientation="Horizontal" DockPanel.Dock="Right" Margin="0,0,8,0" Visibility="Collapsed">
+                <Button x:Name="LoginOpenSettingsButton" Content="I have my own Claude account" Margin="4,6" Padding="12,4" Click="OnLoginOpenSettingsClicked" Visibility="Collapsed" />
+                <Button x:Name="LoginButton" Content="Log In" Margin="4,6" Padding="12,4" Click="OnLoginClicked" IsDefault="True" />
+                <Button x:Name="LoginCancelButton" Content="Cancel" Margin="4,6" Padding="12,4" Click="OnLoginCancelClicked" />
+            </StackPanel>
+            <TextBlock x:Name="TitleText" Foreground="White" VerticalAlignment="Center" Margin="12,0" FontSize="14" />
+        </DockPanel>
+
+        <Grid Grid.Row="1" x:Name="ContentHost" Background="#222">
+            <Image x:Name="ImageView" Stretch="Uniform" Visibility="Collapsed" />
+            <MediaElement x:Name="VideoView" LoadedBehavior="Manual" UnloadedBehavior="Stop" Stretch="Uniform" Visibility="Collapsed" />
+            <!-- OnlyOffice's WebView2 editor control is added here in code-behind, see ShowOffice(). -->
+            <Grid x:Name="OfficeHost" Visibility="Collapsed" />
+            <TextBlock x:Name="StatusText" Foreground="#CCC" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="16" Visibility="Collapsed" />
+            <StackPanel x:Name="LoginPanel" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center" Width="320">
+                <TextBlock x:Name="LoginTitleText" Text="Log in to SquirrelWisdom" Foreground="White" FontSize="18" Margin="0,0,0,4" HorizontalAlignment="Center" />
+                <TextBlock x:Name="LoginSubtitleText" Text="Needed for Notes and other features that use your SquirrelWisdom account." Foreground="#AAA" TextWrapping="Wrap" TextAlignment="Center" Margin="0,0,0,16" />
+                <TextBlock Text="Email" Foreground="#CCC" Margin="0,0,0,2" />
+                <TextBox x:Name="LoginEmailBox" Padding="6,4" Margin="0,0,0,10" />
+                <TextBlock Text="Password" Foreground="#CCC" Margin="0,0,0,2" />
+                <PasswordBox x:Name="LoginPasswordBox" Padding="6,4" Margin="0,0,0,10" />
+                <CheckBox x:Name="RegisterToggle" Content="I don't have an account -- register instead" Foreground="#CCC"
+                          Margin="0,0,0,10" Checked="OnRegisterToggleChanged" Unchecked="OnRegisterToggleChanged" />
+                <TextBlock x:Name="LoginErrorText" Foreground="#FF8080" TextWrapping="Wrap" Margin="0,0,0,10" Visibility="Collapsed" />
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

@@ -1,0 +1,23 @@
+{
+  "name": "mcp-windows-keyboard",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server that injects keyboard events (type text, key presses, held keys) on Windows",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-windows-keyboard": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && dotnet build native -c Release -o dist",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

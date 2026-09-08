@@ -1,0 +1,29 @@
+{
+  "name": "mcp-email",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server for direct IMAP/SMTP email access (read/search/manage inbox, send mail) for any account",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-email": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1",
+    "imapflow": "^1.0.171",
+    "mailparser": "^3.7.2",
+    "nodemailer": "^9.0.3",
+    "mcp-vault-client": "file:../_shared/vault"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5",
+    "@types/mailparser": "^3.4.5",
+    "@types/nodemailer": "^6.4.17"
+  }
+}

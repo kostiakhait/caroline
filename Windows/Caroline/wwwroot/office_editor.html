@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Document Editor</title>
+<style>
+  html, body, #holder { width: 100%; height: 100%; margin: 0; padding: 0; background: #222; overflow: hidden; }
+  #status { color: #ccc; font: 14px sans-serif; text-align: center; padding-top: 40px; }
+</style>
+</head>
+<body>
+<div id="status">Loading document…</div>
+<div id="holder" style="display:none"></div>
+<script>
+  // Config comes in via the query string (this page is loaded with
+  // file:///.../office_editor.html?documentType=...&... -- see
+  // DocumentViewerWindow.xaml.cs's ShowOffice()) rather than postMessage,
+  // since it's just navigated to fresh each time, never reused.
+  const params = new URLSearchParams(location.search);
+  const cfg = {
+    documentType: params.get("documentType"),
+    fileType: params.get("fileType"),
+    editable: params.get("editable") === "true",
+    key: params.get("key"),
+    title: params.get("title") || "Document",
+    documentUrl: params.get("documentUrl"),
+    onlyofficeUrl: params.get("onlyofficeUrl"),
+    callbackUrl: params.get("callbackUrl") || undefined,
+  };
+
+  function showError(msg) {
+    const status = document.getElementById("status");
+    status.style.display = "block";
+    status.textContent = msg;
+    document.getElementById("holder").style.display = "none";
+  }
+
+  if (!cfg.documentUrl || !cfg.onlyofficeUrl) {
+    showError("Missing document configuration.");
+  } else {
+    const script = document.createElement("script");
+    script.src = `${cfg.onlyofficeUrl}/web-apps/apps/api/documents/api.js`;
+    script.onload = () => {
+      document.getElementById("status").style.display = "none";
+      document.getElementById("holder").style.display = "block";
+      try {
+        new DocsAPI.DocEditor("holder", {
+          document: {
+            fileType: cfg.fileType,
+            key: cfg.key,
+            title: cfg.title,
+            url: cfg.documentUrl,
+            permissions: { edit: cfg.editable, download: true },
+          },
+          documentType: cfg.documentType,
+          editorConfig: {
+            mode: cfg.editable ? "edit" : "view",
+            callbackUrl: cfg.callbackUrl,
+            lang: "en",
+          },
+          width: "100%",
+          height: "100%",
+        });
+      } catch (e) {
+        showError("Could not start the document editor: " + e.message);
+      }
+    };
+    script.onerror = () => showError("Could not reach the document editor server.");
+    document.head.appendChild(script);
+  }
+</script>
+</body>
+</html>

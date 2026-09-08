@@ -1,0 +1,16 @@
+{
+  "name": "mcp-vault-client",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "Shared client library for storing/retrieving MCP server credentials as notes in the user's secure Squirrel Wisdom Notes account, instead of local plaintext files.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

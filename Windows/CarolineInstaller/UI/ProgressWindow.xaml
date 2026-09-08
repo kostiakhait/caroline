@@ -1,0 +1,92 @@
+<Window x:Class="CarolineInstaller.UI.ProgressWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Caroline Setup"
+        Width="800" Height="500"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        Topmost="True"
+        Background="Black">
+    <Window.Resources>
+        <Style x:Key="TitleBarButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="44" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#33FFFFFF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <Grid>
+        <Image x:Name="BannerImage" Stretch="UniformToFill" />
+
+        <!-- Dark gradient at the bottom so the status text stays readable over any banner. -->
+        <Rectangle VerticalAlignment="Bottom" Height="140">
+            <Rectangle.Fill>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                    <GradientStop Color="#00000000" Offset="0" />
+                    <GradientStop Color="#CC000000" Offset="1" />
+                </LinearGradientBrush>
+            </Rectangle.Fill>
+        </Rectangle>
+
+        <StackPanel VerticalAlignment="Bottom" Margin="24,0,24,20">
+            <TextBlock x:Name="StatusText"
+                       Foreground="White"
+                       FontSize="16"
+                       Margin="0,0,0,8" />
+            <ProgressBar x:Name="ProgressBarControl"
+                         Height="18"
+                         Minimum="0" Maximum="1" Value="0"
+                         IsIndeterminate="True" />
+            <TextBlock x:Name="SpeedEtaText"
+                       Text=""
+                       Foreground="#CCCCCC"
+                       FontSize="12"
+                       Margin="0,6,0,0" />
+        </StackPanel>
+
+        <!-- Custom title bar overlaid on the banner: drag-to-move plus minimize/cancel, since
+             WindowStyle="None" leaves no OS-provided way to do any of that. -->
+        <Border VerticalAlignment="Top" Height="36" Background="#66000000"
+                MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
+            <Grid>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0" IsHitTestVisible="False">
+                    <TextBlock Text="Caroline Setup"
+                               Foreground="White"
+                               FontSize="13" />
+                    <TextBlock x:Name="VersionText"
+                               Foreground="#AAFFFFFF"
+                               FontSize="12"
+                               Margin="10,0,0,0" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="MinimizeButton"
+                            Content="&#8212;"
+                            Click="Minimize_Click"
+                            Style="{StaticResource TitleBarButtonStyle}" />
+                    <Button x:Name="CancelButton"
+                            Content="&#10005;"
+                            Click="Cancel_Click"
+                            Style="{StaticResource TitleBarButtonStyle}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

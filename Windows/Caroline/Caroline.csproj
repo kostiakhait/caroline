@@ -1,0 +1,80 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Resources\app.ico</ApplicationIcon>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <AssemblyName>Caroline</AssemblyName>
+    <RootNamespace>Caroline</RootNamespace>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2957.106" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <!-- Crop/downscale for app_browser_screenshot: same System.Drawing-based approach as
+         MCP/window-screenshot's native/Program.cs (ApplyCropAndDownscale), ported here since
+         this capture happens directly in-process (WebView2's own CapturePreviewAsync), not
+         through that separate native exe. -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Visual mode: renders talking-head video for voice replies (see VisualModeManager.cs).
+         Vendored into this repo (vendor/XcfaRenderer/) so the project is self-contained.
+         Model FILES (.xcfa) themselves are not part of this repo (created by a separate,
+         private pipeline), only the renderer that plays them back. -->
+    <ProjectReference Include="..\..\vendor\XcfaRenderer\XcfaRenderer.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Resources\app.ico" />
+    <Resource Include="Resources\icon.png" />
+    <Resource Include="Resources\splash.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The chat UI (HTML/CSS/JS) hosted inside WebView2, copied next to the
+         built exe so it's reachable via a file:// URL at runtime. -->
+    <None Include="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SplashWindow's photo cycle uses the installer's own onboarding
+         banners (CarolineInstaller/Assets/Banners) rather than duplicating
+         a separate image set just for this: copied to SplashBanners\ next
+         to the built exe (see SplashWindow.xaml.cs). -->
+    <None Include="..\CarolineInstaller\Assets\Banners\*.png">
+      <Link>SplashBanners\%(FileName)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!-- Dev-time convenience: BackendProcess.cs spawns node against
+       <output>/backend/dist/server.js, a copy independent of
+       ../../backend/dist (node_modules and mcp-servers live only in that
+       copy; see build.bat for the full release packaging). Without this
+       target, editing backend/src and running `npx tsc` there updates the
+       source tree's dist/ but not this copy, so the running app keeps
+       executing stale backend code with no error whatsoever; this is
+       exactly what happened once during development, where persona fields
+       silently came back empty because the running backend didn't have
+       the persona_get op yet. This only copies the small compiled .js
+       files, not node_modules/mcp-servers (those need build.bat's full
+       copy if they ever change). -->
+  <Target Name="SyncBackendDist" AfterTargets="Build">
+    <ItemGroup>
+      <BackendDistFiles Include="..\..\backend\dist\**\*.js" />
+    </ItemGroup>
+    <Copy SourceFiles="@(BackendDistFiles)"
+          DestinationFolder="$(OutDir)backend\dist\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

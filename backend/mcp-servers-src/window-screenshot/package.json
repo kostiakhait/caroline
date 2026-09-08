@@ -1,0 +1,23 @@
+{
+  "name": "mcp-windows-window-screenshot",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server that captures screenshots of a specific Windows window by handle (including a non-foreground/background window), as a single frame or a timed burst of frames",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-windows-window-screenshot": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && dotnet build native -c Release -o dist",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

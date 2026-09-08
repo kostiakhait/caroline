@@ -1,0 +1,53 @@
+Caroline
+Copyright 2026 Konstantin Khait
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+
+No affiliation with Anthropic
+
+Caroline is an independent, third-party application. It is built on top of
+the Claude Agent SDK and uses Claude models via the Anthropic API, but it is
+not developed, published, reviewed, or endorsed by Anthropic, PBC. "Claude"
+and "Anthropic" are trademarks of Anthropic, PBC, used here only to
+accurately describe interoperability.
+
+--------------------------------------------------------------------------
+
+Proprietary runtime dependency
+
+Caroline's backend depends on the Claude Agent SDK (npm package
+"@anthropic-ai/claude-agent-sdk"), a proprietary package published by
+Anthropic under its own license, fetched from the npm registry at build
+time like any other dependency. It is not vendored or redistributed as
+part of this repository; anyone building Caroline needs to accept
+Anthropic's own terms for that package independently.
+
+--------------------------------------------------------------------------
+
+Vendored components
+
+The following directories contain code originally developed as part of a
+private monorepo and vendored here so this repository is self-contained
+and independently buildable. Each remains licensed under the terms of this
+repository (Apache License 2.0) as vendored, unless a more specific notice
+is present within that directory:
+
+  - backend/mcp-servers-src/*  -- MCP server implementations Caroline's
+    backend spawns/bundles at build time (see backend/scripts/
+    bundle-mcp-servers.mjs).
+  - vendor/XcfaRenderer/       -- the Visual Mode playback/rendering engine
+    (renders and plays back pre-built .xcfa talking-head model files). The
+    separate, private pipeline that CREATES .xcfa model files is not part
+    of this repository and is not open source.
+
+--------------------------------------------------------------------------
+
+Service-identity API keys
+
+A small number of API keys embedded in this repository's source (for
+example the SquirrelWisdom/Camerlengo backend service keys) identify the
+Caroline *application* to its backend service, the way a public OAuth
+client_id would -- they are not per-user secrets, and are not intended to
+be kept confidential.

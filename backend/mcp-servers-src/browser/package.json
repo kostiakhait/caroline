@@ -1,0 +1,24 @@
+{
+  "name": "mcp-browser",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "description": "MCP server that drives a single persistent Chromium instance over raw CDP, owned by a detached daemon process instead of one browser-per-session. Avoids the profile-lock/session-crash instability of running @playwright/mcp's own server per Claude Code session.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-browser": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright-core": "^1.55.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

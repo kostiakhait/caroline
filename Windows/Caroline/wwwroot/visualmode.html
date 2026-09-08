@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  img, video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #vid { display: none; }
+</style>
+</head>
+<body>
+  <img id="staticImg" />
+  <video id="vid"></video>
+  <script>
+    const staticImg = document.getElementById("staticImg");
+    const vid = document.getElementById("vid");
+
+    // Called by VisualModeWindow.xaml.cs (ExecuteScriptAsync) to show the "silence" frame
+    // the moment TTS generation starts, before any audio/render exists yet.
+    window.showStatic = function (dataUri) {
+      vid.pause();
+      vid.style.display = "none";
+      staticImg.style.display = "block";
+      staticImg.src = dataUri;
+    };
+
+    // Called once the rendered .webm is ready -- fileUri is a file:/// path.
+    window.playVideo = function (fileUri) {
+      staticImg.style.display = "none";
+      vid.style.display = "block";
+      vid.muted = false;
+      vid.volume = 1.0;
+      vid.src = fileUri;
+      vid.currentTime = 0;
+      // A rejected play() (autoplay policy, unsupported codec/container) used to be
+      // swallowed silently here with nothing to unblock the C# side's await on
+      // "ended" -- confirmed live (2026-09-03) as a real hang: render succeeded but
+      // playback never started/finished, and VisualModeManager.HandleAudioAsync
+      // waited on playbackEnded forever. Treat a failed play() the same as the video
+      // ending -- there's nothing more this window can do about it.
+      vid.play().catch((err) => {
+        window.chrome.webview.postMessage({ type: "ended", error: String(err) });
+      });
+    };
+
+    // Reports the real clip duration back to native the moment it's known, so
+    // VisualModeWindow can hide the control bar entirely for very short clips
+    // (see OnDurationKnown -- under 10s isn't worth showing pause/restart/stop for).
+    vid.addEventListener("loadedmetadata", () => {
+      window.chrome.webview.postMessage({ type: "duration", seconds: vid.duration });
+    });
+
+    vid.addEventListener("ended", () => {
+      window.chrome.webview.postMessage({ type: "ended" });
+    });
+
+    // A mid-playback decode/network error (bad file, unsupported VP9+alpha
+    // combination, etc.) fires "error", never "ended" -- without this listener
+    // that also hung the C# side forever, same root cause as the play() rejection
+    // above.
+    vid.addEventListener("error", () => {
+      const err = vid.error ? `code=${vid.error.code} message=${vid.error.message}` : "unknown";
+      window.chrome.webview.postMessage({ type: "ended", error: err });
+    });
+  </script>
+</body>
+</html>
