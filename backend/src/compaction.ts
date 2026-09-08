@@ -41,14 +41,31 @@ function stubNote(parentPath: string, detail: string): ContentBlock {
   };
 }
 
-/** Rewrites tool_result content blocks in place: image blocks -> stub, everything else left alone (handled by the caller for the >1h tool-call rule). */
+/**
+ * Rewrites a tool_result block's content in place for the >1h rule: image
+ * blocks -> stub (array-content case, e.g. a screenshot tool), or the whole
+ * string -> stub (string-content case -- Read, Bash, Grep, and most other
+ * tools return their result as a plain string, not an array of blocks).
+ * Bug fix (2026-09-08): only the array-content case was ever handled here --
+ * confirmed live via direct reproduction that a large STRING tool_result
+ * (a big file Read, a big command's stdout) survived completely untouched
+ * by this rule, unlike everything else the >1h/>1day rules already age out,
+ * and directly inflates real API token usage on every later turn until the
+ * full >1day turn-collapse eventually caught it.
+ */
 function filterToolResultBlock(block: ContentBlock, parentPath: string): ContentBlock {
-  if (block.type !== "tool_result" || !Array.isArray(block.content)) return block;
-  const innerBlocks = block.content as ContentBlock[];
-  const filteredInner = innerBlocks.map((inner) =>
-    inner.type === "image" ? stubNote(parentPath, "скриншот") : inner,
-  );
-  return { ...block, content: filteredInner };
+  if (block.type !== "tool_result") return block;
+  if (Array.isArray(block.content)) {
+    const innerBlocks = block.content as ContentBlock[];
+    const filteredInner = innerBlocks.map((inner) =>
+      inner.type === "image" ? stubNote(parentPath, "скриншот") : inner,
+    );
+    return { ...block, content: filteredInner };
+  }
+  if (typeof block.content === "string") {
+    return { ...block, content: stubNote(parentPath, "результат инструмента").text };
+  }
+  return block;
 }
 
 /** >1h rule: strip image bytes (rule 1) and non-image tool_use/tool_result payloads (rule 3), keep the tool name for readability. */

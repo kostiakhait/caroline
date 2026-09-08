@@ -45,7 +45,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -1514,6 +1514,7 @@ class ChatSession {
               consultLargeModelInstruction(),
               noRemoteFilesystemScansInstruction(),
               taskDecompositionInstruction(),
+              scriptOrSubagentDelegationInstruction(),
               learnFromMistakesInstruction(),
             ].filter(Boolean).join("\n\n"),
           },

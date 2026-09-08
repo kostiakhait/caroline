@@ -364,6 +364,41 @@ export function taskDecompositionInstruction(): string {
 }
 
 /**
+ * Per explicit instruction (2026-09-08): Caroline has Python and Bash
+ * specifically so mechanical, repetitive tasks don't have to be driven one
+ * manual tool call at a time -- and every tool result from a manual loop
+ * lands in her own live context, which is exactly the kind of accumulation
+ * dehydrate.ts/compaction.ts exist to clean up after the fact. Better to not
+ * generate the bloat in the first place. Deliberately doesn't hardcode
+ * background-agent tool names (TaskOutput/TaskStop or equivalent) since
+ * that surface can vary by CLI build -- phrased so she finds the right one
+ * in her own current tool list rather than trusting a name that might not
+ * exist.
+ */
+export function scriptOrSubagentDelegationInstruction(): string {
+  return (
+    `When a task is really the same mechanical operation repeated over many similar targets, with no real ` +
+    `judgment needed per item (checking several mailboxes, applying the same check across a list of files, ` +
+    `pulling the same field out of many records), don't loop through it yourself one tool call at a time -- ` +
+    `write and run a script (you have Python and Bash for exactly this) that does all of them in one go. ` +
+    `It's faster and more reliable than a manual loop, and just as important: only the script's own (much ` +
+    `smaller) summary output lands in your conversation, not every raw result along the way.\n` +
+    `When a task instead needs real judgment at each step and is substantial/self-contained enough to run ` +
+    `on its own (an open-ended search through a large directory tree for something you'd have to actually ` +
+    `read and evaluate, a big independent research task) -- same idea, different tool: delegate it to a ` +
+    `subagent via Task if it's available, so the exploration/raw output stays out of your own context and ` +
+    `you fold in only its conclusion.\n` +
+    `Either way, if it's going to take a while, run it in the background (see the note on Bash's ` +
+    `run_in_background above -- Task supports the same for subagents) -- but backgrounding something is not ` +
+    `"fire and forget": check on it once you'd expect it to be done using whatever tool your current tool ` +
+    `list offers for that (BashOutput for a script; the equivalent for a backgrounded agent), actually use ` +
+    `its result, and stop it (KillShell / the agent equivalent) if it hangs, is no longer needed, or turns ` +
+    `out partway through to have been the wrong approach. Never leave something running in the background ` +
+    `that you never check back on.`
+  );
+}
+
+/**
  * Per explicit instruction (2026-09-07): Caroline should learn from her own mistakes
  * durably, not just apologize in the moment and forget by the next session. Skills are
  * exactly the right mechanism for this, already proven for procedural knowledge
