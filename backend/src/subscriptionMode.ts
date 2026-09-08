@@ -81,12 +81,19 @@ async function hasOwnAnthropicOAuth(cwd: string): Promise<boolean> {
 // turn just failed. Per explicit instruction (2026-09-08): once own-Anthropic
 // is CONFIRMED exhausted (server.ts calls markOwnAnthropicExhausted after a
 // real billing_error/rate_limit_event, not speculatively), fall back to
-// sw-proxy for as long as the exhaustion is expected to last, then
-// automatically try own-Anthropic again -- no manual "switch back" needed:
-// if it's still down, the next failure just re-arms the same cooldown; if
-// it recovered, the turn just succeeds on own-Anthropic and nothing else
-// needs to happen.
+// sw-proxy -- but keep actively checking whether it's back, not just trusting
+// the SDK's own resetsAt and waiting it out: confirmed live (2026-09-08) that
+// real availability can flap on a much shorter cycle than resetsAt suggests
+// (five separate switches inside one morning), and per explicit instruction,
+// a real periodic probe against the actual account is simpler and more
+// trustworthy than trying to predict availability -- token cost of asking
+// isn't a concern here.
 let ownAnthropicBlockedUntil: number | null = null;
+/** When resolveMode() last let a call through to own-Anthropic while
+ *  nominally still blocked, to test whether it's back -- see
+ *  OWN_ANTHROPIC_RECHECK_INTERVAL_MS. Null means no probe is overdue yet
+ *  (markOwnAnthropicExhausted just set one up). */
+let ownAnthropicLastRecheckAt: number | null = null;
 
 /** Used when the real reset time isn't known -- billing_error carries none
  *  at all, and even a rate-limit's resetsAt is occasionally absent. Short
@@ -95,14 +102,41 @@ let ownAnthropicBlockedUntil: number | null = null;
  *  account every retry. */
 const OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS = 30 * 60_000; // 30 minutes
 
+/** How often resolveMode() lets a real attempt through to own-Anthropic
+ *  while still nominally blocked, regardless of how far off resetsAt is --
+ *  the actual probe (below) is just resolveMode() returning
+ *  "own-anthropic-oauth"/"-key" for one round; if the CLI's own next request
+ *  still fails, whichever detection path in server.ts catches it
+ *  (billing_error / rate_limit_event / cc_cli_limit_message) calls
+ *  markOwnAnthropicExhausted() again with a fresh cooldown, same as any
+ *  other failure. If it succeeds, server.ts's 'init' handler calls
+ *  clearOwnAnthropicExhausted() -- see that function's own doc comment. */
+const OWN_ANTHROPIC_RECHECK_INTERVAL_MS = 2 * 60_000; // 2 minutes
+
 /** Call once own-Anthropic has actually failed on a real request (billing_error
  *  or a rejected rate_limit_event) -- never speculatively. `resetsAt`, when
  *  the SDK's own rate_limit_info supplied one, is honored exactly; otherwise
- *  falls back to OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS. */
+ *  falls back to OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS. Also arms the next
+ *  recheck window (this call itself was one such attempt, successful or not
+ *  -- it just found out the answer is "still no"). */
 export function markOwnAnthropicExhausted(resetsAt?: number | null): void {
   const until = resetsAt && resetsAt > Date.now() ? resetsAt : Date.now() + OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS;
   ownAnthropicBlockedUntil = until;
-  console.error(`[caroline] [subscriptionMode] markOwnAnthropicExhausted: own-Anthropic blocked until ${new Date(until).toISOString()}`);
+  ownAnthropicLastRecheckAt = Date.now();
+  console.error(`[caroline] [subscriptionMode] markOwnAnthropicExhausted: own-Anthropic blocked until ${new Date(until).toISOString()}, next recheck in ${Math.round(OWN_ANTHROPIC_RECHECK_INTERVAL_MS / 1000)}s`);
+}
+
+/** Call when a session actually resolved to own-Anthropic and proved itself
+ *  alive (server.ts's 'init' handler -- "the earliest proof this query() is
+ *  genuinely alive and talking to the CLI", same trust level that handler's
+ *  own connState recovery already relies on: if this turns out to be wrong,
+ *  the very next real request re-blocks it via markOwnAnthropicExhausted,
+ *  exactly like any other misjudged recovery in this file already self-heals). */
+export function clearOwnAnthropicExhausted(): void {
+  if (ownAnthropicBlockedUntil === null) return; // nothing to clear, common case
+  console.error("[caroline] [subscriptionMode] clearOwnAnthropicExhausted: own-Anthropic confirmed reachable again");
+  ownAnthropicBlockedUntil = null;
+  ownAnthropicLastRecheckAt = null;
 }
 
 /**
@@ -115,7 +149,19 @@ export function markOwnAnthropicExhausted(resetsAt?: number | null): void {
  */
 export async function resolveMode(workspaceDir: string): Promise<ResolvedMode> {
   const swLoggedIn = isLoggedIn();
-  const ownAnthropicBlocked = ownAnthropicBlockedUntil !== null && Date.now() < ownAnthropicBlockedUntil;
+  const now = Date.now();
+  const nominallyBlocked = ownAnthropicBlockedUntil !== null && now < ownAnthropicBlockedUntil;
+  const recheckDue = nominallyBlocked && (ownAnthropicLastRecheckAt === null || now - ownAnthropicLastRecheckAt >= OWN_ANTHROPIC_RECHECK_INTERVAL_MS);
+  if (recheckDue) {
+    // This round's own-Anthropic attempt (if it goes that far, below) IS the
+    // probe -- record it now so a burst of near-simultaneous resolveMode()
+    // calls (multiple tabs restarting together) doesn't let them all through
+    // at once; whichever of them actually fails re-arms this via
+    // markOwnAnthropicExhausted anyway.
+    ownAnthropicLastRecheckAt = now;
+    console.error("[caroline] [subscriptionMode] resolveMode: own-Anthropic recheck due -- trying it again this round");
+  }
+  const ownAnthropicBlocked = nominallyBlocked && !recheckDue;
   if (ownAnthropicBlocked && swLoggedIn) {
     console.error(`[caroline] [subscriptionMode] resolveMode: own-Anthropic still exhausted (until ${new Date(ownAnthropicBlockedUntil!).toISOString()}) -- using sw-proxy instead`);
     return { chatSource: "sw-proxy", swLoggedIn };

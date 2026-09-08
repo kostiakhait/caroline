@@ -99,10 +99,24 @@ keep re-picking it forever, even with a paid, logged-in SW account sitting unuse
 instruction (2026-09-08): once own-Anthropic is CONFIRMED exhausted on a real request (a
 `billing_error`, or a rejected `rate_limit_event`), `markOwnAnthropicExhausted()` records it
 (honoring the SDK's own `resetsAt` when the failure supplied one, else a 30-minute default
-cooldown), and `resolveMode()` skips straight to `sw-proxy` for as long as that lasts — then
-automatically retries own-Anthropic once the cooldown passes, with no manual "switch back" step.
-Only applies when SW is logged in; with no SW account there's nowhere to fall back to, so it just
-keeps retrying own-Anthropic as before.
+cooldown), and `resolveMode()` skips straight to `sw-proxy` while that lasts. Only applies when SW
+is logged in; with no SW account there's nowhere to fall back to, so it just keeps retrying
+own-Anthropic as before.
+
+Switching back is active, not just a wait for the cooldown to expire — confirmed live the same day
+that real availability can flap faster than the SDK's own `resetsAt` suggests (five switches in one
+morning), so `resolveMode()` lets a real attempt through to own-Anthropic every
+`OWN_ANTHROPIC_RECHECK_INTERVAL_MS` (2 minutes) regardless of how far off the nominal cooldown still
+is. If that attempt reaches the CLI's `init` message, `clearOwnAnthropicExhausted()` (called from
+server.ts's `init` handler, same trust level as its own connState recovery) treats that as
+confirmation and lifts the block; if it fails again, whichever detection path catches it just
+re-arms `markOwnAnthropicExhausted()` with a fresh cooldown, same as any other failure.
+
+`lastRateLimitInfo` (crash-attribution memory for a silent stream death, see its own doc comment)
+is cleared whenever a deliberate chat-source switch happens — before this fix it survived the
+switch to sw-proxy and misattributed that source's own, unrelated failures (confirmed live: a
+`Prompt is too long` turn) to "still exhausted on own-Anthropic", which was wrong information even
+though the resulting chatSource choice happened to still be correct.
 
 A depleted **SW** balance (`handleBalanceExhausted`, source `"sw"`) never retries against a
 different source — there isn't one — so it explains what happened (status-bar/system_notice UI

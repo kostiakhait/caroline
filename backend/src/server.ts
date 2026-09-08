@@ -19,7 +19,7 @@ import { createViewerTool, takeViewerRequest, type OfficeConfig } from "./viewer
 import { finishOfficeEditSession } from "./officeEditor.js";
 import { createLoginTool, takeLoginRequest, verifyAndSaveLogin, registerAndSaveLogin, isLoggedIn, getV2Session, openLoginRequest, loggedInEmail, clearCredentials } from "./login.js";
 import { requireSwOrPrompt } from "./swGate.js";
-import { resolveMode, buildOptionsEnv, getSwStatus, getOwnAnthropicApiKey, setOwnAnthropicApiKey, createTopupCheckoutUrl, markOwnAnthropicExhausted, type ChatSource } from "./subscriptionMode.js";
+import { resolveMode, buildOptionsEnv, getSwStatus, getOwnAnthropicApiKey, setOwnAnthropicApiKey, createTopupCheckoutUrl, markOwnAnthropicExhausted, clearOwnAnthropicExhausted, type ChatSource } from "./subscriptionMode.js";
 import { getSmsAccountStatus, setSmsAccount, removeSmsAccount } from "./smsAccount.js";
 import { isVisualModeEnabled, setVisualModeEnabled, resolveVisualModel } from "./visualMode.js";
 
@@ -1426,6 +1426,16 @@ class ChatSession {
             if (this.connState.kind !== "connected") {
               this.setConnState("connected");
             }
+            // Same "earliest proof this session is genuinely alive" trust level
+            // as the connState recovery just above -- if own-Anthropic was
+            // marked exhausted and THIS session (still resolved to it, or the
+            // periodic recheck let it through again) reached init, treat that
+            // as confirmation it's back. Wrong guesses self-heal exactly like
+            // connState's: the very next real billing_error/rate_limit_event/
+            // cc_cli_limit_message just re-blocks it via markOwnAnthropicExhausted.
+            if (mode.chatSource === "own-anthropic-oauth" || mode.chatSource === "own-anthropic-key") {
+              clearOwnAnthropicExhausted();
+            }
             // checkHang below only catches an MCP server hanging mid-turn --
             // this catches the other half, one that failed to start at all
             // (bad binary path, crashed on launch, etc.). Previously this
@@ -1494,6 +1504,21 @@ class ChatSession {
         if (this.restartForChatSourceSwitch) {
           this.restartForChatSourceSwitch = false;
           console.error("[caroline] runLoop catch: session closed for a chat-source fallback -- fresh query() will pick up sw-proxy");
+          // Confirmed live (2026-09-08): lastRateLimitInfo's own doc comment says it
+          // deliberately stays 'rejected' until a later event reports otherwise -- true
+          // and correct when there's only ever ONE possible chat source (the original
+          // design), but once a source switch is possible, that stale info survives
+          // into the NEW session on the NEW source and misattributes its own, unrelated
+          // failures to "still exhausted" instead of surfacing what actually went wrong.
+          // Confirmed live: an sw-proxy request genuinely failed with "Prompt is too
+          // long" (nothing to do with rate limits), and the very next silent stream
+          // death got misclassified as still-rate-limited purely because this field was
+          // never cleared -- the fallback itself (ownAnthropicBlockedUntil in
+          // subscriptionMode.ts) is unaffected by this and stayed correct throughout,
+          // but the UI/logs lied about why. A session on a fresh chat source starts
+          // clean; whatever this source's own real failures turn out to be will set
+          // this again on their own merits.
+          this.lastRateLimitInfo = null;
           // Same "don't replay raw text, let scheduleApiRetry's own generic
           // nudge (already scheduled by the caller that closed this session)
           // pick things back up" treatment as the billing/rate-limit catch
