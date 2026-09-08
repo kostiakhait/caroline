@@ -40,5 +40,11 @@ deploy.bat
 deploy_models.bat
 deploy.mk
 
+# --- Ad-hoc test/diagnostic scripts (backend/) ------------------------------
+# One-off .mjs scripts run directly against dist/ or the SDK for live
+# reproduction/verification during development (e.g. test-dehydrate.mjs,
+# analyze-session-size.mjs) -- not a real test suite, never meant to ship.
+backend/*.mjs
+
 # --- Misc build/debug artifacts --------------------------------------------
 *.log

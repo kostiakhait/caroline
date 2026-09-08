@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-import { query, type Options, type Query, type SDKMessage, type SDKUserMessage, type SDKRateLimitInfo } from "@anthropic-ai/claude-agent-sdk";
+import { query, forkSession, type Options, type Query, type SDKMessage, type SDKUserMessage, type SDKRateLimitInfo, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages/messages";
 import { ensureWorkspace } from "./workspace.js";
 import { authStatus, authLogout, spawnAuthLogin, mcpList, mcpAdd, mcpRemove } from "./control.js";
@@ -59,6 +59,8 @@ console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js 
 configureIsolatedGitBash();
 import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
+import { dehydratePreviousTurns } from "./dehydrate.js";
+import { classifyParallelSafety, runParallelBranch, buildBranchReportText, deleteSessionFile } from "./parallel.js";
 import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, countDescendantProcesses } from "./processReaper.js";
 import { readRecentHistory } from "./history.js";
 
@@ -487,6 +489,33 @@ class ChatSession {
   /** This tab's own Claude session id, once known -- see runLoop's resume
    *  option and the capture point inside the for-await loop below. */
   private lastSavedSessionId: string | null = null;
+  /** Which session id dehydratePreviousTurns() was last called against for
+   *  THIS tab -- see runDehydration(). Reset (along with
+   *  dehydratedThroughLine below) whenever the live session id changes
+   *  (a fresh process lifetime, a resume, or a compaction fork), since a
+   *  different .jsonl file means nothing in it has been scanned yet. */
+  private dehydratedForSessionId: string | null = null;
+  /** How many lines of dehydratedForSessionId's .jsonl are already known
+   *  clean/dehydrated -- see dehydrate.ts's own doc comment on why only the
+   *  tail past this point can ever need (re-)scanning. 0 = nothing scanned
+   *  yet for the current dehydratedForSessionId. */
+  private dehydratedThroughLine = 0;
+  /** A defensive forkSession() snapshot of the live session, taken right
+   *  before EACH turn's own query() starts (and thus starts appending to
+   *  the live file) -- see parallel.ts's own doc comment for why this is
+   *  the only safe, static basis a parallel branch can resume from. null
+   *  when there's no history yet to snapshot (a brand-new conversation) or
+   *  the snapshot attempt itself failed. Replaced (old one deleted) at the
+   *  top of every runLoop iteration -- never kept longer than one turn. */
+  private preTurnSnapshotId: string | null = null;
+  /** anthropicEnv/mcpServers/disallowedTools as resolved for the CURRENT
+   *  turn -- cached here (not just a runLoop-local) so submitOrBranch() can
+   *  reuse the exact same chat-source/tool config for a parallel branch
+   *  without re-resolving it (and without threading it through the
+   *  submit()/pushMessage() call chain, which has nothing to do with this). */
+  private lastAnthropicEnv: Record<string, string> | undefined = undefined;
+  private lastMcpServers: Record<string, McpServerConfig> | null = null;
+  private lastDisallowedTools: string[] = [];
   /** Per-server retry timers for MCP servers that failed to connect (see the
    *  'system'/'init' handling in runLoop) -- keyed by server name so a
    *  second failure report for the same name doesn't stack a duplicate
@@ -522,6 +551,20 @@ class ChatSession {
   private restartForUrgentCompaction = false;
   private urgentCompactionReplayText: string | null = null;
   private urgentCompactionReplayAttachments: Attachment[] = [];
+  /** Same restart-without-cost mechanism as restartForChatSourceSwitch/
+   *  restartForUrgentCompaction above -- per explicit instruction (2026-09-08):
+   *  directly confirmed live that a running CLI subprocess keeps its
+   *  conversation in memory across turns and never re-reads the on-disk
+   *  .jsonl mid-lifetime (a turn's cache_read_input_tokens exactly matched
+   *  the token count of content already stripped from disk between turns --
+   *  see test-dehydrate-live.mjs), so runDehydration()'s in-place rewrite is
+   *  otherwise invisible to the live process until SOME restart happens.
+   *  Set right after every normal "result" (not just urgent/failure paths)
+   *  so a fresh query() -- which DOES read the file fresh at resume -- picks
+   *  up the just-dehydrated transcript before the next turn. Unlike
+   *  urgentCompaction's flag, this never needs a replay: the turn already
+   *  completed and was already delivered to the user. */
+  private restartForDehydration = false;
   // Was 10 minutes; shortened per explicit instruction (2026-09-03) -- the
   // subscription/balance this is retrying against can recover at any moment
   // (the user re-logging in, a monthly cap resetting, a top-up landing), and
@@ -812,6 +855,97 @@ class ChatSession {
     }
   }
 
+  /**
+   * Per explicit instruction (2026-09-08): every turn, not just on the hourly/
+   * urgent compaction schedule, the PREVIOUS turn's raw image/document bytes
+   * get replaced with a link to a file on disk -- see dehydrate.ts's own doc
+   * comment for exactly why this is safe to do IN PLACE (unlike
+   * compaction.ts, which only ever touches a fork) and for the two call
+   * sites this is invoked from. `sessionId` is whatever this tab's CURRENT
+   * live session id is -- undefined/null means nothing has been resumed/
+   * started yet, nothing to do.
+   */
+  private async runDehydration(sessionId: string | null | undefined): Promise<void> {
+    if (!sessionId) return;
+    if (sessionId !== this.dehydratedForSessionId) {
+      console.error(`[caroline] dehydrate: tab ${this.tabId} switching tracked session ${this.dehydratedForSessionId ?? "(none)"} -> ${sessionId}, rescanning from line 0`);
+      this.dehydratedForSessionId = sessionId;
+      this.dehydratedThroughLine = 0;
+    }
+    try {
+      const outcome = await dehydratePreviousTurns(workspaceDir, sessionId, this.dehydratedThroughLine);
+      this.dehydratedThroughLine = outcome.newThroughLine;
+      if (outcome.changed) {
+        console.error(`[caroline] dehydrate: tab ${this.tabId} session ${sessionId} entriesChanged=${outcome.entriesChanged} linesRescanned=${outcome.linesRescanned}`);
+      }
+    } catch (err) {
+      // Same "never take down the live conversation" guarantee as
+      // compaction.ts -- this is optional housekeeping, log and move on.
+      console.error(`[caroline] dehydrate: tab ${this.tabId} session ${sessionId} failed (ignored, will retry next turn):`, err);
+    }
+  }
+
+  /**
+   * Entry point for a REAL incoming user message (the ws `user_message`
+   * handler and the tab-agnostic HTTP `/api/message` endpoint) -- NOT for
+   * internal replays/proactive nudges, which must keep calling submit()
+   * directly. See the approved parallel-turns plan (foamy-sniffing-pixel.md)
+   * for the full design. If no turn is in flight, behaves exactly like
+   * submit() always has. If one IS in flight, asks a cheap model call
+   * (classifyParallelSafety) whether this new message is independent enough
+   * to work on right now, in a throwaway branch forked off this turn's own
+   * defensive pre-turn snapshot, instead of just queueing behind it.
+   * Attachments always fall back to plain sequential queueing -- carrying
+   * them into a branch isn't handled here, and silently dropping them would
+   * be worse than just queueing normally.
+   */
+  submitOrBranch(text: string, attachments: Attachment[] = [], isVoice = false): void {
+    if (
+      !this.turnPending ||
+      this.pendingUserText === null ||
+      !this.preTurnSnapshotId ||
+      !this.lastMcpServers ||
+      attachments.length > 0
+    ) {
+      this.submit(text, attachments, true, false, isVoice);
+      return;
+    }
+    const inFlightTaskText = this.pendingUserText;
+    const snapshotId = this.preTurnSnapshotId;
+    const anthropicEnv = this.lastAnthropicEnv;
+    const mcpServers = this.lastMcpServers;
+    const disallowedTools = this.lastDisallowedTools;
+    void (async () => {
+      const isParallel = await classifyParallelSafety(anthropicEnv, workspaceDir, inFlightTaskText, text);
+      if (!isParallel) {
+        console.error(`[caroline] [parallel] tab=${this.tabId} classifier said SEQUENTIAL -- queueing normally: ${truncateForLog(text)}`);
+        this.submit(text, attachments, true, false, isVoice);
+        return;
+      }
+      let branchSessionId: string;
+      try {
+        const forked = await forkSession(snapshotId, { dir: workspaceDir });
+        branchSessionId = forked.sessionId;
+      } catch (err) {
+        console.error(`[caroline] [parallel] tab=${this.tabId} failed to fork branch off snapshot ${snapshotId} -- falling back to sequential:`, err);
+        this.submit(text, attachments, true, false, isVoice);
+        return;
+      }
+      console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} spawned for: ${truncateForLog(text)}`);
+      runParallelBranch({ workspaceDir, branchSessionId, text, anthropicEnv, mcpServers, disallowedTools })
+        .then((answer) => {
+          console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} reporting back (answer=${answer !== null ? "ok" : "null"})`);
+          this.injectProactive(buildBranchReportText(text, answer), false);
+        })
+        .catch((err) => {
+          console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} promise chain rejected unexpectedly:`, err);
+        })
+        .finally(() => {
+          void deleteSessionFile(workspaceDir, branchSessionId);
+        });
+    })();
+  }
+
   submit(text: string, attachments: Attachment[] = [], isRealUser = true, silent = false, isVoice = false): void {
     // AND-combine, don't overwrite -- see silentTurn's own doc comment for
     // the exact race this fixes (a later silent submit landing in the same
@@ -940,6 +1074,10 @@ class ChatSession {
     this.clearApiRetryTimer();
     this.activeQuery?.interrupt().catch((err) => console.error("[caroline] dispose(): interrupt() failed (ignored):", err));
     this.resolveNext?.();
+    if (this.preTurnSnapshotId) {
+      void deleteSessionFile(workspaceDir, this.preTurnSnapshotId);
+      this.preTurnSnapshotId = null;
+    }
   }
 
   private clearApiRetryTimer(): void {
@@ -1103,6 +1241,16 @@ class ChatSession {
         this.resolveNext = null;
         continue;
       }
+      // Per explicit instruction (2026-09-08): the PREVIOUS turn's raw
+      // image/document bytes get dehydrated to disk every turn, not just on
+      // the hourly/urgent schedule -- see runDehydration()'s own doc
+      // comment. Awaited HERE, before shifting/yielding the next queued
+      // item, is exactly what makes this safe to do in place: the CLI only
+      // ever asks this generator for its next prompt once it has fully
+      // finished (and flushed to disk) the PREVIOUS turn, so no turn is in
+      // flight right now -- and the CLI won't see the NEXT turn at all until
+      // this await resolves, so the rewrite is always complete first.
+      await this.runDehydration(this.lastSavedSessionId);
       const item = this.queue.shift()!;
       this.turnIsVoice = this.turnIsVoice || item.isVoice;
       console.error(`[caroline] [queue] consuming queued message isVoice=${item.isVoice} -> turnIsVoice=${this.turnIsVoice}`);
@@ -1173,6 +1321,7 @@ class ChatSession {
           console.error("[caroline] failed to build chat-source env, falling through to no chat source:", err);
         }
         console.error(`[caroline] runLoop: chatSource=${mode.chatSource} swLoggedIn=${mode.swLoggedIn} envOverride=${anthropicEnv ? "yes" : "no"} -- creating query()`);
+        this.lastAnthropicEnv = anthropicEnv;
 
         // No explicit mcpServers here: cwd is Caroline's own workspace
         // directory, a normal Claude Code project dir with its own
@@ -1217,9 +1366,73 @@ class ChatSession {
               console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction failed (resuming original session as-is):`, err);
             }
           }
+          // Per-turn dehydration's own FIRST opportunity this query()
+          // lifetime -- see runDehydration()'s and inputStream()'s own doc
+          // comments for why every subsequent turn is handled there
+          // instead. Done here specifically (before query() creation, no
+          // live CLI process for this lifetime exists yet at all) so there
+          // is nothing to race: whatever the CLI reads once it starts up
+          // and resumes resumeSessionId is guaranteed to already be the
+          // rewritten file, not a stale in-flight read.
+          await this.runDehydration(resumeSessionId);
         }
         const queryStartedAt = Date.now();
         console.error(`[caroline] runLoop: about to create query() -- resume=${resumeSessionId ?? "(none)"} tab=${this.tabId} descendantProcesses=${await countDescendantProcesses(process.pid)}`);
+        // Adds schedule_reminder/list_reminders/cancel_reminder and
+        // open_file as in-process tools -- merges with (doesn't replace)
+        // the user-scope caroline-* servers discovered from cwd.
+        const mcpServers: Record<string, McpServerConfig> = {
+          "caroline-scheduler": createSchedulerTool(workspaceDir),
+          "caroline-files": createFileOpenerTool(),
+          "caroline-viewer": createViewerTool((event) => this.send(event)),
+          "caroline-login": createLoginTool((event) => this.send(event)),
+          // Caroline's own in-process fork of MCP/email (see
+          // Caroline/backend/src/email/index.ts) -- action calls
+          // (send/delete/move/mark/download) return immediately and
+          // report their real outcome via a proactive follow-up instead
+          // of blocking the turn on a slow IMAP/SMTP round trip.
+          "caroline-email": createEmailTool((text) => this.injectProactive(text, false)),
+          "caroline-appbrowser": createAppBrowserTool(),
+          "caroline-ratatosk": createRatatoskTools(workspaceDir, (event) => this.send(event)),
+          "caroline-consult": createConsultTools((event) => this.send(event)),
+        };
+        // notes_login asks the model to pass the user's email/password as
+        // tool parameters -- directly against the hard rule (see login.ts's
+        // ensure_squirrelwisdom_login, the squirrelwisdom-login skill) that
+        // credentials only ever go through the native login window, never
+        // through chat/tool-call context. Hidden here rather than patched
+        // in MCP/notes since that binary is shared with the standalone
+        // Notes MCP server, which has no such rule. Every other notes_*
+        // tool is unaffected.
+        const disallowedTools = ["mcp__caroline-notes__notes_login"];
+        this.lastMcpServers = mcpServers;
+        this.lastDisallowedTools = disallowedTools;
+
+        // Defensive parallel-branch snapshot -- per explicit instruction
+        // (2026-09-08, see the approved parallel-turns plan): forkSession()
+        // is only safe against a file nothing else is writing to, and this
+        // turn's OWN query() below is about to start appending to
+        // resumeSessionId. This is the last moment a safe, static copy of
+        // "right before this turn" can be taken -- submitOrBranch() forks
+        // AGAIN off of THIS snapshot if a second message arrives while this
+        // turn is running. The previous turn's snapshot is deleted first --
+        // never kept longer than one turn, or these would accumulate one
+        // full session copy per turn forever.
+        if (this.preTurnSnapshotId) {
+          const staleSnapshotId = this.preTurnSnapshotId;
+          this.preTurnSnapshotId = null;
+          void deleteSessionFile(workspaceDir, staleSnapshotId);
+        }
+        if (resumeSessionId) {
+          try {
+            const { sessionId: snapshotId } = await forkSession(resumeSessionId, { dir: workspaceDir });
+            this.preTurnSnapshotId = snapshotId;
+            console.error(`[caroline] [parallel] tab=${this.tabId} pre-turn snapshot ${resumeSessionId} -> ${snapshotId}`);
+          } catch (err) {
+            console.error(`[caroline] [parallel] tab=${this.tabId} pre-turn snapshot failed (parallel branching unavailable this turn):`, err);
+          }
+        }
+
         const options: Options = {
           ...(anthropicEnv ? { env: anthropicEnv } : {}),
           // Confirmed live (2026-09-08): the CLI's own automatic-compaction feature
@@ -1257,33 +1470,8 @@ class ChatSession {
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           cwd: workspaceDir,
-          // Adds schedule_reminder/list_reminders/cancel_reminder and
-          // open_file as in-process tools -- merges with (doesn't replace)
-          // the user-scope caroline-* servers discovered from cwd.
-          mcpServers: {
-            "caroline-scheduler": createSchedulerTool(workspaceDir),
-            "caroline-files": createFileOpenerTool(),
-            "caroline-viewer": createViewerTool((event) => this.send(event)),
-            "caroline-login": createLoginTool((event) => this.send(event)),
-            // Caroline's own in-process fork of MCP/email (see
-            // Caroline/backend/src/email/index.ts) -- action calls
-            // (send/delete/move/mark/download) return immediately and
-            // report their real outcome via a proactive follow-up instead
-            // of blocking the turn on a slow IMAP/SMTP round trip.
-            "caroline-email": createEmailTool((text) => this.injectProactive(text, false)),
-            "caroline-appbrowser": createAppBrowserTool(),
-            "caroline-ratatosk": createRatatoskTools(workspaceDir, (event) => this.send(event)),
-            "caroline-consult": createConsultTools((event) => this.send(event)),
-          },
-          // notes_login asks the model to pass the user's email/password as
-          // tool parameters -- directly against the hard rule (see login.ts's
-          // ensure_squirrelwisdom_login, the squirrelwisdom-login skill) that
-          // credentials only ever go through the native login window, never
-          // through chat/tool-call context. Hidden here rather than patched
-          // in MCP/notes since that binary is shared with the standalone
-          // Notes MCP server, which has no such rule. Every other notes_*
-          // tool is unaffected.
-          disallowedTools: ["mcp__caroline-notes__notes_login"],
+          mcpServers,
+          disallowedTools,
           // Conversation persists across app restarts, not just within one
           // run -- but NOT via continue:true. continue always resumes "the
           // most recent session for this cwd", which is fine for a single
@@ -1582,6 +1770,14 @@ class ChatSession {
           if (message.type === "result") {
             this.silentTurn = true;
             this.turnIsVoice = false;
+            // Per explicit instruction (2026-09-08) -- see restartForDehydration's
+            // own doc comment for why this HAS to be a real restart, not just an
+            // in-place rewrite left for the live process to notice on its own.
+            // Awaited before closing so the file is fully rewritten before the
+            // fresh query() below ever tries to read it.
+            await this.runDehydration(sid ?? this.lastSavedSessionId);
+            this.restartForDehydration = true;
+            this.activeQuery?.close();
           }
           if (message.type === "system" && message.subtype === "init") {
             this.hasSeenInit = true;
@@ -1732,6 +1928,15 @@ class ChatSession {
             console.error(`[caroline] [urgent-compaction] tab=${this.tabId} no captured turn to replay (pendingUserText was already null) -- nothing queued`);
           }
           continue; // fresh query() below, no restart-budget cost
+        }
+        // This session was deliberately closed above (in-stream) right after
+        // its own normal "result" -- see restartForDehydration's own doc
+        // comment. Unlike urgentCompaction, no replay: the turn already
+        // completed and was already delivered to the user, nothing was lost.
+        if (this.restartForDehydration) {
+          this.restartForDehydration = false;
+          console.error(`[caroline] dehydrate: tab ${this.tabId} session closed for post-turn dehydration -- fresh query() will resume the rewritten transcript`);
+          continue; // fresh query() below, no restart-budget cost, no replay
         }
         // Fallback path for handleBalanceExhausted: covers a billing failure that
         // surfaced as a thrown error instead of an in-stream assistant message
@@ -2589,7 +2794,7 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
       const tabId = url.searchParams.get("tab") ?? PRIMARY_TAB_ID;
       const target = sessions.get(tabId);
       if (!target) return sendJson(res, 503, { ok: false, error: `No active session for tab "${tabId}" -- open that tab in the Caroline window at least once first.` });
-      target.submit(body.text, Array.isArray(body.attachments) ? body.attachments : []);
+      target.submitOrBranch(body.text, Array.isArray(body.attachments) ? body.attachments : []);
       return sendJson(res, 202, { ok: true });
     }
     if (req.method === "GET" && url.pathname === "/api/status") {
@@ -2697,7 +2902,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
       const parsed = JSON.parse(raw.toString());
       console.error(`[caroline] [ws] tabId=${tabId} message type=${parsed.type ?? "unknown"}`);
       if (parsed.type === "user_message" && typeof parsed.text === "string") {
-        session.submit(parsed.text, Array.isArray(parsed.attachments) ? parsed.attachments : [], true, false, !!parsed.voice);
+        session.submitOrBranch(parsed.text, Array.isArray(parsed.attachments) ? parsed.attachments : [], !!parsed.voice);
       } else if (parsed.type === "interrupt") {
         session.stop();
       } else if (parsed.type === "control_request") {

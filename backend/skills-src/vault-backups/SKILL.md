@@ -42,3 +42,23 @@ optional, every time this cycle runs, not just when you happen to have written a
 
 To restore on a fresh machine: list notes titled `vault:skill:*` in "Caroline:Vault", and recreate
 each one as Skills/lessons-learned/<topic-name>/SKILL.md from the note's content.
+
+## Dehydrated attachments/images -- also synced every cycle, mandatory
+
+workspace/dehydrated/ (plus workspace/uploads/) holds every image/document a dehydration pass has
+ever stripped out of chat history and replaced with a `[... Сохранено в файле: <path>. Прочитать
+через Read при необходимости.]` note (see server.ts's runDehydration/dehydrate.ts) -- like
+Skills/lessons-learned/, this lives only on this one machine's local disk, so a note pointing at
+one of these files is only as durable as the file itself.
+
+As part of this SAME periodic cycle, back these up too: find (or create) a note titled
+"vault:dehydrated-files" in "Caroline:Vault", call notes_list_attachments restricted to that note
+to see which filenames are already backed up, then list workspace/dehydrated/ and
+workspace/uploads/ and notes_attach every file NOT already on that list (call notes_attach with
+just the file path, no explicit originalName, so the attachment's stored name matches the local
+filename exactly -- that's what makes the "already attached?" comparison work). Skip files already
+attached; don't re-upload the same file twice. Mandatory, not optional, every time this cycle runs.
+
+If a resumed conversation later references a dehydrated file that's gone from local disk (a lost/
+reinstalled machine), look for it as an attachment on "vault:dehydrated-files" by filename before
+telling the user it's unrecoverable.
