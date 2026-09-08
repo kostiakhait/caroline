@@ -14,7 +14,9 @@
 // class of failure mostly disappears on its own even without extra cleanup logic here.
 
 import { spawn } from "node:child_process";
-import { chromium, type Browser } from "playwright-core";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 
 export interface DaemonConfig {
   port: number;
@@ -106,16 +108,51 @@ export async function getBrowser(cfg: DaemonConfig): Promise<Browser> {
   if (cachedBrowser && cachedPort === cfg.port && cachedBrowser.isConnected()) {
     return cachedBrowser;
   }
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cfg.port}`);
+  // Explicit timeout -- Playwright's own default here is generous enough to matter (a CDP
+  // endpoint that accepts the TCP connection but never completes the protocol handshake, e.g.
+  // a daemon stuck mid-launch, would otherwise hang every single tool call that needs a page,
+  // before any of index.ts's own per-operation timeouts even get a chance to apply).
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cfg.port}`, { timeout: 20_000 });
   cachedBrowser = browser;
   cachedPort = cfg.port;
   return browser;
+}
+
+// Per explicit instruction (2026-09-04): confirmed live that a triggered download was
+// silently routed into a Playwright-managed temp folder (%TEMP%\playwright-artifacts-...)
+// instead of the user's real Downloads folder -- since this browser is reached via
+// connectOverCDP against a raw, hand-launched Chromium (not Playwright's own launch()/
+// launchPersistentContext(), see this file's own header comment), nothing ever configured
+// where Playwright should put downloads, and its default behavior for a CDP-attached
+// browser is to intercept every download into that ephemeral artifacts directory until
+// something explicitly calls download.saveAs() to move it out. Wiring a 'download' listener
+// on every current AND future page (context's own 'page' event covers new tabs/popups) that
+// saves straight to the real Downloads folder closes that gap for every browser tool call,
+// not just ones that happen to already know to handle it themselves.
+const DOWNLOADS_DIR = join(homedir(), "Downloads");
+const contextsWithDownloadHandling = new WeakSet<BrowserContext>();
+
+function wireDownloadHandling(context: BrowserContext): void {
+  if (contextsWithDownloadHandling.has(context)) return;
+  contextsWithDownloadHandling.add(context);
+
+  const handlePage = (page: Page) => {
+    page.on("download", (download) => {
+      const destPath = join(DOWNLOADS_DIR, download.suggestedFilename());
+      download.saveAs(destPath).catch((err) => {
+        console.error(`[browser-daemon] download.saveAs(${destPath}) failed:`, err);
+      });
+    });
+  };
+  context.on("page", handlePage);
+  for (const page of context.pages()) handlePage(page);
 }
 
 export async function getPage(cfg: DaemonConfig) {
   const browser = await getBrowser(cfg);
   const contexts = browser.contexts();
   const context = contexts[0] ?? (await browser.newContext());
+  wireDownloadHandling(context);
   const pages = context.pages();
   const page = pages.find((p) => !p.isClosed()) ?? (await context.newPage());
   return { browser, context, page };
@@ -128,11 +165,14 @@ export async function killDaemon(cfg: DaemonConfig): Promise<void> {
   cachedBrowser = null;
   cachedPort = null;
   await new Promise<void>((resolve) => {
+    // Bounded even though this is itself a recovery escape hatch -- a hung netstat/taskkill
+    // would otherwise strand the caller with no way out of the very tool meant to provide one.
+    const timer = setTimeout(() => resolve(), 10_000);
     const netstat = spawn("cmd", [
       "/c",
       `for /f "tokens=5" %a in ('netstat -ano ^| findstr :${cfg.port} ^| findstr LISTENING') do taskkill /F /PID %a`,
     ]);
-    netstat.on("close", () => resolve());
-    netstat.on("error", () => resolve());
+    netstat.on("close", () => { clearTimeout(timer); resolve(); });
+    netstat.on("error", () => { clearTimeout(timer); resolve(); });
   });
 }

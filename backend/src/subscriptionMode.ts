@@ -68,19 +68,60 @@ async function hasOwnAnthropicOAuth(cwd: string): Promise<boolean> {
   }
 }
 
+// ------------------------------------------- own-Anthropic exhaustion fallback --
+//
+// Own-Anthropic (OAuth login, then a manually-pasted key) still always wins
+// over the SquirrelWisdom proxy when it's actually USABLE -- someone already
+// paying Anthropic directly is never silently switched onto a metered proxy
+// just because they also happen to have an SW account. But "available" used
+// to only ever mean "logged in", never "currently has room left" -- so a
+// depleted own-Anthropic account (usage-window rate limit, or a
+// billing_error credit-balance failure) made resolveMode() keep re-picking
+// it forever, and a paid, logged-in SW account sat there unused while every
+// turn just failed. Per explicit instruction (2026-09-08): once own-Anthropic
+// is CONFIRMED exhausted (server.ts calls markOwnAnthropicExhausted after a
+// real billing_error/rate_limit_event, not speculatively), fall back to
+// sw-proxy for as long as the exhaustion is expected to last, then
+// automatically try own-Anthropic again -- no manual "switch back" needed:
+// if it's still down, the next failure just re-arms the same cooldown; if
+// it recovered, the turn just succeeds on own-Anthropic and nothing else
+// needs to happen.
+let ownAnthropicBlockedUntil: number | null = null;
+
+/** Used when the real reset time isn't known -- billing_error carries none
+ *  at all, and even a rate-limit's resetsAt is occasionally absent. Short
+ *  enough that a manual top-up or a subscription window reset gets picked
+ *  back up reasonably soon, long enough not to hammer a still-exhausted
+ *  account every retry. */
+const OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS = 30 * 60_000; // 30 minutes
+
+/** Call once own-Anthropic has actually failed on a real request (billing_error
+ *  or a rejected rate_limit_event) -- never speculatively. `resetsAt`, when
+ *  the SDK's own rate_limit_info supplied one, is honored exactly; otherwise
+ *  falls back to OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS. */
+export function markOwnAnthropicExhausted(resetsAt?: number | null): void {
+  const until = resetsAt && resetsAt > Date.now() ? resetsAt : Date.now() + OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS;
+  ownAnthropicBlockedUntil = until;
+  console.error(`[caroline] [subscriptionMode] markOwnAnthropicExhausted: own-Anthropic blocked until ${new Date(until).toISOString()}`);
+}
+
 /**
- * Own-Anthropic (OAuth login, then a manually-pasted key) always wins over
- * the SquirrelWisdom proxy when available (confirmed design decision) --
- * someone already paying Anthropic directly is never silently switched onto
- * a metered proxy. Neither available -> "none": server.ts's runLoop checks
- * for exactly this chatSource before creating query() and proactively opens
- * the native login window itself (see requireSwOrPrompt) -- per explicit
- * instruction (2026-09-07), this can't be left to the model to notice and
- * react to, since the model can't run any tool call at all without a chat
- * source to run it with.
+ * Neither own-Anthropic nor SW available -> "none": server.ts's runLoop
+ * checks for exactly this chatSource before creating query() and
+ * proactively opens the native login window itself (see requireSwOrPrompt)
+ * -- per explicit instruction (2026-09-07), this can't be left to the model
+ * to notice and react to, since the model can't run any tool call at all
+ * without a chat source to run it with.
  */
 export async function resolveMode(workspaceDir: string): Promise<ResolvedMode> {
   const swLoggedIn = isLoggedIn();
+  const ownAnthropicBlocked = ownAnthropicBlockedUntil !== null && Date.now() < ownAnthropicBlockedUntil;
+  if (ownAnthropicBlocked && swLoggedIn) {
+    console.error(`[caroline] [subscriptionMode] resolveMode: own-Anthropic still exhausted (until ${new Date(ownAnthropicBlockedUntil!).toISOString()}) -- using sw-proxy instead`);
+    return { chatSource: "sw-proxy", swLoggedIn };
+  }
+  // Blocked but no SW to fall back to -- nothing to lose by trying
+  // own-Anthropic anyway (below), same as if it were never blocked.
   if (await hasOwnAnthropicOAuth(workspaceDir)) {
     console.error(`[caroline] [subscriptionMode] resolveMode: chatSource=own-anthropic-oauth swLoggedIn=${swLoggedIn}`);
     return { chatSource: "own-anthropic-oauth", swLoggedIn };

@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer as createHttpServer } from "node:http";
 import { z } from "zod";
 import { ensureSession, login, withSession } from "./session.js";
 import {
@@ -17,9 +19,7 @@ import {
   updateNote,
   type NoteEntry,
 } from "./notes.js";
-import { attachFile, attachmentUrl, downloadAttachment, listAttachments, removeAttachment } from "./attachments.js";
-
-const server = new McpServer({ name: "notes", version: "1.0.0" });
+import { attachFile, downloadAttachment, listAttachments, removeAttachment } from "./attachments.js";
 
 function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
@@ -43,6 +43,9 @@ function summarize(entry: NoteEntry) {
 const folderMemoryNote =
   ' For Claude\'s own long-term memory (not asked for by the user), use folder "Claude Memory" ' +
   "unless the user directs otherwise. This tool works with any note/folder the user names, too.";
+
+function buildServer(): McpServer {
+const server = new McpServer({ name: "notes", version: "1.0.0" });
 
 server.registerTool(
   "notes_login",
@@ -244,7 +247,9 @@ server.registerTool(
   "notes_attach",
   {
     title: "Attach a file to a note",
-    description: "Uploads a local file and attaches it to a note. Effective size limit ~47MB. Returns a public URL for the uploaded file.",
+    description:
+      "Uploads a local file and attaches it to a note. Effective size limit ~47MB. There is no " +
+      "downloadable URL for the result -- fetch its bytes with notes_download_attachment instead.",
     inputSchema: {
       noteId: z.string().describe("Note id to attach the file to."),
       filePath: z.string().describe("Absolute local file path to upload."),
@@ -252,12 +257,8 @@ server.registerTool(
     },
   },
   async ({ noteId, filePath, originalName }) => {
-    let hash16 = "";
-    const entry = await withSession((ctx) => {
-      hash16 = ctx.hash16;
-      return attachFile(ctx.session, noteId, filePath, originalName);
-    });
-    return jsonResult({ ...entry, url: attachmentUrl(hash16, entry.filename) });
+    const entry = await withSession((ctx) => attachFile(ctx.session, noteId, filePath, originalName));
+    return jsonResult(entry);
   }
 );
 
@@ -265,16 +266,14 @@ server.registerTool(
   "notes_list_attachments",
   {
     title: "List attachments",
-    description: "Lists attachments, optionally filtered to a single note.",
+    description:
+      "Lists attachments, optionally filtered to a single note. There is no downloadable URL for " +
+      "any of them -- fetch bytes with notes_download_attachment.",
     inputSchema: { noteId: z.string().optional().describe("Restrict to attachments on this note. Omit to list every attachment in the account.") },
   },
   async ({ noteId }) => {
-    let hash16 = "";
-    const entries = await withSession((ctx) => {
-      hash16 = ctx.hash16;
-      return listAttachments(ctx.session, noteId);
-    });
-    return jsonResult(entries.map((e) => ({ ...e, url: attachmentUrl(hash16, e.filename) })));
+    const entries = await withSession((ctx) => listAttachments(ctx.session, noteId));
+    return jsonResult(entries);
   }
 );
 
@@ -283,16 +282,16 @@ server.registerTool(
   {
     title: "Download an attachment",
     description:
-      "Downloads an attachment's raw bytes to a local file path. The attachment URL is also " +
-      "publicly fetchable directly (no auth needed), but this saves it to disk in one step.",
+      "Downloads an attachment's raw bytes to a local file path. This is the ONLY way to fetch an " +
+      "attachment's content -- there is no plain downloadable URL for it.",
     inputSchema: {
       filename: z.string().describe("The attachment's stored filename (from notes_attach/notes_list_attachments, not the original display name)."),
       savePath: z.string().describe("Absolute local file path to write the downloaded bytes to."),
     },
   },
   async ({ filename, savePath }) => {
-    const { hash16 } = await ensureSession();
-    const bytes = await downloadAttachment(hash16, filename, savePath);
+    const { session } = await ensureSession();
+    const bytes = await downloadAttachment(session, filename, savePath);
     return textResult(`Downloaded ${bytes} byte(s) to "${savePath}".`);
   }
 );
@@ -313,5 +312,53 @@ server.registerTool(
   }
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+return server;
+}
+
+// --http-port <port> lets many query() instances (one per Caroline tab) share
+// ONE running copy of this server instead of each spawning its own -- per
+// explicit instruction (2026-09-06): stdio transport is strictly 1:1 (one
+// parent, one child), so N tabs meant N independent copies of every such
+// server, confirmed live as the actual cause of a 240+ node.exe process
+// swarm accumulating over a day of restarts. Falls back to stdio when the
+// flag is absent, for any caller (an interactive `claude` session's own
+// project-scoped .mcp.json, for instance) that still expects to spawn its
+// own copy.
+const httpPortIdx = process.argv.indexOf("--http-port");
+if (httpPortIdx >= 0) {
+  const port = Number(process.argv[httpPortIdx + 1]);
+  createHttpServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/mcp") {
+      res.writeHead(404).end();
+      return;
+    }
+    // A stateless transport (sessionIdGenerator: undefined) can only ever handle ONE
+    // request -- reusing it, or the McpServer/Protocol it's connected to, across
+    // requests throws ("Stateless transport cannot be reused across requests" /
+    // "Already connected to a transport", both from the SDK itself). Confirmed live
+    // (2026-09-06) as the actual cause of every one of Caroline's shared utility MCP
+    // servers 500ing on every call past their very first, for hours, surviving app
+    // restarts (a deterministic bug, not a stuck process). Fresh server+transport per
+    // request, per the SDK's own stateless example
+    // (examples/server/simpleStatelessStreamableHttp.js), fixes it.
+    const server = buildServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      console.error("[mcp] request handling failed:", err);
+      if (!res.headersSent) res.writeHead(500).end();
+    }
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+  }).listen(port, "127.0.0.1", () => {
+    console.error(`[mcp] listening on http://127.0.0.1:${port}/mcp`);
+  });
+} else {
+  const server = buildServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}

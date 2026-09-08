@@ -1,6 +1,6 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { MAX_ATTACHMENT_BYTES, callPlugin, genAttachmentFilename, getBytes, toBase64 } from "./api.js";
+import { MAX_ATTACHMENT_BYTES, callPlugin, genAttachmentFilename, toBase64 } from "./api.js";
 
 export interface AttachmentEntry {
   filename: string;
@@ -8,11 +8,6 @@ export interface AttachmentEntry {
   uploaded: string;
   noteId: string;
 }
-
-// Attachment blobs are still served from this plain, not-yet-authenticated static path
-// (see "Known gap" in NOTES_API.md) — uploads/removals go through the Notes plugin, but
-// downloads don't need a session.
-const filePath = (hash16: string, filename: string) => `files/${hash16}/${filename}`;
 
 export async function attachFile(
   session: string,
@@ -67,13 +62,23 @@ export async function removeAttachment(session: string, noteId: string, filename
   await callPlugin("removeAttachment", session, { filename });
 }
 
-export function attachmentUrl(hash16: string, filename: string): string {
-  return `https://squirrelwisdom.com/files/${hash16}/${filename}`;
-}
-
-export async function downloadAttachment(hash16: string, filename: string, savePath: string): Promise<number> {
-  const bytes = await getBytes(filePath(hash16, filename));
-  if (!bytes) throw new Error(`Attachment file "${filename}" not found on the server.`);
+// Confirmed live (2026-09-03): the plain "files/{hash16}/{filename}" static path this used
+// to hit was removed from the server intentionally (hash16 = sha256(login).slice(0,16) is
+// NOT a secret, so serving attachments from it let anyone with just a victim's email read/
+// overwrite their files via a bare curl -- see reforce's apps/Notes/main.py header comment).
+// The server hasn't answered that route at all since; every request to it 404s, on both old
+// and freshly-uploaded attachments alike. readAttachment (via the same authenticated
+// plugins:call envelope every other Notes action already goes through) is the only way to
+// fetch an attachment's bytes now -- see portal/NOTES_API.md's "Read an attachment's bytes"
+// section, which says exactly that: "There is no plain URL for attachment content." Do NOT
+// reintroduce a static/URL-based path for this -- that's the vulnerability this closed.
+export async function downloadAttachment(session: string, filename: string, savePath: string): Promise<number> {
+  const result = await callPlugin("readAttachment", session, { filename });
+  const contentB64 = result?.content;
+  if (typeof contentB64 !== "string") {
+    throw new Error(`Attachment "${filename}" not found (readAttachment returned no content).`);
+  }
+  const bytes = Buffer.from(contentB64, "base64");
   await writeFile(savePath, bytes);
   return bytes.length;
 }

@@ -17,8 +17,37 @@ export interface VerifyPasswordResult {
 // (session.ts's withSession) can re-login and retry once instead of failing outright.
 export class SessionExpiredError extends Error {}
 
+/**
+ * Node's global fetch() (undici) pools keep-alive connections -- in a
+ * long-running process (this MCP server can live for hours inside
+ * Caroline), a pooled connection can go stale server-side and every
+ * subsequent request on it fails with a generic network-level "fetch
+ * failed" error, indefinitely, until the process restarts. Confirmed live:
+ * a fresh one-off script hitting the exact same endpoint at the same
+ * moment worked immediately, while the long-lived server kept failing --
+ * the process itself wasn't broken, just its reused connection. A retry
+ * opens a fresh connection and succeeds, which is what lets this recover
+ * on its own instead of needing Caroline's whole app restarted. Only
+ * retries a genuine fetch() throw (DNS/connection-level failure) -- an
+ * actual HTTP error response (4xx/5xx) is a real answer from the server,
+ * not a stale-connection symptom, so that's surfaced immediately as
+ * before, not retried here.
+ */
+async function fetchWithRetry(url: string, init: RequestInit | undefined, retries = 2): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 async function postJson(body: Record<string, unknown>): Promise<any> {
-  const res = await fetch(BASE_URL + "/", {
+  const res = await fetchWithRetry(BASE_URL + "/", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -27,15 +56,6 @@ async function postJson(body: Record<string, unknown>): Promise<any> {
     throw new Error(`Squirrel Wisdom API HTTP ${res.status} for command "${body[".command"]}"`);
   }
   return res.json();
-}
-
-export async function getBytes(path: string): Promise<Buffer | null> {
-  const res = await fetch(`${BASE_URL}/${path}`);
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`Squirrel Wisdom API HTTP ${res.status} fetching "${path}"`);
-  }
-  return Buffer.from(await res.arrayBuffer());
 }
 
 export async function verifyPassword(email: string, password: string): Promise<VerifyPasswordResult> {

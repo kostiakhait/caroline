@@ -97,6 +97,31 @@ function refSelector(ref: string): string {
   return `[data-mcp-ref="${ref}"]`;
 }
 
+// --- operation timeouts ----------------------------------------------------------------------
+// Playwright's page.evaluate()/keyboard.press() have NO built-in timeout -- a wedged tab (page
+// unresponsive, a stuck dialog, a dead renderer still holding the CDP connection open) blocks
+// the call forever. Confirmed live (2026-08-31): a browser_find call sat for 575+ seconds with
+// zero recourse except closing the whole Caroline window, which is exactly the class of problem
+// server.ts's own checkHang()/hasSeenInit work fixed one layer up today -- this is the same
+// fix at the MCP-tool layer, where it actually originates. Racing against a timer can't truly
+// cancel the underlying Playwright operation (there's no cooperative cancellation for
+// evaluate()), but it returns control to the caller instead of hanging the whole MCP
+// connection, so Caroline can decide to retry, take a different approach, or call
+// browser_restart_daemon instead of being stuck with no way out.
+class OperationTimeoutError extends Error {}
+
+async function withTimeout<T>(label: string, ms: number, p: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new OperationTimeoutError(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
 async function resolveTarget(page: Page, opts: { ref?: string; selector?: string }) {
   if (opts.ref) return page.locator(refSelector(opts.ref)).first();
   if (opts.selector) return page.locator(opts.selector).first();
@@ -153,7 +178,7 @@ server.registerTool(
   },
   async ({ url }) => {
     const { page } = await getPage(cfg);
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await withTimeout("browser_navigate", 30_000, page.goto(url, { waitUntil: "domcontentloaded" }));
     return { content: [{ type: "text" as const, text: `Navigated to ${page.url()}` }] };
   }
 );
@@ -168,7 +193,7 @@ server.registerTool(
   },
   async () => {
     const { page } = await getPage(cfg);
-    const tagged = await tagPage(page);
+    const tagged = await withTimeout("browser_snapshot", 20_000, tagPage(page));
     return { content: [{ type: "text" as const, text: JSON.stringify(tagged, null, 2) }] };
   }
 );
@@ -183,7 +208,7 @@ server.registerTool(
   },
   async ({ text }) => {
     const { page } = await getPage(cfg);
-    const tagged = await tagPage(page);
+    const tagged = await withTimeout("browser_find", 20_000, tagPage(page));
     const needle = text.toLowerCase();
     const matches = tagged.filter((t) => t.name.toLowerCase().includes(needle));
     return { content: [{ type: "text" as const, text: JSON.stringify(matches, null, 2) }] };
@@ -200,7 +225,7 @@ server.registerTool(
   async ({ ref, selector }) => {
     const { page } = await getPage(cfg);
     const locator = await resolveTarget(page, { ref, selector });
-    const result = await clickWithFallback(page, locator);
+    const result = await withTimeout("browser_click", 20_000, clickWithFallback(page, locator));
     return { content: [{ type: "text" as const, text: result }] };
   }
 );
@@ -216,7 +241,7 @@ server.registerTool(
   async ({ ref, selector, text }) => {
     const { page } = await getPage(cfg);
     const locator = await resolveTarget(page, { ref, selector });
-    const result = await typeWithFallback(page, locator, text);
+    const result = await withTimeout("browser_type", 20_000, typeWithFallback(page, locator, text));
     return { content: [{ type: "text" as const, text: result }] };
   }
 );
@@ -230,7 +255,7 @@ server.registerTool(
   },
   async ({ key }) => {
     const { page } = await getPage(cfg);
-    await page.keyboard.press(key);
+    await withTimeout("browser_press_key", 10_000, page.keyboard.press(key));
     return { content: [{ type: "text" as const, text: `pressed ${key}` }] };
   }
 );
@@ -244,7 +269,11 @@ server.registerTool(
   },
   async ({ fullPage }) => {
     const { page } = await getPage(cfg);
-    const buffer = await page.screenshot({ fullPage: fullPage ?? false, type: "png" });
+    const buffer = await withTimeout(
+      "browser_take_screenshot",
+      20_000,
+      page.screenshot({ fullPage: fullPage ?? false, type: "png" })
+    );
     return {
       content: [
         { type: "text" as const, text: `Screenshot of ${page.url()}` },
@@ -266,9 +295,13 @@ server.registerTool(
     const { page } = await getPage(cfg);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const compiled = (0, eval)(`(${fn})`) as (arg?: unknown) => unknown;
-    const result = ref
-      ? await page.locator(refSelector(ref)).first().evaluate(compiled as never)
-      : await page.evaluate(compiled as never);
+    const result = await withTimeout(
+      "browser_evaluate",
+      20_000,
+      ref
+        ? page.locator(refSelector(ref)).first().evaluate(compiled as never)
+        : page.evaluate(compiled as never)
+    );
     return { content: [{ type: "text" as const, text: JSON.stringify(result ?? null) }] };
   }
 );
@@ -285,7 +318,11 @@ server.registerTool(
     const { page, context, browser } = await getPage(cfg);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const fn = (0, eval)(`(${code})`) as (p: unknown, c: unknown, b: unknown) => unknown;
-    const result = await fn(page, context, browser);
+    // Generous cap (this is the escape hatch for genuine multi-step flows, e.g. an atomic
+    // click+waitForEvent('filechooser') pair) but still bounded -- unbounded was exactly how a
+    // wedged page turned into an unrecoverable MCP call with no way out short of restarting the
+    // whole Caroline session.
+    const result = await withTimeout("browser_run_code_unsafe", 60_000, Promise.resolve(fn(page, context, browser)));
     return { content: [{ type: "text" as const, text: typeof result === "string" ? result : JSON.stringify(result ?? null) }] };
   }
 );
@@ -310,7 +347,7 @@ server.registerTool(
     }
     if (action === "new") {
       const page = await context.newPage();
-      if (url) await page.goto(url, { waitUntil: "domcontentloaded" });
+      if (url) await withTimeout("browser_tabs(new)", 30_000, page.goto(url, { waitUntil: "domcontentloaded" }));
       return { content: [{ type: "text" as const, text: `Opened tab ${context.pages().length - 1}: ${page.url()}` }] };
     }
     const pages = context.pages();
@@ -318,12 +355,12 @@ server.registerTool(
       return { isError: true, content: [{ type: "text" as const, text: `No tab at index ${index}` }] };
     }
     if (action === "close") {
-      await pages[index].close();
+      await withTimeout("browser_tabs(close)", 10_000, pages[index].close());
       return { content: [{ type: "text" as const, text: `Closed tab ${index}` }] };
     }
     // select: bring to front so subsequent tool calls that just grab pages()[0] still work
     // reasonably; getPage() always uses the first non-closed page, so make that this one.
-    await pages[index].bringToFront();
+    await withTimeout("browser_tabs(select)", 10_000, pages[index].bringToFront());
     return { content: [{ type: "text" as const, text: `Selected tab ${index}: ${pages[index].url()}` }] };
   }
 );
@@ -354,7 +391,7 @@ server.registerTool(
   },
   async ({ width, height }) => {
     const { page } = await getPage(cfg);
-    await page.setViewportSize({ width, height });
+    await withTimeout("browser_resize", 10_000, page.setViewportSize({ width, height }));
     return { content: [{ type: "text" as const, text: `Resized to ${width}x${height}` }] };
   }
 );

@@ -19,7 +19,7 @@ import { createViewerTool, takeViewerRequest, type OfficeConfig } from "./viewer
 import { finishOfficeEditSession } from "./officeEditor.js";
 import { createLoginTool, takeLoginRequest, verifyAndSaveLogin, registerAndSaveLogin, isLoggedIn, getV2Session, openLoginRequest, loggedInEmail, clearCredentials } from "./login.js";
 import { requireSwOrPrompt } from "./swGate.js";
-import { resolveMode, buildOptionsEnv, getSwStatus, getOwnAnthropicApiKey, setOwnAnthropicApiKey, createTopupCheckoutUrl } from "./subscriptionMode.js";
+import { resolveMode, buildOptionsEnv, getSwStatus, getOwnAnthropicApiKey, setOwnAnthropicApiKey, createTopupCheckoutUrl, markOwnAnthropicExhausted, type ChatSource } from "./subscriptionMode.js";
 import { getSmsAccountStatus, setSmsAccount, removeSmsAccount } from "./smsAccount.js";
 import { isVisualModeEnabled, setVisualModeEnabled, resolveVisualModel } from "./visualMode.js";
 
@@ -471,6 +471,18 @@ class ChatSession {
    *  original turn actually goes through. Cleared on a successful (non-blocked)
    *  result and on dispose(). */
   private apiRetryTimer: NodeJS.Timeout | null = null;
+  /** Set just before force-closing activeQuery specifically to pick up an
+   *  own-Anthropic -> sw-proxy chat-source fallback (see subscriptionMode.ts's
+   *  markOwnAnthropicExhausted): Options.env is baked into the CLI subprocess
+   *  at query() creation and can't change on an already-running session, so
+   *  scheduleApiRetry's normal "feed a retry message into the SAME session"
+   *  path would just keep failing against the exhausted source forever --
+   *  this session needs to actually END so the next while-loop iteration
+   *  re-resolves mode and gets a fresh subprocess with the new env. Checked
+   *  first in runLoop's catch block so the resulting failure is recognized as
+   *  this deliberate, expected restart -- no restart-budget cost, no
+   *  misattribution to a generic hang/crash. Cleared as soon as it's acted on. */
+  private restartForChatSourceSwitch = false;
   // Was 10 minutes; shortened per explicit instruction (2026-09-03) -- the
   // subscription/balance this is retrying against can recover at any moment
   // (the user re-logging in, a monthly cap resetting, a top-up landing), and
@@ -890,17 +902,34 @@ class ChatSession {
   /** Same status-bar-only/yellow-lamp/auto-retry treatment as cc_cli_limit_message
    *  (distinct from billing_error's red -- a usage-window limit resets on its own,
    *  there's nothing to fix), driven by the SDK's own structured rate_limit_info
-   *  instead of matched text -- see lastRateLimitInfo's own doc comment. */
-  private handleRateLimitRejected(source: string, info: SDKRateLimitInfo): void {
+   *  instead of matched text -- see lastRateLimitInfo's own doc comment.
+   *
+   *  `chatSource`/`swLoggedIn` (the SAME mode runLoop resolved for the turn that
+   *  just got rejected -- callers pass it straight through) let this fall back to
+   *  the user's SquirrelWisdom account instead of just waiting out own-Anthropic's
+   *  usage window: see subscriptionMode.ts's markOwnAnthropicExhausted doc comment.
+   *  A rate limit on chatSource "sw-proxy" itself has nowhere further to fall back
+   *  to, so it's left alone -- same wait-and-retry as before.
+   *
+   *  Returns whether it fell back -- an IN-STREAM caller (still on the now-stale
+   *  session) must force-close it (see restartForChatSourceSwitch's own doc
+   *  comment) for the fallback to actually take effect; a catch-block caller is
+   *  already on its way to a fresh iteration regardless and can ignore it. */
+  private handleRateLimitRejected(source: string, info: SDKRateLimitInfo, chatSource: ChatSource, swLoggedIn: boolean): boolean {
+    const fellBackToSw = (chatSource === "own-anthropic-oauth" || chatSource === "own-anthropic-key") && swLoggedIn;
+    if (fellBackToSw) markOwnAnthropicExhausted(info.resetsAt);
     // Status-bar/system_notice text is UI chrome, not a chat reply -- always
     // English, regardless of what language the conversation itself is in
     // (see detectRecentLanguage for that separate concern).
     const resetText = info.resetsAt ? ` Resets: ${new Date(info.resetsAt).toLocaleString("en-US")}.` : "";
     const typeText = info.rateLimitType ? ` (${info.rateLimitType})` : "";
-    const text = `Hit the Claude usage limit${typeText}.${resetText} Retrying automatically.`;
-    console.error(`[caroline] rate limit rejected (source=${source}): ${JSON.stringify(info)}`);
+    const text = fellBackToSw
+      ? `Hit your own Anthropic account's usage limit${typeText}.${resetText} Switching to SquirrelWisdom for now -- I'll switch back automatically.`
+      : `Hit the Claude usage limit${typeText}.${resetText} Retrying automatically.`;
+    console.error(`[caroline] rate limit rejected (source=${source}, chatSource=${chatSource}): ${JSON.stringify(info)} fellBackToSw=${fellBackToSw}`);
     this.setConnState("limited", text);
     this.scheduleApiRetry(`rate_limit_rejected:${source}`, this.turnIsVoice);
+    return fellBackToSw;
   }
 
   private clearMcpReconnectTimers(): void {
@@ -1231,9 +1260,18 @@ class ChatSession {
           if (message.type === "assistant" && message.error === "billing_error") {
             const source: "sw" | "anthropic" = mode.chatSource === "sw-proxy" ? "sw" : "anthropic";
             console.error(`[caroline] billing_error on chatSource=${mode.chatSource} -- source=${source}`);
-            const explanation = await this.handleBalanceExhausted(source);
-            this.setConnState("billing_blocked", explanation, { armIgnoreNextResult: true });
+            const { text: explanation, fellBackToSw } = await this.handleBalanceExhausted(source, mode.swLoggedIn);
+            this.setConnState(fellBackToSw ? "limited" : "billing_blocked", explanation, { armIgnoreNextResult: true });
             this.scheduleApiRetry(`billing_error:${source}`, this.turnIsVoice);
+            // This session's own subprocess still has the OLD (exhausted)
+            // env baked in -- scheduleApiRetry's normal same-session retry
+            // would just fail the same way again. Force it down so the next
+            // while-loop iteration re-resolves mode and actually gets
+            // sw-proxy (see restartForChatSourceSwitch's own doc comment).
+            if (fellBackToSw) {
+              this.restartForChatSourceSwitch = true;
+              this.activeQuery?.close();
+            }
             continue; // don't forward the raw/substituted message as a chat bubble
           }
 
@@ -1249,9 +1287,26 @@ class ChatSession {
               .map((b) => b.text)
               .find((t) => CC_CLI_LIMIT_PATTERN.test(t));
             if (limitText) {
-              console.error(`[caroline] cc_cli_limit_message hit: ${truncateForLog(limitText)}`);
-              this.setConnState("limited", limitText, { armIgnoreNextResult: true });
+              // This is specifically the bundled CLI's own OAuth-subscription
+              // usage-cap tracking (Pro/Max session/weekly limits) -- it has
+              // no meaning for own-anthropic-key (pay-as-you-go, no such cap)
+              // or sw-proxy (not the CLI's own subscription), so only
+              // own-anthropic-oauth ever triggers this. No structured resetsAt
+              // to hand markOwnAnthropicExhausted -- the human-readable time
+              // is embedded in limitText itself, not reliably parseable, so
+              // this uses the default cooldown like billing_error does.
+              const fellBackToSw = mode.chatSource === "own-anthropic-oauth" && mode.swLoggedIn;
+              if (fellBackToSw) markOwnAnthropicExhausted();
+              const text = fellBackToSw
+                ? `${limitText} Switching to SquirrelWisdom for now -- I'll switch back automatically.`
+                : limitText;
+              console.error(`[caroline] cc_cli_limit_message hit (fellBackToSw=${fellBackToSw}): ${truncateForLog(limitText)}`);
+              this.setConnState("limited", text, { armIgnoreNextResult: true });
               this.scheduleApiRetry("cc_cli_limit_message", this.turnIsVoice);
+              if (fellBackToSw) {
+                this.restartForChatSourceSwitch = true;
+                this.activeQuery?.close();
+              }
               continue; // don't forward the raw text as a chat bubble
             }
           }
@@ -1265,7 +1320,13 @@ class ChatSession {
             this.lastRateLimitInfo = message.rate_limit_info;
             if (message.rate_limit_info.status === "rejected") {
               this.ignoreNextResultRecovery = true;
-              this.handleRateLimitRejected("in-stream", message.rate_limit_info);
+              const fellBackToSw = this.handleRateLimitRejected("in-stream", message.rate_limit_info, mode.chatSource, mode.swLoggedIn);
+              // Same reasoning as billing_error above: this session's env is
+              // fixed, force it down so the fallback actually takes effect.
+              if (fellBackToSw) {
+                this.restartForChatSourceSwitch = true;
+                this.activeQuery?.close();
+              }
               continue; // don't forward as a chat bubble
             }
           }
@@ -1421,23 +1482,49 @@ class ChatSession {
           );
           continue; // fresh query() below, no failure logged/counted
         }
+        // This session was deliberately closed above (in-stream) specifically
+        // to pick up an own-Anthropic -> sw-proxy chat-source fallback -- see
+        // restartForChatSourceSwitch's own doc comment for why a live session
+        // can't just apply that switch to itself. Checked before any other
+        // classification below so this expected, deliberate restart is never
+        // misattributed to a generic hang/crash or miscounted against the
+        // restart budget, regardless of what the resulting thrown error (or
+        // clean generator end -> synthesized "stream ended unexpectedly"
+        // above) happens to look like.
+        if (this.restartForChatSourceSwitch) {
+          this.restartForChatSourceSwitch = false;
+          console.error("[caroline] runLoop catch: session closed for a chat-source fallback -- fresh query() will pick up sw-proxy");
+          // Same "don't replay raw text, let scheduleApiRetry's own generic
+          // nudge (already scheduled by the caller that closed this session)
+          // pick things back up" treatment as the billing/rate-limit catch
+          // paths below -- this IS that same kind of recoverable failure,
+          // just detected in-stream instead of via a thrown/matched error.
+          this.turnPending = false;
+          this.pendingUserText = null;
+          this.pendingAttachments = [];
+          clearPendingTurn(workspaceDir, this.tabId);
+          continue; // fresh query() below, no restart-budget cost, no replay
+        }
         // Fallback path for handleBalanceExhausted: covers a billing failure that
         // surfaced as a thrown error instead of an in-stream assistant message
         // with .error === 'billing_error' (the primary detection point, above in
         // the for-await loop) -- e.g. if query() itself rejects before yielding
         // anything. Text-matched here (not the structured field) since a thrown
         // JS Error has no such field; source is inferred from which balance the
-        // message text names, not from chatSource (out of scope in this catch
-        // block, and unnecessary -- the two error texts are already distinct).
+        // message text names, not from chatSource (the `mode` local from the
+        // top of this iteration is out of scope in a catch block -- re-resolved
+        // fresh below instead, cheap and deterministic given nothing else about
+        // login/settings state changed between there and here).
         const balanceSource = detectBalanceExhaustion(String(err));
         if (balanceSource) {
           console.error(`[caroline] runLoop catch: billing failure (source=${balanceSource}) thrown instead of in-stream -- not restarting/replaying`);
-          const explanation = await this.handleBalanceExhausted(balanceSource);
+          const { swLoggedIn: recentSwLoggedIn } = await resolveMode(workspaceDir);
+          const { text: explanation, fellBackToSw } = await this.handleBalanceExhausted(balanceSource, recentSwLoggedIn);
           this.turnPending = false;
           this.pendingUserText = null;
           this.pendingAttachments = [];
           clearPendingTurn(workspaceDir, this.tabId);
-          this.setConnState("billing_blocked", explanation);
+          this.setConnState(fellBackToSw ? "limited" : "billing_blocked", explanation);
           this.scheduleApiRetry(`billing_error(thrown):${balanceSource}`, this.turnIsVoice);
           continue; // fresh query() below, but nothing doomed gets replayed into it
         }
@@ -1467,7 +1554,10 @@ class ChatSession {
           console.error("[caroline] runLoop catch: stream died with lastRateLimitInfo still 'rejected' -- treating as a limit hit, not a generic failure");
           this.turnPending = false;
           clearPendingTurn(workspaceDir, this.tabId);
-          this.handleRateLimitRejected("silent-stream-death", this.lastRateLimitInfo);
+          // `mode` from the top of this iteration is out of scope in a catch
+          // block -- re-resolved fresh here, same reasoning as balanceSource above.
+          const recentMode = await resolveMode(workspaceDir);
+          this.handleRateLimitRejected("silent-stream-death", this.lastRateLimitInfo, recentMode.chatSource, recentMode.swLoggedIn);
           continue; // fresh query() below, no restart-budget cost, no replay
         }
         await this.handleFailure(err);
@@ -1644,17 +1734,27 @@ class ChatSession {
    * Anthropic account (chatSource "own-anthropic-oauth"/"own-anthropic-key",
    * Anthropic's own "credit balance is too low" response). Unlike a
    * transient classifier refusal (see CLASSIFIER_REFUSAL_PATTERN), retrying
-   * the SAME request accomplishes nothing here -- the balance doesn't fix
-   * itself -- so this never auto-retries: it explains what happened in the
-   * user's own language, and for the sw-proxy case also opens the top-up
-   * checkout window directly (same flow as Settings' "open_payment_from_settings"),
-   * so paying takes one click instead of hunting through Settings first.
-   * Returns the explanation text (caller decides where it ends up -- a
-   * synthesized assistant message when caught in-stream, or injectProactive
-   * when caught as a thrown error in runLoop's catch block).
+   * the SAME request against the SAME source accomplishes nothing here -- so
+   * for the sw-proxy case this never auto-recovers on its own: it explains
+   * what happened and opens the top-up checkout window directly (same flow
+   * as Settings' "open_payment_from_settings"), so paying takes one click
+   * instead of hunting through Settings first. For the anthropic case, if
+   * the user also has a logged-in SquirrelWisdom account, it falls back to
+   * that instead (see subscriptionMode.ts's markOwnAnthropicExhausted) --
+   * per explicit instruction (2026-09-08): a paid, logged-in SW account must
+   * not just sit unused while every turn fails because the user's own
+   * Anthropic credits ran dry. `swLoggedIn` is the SAME mode.swLoggedIn the
+   * caller already resolved for this turn.
+   * Returns the explanation text plus whether it fell back (caller decides
+   * where the text ends up -- a synthesized assistant message when caught
+   * in-stream, or injectProactive when caught as a thrown error in runLoop's
+   * catch block -- and which connState kind fits: still-blocked is red,
+   * fell-back-automatically reads better as the same yellow "limited" a
+   * rate-limit gets).
    */
-  private async handleBalanceExhausted(source: "sw" | "anthropic"): Promise<string> {
+  private async handleBalanceExhausted(source: "sw" | "anthropic", swLoggedIn: boolean): Promise<{ text: string; fellBackToSw: boolean }> {
     let paymentOpened = false;
+    let fellBackToSw = false;
     if (source === "sw") {
       try {
         const checkoutUrl = await createTopupCheckoutUrl();
@@ -1663,9 +1763,15 @@ class ChatSession {
       } catch (err) {
         console.error("[caroline] handleBalanceExhausted: createTopupCheckoutUrl failed:", err);
       }
+    } else if (source === "anthropic" && swLoggedIn) {
+      // No resetsAt here -- Anthropic's billing_error carries no reset time
+      // (unlike a rate limit), so this uses markOwnAnthropicExhausted's
+      // default cooldown and re-checks own-Anthropic periodically.
+      markOwnAnthropicExhausted();
+      fellBackToSw = true;
     }
-    console.error(`[caroline] handleBalanceExhausted: source=${source} paymentOpened=${paymentOpened}`);
-    return BALANCE_EXHAUSTED_MESSAGE[source](paymentOpened);
+    console.error(`[caroline] handleBalanceExhausted: source=${source} paymentOpened=${paymentOpened} fellBackToSw=${fellBackToSw}`);
+    return { text: BALANCE_EXHAUSTED_MESSAGE[source](paymentOpened, fellBackToSw), fellBackToSw };
   }
 }
 
@@ -1731,15 +1837,19 @@ const CONTINUE_OR_SILENT_NUDGE: Record<NudgeLanguage, string> = {
  * correct for CONTINUE_OR_SILENT_NUDGE/STARTUP_GREETING_NUDGE (real chat
  * content) but wrong here.
  */
-const BALANCE_EXHAUSTED_MESSAGE: Record<"sw" | "anthropic", (paymentOpened: boolean) => string> = {
+const BALANCE_EXHAUSTED_MESSAGE: Record<"sw" | "anthropic", (paymentOpened: boolean, fellBackToSw: boolean) => string> = {
   sw: (paymentOpened) =>
     "Couldn't reply -- the SquirrelWisdom wallet balance ran out." +
     (paymentOpened
       ? " I opened the top-up checkout window -- you can pay right now and I'll answer this message once it clears."
       : " I couldn't open the payment window automatically -- please top up via Settings -> Account & Billing."),
-  anthropic: () =>
-    "Couldn't reply -- your own Anthropic account is out of credits. I can't top that up myself (it's not " +
-    "through SquirrelWisdom) -- please visit console.anthropic.com's Billing section.",
+  anthropic: (_paymentOpened, fellBackToSw) =>
+    fellBackToSw
+      ? "Your own Anthropic account is out of credits -- switching to your SquirrelWisdom account for now. " +
+        "I'll switch back automatically once Anthropic is available again (or you can top up sooner at " +
+        "console.anthropic.com's Billing section)."
+      : "Couldn't reply -- your own Anthropic account is out of credits. I can't top that up myself (it's not " +
+        "through SquirrelWisdom) -- please visit console.anthropic.com's Billing section.",
 };
 
 /**

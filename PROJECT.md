@@ -82,7 +82,8 @@ Reliability engineering, all confirmed-live fixes for real incidents, not specul
 ## Paying for chat: `subscriptionMode.ts`
 
 Every session resolves ONE of four chat sources, in this priority order, and never silently
-switches someone already paying Anthropic directly onto a metered proxy:
+switches someone already paying Anthropic directly onto a metered proxy just because they *also*
+happen to have an SW account:
 
 1. **`own-anthropic-oauth`** — the bundled CLI's own `claude auth login` OAuth session, if logged in.
 2. **`own-anthropic-key`** — a manually pasted `ANTHROPIC_API_KEY` (Settings → Account & Billing).
@@ -92,9 +93,21 @@ switches someone already paying Anthropic directly onto a metered proxy:
 4. **`none`** — the CLI's own request just fails; that failure is what triggers the
    credentials-needed UI, not a separate first-run check.
 
-A depleted balance (`handleBalanceExhausted`) never retries silently — it explains what happened
-in the user's detected language and, for the `sw` case, opens a Revolut-hosted top-up checkout
-window directly (`createTopupCheckoutUrl`).
+**Own-Anthropic exhaustion fallback**: "available" above means "logged in", not "currently has
+room left" — a rate-limited or credit-depleted own-Anthropic account used to make `resolveMode()`
+keep re-picking it forever, even with a paid, logged-in SW account sitting unused. Per explicit
+instruction (2026-09-08): once own-Anthropic is CONFIRMED exhausted on a real request (a
+`billing_error`, or a rejected `rate_limit_event`), `markOwnAnthropicExhausted()` records it
+(honoring the SDK's own `resetsAt` when the failure supplied one, else a 30-minute default
+cooldown), and `resolveMode()` skips straight to `sw-proxy` for as long as that lasts — then
+automatically retries own-Anthropic once the cooldown passes, with no manual "switch back" step.
+Only applies when SW is logged in; with no SW account there's nowhere to fall back to, so it just
+keeps retrying own-Anthropic as before.
+
+A depleted **SW** balance (`handleBalanceExhausted`, source `"sw"`) never retries against a
+different source — there isn't one — so it explains what happened (status-bar/system_notice UI
+chrome, always English, not a chat reply) and opens a Revolut-hosted top-up checkout window
+directly (`createTopupCheckoutUrl`).
 
 ## SquirrelWisdom-backed tools and the login gate
 
