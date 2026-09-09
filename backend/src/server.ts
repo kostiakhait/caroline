@@ -290,6 +290,31 @@ const TOOL_CONCURRENCY_ERROR_PATTERN = /tool use concurrency issues/i;
 // suppress it, no action needed (the account's real login state is fine;
 // this is specifically the CLI's own internal compaction call complaining).
 const NOT_LOGGED_IN_PATTERN = /Not logged in/i;
+// Bug fix (2026-09-09): confirmed live -- a tab's stored session id can end
+// up pointing at a .jsonl that no longer exists (root cause: the primary
+// tab's migration fallback once adopted another tab's throwaway
+// forkSession() snapshot as if it were a real conversation -- see
+// findMostRecentClaudeSessionId's own doc comment, now fixed at the source
+// too). claude.exe reports this on stderr immediately and deterministically
+// every single retry -- confirmed live as an 80+ minute, ever-tightening
+// retry loop with no backoff (the failure comes back too fast for the
+// generic hang/restart machinery to ever back off). Same recovery as
+// TOOL_CONCURRENCY_ERROR_PATTERN: there's nothing to fix about a session id
+// that doesn't exist, so abandon it and start fresh (see its own stderr
+// callback hookup, since this is a stream-level failure with no assistant
+// message to detect it from).
+const SESSION_NOT_FOUND_PATTERN = /No conversation found with session ID/i;
+
+// Process-wide registry of every forkSession() snapshot id currently on disk
+// (both ChatSession.preTurnSnapshotId's defensive per-turn copy and
+// submitOrBranch's branchSessionId) -- populated right where each is
+// created, removed right where each is deleted. Passed to
+// findMostRecentClaudeSessionId so the primary tab's pre-multi-tab migration
+// fallback can never again mistake one of these throwaway files for a real
+// conversation (see that function's own doc comment for the incident this
+// fixes). All tabs share one Node process, so one process-wide Set is
+// correct here, not per-tab state.
+const liveSnapshotSessionIds = new Set<string>();
 // The one confirmed-failing session on 2026-09-08 was 12.2MB (barely
 // shrunk by routine hourly compaction's age-based rules, since most of its
 // bloat was recent). Set a bit below that to catch it before the resume
@@ -792,6 +817,9 @@ class ChatSession {
     }
   }
 
+  /** Read-only outside the class -- handleControlRequest (a plain function, not a method) needs this purely to label its own diagnostic log lines. */
+  get publicTabId(): string { return this.tabId; }
+
   constructor(private readonly send: (event: OutEvent) => void, private readonly tabId: string) {
     this.watchdogTimer = setInterval(() => this.checkHang(), WATCHDOG_INTERVAL_MS);
     this.compactionTimer = setInterval(() => this.maybeCompact(), COMPACTION_CHECK_INTERVAL_MS);
@@ -1044,6 +1072,7 @@ class ChatSession {
       try {
         const forked = await forkSession(snapshotId, { dir: workspaceDir });
         branchSessionId = forked.sessionId;
+        liveSnapshotSessionIds.add(branchSessionId);
       } catch (err) {
         console.error(`[caroline] [parallel] tab=${this.tabId} failed to fork branch off snapshot ${snapshotId} -- falling back to sequential:`, err);
         this.submit(text, attachments, true, false, isVoice);
@@ -1059,6 +1088,7 @@ class ChatSession {
           console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} promise chain rejected unexpectedly:`, err);
         })
         .finally(() => {
+          liveSnapshotSessionIds.delete(branchSessionId);
           void deleteSessionFile(workspaceDir, branchSessionId);
         });
     })();
@@ -1202,6 +1232,7 @@ class ChatSession {
     this.activeQuery?.interrupt().catch((err) => console.error("[caroline] dispose(): interrupt() failed (ignored):", err));
     this.resolveNext?.();
     if (this.preTurnSnapshotId) {
+      liveSnapshotSessionIds.delete(this.preTurnSnapshotId);
       void deleteSessionFile(workspaceDir, this.preTurnSnapshotId);
       this.preTurnSnapshotId = null;
     }
@@ -1414,7 +1445,7 @@ class ChatSession {
       return undefined;
     }
     if (this.tabId !== PRIMARY_TAB_ID) return undefined;
-    const migrated = findMostRecentClaudeSessionId(workspaceDir);
+    const migrated = findMostRecentClaudeSessionId(workspaceDir, liveSnapshotSessionIds);
     if (migrated) {
       console.error(`[caroline] primary tab: no stored session id yet -- migrating pre-multi-tab conversation ${migrated}`);
       saveTabSessionId(workspaceDir, this.tabId, migrated);
@@ -1582,12 +1613,14 @@ class ChatSession {
         if (this.preTurnSnapshotId) {
           const staleSnapshotId = this.preTurnSnapshotId;
           this.preTurnSnapshotId = null;
+          liveSnapshotSessionIds.delete(staleSnapshotId);
           void deleteSessionFile(workspaceDir, staleSnapshotId);
         }
         if (resumeSessionId) {
           try {
             const { sessionId: snapshotId } = await forkSession(resumeSessionId, { dir: workspaceDir });
             this.preTurnSnapshotId = snapshotId;
+            liveSnapshotSessionIds.add(snapshotId);
             console.error(`[caroline] [parallel] tab=${this.tabId} pre-turn snapshot ${resumeSessionId} -> ${snapshotId}`);
           } catch (err) {
             console.error(`[caroline] [parallel] tab=${this.tabId} pre-turn snapshot failed (parallel branching unavailable this turn):`, err);
@@ -1619,6 +1652,19 @@ class ChatSession {
           // cause captured anywhere.
           stderr: (data: string) => {
             console.error(`[caroline] [claude-stderr] tab=${this.tabId} resume=${resumeSessionId ?? "(none)"}: ${data}`);
+            // See SESSION_NOT_FOUND_PATTERN's own doc comment. Detected here
+            // (not in the message loop below) because this failure never
+            // produces an assistant message at all -- the stream just ends,
+            // and without this the tab retries the same dead session id
+            // forever with no backoff (confirmed live: 80+ minutes, retries
+            // accelerating toward one every few seconds). Guarded on
+            // restartForUnrecoverableSession so a chatty/repeated stderr line
+            // for the SAME failure doesn't call resetUnrecoverableSession
+            // more than once per attempt.
+            if (SESSION_NOT_FOUND_PATTERN.test(data) && !this.restartForUnrecoverableSession) {
+              console.error(`[caroline] tab=${this.tabId} stderr reports resume=${resumeSessionId ?? "(none)"} doesn't exist on disk -- abandoning it and starting fresh`);
+              this.resetUnrecoverableSession(this.pendingUserText, this.pendingAttachments);
+            }
           },
           // 'auto' (a model classifier approving/denying each call) was
           // real friction for zero benefit here -- confirmed live, it
@@ -2592,6 +2638,10 @@ async function handleControlRequest(
     filePath?: string;
     attachmentName?: string;
     attachmentTs?: number;
+    chatJsVersion?: string;
+    href?: string;
+    transcriptEntryCount?: number;
+    attachmentNames?: string;
   },
   send: (event: OutEvent) => void,
   // The session tied to whichever connection actually sent this request --
@@ -3028,6 +3078,16 @@ async function handleControlRequest(
       // the original filename and roughly when it was sent. Falls back to
       // workspace/dehydrated/ too (dehydrate.ts's own per-turn copy), in case
       // the uploads/ one was ever cleaned up but a dehydrated copy survives.
+      // Diagnostic-only (2026-09-09): lets a stale-WebView2-cache suspicion
+      // be confirmed or ruled out purely from this log file -- chat.js sends
+      // its own CHAT_JS_VERSION right after every connect (see its own doc
+      // comment), so what's ACTUALLY executing in the tab is visible here,
+      // independent of what's on disk or what any cache-clear call claims.
+      case "client_diag": {
+        console.error(`[caroline] [client_diag] tab=${session?.publicTabId ?? "(unknown)"} chatJsVersion=${parsed.chatJsVersion ?? "(unknown)"} href=${parsed.href ?? "(unknown)"} transcriptEntryCount=${parsed.transcriptEntryCount ?? "(unknown)"} attachmentNames=${parsed.attachmentNames ?? "(unknown)"}`);
+        send({ type: "control_response", op, ok: true, requestId: parsed.requestId });
+        break;
+      }
       case "find_attachment": {
         const requestId = parsed.requestId;
         const wantName = parsed.attachmentName;

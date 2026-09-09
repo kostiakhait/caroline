@@ -3,7 +3,22 @@
 <head>
 <meta charset="utf-8" />
 <title>Caroline</title>
-<link rel="stylesheet" href="chat.css" />
+<script>
+  // Bug fix (2026-09-09): a plain <link>/<script src="chat.css"/"chat.js">
+  // gave WebView2's own HTTP cache no reason to ever treat a rebuilt file as
+  // different from the one it already had -- confirmed live that even a full
+  // Caroline.exe process restart (destroying and recreating every WebView2
+  // tab control, a real navigation each time) kept serving a stale chat.js
+  // long after the file on disk had changed; MainWindow.xaml.cs's own
+  // Network.clearBrowserCache call before each navigation was meant to cover
+  // this and evidently doesn't reliably. A changed URL is a guaranteed cache
+  // miss regardless of any caching layer's own behavior, so MainWindow.xaml.cs
+  // now passes assetsVersion (the actual on-disk chat.js/chat.css mtime) on
+  // this page's own URL, and these two resources are loaded keyed to it --
+  // self-updating, no manual version bump ever needed again.
+  var assetsVersion = new URLSearchParams(location.search).get("assetsVersion") || Date.now();
+  document.write('<link rel="stylesheet" href="chat.css?v=' + encodeURIComponent(assetsVersion) + '" />');
+</script>
 </head>
 <body>
   <div class="header">
@@ -187,6 +202,8 @@
     </div>
   </div>
 
-  <script src="chat.js"></script>
+  <script>
+    document.write('<script src="chat.js?v=' + encodeURIComponent(assetsVersion) + '"><\/script>');
+  </script>
 </body>
 </html>

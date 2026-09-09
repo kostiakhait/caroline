@@ -23,10 +23,41 @@ export interface HistoryEntry {
   role: "user" | "assistant";
   text: string;
   ts: number;
+  attachments?: { name: string }[];
 }
 
 function sanitizeProjectDirName(path: string): string {
   return path.replace(/[\\:]/g, "-");
+}
+
+// server.ts's attachmentToBlocks() sends an image/document/file as its own
+// real content block (type "image"/"document", no filename anywhere on it)
+// PLUS a paired text block noting where it was saved -- these three fixed
+// prefixes are that note's only ones. Recognizing them here is how a
+// recovered attachment gets its name back: the block itself never had one.
+const ATTACHMENT_NOTE_PREFIXES = [
+  "[This image is also saved at ",
+  "[This document is also saved at ",
+  "[Attached file saved to ",
+];
+
+/**
+ * If `blockText` is one of attachmentToBlocks()'s own saved-path notes,
+ * pulls the original filename back out of it (saveAttachmentToUploads names
+ * files "<uuid>-<originalName>" -- stripping that prefix recovers the name
+ * the user actually gave it). Returns null for ordinary message text.
+ */
+function extractAttachmentNote(blockText: string): { name: string } | null {
+  for (const prefix of ATTACHMENT_NOTE_PREFIXES) {
+    if (!blockText.startsWith(prefix)) continue;
+    const rest = blockText.slice(prefix.length);
+    const dashIdx = rest.indexOf(" -- ");
+    const savedPath = (dashIdx >= 0 ? rest.slice(0, dashIdx) : rest.replace(/\.?\]\s*$/, "")).trim();
+    const base = savedPath.split(/[\\/]/).pop() || savedPath;
+    const name = base.replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, "");
+    return { name };
+  }
+  return null;
 }
 
 function latestSessionFile(workspaceDir: string): string | null {
@@ -47,16 +78,29 @@ function latestSessionFile(workspaceDir: string): string | null {
   return best;
 }
 
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b: any) => b?.type === "text" && typeof b.text === "string")
-    .map((b: any) => b.text)
-    .join("\n\n");
+// Bug fix (2026-09-09): this used to only look at type==="text" blocks and
+// join them verbatim, which meant (a) an attached image/document was
+// invisible here -- its own content block has no filename and isn't text at
+// all, so it just vanished with no trace, not even a chip -- and (b) the
+// paired "[This image is also saved at ...]" note (see attachmentToBlocks)
+// leaked into the visible bubble text as ugly raw prose. Now the note is
+// recognized, turned into a proper {name} the chat UI can offer to recover
+// (see chat.js's renderAttachment/find_attachment), and excluded from `text`.
+function extractTextAndAttachments(content: unknown): { text: string; attachments: { name: string }[] } {
+  if (typeof content === "string") return { text: content, attachments: [] };
+  if (!Array.isArray(content)) return { text: "", attachments: [] };
+  const textParts: string[] = [];
+  const attachments: { name: string }[] = [];
+  for (const b of content as any[]) {
+    if (b?.type !== "text" || typeof b.text !== "string") continue;
+    const note = extractAttachmentNote(b.text);
+    if (note) attachments.push(note);
+    else textParts.push(b.text);
+  }
+  return { text: textParts.join("\n\n"), attachments };
 }
 
-/** Shared by readRecentHistory and readArchivedEntries -- both turn a raw JSONL blob into the same {role,text,ts} shape the chat UI already knows how to render as bubbles. */
+/** Shared by readRecentHistory and readArchivedEntries -- both turn a raw JSONL blob into the same {role,text,ts,attachments?} shape the chat UI already knows how to render as bubbles. */
 function extractEntriesFromJsonl(raw: string, sourceLabel: string): HistoryEntry[] {
   const entries: HistoryEntry[] = [];
   const lines = raw.split("\n");
@@ -65,10 +109,15 @@ function extractEntriesFromJsonl(raw: string, sourceLabel: string): HistoryEntry
     try {
       const obj = JSON.parse(line);
       if (obj.type !== "user" && obj.type !== "assistant") continue;
-      const text = extractText(obj.message?.content);
-      if (!text.trim()) continue;
+      const { text, attachments } = extractTextAndAttachments(obj.message?.content);
+      if (!text.trim() && attachments.length === 0) continue;
       const ts = obj.timestamp ? Date.parse(obj.timestamp) : Date.now();
-      entries.push({ role: obj.type, text, ts: Number.isFinite(ts) ? ts : Date.now() });
+      entries.push({
+        role: obj.type,
+        text,
+        ts: Number.isFinite(ts) ? ts : Date.now(),
+        ...(attachments.length > 0 ? { attachments } : {}),
+      });
     } catch (err) {
       console.error(`[caroline] readRecentHistory: skipping malformed line in ${sourceLabel}:`, err);
     }

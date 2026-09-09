@@ -149,16 +149,31 @@ export function clearTabSessionId(workspaceDir: string, tabId: string): void {
  * one's id, mirroring what continue:true would have picked. Never throws --
  * worst case (directory layout changes, permissions, anything) the caller
  * just falls through to starting fresh, same as any other new tab.
+ *
+ * Bug fix (2026-09-09): confirmed live -- the parallel-turns feature's
+ * defensive forkSession() snapshots (server.ts's preTurnSnapshotId/
+ * branchSessionId) are real, throwaway .jsonl files in this SAME project
+ * directory, and one of them can easily be the most-recently-modified file
+ * at the exact moment this runs (it's created right before a real turn
+ * starts). This fallback then adopted it as if it were a real conversation;
+ * the owning tab later deleted it as routine snapshot cleanup once its own
+ * next turn began, leaving the primary tab permanently resuming a session id
+ * that no longer exists (an immediate, unrecoverable "No conversation found
+ * with session ID" on every retry, no backoff, forever). `excludeIds` lets
+ * the caller pass its own registry of currently-live snapshot ids so this
+ * never happens again -- see server.ts's liveSnapshotSessionIds.
  */
-export function findMostRecentClaudeSessionId(workspaceDir: string): string | null {
+export function findMostRecentClaudeSessionId(workspaceDir: string, excludeIds?: ReadonlySet<string>): string | null {
   try {
     const projectDir = claudeProjectDir(workspaceDir);
     if (!existsSync(projectDir)) return null;
     let best: { id: string; mtimeMs: number } | null = null;
     for (const entry of readdirSync(projectDir)) {
       if (!entry.endsWith(".jsonl")) continue;
+      const id = entry.slice(0, -".jsonl".length);
+      if (excludeIds?.has(id)) continue;
       const mtimeMs = statSync(join(projectDir, entry)).mtimeMs;
-      if (!best || mtimeMs > best.mtimeMs) best = { id: entry.slice(0, -".jsonl".length), mtimeMs };
+      if (!best || mtimeMs > best.mtimeMs) best = { id, mtimeMs };
     }
     return best?.id ?? null;
   } catch (err) {

@@ -1,4 +1,9 @@
 (() => {
+  // Diagnostic marker (2026-09-09): bumped every time this file changes --
+  // sent to the backend right after connect (see "client_diag" below) and
+  // logged server-side, purely so a stale-cache suspicion can be confirmed
+  // or ruled out from caroline.log alone, with zero UI interaction needed.
+  const CHAT_JS_VERSION = "2026-09-09-image-autorecover-3-wsrace-fix";
   const port = new URLSearchParams(location.search).get("port") || "8765";
   // Which tab this WebView2 instance belongs to (see MainWindow's tab strip,
   // each tab navigates to chat.html?tab=<id>) -- threaded into the WS URL so
@@ -509,26 +514,89 @@
   // localStorage/compaction does), so a chip that lost its own payload isn't
   // actually gone, just needs asking the backend to find it again by name +
   // roughly when it was sent (see find_attachment's own doc comment).
-  function tryRecoverAttachment(chip, a, ts) {
-    chip.classList.add("attachment-chip-recoverable");
-    chip.title = "Click to load this attachment";
-    chip.addEventListener("click", (e) => {
-      e.preventDefault();
-      chip.title = "Loading…";
-      chip.classList.add("attachment-chip-loading");
+  //
+  // Bug fix (2026-09-09): confirmed live -- replayTranscript() runs BEFORE
+  // connect() (see the bottom of this file), and its own loop is entirely
+  // synchronous for any entry without an attId (no IndexedDB lookup to
+  // await), so renderAttachment's new auto-recovery path could reach this
+  // point while `ws` was still null. sendControl() silently no-ops on a
+  // closed/missing socket, so the request never actually left the page and
+  // this promise never resolved -- a get_history/localStorage-recovered
+  // image looked like it was perpetually "Loading…" with nothing in
+  // caroline.log to explain why. Now waits for the same WS this page will
+  // use for everything else instead of assuming it's already open.
+  function waitForWsOpen() {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (ws && ws.readyState === WebSocket.OPEN) resolve();
+        else setTimeout(check, 150);
+      };
+      check();
+    });
+  }
+
+  async function fetchAttachment(name, ts) {
+    await waitForWsOpen();
+    return new Promise((resolve) => {
       const requestId = `find-att-${++findAttachmentSeq}`;
       pendingFindAttachmentRequests.set(requestId, (ok, parsed) => {
         pendingFindAttachmentRequests.delete(requestId);
-        chip.classList.remove("attachment-chip-loading");
-        if (!ok || !parsed) {
-          chip.title = "Couldn't find this attachment on disk";
-          return;
-        }
-        const recovered = renderAttachment({ name: a.name, mimeType: parsed.mimeType, dataBase64: parsed.dataBase64 }, ts);
-        chip.replaceWith(recovered);
+        resolve(ok && parsed ? parsed : null);
       });
-      sendControl("find_attachment", { attachmentName: a.name, attachmentTs: ts, requestId });
+      sendControl("find_attachment", { attachmentName: name, attachmentTs: ts, requestId });
+    });
+  }
+
+  function tryRecoverAttachment(chip, a, ts) {
+    chip.classList.add("attachment-chip-recoverable");
+    chip.title = "Click to load this attachment";
+    chip.addEventListener("click", async (e) => {
+      e.preventDefault();
+      chip.title = "Loading…";
+      chip.classList.add("attachment-chip-loading");
+      const parsed = await fetchAttachment(a.name, ts);
+      chip.classList.remove("attachment-chip-loading");
+      if (!parsed) {
+        chip.title = "Couldn't find this attachment on disk";
+        return;
+      }
+      chip.replaceWith(renderAttachment({ name: a.name, mimeType: parsed.mimeType, dataBase64: parsed.dataBase64 }, ts));
     }, { once: true });
+  }
+
+  // True when there's enough to guess this attachment is an image worth
+  // showing inline, even before find_attachment resolves its real mimeType
+  // (a get_history-recovered attachment only ever carries a bare {name} --
+  // see history.ts's extractAttachmentNote -- so the extension is all
+  // there is to go on up front).
+  function looksLikeImageAttachment(a) {
+    const mime = a.mimeType || "";
+    if (mime.startsWith("image/")) return true;
+    if (mime) return false; // a known non-image type -- don't second-guess it
+    return /\.(png|jpe?g|gif|webp|bmp)$/i.test(a.name || "");
+  }
+
+  // Per explicit instruction (2026-09-09): "пока не будут нормально, а не
+  // плейсхолдерами отображаться картинки — задача не решена" -- a
+  // click-to-load chip still counts as a placeholder. For anything that
+  // looks like an image, fetch it immediately instead of waiting for a
+  // click; only falls back to the manual click-to-retry chip if the backend
+  // genuinely can't find the file (deleted, or outside find_attachment's
+  // 30-minute match window).
+  function autoRecoverImage(placeholder, a, ts) {
+    fetchAttachment(a.name, ts).then((parsed) => {
+      if (!parsed) {
+        const chip = document.createElement("div");
+        chip.className = "attachment-chip";
+        chip.innerHTML = `<span>🖼️</span><span class="name"></span>`;
+        chip.querySelector(".name").textContent = a.name;
+        chip.title = "Couldn't auto-load -- click to retry";
+        tryRecoverAttachment(chip, a, ts);
+        placeholder.replaceWith(chip);
+        return;
+      }
+      placeholder.replaceWith(renderAttachment({ name: a.name, mimeType: parsed.mimeType, dataBase64: parsed.dataBase64 }, ts));
+    });
   }
 
   // Full inline preview when the base64 payload is still in hand (a
@@ -554,6 +622,18 @@
       video.controls = true;
       video.src = `data:${mime};base64,${a.dataBase64}`;
       return video;
+    }
+    // No bytes yet, but this looks like an image -- auto-fetch instead of
+    // making the user click a placeholder chip first (see autoRecoverImage's
+    // own doc comment).
+    if (!a.dataBase64 && ts && looksLikeImageAttachment(a)) {
+      const placeholder = document.createElement("div");
+      placeholder.className = "attachment-chip attachment-chip-loading";
+      placeholder.innerHTML = `<span>🖼️</span><span class="name"></span>`;
+      placeholder.querySelector(".name").textContent = a.name;
+      placeholder.title = "Loading…";
+      autoRecoverImage(placeholder, a, ts);
+      return placeholder;
     }
     const chip = document.createElement(a.dataBase64 ? "a" : "div");
     chip.className = "attachment-chip";
@@ -1009,6 +1089,22 @@
     ws.addEventListener("open", () => {
       wsConnected = true;
       setStatus("connected", "connected");
+      {
+        // Diagnostic-only, same reasoning as CHAT_JS_VERSION above -- proves
+        // or disproves from caroline.log alone whether a given attachment
+        // bubble's own transcript entry is even still in localStorage (it
+        // could have been pushed out of TRANSCRIPT_MAX by tonight's heavy
+        // restart-cycling noise), independent of whether renderAttachment's
+        // own recovery logic is running correctly.
+        const t = loadTranscript();
+        const attachmentNames = t.flatMap((e) => (e.attachments || []).map((a) => a.name));
+        sendControl("client_diag", {
+          chatJsVersion: CHAT_JS_VERSION,
+          href: location.href,
+          transcriptEntryCount: t.length,
+          attachmentNames: JSON.stringify(attachmentNames),
+        });
+      }
       pollChannelStatus();
       sendControl("visual_mode_get");
       // See replayTranscript()/history.ts: an empty localStorage transcript
@@ -1235,7 +1331,16 @@
         try {
           const entries = JSON.parse(evt.stdout || "[]");
           for (const entry of entries) {
-            const div = addBubble(entry.role, entry.text, [], { persist: true, ts: entry.ts });
+            // Bug fix (2026-09-09): this used to hardcode [] here, so a
+            // get_history-recovered bubble could never show an attachment at
+            // all, even as a recoverable chip -- confirmed live as the actual
+            // cause of images silently disappearing (not just losing their
+            // preview) across the one restart path that runs almost every
+            // time this app reopens. history.ts now extracts {name} for any
+            // image/document/file the real transcript shows was attached;
+            // renderAttachment (via addBubble) auto-fetches the real bytes
+            // for anything that looks like an image.
+            const div = addBubble(entry.role, entry.text, entry.attachments || [], { persist: true, ts: entry.ts });
             const filePath = extractDehydratedFilePath(entry.text);
             if (filePath) addExpandLink(div, filePath);
           }

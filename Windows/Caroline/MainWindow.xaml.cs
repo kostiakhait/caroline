@@ -643,6 +643,30 @@ public partial class MainWindow : Window
             var wwwrootDir = Path.Combine(AppContext.BaseDirectory, "wwwroot");
             webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
                 "caroline.local", wwwrootDir, CoreWebView2HostResourceAccessKind.Allow);
+            // Bug fix (2026-09-09): the WebView2 profile itself is persistent
+            // across app restarts (see EnsureSharedWebViewEnvAsync's own
+            // userDataFolder) -- confirmed live that a rebuilt chat.js/chat.css
+            // dropped into wwwroot/ was NOT picked up by a plain app restart,
+            // because the browser cache from a PREVIOUS run's fetch of
+            // https://caroline.local/chat.js was still being served. Clearing
+            // the cache for this virtual host's own resources right before
+            // every navigation guarantees a fresh fetch every single time,
+            // not just the first one after install -- cheap (local disk
+            // cache only, not cookies/login state) and this is the only
+            // place chat.html/js/css/wwwroot assets are ever loaded from.
+            try
+            {
+                // CoreWebView2Profile.ClearBrowsingDataAsync isn't available in
+                // this project's pinned WebView2 SDK version (1.0.2957.106) --
+                // the DevTools Protocol's Network.clearBrowserCache has been
+                // present since WebView2's earliest versions and does the same
+                // thing, reached via the always-available CallDevToolsProtocolMethodAsync.
+                await webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Network.clearBrowserCache", "{}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"InitWebViewForTabAsync({tab.Id}): clearBrowserCache threw (ignored, navigating anyway): {ex.Message}");
+            }
             // ?tab=<id> -- routes this WS connection to the right per-tab
             // ChatSession on the Node side (server.ts's `sessions` map) and
             // keys this tab's own localStorage transcript (chat.js), since
@@ -652,7 +676,23 @@ public partial class MainWindow : Window
             // native/WPF setting the backend has no stake in, so there's no round trip to
             // wait on and no race to worry about; the page just knows its initial state
             // the same way it already knows its own port/tab.
-            webView.Source = new Uri($"https://caroline.local/chat.html?port={BackendProcess.Port}&tab={Uri.EscapeDataString(tab.Id)}&alwaysOnTop={(_settings.AlwaysOnTop ? "1" : "0")}");
+            // assetsVersion -- see chat.html's own doc comment: the actual on-disk
+            // mtime of chat.js/chat.css, so a changed file always gets a different
+            // URL and can never be served stale regardless of any WebView2 caching
+            // layer's own behavior (clearBrowserCache above is belt-and-suspenders,
+            // not the only thing this now depends on).
+            long assetsVersion = 0;
+            try
+            {
+                var chatJsWrite = File.GetLastWriteTimeUtc(Path.Combine(wwwrootDir, "chat.js")).Ticks;
+                var chatCssWrite = File.GetLastWriteTimeUtc(Path.Combine(wwwrootDir, "chat.css")).Ticks;
+                assetsVersion = Math.Max(chatJsWrite, chatCssWrite);
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"InitWebViewForTabAsync({tab.Id}): failed to read chat.js/chat.css mtime for assetsVersion (falling back to 0, cache-busting won't work this launch): {ex.Message}");
+            }
+            webView.Source = new Uri($"https://caroline.local/chat.html?port={BackendProcess.Port}&tab={Uri.EscapeDataString(tab.Id)}&alwaysOnTop={(_settings.AlwaysOnTop ? "1" : "0")}&assetsVersion={assetsVersion}");
         }
         catch (Exception ex) when (ex.GetType().Name.Contains("WebView2RuntimeNot"))
         {
