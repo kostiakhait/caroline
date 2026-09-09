@@ -88,12 +88,27 @@ function formatTimestampForModel(d: Date): string {
  * just theoretical. Stamped once per entry (not per block) here, in the
  * same per-turn pass that already touches every entry's content exactly
  * once (see dehydratePreviousTurns' alreadyThroughLine). Skipped for
- * entries that already start with a "[Sent: " block so a real/proactive
- * user turn is never double-stamped.
+ * entries that already start with a "[Sent: " block (a real/proactive user
+ * turn) OR with this function's OWN stamp shape, so neither ever gets
+ * double-stamped.
+ *
+ * Bug fix (2026-09-09): confirmed live -- this originally checked ONLY for
+ * "[Sent: ", not its own stamp's shape. dehydratePreviousTurns' own
+ * alreadyThroughLine skip normally makes that harmless (each entry visited
+ * once, ever) -- but "tab X switching tracked session A -> B, rescanning
+ * from line 0" (server.ts, whenever the tracked session id itself changes)
+ * resets alreadyThroughLine to 0, and confirmed live that this can fire
+ * repeatedly, in rapid succession, for the SAME two session ids oscillating
+ * back and forth -- each rescan blindly prepended ANOTHER stamp, unbounded.
+ * Found two real entries with 350+ duplicate stamp blocks each, almost
+ * certainly what was then making those sessions fail/hang on resume. Now
+ * recognized and skipped regardless of how many times a given entry gets
+ * rescanned.
  */
+const TIMESTAMP_STAMP_PATTERN = /^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )/;
 function stampTimestampIfMissing(entry: RawEntry, content: ContentBlock[]): ContentBlock[] {
   const first = content[0];
-  const alreadyStamped = first?.type === "text" && typeof first.text === "string" && first.text.startsWith("[Sent: ");
+  const alreadyStamped = first?.type === "text" && typeof first.text === "string" && TIMESTAMP_STAMP_PATTERN.test(first.text);
   if (alreadyStamped || typeof entry.timestamp !== "string") return content;
   const parsed = new Date(entry.timestamp);
   if (Number.isNaN(parsed.getTime())) return content;

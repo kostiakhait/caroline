@@ -1359,6 +1359,25 @@ class ChatSession {
         // ensureWorkspace()), not this cwd's .mcp.json -- see workspace.ts
         // for why. cwd still matters for CLAUDE.md / Skills/ discovery.
         let resumeSessionId = this.resolveResumeSessionId();
+        // Bug fix (2026-09-09): lastSavedSessionId used to update ONLY once the
+        // SDK echoed a session_id back in-stream (below) -- fine when a turn
+        // actually reaches 'init', but a session that repeatedly fails to get
+        // that far (confirmed live: tab stuck 6+ hours, hasSeenInit always
+        // false) left it permanently stale at whatever it was BEFORE the last
+        // fork/compaction, while resumeSessionId (re-resolved from disk every
+        // loop iteration) correctly tracked the new one. inputStream()'s own
+        // dehydration call (below, keyed off lastSavedSessionId) and this
+        // decode's pre-resume one (keyed off resumeSessionId) then disagreed
+        // on every single retry, each "correcting" the other back and forth --
+        // confirmed live as "switching tracked session A -> B" / "B -> A"
+        // alternating dozens of times in minutes, each one a full rescan from
+        // line 0. Worse, combined with stampTimestampIfMissing's own bug (see
+        // its doc comment), those repeated rescans piled 350+ duplicate
+        // timestamp blocks onto single entries -- almost certainly why those
+        // sessions then failed/hung on resume. Syncing here, the moment
+        // resumeSessionId is actually known, means both call sites always
+        // agree, whether or not the SDK ever gets the chance to confirm it.
+        if (resumeSessionId) this.lastSavedSessionId = resumeSessionId;
         // Proactive, SDK-INDEPENDENT compaction check -- per explicit instruction
         // (2026-09-08): our own compaction is our own decision, not something that
         // should wait on or depend on any signal from the SDK/CLI. A plain fs.stat
@@ -1381,6 +1400,7 @@ class ChatSession {
                 saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
                 console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction done: ${resumeSessionId} -> ${result.newSessionId}`);
                 resumeSessionId = result.newSessionId;
+                this.lastSavedSessionId = result.newSessionId; // keep inputStream()'s own dehydration call in sync too -- see the sync above's doc comment
               } else {
                 console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction returned null despite force=true -- resuming the original session as-is`);
               }
