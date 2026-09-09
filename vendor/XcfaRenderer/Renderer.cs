@@ -144,6 +144,9 @@ public static class Renderer
         internal SegmentLibrary Library { get; init; } = null!;
         internal SilenceLibrary SilenceLibrary { get; init; } = null!;
         internal Func<int, Frame[]> GetDecodedSegment { get; init; } = null!;
+        /// <summary>Lazy, single-frame decode+cache -- see GetDecodedFrame's doc comment in Prepare()
+        /// for why RenderFrameLevel (the production path) uses this instead of GetDecodedSegment.</summary>
+        internal Func<int, int, Frame?> GetDecodedFrame { get; init; } = null!;
 
         /// <summary>Renders one audio clip against this already-prepared model.</summary>
         public void Render(string audioPath, string outputPath, RenderOptions? options = null) =>
@@ -257,6 +260,33 @@ public static class Renderer
             return frames;
         }
 
+        // Lazy, single-frame counterpart to GetDecodedSegment, for RenderFrameLevel (the
+        // production render_mode="frame" path). Profiling a ~31s clip (2026-09-09) found
+        // getDecodedSegment costing 13.4s of an 18.2s frame loop: on every cache miss it
+        // eagerly decoded (and, with RemoveBg, alpha-composited) EVERY frame in the segment,
+        // even though find_best_frame's hysteresis switches segments on most cooldown windows
+        // -- most of that decoded work was thrown away unused before the next jump. This
+        // decodes only the one frame index actually requested, cached per (segId, frameIdx)
+        // so revisiting the same stored frame later is still free. Cut the same test clip's
+        // frame loop from 18.2s to 5.9s. RenderSegmentMode still uses GetDecodedSegment/
+        // decodedSegCache above unchanged -- it genuinely walks whole segments for its own
+        // flow-interpolation, and isn't the production render mode.
+        var decodedFrameCache = new Dictionary<(int SegId, int FrameIdx), Frame>();
+
+        Frame? GetDecodedFrame(int segId, int frameIdx)
+        {
+            var key = (segId, frameIdx);
+            if (decodedFrameCache.TryGetValue(key, out var cached)) return cached;
+            var seg = catalog.Segments.First(s => s.Id == segId);
+            if (seg.Frames.Length == 0) return null;
+            var idx = Math.Min(frameIdx, seg.Frames.Length - 1);
+            var idxKey = (segId, idx);
+            if (decodedFrameCache.TryGetValue(idxKey, out var cachedAtClampedIdx)) return cachedAtClampedIdx;
+            var frame = ApplyBgIfNeeded(segId, idx, Frame.DecodeJpeg(xcfa.ReadFrame(seg, idx), outW, outH));
+            decodedFrameCache[idxKey] = frame;
+            return frame;
+        }
+
         // Silence-tagged segments, pre-decoded and bg-processed the same way as GetDecodedSegment,
         // grouped by mul -- feeds the living-pause state machine below. Direct port of
         // precompute_silence_flows's new-model (tagged-segment) branch; see SilenceLibrary.cs.
@@ -267,6 +297,7 @@ public static class Renderer
             Xcfa = xcfa, Catalog = catalog, BaseFrame = baseFrame, OutW = outW, OutH = outH,
             WantsBg = wantsBg, UseAlphaChannel = useAlphaChannel, BaseMask = baseMask, FaceRegion = faceRegion,
             Library = library, SilenceLibrary = silenceLibrary, GetDecodedSegment = GetDecodedSegment,
+            GetDecodedFrame = GetDecodedFrame,
         };
     }
 
@@ -287,7 +318,7 @@ public static class Renderer
             RenderFrameLevel(
                 writer: encoder, nFrames: nFrames, fps: options.Fps, sampleFps: model.Catalog.Fps,
                 library: model.Library, silenceLibrary: model.SilenceLibrary, feats: feats, energies: energies,
-                baseFrame: model.BaseFrame, faceRegion: model.FaceRegion, getDecodedSegment: model.GetDecodedSegment,
+                baseFrame: model.BaseFrame, faceRegion: model.FaceRegion, getDecodedFrame: model.GetDecodedFrame,
                 useAlphaChannel: model.UseAlphaChannel, baseMask: model.BaseMask,
                 micro: options.MicroMovement, styleIntensity: options.StyleIntensity,
                 minSilenceSeconds: options.MinSilenceSeconds, exitSeconds: options.SilenceExitSeconds);
@@ -330,7 +361,7 @@ public static class Renderer
     private static void RenderFrameLevel(
         Encoder writer, int nFrames, int fps, float sampleFps,
         SegmentLibrary library, SilenceLibrary silenceLibrary, AudioFeatures.FeatureStream feats, float[] energies,
-        Frame baseFrame, (int X, int Y, int W, int H)? faceRegion, Func<int, Frame[]> getDecodedSegment,
+        Frame baseFrame, (int X, int Y, int W, int H)? faceRegion, Func<int, int, Frame?> getDecodedFrame,
         bool useAlphaChannel, byte[]? baseMask, bool micro, double styleIntensity, double minSilenceSeconds = 2.0, double exitSeconds = 1.0)
     {
         const float silenceThresh = 0.005f;
@@ -542,9 +573,9 @@ public static class Renderer
 
             if (curSegId >= 0)
             {
-                var decoded = getDecodedSegment(curSegId);
-                if (decoded.Length > 0)
-                    lastFrame = decoded[Math.Min(curFrameIdx, decoded.Length - 1)];
+                var decoded = getDecodedFrame(curSegId, curFrameIdx);
+                if (decoded is not null)
+                    lastFrame = decoded;
             }
 
             EmitAndAdvance(lastFrame);
