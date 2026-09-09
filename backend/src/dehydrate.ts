@@ -387,6 +387,33 @@ export async function agePreviousTurnsInPlace(workspaceDir: string, sessionId: s
     }
   }
 
+  // Bug fix (2026-09-08): confirmed live -- a split landing between a
+  // tool_use-ending assistant entry and its own tool_result reply (always
+  // the PHYSICALLY NEXT entry: a tool call blocks the turn until the CLI
+  // sends its result back) orphans that tool_result. The API rejects the
+  // resumed session outright the moment it's next resumed ("API Error: 400
+  // due to tool use concurrency issues.", confirmed live 2026-09-08) --
+  // the tool_use entry ends up archived into the reference entry while its
+  // own tool_result stays live with no matching tool_use anywhere left in
+  // the file. Pull the tool_use entry (and, transitively, whatever's ahead
+  // of it) into the live tail too whenever this would happen, so a pair
+  // never gets split across the boundary. Self-limiting: the entry before a
+  // tool_use-ending assistant entry is always a user entry (a real message
+  // or an earlier tool_result), which never matches this condition itself.
+  while (splitIndex > 0) {
+    const boundary = entries[splitIndex - 1];
+    const boundaryContent = boundary.message?.content;
+    const nextContent = entries[splitIndex]?.message?.content;
+    if (boundary.type !== "assistant" || !Array.isArray(boundaryContent) || !Array.isArray(nextContent)) break;
+    const toolUseIds = new Set(
+      boundaryContent.filter((b): b is ContentBlock & { id: string } => b.type === "tool_use" && typeof b.id === "string").map((b) => b.id),
+    );
+    if (toolUseIds.size === 0) break;
+    const nextHasMatchingResult = nextContent.some((b) => b.type === "tool_result" && toolUseIds.has((b as { tool_use_id?: string }).tool_use_id ?? ""));
+    if (!nextHasMatchingResult) break;
+    splitIndex--;
+  }
+
   // Nothing to collapse: either the whole transcript already fits the
   // budget (splitIndex never got set past 0), or the only thing before the
   // split point is our own existing reference entry from a previous pass
