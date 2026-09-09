@@ -5,7 +5,7 @@ import { readFile as readFileAsync, readdir as readdirAsync, stat as statAsync }
 import { fileURLToPath } from "node:url";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-import { query, forkSession, type Options, type Query, type SDKMessage, type SDKUserMessage, type SDKRateLimitInfo, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Options, type Query, type SDKMessage, type SDKUserMessage, type SDKRateLimitInfo, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages/messages";
 import { ensureWorkspace } from "./workspace.js";
 import { authStatus, authLogout, spawnAuthLogin, mcpList, mcpAdd, mcpRemove } from "./control.js";
@@ -46,7 +46,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, continuityPointerInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -58,10 +58,9 @@ import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundI
 console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js mtime=${statSync(fileURLToPath(import.meta.url)).mtime.toISOString()} startedAt=${new Date().toISOString()} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
 
 configureIsolatedGitBash();
-import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, findMostRecentClaudeSessionId, claudeProjectDir } from "./durability.js";
+import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, loadTabContinuityArchive, saveTabContinuityArchive, findMostRecentClaudeSessionId, claudeProjectDir } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
 import { dehydratePreviousTurns, agePreviousTurnsInPlace, dehydratedDir } from "./dehydrate.js";
-import { classifyParallelSafety, runParallelBranch, buildBranchReportText, deleteSessionFile } from "./parallel.js";
 import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, describeDescendantProcesses } from "./processReaper.js";
 import { readRecentHistory, readArchivedEntries } from "./history.js";
 
@@ -291,30 +290,21 @@ const TOOL_CONCURRENCY_ERROR_PATTERN = /tool use concurrency issues/i;
 // this is specifically the CLI's own internal compaction call complaining).
 const NOT_LOGGED_IN_PATTERN = /Not logged in/i;
 // Bug fix (2026-09-09): confirmed live -- a tab's stored session id can end
-// up pointing at a .jsonl that no longer exists (root cause: the primary
-// tab's migration fallback once adopted another tab's throwaway
-// forkSession() snapshot as if it were a real conversation -- see
-// findMostRecentClaudeSessionId's own doc comment, now fixed at the source
-// too). claude.exe reports this on stderr immediately and deterministically
-// every single retry -- confirmed live as an 80+ minute, ever-tightening
-// retry loop with no backoff (the failure comes back too fast for the
-// generic hang/restart machinery to ever back off). Same recovery as
+// up pointing at a .jsonl that no longer exists on disk for any reason (the
+// original incident this was found from -- the now-removed parallel-turns
+// feature's own throwaway forkSession() snapshots racing the primary tab's
+// migration fallback -- can no longer happen, but this stays as general
+// resilience against the same class of failure from any other cause).
+// claude.exe reports this on stderr immediately and deterministically every
+// single retry -- confirmed live as an 80+ minute, ever-tightening retry
+// loop with no backoff (the failure comes back too fast for the generic
+// hang/restart machinery to ever back off). Same recovery as
 // TOOL_CONCURRENCY_ERROR_PATTERN: there's nothing to fix about a session id
 // that doesn't exist, so abandon it and start fresh (see its own stderr
 // callback hookup, since this is a stream-level failure with no assistant
 // message to detect it from).
 const SESSION_NOT_FOUND_PATTERN = /No conversation found with session ID/i;
 
-// Process-wide registry of every forkSession() snapshot id currently on disk
-// (both ChatSession.preTurnSnapshotId's defensive per-turn copy and
-// submitOrBranch's branchSessionId) -- populated right where each is
-// created, removed right where each is deleted. Passed to
-// findMostRecentClaudeSessionId so the primary tab's pre-multi-tab migration
-// fallback can never again mistake one of these throwaway files for a real
-// conversation (see that function's own doc comment for the incident this
-// fixes). All tabs share one Node process, so one process-wide Set is
-// correct here, not per-tab state.
-const liveSnapshotSessionIds = new Set<string>();
 // The one confirmed-failing session on 2026-09-08 was 12.2MB (barely
 // shrunk by routine hourly compaction's age-based rules, since most of its
 // bloat was recent). Set a bit below that to catch it before the resume
@@ -557,22 +547,6 @@ class ChatSession {
    *  tail past this point can ever need (re-)scanning. 0 = nothing scanned
    *  yet for the current dehydratedForSessionId. */
   private dehydratedThroughLine = 0;
-  /** A defensive forkSession() snapshot of the live session, taken right
-   *  before EACH turn's own query() starts (and thus starts appending to
-   *  the live file) -- see parallel.ts's own doc comment for why this is
-   *  the only safe, static basis a parallel branch can resume from. null
-   *  when there's no history yet to snapshot (a brand-new conversation) or
-   *  the snapshot attempt itself failed. Replaced (old one deleted) at the
-   *  top of every runLoop iteration -- never kept longer than one turn. */
-  private preTurnSnapshotId: string | null = null;
-  /** anthropicEnv/mcpServers/disallowedTools as resolved for the CURRENT
-   *  turn -- cached here (not just a runLoop-local) so submitOrBranch() can
-   *  reuse the exact same chat-source/tool config for a parallel branch
-   *  without re-resolving it (and without threading it through the
-   *  submit()/pushMessage() call chain, which has nothing to do with this). */
-  private lastAnthropicEnv: Record<string, string> | undefined = undefined;
-  private lastMcpServers: Record<string, McpServerConfig> | null = null;
-  private lastDisallowedTools: string[] = [];
   /** Per-server retry timers for MCP servers that failed to connect (see the
    *  'system'/'init' handling in runLoop) -- keyed by server name so a
    *  second failure report for the same name doesn't stack a duplicate
@@ -969,6 +943,16 @@ class ChatSession {
             `The conversation from BEFORE this reset is fully preserved at ${archivePath} -- if the user's ` +
             `message below refers to something earlier that you don't have in this fresh context, Read that ` +
             `file to find it before saying you don't know.]\n\n`;
+          // Bug fix (2026-09-09): confirmed live -- this note only ever
+          // reached the ONE turn it's prepended to below; any LATER turn in
+          // this same fresh session had no such note in view and looked, for
+          // all Caroline could tell, like the genuine start of the
+          // conversation (confirmed live: she flatly denied having just
+          // changed a mailbox password that was, in fact, several turns back
+          // in exactly this situation). Persisted here so it's part of the
+          // system prompt for the whole session's lifetime, not a message
+          // that scrolls out of view -- see continuityPointerInstruction.
+          saveTabContinuityArchive(workspaceDir, this.tabId, archivePath);
           console.error(`[caroline] tab ${this.tabId}: archived abandoned session ${oldSessionId} -> ${archivePath}`);
         }
       } catch (err) {
@@ -1031,68 +1015,6 @@ class ChatSession {
     }
   }
 
-  /**
-   * Entry point for a REAL incoming user message (the ws `user_message`
-   * handler and the tab-agnostic HTTP `/api/message` endpoint) -- NOT for
-   * internal replays/proactive nudges, which must keep calling submit()
-   * directly. See the approved parallel-turns plan (foamy-sniffing-pixel.md)
-   * for the full design. If no turn is in flight, behaves exactly like
-   * submit() always has. If one IS in flight, asks a cheap model call
-   * (classifyParallelSafety) whether this new message is independent enough
-   * to work on right now, in a throwaway branch forked off this turn's own
-   * defensive pre-turn snapshot, instead of just queueing behind it.
-   * Attachments always fall back to plain sequential queueing -- carrying
-   * them into a branch isn't handled here, and silently dropping them would
-   * be worse than just queueing normally.
-   */
-  submitOrBranch(text: string, attachments: Attachment[] = [], isVoice = false): void {
-    if (
-      !this.turnPending ||
-      this.pendingUserText === null ||
-      !this.preTurnSnapshotId ||
-      !this.lastMcpServers ||
-      attachments.length > 0
-    ) {
-      this.submit(text, attachments, true, false, isVoice);
-      return;
-    }
-    const inFlightTaskText = this.pendingUserText;
-    const snapshotId = this.preTurnSnapshotId;
-    const anthropicEnv = this.lastAnthropicEnv;
-    const mcpServers = this.lastMcpServers;
-    const disallowedTools = this.lastDisallowedTools;
-    void (async () => {
-      const isParallel = await classifyParallelSafety(anthropicEnv, workspaceDir, inFlightTaskText, text);
-      if (!isParallel) {
-        console.error(`[caroline] [parallel] tab=${this.tabId} classifier said SEQUENTIAL -- queueing normally: ${truncateForLog(text)}`);
-        this.submit(text, attachments, true, false, isVoice);
-        return;
-      }
-      let branchSessionId: string;
-      try {
-        const forked = await forkSession(snapshotId, { dir: workspaceDir });
-        branchSessionId = forked.sessionId;
-        liveSnapshotSessionIds.add(branchSessionId);
-      } catch (err) {
-        console.error(`[caroline] [parallel] tab=${this.tabId} failed to fork branch off snapshot ${snapshotId} -- falling back to sequential:`, err);
-        this.submit(text, attachments, true, false, isVoice);
-        return;
-      }
-      console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} spawned for: ${truncateForLog(text)}`);
-      runParallelBranch({ workspaceDir, branchSessionId, text, anthropicEnv, mcpServers, disallowedTools })
-        .then((answer) => {
-          console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} reporting back (answer=${answer !== null ? "ok" : "null"})`);
-          this.injectProactive(buildBranchReportText(text, answer), false);
-        })
-        .catch((err) => {
-          console.error(`[caroline] [parallel] tab=${this.tabId} branch ${branchSessionId} promise chain rejected unexpectedly:`, err);
-        })
-        .finally(() => {
-          liveSnapshotSessionIds.delete(branchSessionId);
-          void deleteSessionFile(workspaceDir, branchSessionId);
-        });
-    })();
-  }
 
   submit(text: string, attachments: Attachment[] = [], isRealUser = true, silent = false, isVoice = false): void {
     // AND-combine, don't overwrite -- see silentTurn's own doc comment for
@@ -1231,11 +1153,6 @@ class ChatSession {
     this.clearApiRetryTimer();
     this.activeQuery?.interrupt().catch((err) => console.error("[caroline] dispose(): interrupt() failed (ignored):", err));
     this.resolveNext?.();
-    if (this.preTurnSnapshotId) {
-      liveSnapshotSessionIds.delete(this.preTurnSnapshotId);
-      void deleteSessionFile(workspaceDir, this.preTurnSnapshotId);
-      this.preTurnSnapshotId = null;
-    }
   }
 
   private clearApiRetryTimer(): void {
@@ -1445,7 +1362,7 @@ class ChatSession {
       return undefined;
     }
     if (this.tabId !== PRIMARY_TAB_ID) return undefined;
-    const migrated = findMostRecentClaudeSessionId(workspaceDir, liveSnapshotSessionIds);
+    const migrated = findMostRecentClaudeSessionId(workspaceDir);
     if (migrated) {
       console.error(`[caroline] primary tab: no stored session id yet -- migrating pre-multi-tab conversation ${migrated}`);
       saveTabSessionId(workspaceDir, this.tabId, migrated);
@@ -1493,7 +1410,6 @@ class ChatSession {
           console.error("[caroline] failed to build chat-source env, falling through to no chat source:", err);
         }
         console.error(`[caroline] runLoop: chatSource=${mode.chatSource} swLoggedIn=${mode.swLoggedIn} envOverride=${anthropicEnv ? "yes" : "no"} -- creating query()`);
-        this.lastAnthropicEnv = anthropicEnv;
 
         // No explicit mcpServers here: cwd is Caroline's own workspace
         // directory, a normal Claude Code project dir with its own
@@ -1597,35 +1513,6 @@ class ChatSession {
         // Notes MCP server, which has no such rule. Every other notes_*
         // tool is unaffected.
         const disallowedTools = ["mcp__caroline-notes__notes_login"];
-        this.lastMcpServers = mcpServers;
-        this.lastDisallowedTools = disallowedTools;
-
-        // Defensive parallel-branch snapshot -- per explicit instruction
-        // (2026-09-08, see the approved parallel-turns plan): forkSession()
-        // is only safe against a file nothing else is writing to, and this
-        // turn's OWN query() below is about to start appending to
-        // resumeSessionId. This is the last moment a safe, static copy of
-        // "right before this turn" can be taken -- submitOrBranch() forks
-        // AGAIN off of THIS snapshot if a second message arrives while this
-        // turn is running. The previous turn's snapshot is deleted first --
-        // never kept longer than one turn, or these would accumulate one
-        // full session copy per turn forever.
-        if (this.preTurnSnapshotId) {
-          const staleSnapshotId = this.preTurnSnapshotId;
-          this.preTurnSnapshotId = null;
-          liveSnapshotSessionIds.delete(staleSnapshotId);
-          void deleteSessionFile(workspaceDir, staleSnapshotId);
-        }
-        if (resumeSessionId) {
-          try {
-            const { sessionId: snapshotId } = await forkSession(resumeSessionId, { dir: workspaceDir });
-            this.preTurnSnapshotId = snapshotId;
-            liveSnapshotSessionIds.add(snapshotId);
-            console.error(`[caroline] [parallel] tab=${this.tabId} pre-turn snapshot ${resumeSessionId} -> ${snapshotId}`);
-          } catch (err) {
-            console.error(`[caroline] [parallel] tab=${this.tabId} pre-turn snapshot failed (parallel branching unavailable this turn):`, err);
-          }
-        }
 
         const options: Options = {
           ...(anthropicEnv ? { env: anthropicEnv } : {}),
@@ -1707,6 +1594,7 @@ class ChatSession {
               bashBackgroundInstruction(),
               timestampAwarenessInstruction(),
               noAlarmingInternalRecoveryInstruction(),
+              continuityPointerInstruction(loadTabContinuityArchive(workspaceDir, this.tabId)),
               noUpdateSentinelInstruction(),
               embeddedBrowserInstruction(),
               noFullFilesystemSearchInstruction(),
@@ -2525,6 +2413,45 @@ function savePersistedLanguage(lang: NudgeLanguage): void {
   }
 }
 
+// Bug fix (2026-09-09): confirmed live -- detectRecentLanguage always picked
+// the SINGLE most recent history entry's text, but every call site that
+// matters (resetUnrecoverableSession, runUrgentCompaction) runs by
+// definition right after the CLI's own "API Error: ... tool use concurrency
+// issues." lands as the last assistant turn, or right after our own
+// hardcoded-English "[System note: this session was just reset ...]" note
+// gets pushed. So the "most recent" entry was tautologically ALWAYS one of
+// these two English synthetic texts, never the actual (often Russian)
+// conversation -- confirmed live as a 100%-reproducible "lang=english" on
+// every single reset tonight, regardless of the real conversation's
+// language, silently poisoning the persisted fallback too. Now walks
+// backward past known synthetic entries to the last one that looks like
+// real conversational content. Every genuine send also carries a leading
+// "[Sent: ...]"/"[Wed, ...]" timestamp stamp (see dehydrate.ts's own
+// TIMESTAMP_STAMP_PATTERN) -- stripped first so it doesn't hide a
+// synthetic payload behind it (confirmed live: the crash-recovery replay
+// nudge below is ALWAYS stamped this way, and very nearly slipped past the
+// first version of this fix for exactly that reason).
+const HISTORY_STAMP_PATTERN = /^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )[^\]]*\]\s*/i;
+// Best-effort, not exhaustive -- new synthetic wrapper shapes keep turning up
+// (confirmed live: a background-task <task-notification> block was the very
+// next one found after fixing the first two). A wrong guess here just means
+// one proactive message reads a little oddly (see this function's own doc
+// comment), so each confirmed instance gets added here rather than chasing
+// a provably complete list up front.
+const SYNTHETIC_HISTORY_TEXT_PATTERNS = [
+  /^API Error:/i,
+  /^\[System note:/i,
+  /^\[Caroline was restarted/i,
+  /^Continue from where you left off\.?$/i,
+  /^No response requested\.?$/i,
+  /^</, // XML/HTML-ish wrapped system content, e.g. <task-notification>...
+];
+
+function isSyntheticHistoryText(rawText: string): boolean {
+  const text = rawText.replace(HISTORY_STAMP_PATTERN, "").trim();
+  return SYNTHETIC_HISTORY_TEXT_PATTERNS.some((p) => p.test(text));
+}
+
 /**
  * Real language detection via Camerlengo's ai:detectLanguage (an actual
  * LLM call, see reforce's AI.py detectLanguage) -- deliberately NOT a
@@ -2538,8 +2465,19 @@ function savePersistedLanguage(lang: NudgeLanguage): void {
  */
 async function detectRecentLanguage(): Promise<NudgeLanguage> {
   try {
-    const entries = readRecentHistory(workspaceDir, 5);
-    const lastText = entries.length > 0 ? entries[entries.length - 1].text : "";
+    // Read a wider window than just "the last one" -- see
+    // SYNTHETIC_HISTORY_TEXT_PATTERNS's own doc comment for why the single
+    // most recent entry can't be trusted, and tonight's restart cadence
+    // could plausibly leave several synthetic entries in a row.
+    const entries = readRecentHistory(workspaceDir, 50);
+    let lastText = "";
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const text = entries[i].text.trim();
+      if (text && !isSyntheticHistoryText(text)) {
+        lastText = text;
+        break;
+      }
+    }
     if (!lastText.trim()) return loadPersistedLanguage() ?? "english";
     // detectLanguage() has its own internal 15s ceiling (see voice.ts's
     // callApi), which is fine for a real voice/STT pipeline but far too
@@ -3227,7 +3165,7 @@ async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Pro
       const tabId = url.searchParams.get("tab") ?? PRIMARY_TAB_ID;
       const target = sessions.get(tabId);
       if (!target) return sendJson(res, 503, { ok: false, error: `No active session for tab "${tabId}" -- open that tab in the Caroline window at least once first.` });
-      target.submitOrBranch(body.text, Array.isArray(body.attachments) ? body.attachments : []);
+      target.submit(body.text, Array.isArray(body.attachments) ? body.attachments : []);
       return sendJson(res, 202, { ok: true });
     }
     if (req.method === "GET" && url.pathname === "/api/status") {
@@ -3335,7 +3273,7 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
       const parsed = JSON.parse(raw.toString());
       console.error(`[caroline] [ws] tabId=${tabId} message type=${parsed.type ?? "unknown"}`);
       if (parsed.type === "user_message" && typeof parsed.text === "string") {
-        session.submitOrBranch(parsed.text, Array.isArray(parsed.attachments) ? parsed.attachments : [], !!parsed.voice);
+        session.submit(parsed.text, Array.isArray(parsed.attachments) ? parsed.attachments : [], true, false, !!parsed.voice);
       } else if (parsed.type === "interrupt") {
         session.stop();
       } else if (parsed.type === "control_request") {

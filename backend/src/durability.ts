@@ -137,6 +137,52 @@ export function clearTabSessionId(workspaceDir: string, tabId: string): void {
   }
 }
 
+// --- per-tab continuity-archive pointer ------------------------------------
+// Bug fix (2026-09-09): confirmed live -- resetUnrecoverableSession's own
+// archive-reference note only ever landed in the ONE turn it was attached
+// to (a one-shot user-turn injection, not part of the system prompt). A
+// later turn in the same fresh session has no such note in view at all, so
+// Caroline had no way to know "this looks like the start of the
+// conversation, but it isn't" -- confirmed live as a real incident (she
+// flatly denied having just changed a mailbox password, because that whole
+// exchange was several turns back in a session she genuinely has no other
+// reason to reconsider). Persisted here (not just held in memory) so it
+// survives a full app restart too, and read fresh into EVERY query()'s own
+// systemPrompt (see server.ts's continuityPointerInstruction usage) for as
+// long as it's set -- a real, standing instruction for the whole session's
+// lifetime, not a single message that scrolls out of attention.
+function tabContinuityArchivePath(workspaceDir: string, tabId: string): string {
+  return join(workspaceDir, `tab-continuity-${sanitizeTabId(tabId)}.json`);
+}
+
+export function loadTabContinuityArchive(workspaceDir: string, tabId: string): string | null {
+  const path = tabContinuityArchivePath(workspaceDir, tabId);
+  if (!existsSync(path)) return null;
+  try {
+    const data = JSON.parse(readFileSync(path, "utf-8")) as { archivePath?: string };
+    return data.archivePath ?? null;
+  } catch (err) {
+    console.error(`[caroline] loadTabContinuityArchive: read/parse failed for tab ${tabId} (treating as none):`, err);
+    return null;
+  }
+}
+
+export function saveTabContinuityArchive(workspaceDir: string, tabId: string, archivePath: string): void {
+  try {
+    writeFileSync(tabContinuityArchivePath(workspaceDir, tabId), JSON.stringify({ archivePath }, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error(`[caroline] saveTabContinuityArchive: write failed for tab ${tabId} (ignored):`, err);
+  }
+}
+
+export function clearTabContinuityArchive(workspaceDir: string, tabId: string): void {
+  try {
+    rmSync(tabContinuityArchivePath(workspaceDir, tabId), { force: true });
+  } catch (err) {
+    console.error(`[caroline] clearTabContinuityArchive: rmSync failed for tab ${tabId} (ignored):`, err);
+  }
+}
+
 /**
  * One-time migration for users upgrading from pre-multi-tab Caroline: before
  * this, the single conversation was resumed via continue:true (whichever
@@ -149,31 +195,16 @@ export function clearTabSessionId(workspaceDir: string, tabId: string): void {
  * one's id, mirroring what continue:true would have picked. Never throws --
  * worst case (directory layout changes, permissions, anything) the caller
  * just falls through to starting fresh, same as any other new tab.
- *
- * Bug fix (2026-09-09): confirmed live -- the parallel-turns feature's
- * defensive forkSession() snapshots (server.ts's preTurnSnapshotId/
- * branchSessionId) are real, throwaway .jsonl files in this SAME project
- * directory, and one of them can easily be the most-recently-modified file
- * at the exact moment this runs (it's created right before a real turn
- * starts). This fallback then adopted it as if it were a real conversation;
- * the owning tab later deleted it as routine snapshot cleanup once its own
- * next turn began, leaving the primary tab permanently resuming a session id
- * that no longer exists (an immediate, unrecoverable "No conversation found
- * with session ID" on every retry, no backoff, forever). `excludeIds` lets
- * the caller pass its own registry of currently-live snapshot ids so this
- * never happens again -- see server.ts's liveSnapshotSessionIds.
  */
-export function findMostRecentClaudeSessionId(workspaceDir: string, excludeIds?: ReadonlySet<string>): string | null {
+export function findMostRecentClaudeSessionId(workspaceDir: string): string | null {
   try {
     const projectDir = claudeProjectDir(workspaceDir);
     if (!existsSync(projectDir)) return null;
     let best: { id: string; mtimeMs: number } | null = null;
     for (const entry of readdirSync(projectDir)) {
       if (!entry.endsWith(".jsonl")) continue;
-      const id = entry.slice(0, -".jsonl".length);
-      if (excludeIds?.has(id)) continue;
       const mtimeMs = statSync(join(projectDir, entry)).mtimeMs;
-      if (!best || mtimeMs > best.mtimeMs) best = { id, mtimeMs };
+      if (!best || mtimeMs > best.mtimeMs) best = { id: entry.slice(0, -".jsonl".length), mtimeMs };
     }
     return best?.id ?? null;
   } catch (err) {

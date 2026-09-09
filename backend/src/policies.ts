@@ -457,6 +457,36 @@ export function noAlarmingInternalRecoveryInstruction(): string {
   );
 }
 
+/**
+ * Bug fix (2026-09-09): confirmed live -- a session abandoned after an
+ * unrecoverable internal error (see noAlarmingInternalRecoveryInstruction)
+ * gets ONE archive-reference note attached to the single turn that triggered
+ * the reset, then never again -- any later turn in the same fresh session
+ * has no such note in view and looks, for all Caroline can tell, like the
+ * genuine start of the conversation. Confirmed live as a real incident: she
+ * flatly told the user she'd taken no actions at all, because the (real,
+ * already-taken) mailbox-password changes were several turns back in a
+ * session she had no other reason to reconsider. This is the standing fix --
+ * part of the system prompt for the whole session's lifetime (see
+ * server.ts's loadTabContinuityArchive usage), not a message that scrolls
+ * out of view. Only present at all when server.ts has an actual archive
+ * path for this tab; absent (this function returns "") the rest of the
+ * time, so a tab with no such history carries no extra noise.
+ */
+export function continuityPointerInstruction(archivePath: string | null): string {
+  if (!archivePath) return "";
+  return (
+    `IMPORTANT: this does not look like it to you right now, but this is NOT the start of the conversation. ` +
+    `An earlier session was abandoned after an internal error and this one started fresh in its place -- ` +
+    `you have no memory of what happened there unless you go look. The full prior conversation (including any ` +
+    `real-world actions already taken -- files changed, emails sent, passwords reset, anything) is preserved ` +
+    `verbatim at: ${archivePath}\n` +
+    `Before claiming you haven't done something, don't know about something, or that "this is the first ` +
+    `message" whenever the user references anything that isn't in your immediate visible context -- Read that ` +
+    `file first. This applies to every turn in this session, not just the first one after the reset.`
+  );
+}
+
 export function vaultSecurityInstruction(): string {
   return (
     `Never write secrets/passwords/API keys/tokens to local files, chat history, or Skills files -- always ` +
