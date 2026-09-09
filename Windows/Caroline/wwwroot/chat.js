@@ -250,6 +250,54 @@
   const TRANSCRIPT_KEY = `caroline:transcript:${tabId}`;
   const TRANSCRIPT_MAX = 300;
 
+  // IndexedDB-backed attachment blob store. Bug fix (2026-09-09): localStorage's
+  // own ~5-10MB quota can't hold real image/video bytes across many messages,
+  // so saveTranscriptEntry only ever kept {name, mimeType} there -- confirmed
+  // live as the actual cause of a real, just-sent image permanently losing its
+  // inline preview (reduced to a bare filename chip forever) the moment the
+  // page reloads, which an exceptionally restart-heavy night made very visible
+  // very often. IndexedDB has no comparable ceiling for this, so the full
+  // attachment (including dataBase64) is kept there instead, keyed by a small
+  // id that DOES fit in the lightweight localStorage list.
+  const ATTACHMENT_DB_NAME = "carolineAttachments";
+  const ATTACHMENT_STORE = "blobs";
+  let attachmentDbPromise = null;
+  function openAttachmentDb() {
+    if (!attachmentDbPromise) {
+      attachmentDbPromise = new Promise((resolve, reject) => {
+        try {
+          const req = indexedDB.open(ATTACHMENT_DB_NAME, 1);
+          req.onupgradeneeded = () => req.result.createObjectStore(ATTACHMENT_STORE);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        } catch (err) { reject(err); }
+      });
+    }
+    return attachmentDbPromise;
+  }
+  async function saveAttachmentBlob(id, attachment) {
+    try {
+      const db = await openAttachmentDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(ATTACHMENT_STORE, "readwrite");
+        tx.objectStore(ATTACHMENT_STORE).put(attachment, id);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (err) { console.error("[caroline] saveAttachmentBlob failed (ignored):", err); }
+  }
+  async function loadAttachmentBlob(id) {
+    try {
+      const db = await openAttachmentDb();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(ATTACHMENT_STORE, "readonly");
+        const req = tx.objectStore(ATTACHMENT_STORE).get(id);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (err) { console.error("[caroline] loadAttachmentBlob failed (ignored):", err); return null; }
+  }
+
   function loadTranscript() {
     try {
       const raw = localStorage.getItem(TRANSCRIPT_KEY);
@@ -262,7 +310,18 @@
   function saveTranscriptEntry(role, text, attachments, ts) {
     try {
       const list = loadTranscript();
-      list.push({ role, text, attachments: (attachments || []).map((a) => ({ name: a.name, mimeType: a.mimeType })), ts });
+      const lightAttachments = (attachments || []).map((a, idx) => {
+        const meta = { name: a.name, mimeType: a.mimeType };
+        if (a.dataBase64) {
+          // Real bytes go to IndexedDB (fire-and-forget -- never block the
+          // send/render path on this), only a small pointer stays here.
+          const attId = `${ts}_${idx}_${Math.random().toString(36).slice(2, 8)}`;
+          meta.attId = attId;
+          void saveAttachmentBlob(attId, { name: a.name, mimeType: a.mimeType, dataBase64: a.dataBase64 });
+        }
+        return meta;
+      });
+      list.push({ role, text, attachments: lightAttachments, ts });
       while (list.length > TRANSCRIPT_MAX) list.shift();
       localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(list));
     } catch { /* private-browsing/quota -- transcript just won't survive a restart */ }
@@ -274,10 +333,18 @@
   // also stops a reconnect from re-requesting it every time.
   let historyRequested = false;
 
-  function replayTranscript() {
+  async function replayTranscript() {
     const entries = loadTranscript();
     for (const entry of entries) {
-      addBubble(entry.role, entry.text, entry.attachments, { persist: false, ts: entry.ts });
+      let attachments = entry.attachments;
+      if (attachments && attachments.some((a) => a.attId)) {
+        attachments = await Promise.all(attachments.map(async (a) => {
+          if (!a.attId) return a;
+          const blob = await loadAttachmentBlob(a.attId);
+          return blob ? { name: blob.name, mimeType: blob.mimeType, dataBase64: blob.dataBase64 } : a;
+        }));
+      }
+      addBubble(entry.role, entry.text, attachments, { persist: false, ts: entry.ts });
     }
     if (entries.length > 0) {
       addStatusLine("— earlier conversation restored —");
