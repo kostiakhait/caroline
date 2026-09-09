@@ -1068,13 +1068,25 @@
         startHeartbeat();
       }
       const turn = turnQueue[0]; // oldest still-unresolved turn -- see turnQueue's doc comment
-      for (const block of msg.message.content || []) {
+      const blocks = msg.message.content || [];
+      // A message that also contains a tool_use block is, by construction, NOT
+      // the turn's final answer -- one SDK "assistant" message is one API
+      // round-trip with a single stop_reason, so any text alongside a tool_use
+      // is pre-tool narration ("let me check X", agentic self-talk, sometimes
+      // even in the wrong language) rather than something addressed to the
+      // user. Only a message with no tool_use (the turn actually ending) is
+      // shown as a chat bubble -- confirmed live 2026-09-08: narration bubbles
+      // like "that overwrote the whole note, let me redo it" were leaking into
+      // the chat as if Caroline were talking to the user.
+      const hasToolUse = blocks.some((b) => b.type === "tool_use");
+      for (const block of blocks) {
         if (block.type === "text" && block.text) {
           // A reminder/proactive check that found nothing worth surfacing
           // (see policies.ts's noUpdateSentinelInstruction) -- suppress just
           // the bubble; tool calls/heartbeat/turn bookkeeping in this same
           // loop still proceed normally, only the text block is skipped.
           if (block.text.trim() === "[[NO_UPDATE]]") continue;
+          if (hasToolUse) continue;
           addBubble("assistant", block.text);
           if (turn) turn.assistantText += (turn.assistantText ? "\n\n" : "") + block.text;
         } else if (block.type === "tool_use") {
