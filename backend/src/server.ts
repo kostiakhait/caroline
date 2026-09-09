@@ -46,7 +46,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -55,14 +55,14 @@ import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundI
 // against dist/ file mtimes) -- error-prone and exactly what caused a long
 // stretch of "fixed" code to be tested against a still-running OLD process
 // that never actually picked it up. This makes it impossible to wonder.
-console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js mtime=${statSync(fileURLToPath(import.meta.url)).mtime.toISOString()} startedAt=${new Date().toISOString()} descendantProcesses=${await countDescendantProcesses(process.pid)}`);
+console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js mtime=${statSync(fileURLToPath(import.meta.url)).mtime.toISOString()} startedAt=${new Date().toISOString()} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
 
 configureIsolatedGitBash();
 import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
 import { dehydratePreviousTurns, agePreviousTurnsInPlace, dehydratedDir } from "./dehydrate.js";
 import { classifyParallelSafety, runParallelBranch, buildBranchReportText, deleteSessionFile } from "./parallel.js";
-import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, countDescendantProcesses } from "./processReaper.js";
+import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, describeDescendantProcesses } from "./processReaper.js";
 import { readRecentHistory, readArchivedEntries } from "./history.js";
 
 const workspaceDir = await ensureWorkspace();
@@ -787,7 +787,7 @@ class ChatSession {
       if (!result) return;
       this.lastCompactedAt = result.compactedAt;
       saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
-      console.error(`[caroline] compaction: tab ${this.tabId} forked ${sessionId} -> ${result.newSessionId}, restarting session, descendantProcesses=${await countDescendantProcesses(process.pid)}`);
+      console.error(`[caroline] compaction: tab ${this.tabId} forked ${sessionId} -> ${result.newSessionId}, restarting session, descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
       this.forceRestart();
     } catch (err) {
       // Background, optional housekeeping (per explicit instruction,
@@ -1028,6 +1028,15 @@ class ChatSession {
       lastUserActivityMs: Date.now() - this.lastUserActivity,
       hangCount: this.hangCount,
       connState: this.connState,
+      // Per explicit instruction (2026-09-08): the external, per-tab
+      // BackendHealthWatchdog needs this to recover ONLY the one stuck tab
+      // (kill just this pid's tree via AppBrowserHost, in-process -- see
+      // BackendHealthWatchdog.cs) instead of the whole shared backend
+      // process, which used to take every other tab down with it. null
+      // whenever this tab's own CLI process hasn't been identified yet
+      // (see cliProcessPid's own doc comment) -- the caller must treat that
+      // as "nothing to target", never guess.
+      cliProcessPid: this.cliProcessPid,
     };
   }
 
@@ -1395,7 +1404,7 @@ class ChatSession {
           await this.runDehydration(resumeSessionId);
         }
         const queryStartedAt = Date.now();
-        console.error(`[caroline] runLoop: about to create query() -- resume=${resumeSessionId ?? "(none)"} tab=${this.tabId} descendantProcesses=${await countDescendantProcesses(process.pid)}`);
+        console.error(`[caroline] runLoop: about to create query() -- resume=${resumeSessionId ?? "(none)"} tab=${this.tabId} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
         // Adds schedule_reminder/list_reminders/cancel_reminder and
         // open_file as in-process tools -- merges with (doesn't replace)
         // the user-scope caroline-* servers discovered from cwd.
@@ -1517,6 +1526,7 @@ class ChatSession {
               progressNarrationInstruction(),
               bashBackgroundInstruction(),
               timestampAwarenessInstruction(),
+              noAlarmingInternalRecoveryInstruction(),
               noUpdateSentinelInstruction(),
               embeddedBrowserInstruction(),
               noFullFilesystemSearchInstruction(),
@@ -2109,7 +2119,7 @@ class ChatSession {
   }
 
   private async handleFailure(err: unknown): Promise<void> {
-    console.error(`[caroline] handleFailure: entered. hangCount=${this.hangCount} turnPending=${this.turnPending} pendingUserText=${this.pendingUserText !== null ? "set" : "null"} descendantProcesses=${await countDescendantProcesses(process.pid)}`);
+    console.error(`[caroline] handleFailure: entered. hangCount=${this.hangCount} turnPending=${this.turnPending} pendingUserText=${this.pendingUserText !== null ? "set" : "null"} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
     console.error("[caroline] session failure, restarting:", err);
     if (err instanceof Error && err.stack) {
       console.error("[caroline] handleFailure: error stack:", err.stack);
@@ -2139,9 +2149,26 @@ class ChatSession {
     }
     console.error(`[caroline] handleFailure: sending caroline_status=restarting, will loop back into runLoop's while() for a fresh query()`);
     this.setConnState("restarting", String(err));
+    // Per explicit instruction (2026-09-08): every real (non-deliberate)
+    // restart -- reaching handleFailure at all already means this, since
+    // every EXPECTED restart (dehydration, chat-source switch, urgent
+    // compaction) bypasses handleFailure entirely via its own `continue` in
+    // runLoop's catch block -- must be visible to Caroline herself, so she
+    // has the real context if the user later asks "what happened just now".
+    // Framed explicitly as internal/not-alarming: the user has their own
+    // way to notice a restart (status bar), this is for HER situational
+    // awareness only. Covers both this session's own internal checkHang
+    // escalation AND an external watchdog force-killing this tab's CLI
+    // process -- both end up here the same way (the query() stream ending),
+    // so one note covers both without needing separate plumbing.
+    const watchdogNote =
+      `[System note: this session just recovered from an internal failure (hangCount=${this.hangCount}): ` +
+      `${err instanceof Error ? err.message : String(err)}. This is Caroline's own infrastructure ` +
+      `self-healing, already handled -- for your own situational awareness only. Do not mention this or ` +
+      `sound any alarm about it to the user unless they specifically ask what happened just now.]`;
     if (this.pendingUserText !== null) {
       console.error(`[caroline] handleFailure: replaying pendingUserText (len=${this.pendingUserText.length}) into the fresh session`);
-      this.pushMessage(this.pendingUserText, this.pendingAttachments);
+      this.pushMessage(`${watchdogNote}\n\n${this.pendingUserText}`, this.pendingAttachments);
     } else {
       // Nothing specific was left hanging, but the previous session could
       // have died mid-tool-call with something genuinely unfinished (a
@@ -2166,10 +2193,15 @@ class ChatSession {
       // from the UI) coming back. If a real message showed up in the
       // meantime, let it get its own normal turn instead.
       if (this.pendingUserText !== null) {
-        console.error("[caroline] handleFailure: pendingUserText appeared during language detection -- skipping the continue-or-silent nudge, a real message will get its own turn");
+        // The real message that just appeared will get its own normal
+        // submit() turn (not through here), which never sees watchdogNote --
+        // queue it separately so the context still isn't lost, same
+        // reasoning as the branch above.
+        console.error("[caroline] handleFailure: pendingUserText appeared during language detection -- skipping the continue-or-silent nudge, injecting watchdogNote on its own instead");
+        this.injectProactive(watchdogNote, true);
       } else {
         console.error(`[caroline] handleFailure: no pendingUserText -- injecting continue-or-silent nudge (lang=${lang})`);
-        this.injectProactive(CONTINUE_OR_SILENT_NUDGE[lang], false);
+        this.injectProactive(`${watchdogNote}\n\n${CONTINUE_OR_SILENT_NUDGE[lang]}`, false);
       }
     }
     console.error("[caroline] handleFailure: done, returning to runLoop");

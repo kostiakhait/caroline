@@ -1,6 +1,8 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -158,6 +160,12 @@ public partial class MainWindow : Window
     private const int MaxBackendRestartsPerWindow = 5;
     private static readonly TimeSpan BackendRestartWindow = TimeSpan.FromMinutes(10);
     private BackendHealthWatchdog? _healthWatchdog;
+    // One per open tab, created/disposed alongside AddTabAsync/CloseTabAsync
+    // -- see BackendHealthWatchdog's own doc comment for why this replaced
+    // the single shared instance's old "check primary, kill everything"
+    // design (2026-09-08).
+    private readonly Dictionary<string, BackendHealthWatchdog> _tabWatchdogs = new();
+    private readonly HttpClient _statusHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     private int _onLoadedCallCount;
 
@@ -233,15 +241,86 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
+    /// Recovers ONE stuck tab without touching the shared backend process or
+    /// any other tab -- the tab-scoped counterpart to RestartBackend (see its
+    /// own doc comment for why that one still exists, whole-process-only,
+    /// for genuine unreachability). Fetches this tab's own cliProcessPid from
+    /// /api/status (added 2026-09-08 specifically for this) and kills just
+    /// that OS process tree directly, in-process (same TerminateProcess
+    /// primitive AppBrowserHost's /kill_process already exposes to the Node
+    /// side -- no need to go through that HTTP bridge here, this IS that
+    /// same .NET process). Killing it ends that tab's own query() stream,
+    /// which the backend's OWN internal handleFailure already notices and
+    /// recovers from on its own (fresh query(), resumed session, the
+    /// existing watchdogNote telling Caroline what happened) -- no separate
+    /// "tell the backend to restart" call needed.
+    /// </summary>
+    private async void RecoverTab(string tabId, string reason)
+    {
+        Logger.Log($"MainWindow.RecoverTab({tabId}): entered (reason={reason})");
+        try
+        {
+            using var resp = await _statusHttp.GetAsync($"http://127.0.0.1:{BackendProcess.Port}/api/status");
+            if (!resp.IsSuccessStatusCode)
+            {
+                Logger.Log($"MainWindow.RecoverTab({tabId}): /api/status returned {(int)resp.StatusCode} -- can't identify this tab's pid, giving up (the whole-process watchdog will catch it if the backend itself is actually down)");
+                return;
+            }
+            var body = await resp.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("tabs", out var tabs) || tabs.ValueKind != JsonValueKind.Array)
+            {
+                Logger.Log($"MainWindow.RecoverTab({tabId}): /api/status response has no tabs[] array -- giving up");
+                return;
+            }
+            int? pid = null;
+            foreach (var t in tabs.EnumerateArray())
+            {
+                if (t.TryGetProperty("tabId", out var id) && id.GetString() == tabId)
+                {
+                    if (t.TryGetProperty("cliProcessPid", out var p) && p.ValueKind == JsonValueKind.Number) pid = p.GetInt32();
+                    break;
+                }
+            }
+            if (pid == null)
+            {
+                Logger.Log($"MainWindow.RecoverTab({tabId}): no cliProcessPid known for this tab yet (query() may still be starting) -- nothing to kill, backend's own internal watchdog is still the primary recovery path here");
+                return;
+            }
+            try
+            {
+                using var proc = Process.GetProcessById(pid.Value);
+                proc.Kill(entireProcessTree: true);
+                Logger.Log($"MainWindow.RecoverTab({tabId}): killed pid={pid} and its tree -- backend's own handleFailure will resume this tab's session with a fresh query()");
+            }
+            catch (ArgumentException)
+            {
+                Logger.Log($"MainWindow.RecoverTab({tabId}): pid={pid} already gone -- nothing to do");
+            }
+            // Same reasoning as RestartBackend's own NotifyBackendRestarted
+            // call: without this, this tab's own watchdog could declare it
+            // frozen again 60-90s later, while the fresh query() is still
+            // legitimately starting up, before it's even had a chance.
+            if (_tabWatchdogs.TryGetValue(tabId, out var tabWatchdog)) tabWatchdog.NotifyBackendRestarted();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"MainWindow.RecoverTab({tabId}): failed: {ex}");
+        }
+    }
+
+    /// <summary>
     /// Shared by both recovery paths: BackendProcess.Crashed (the process
     /// exited on its own) and BackendHealthWatchdog.Frozen (the process is
-    /// alive but not answering / irrecoverably stuck -- see its own doc
-    /// comment). Same MaxBackendRestartsPerWindow give-up threshold either
-    /// way: a backend that keeps needing rescue, whether by crashing or by
-    /// freezing, needs a human, not an infinite respawn loop. One backend
+    /// alive but not answering at all -- see that class's own doc comment
+    /// for why that's the one case left genuinely whole-process). Same
+    /// MaxBackendRestartsPerWindow give-up threshold either way: a backend
+    /// that keeps needing rescue, whether by crashing or by being completely
+    /// unreachable, needs a human, not an infinite respawn loop. One backend
     /// process serves every tab (see the `sessions` map on the Node side),
-    /// so this restart is shared across all of them, not per-tab -- every
-    /// tab's own chat.js independently reconnects once it's back (see below).
+    /// so THIS restart is shared across all of them, not per-tab -- a single
+    /// stuck tab is RecoverTab's job instead (see its own doc comment), not
+    /// this one's.
     /// </summary>
     private void RestartBackend(string reasonForLog, string? extraUserNote = null)
     {
@@ -289,6 +368,11 @@ public partial class MainWindow : Window
             // an exact-clockwork restart every ~60s, forever. See
             // BackendHealthWatchdog.NotifyBackendRestarted's own comment.
             _healthWatchdog?.NotifyBackendRestarted();
+            // A whole-process restart means every open tab's own query() is
+            // about to cold-start too -- same "don't judge it before it's
+            // had a chance" reasoning as the line above, just extended to
+            // every per-tab watchdog instead of only the shared one.
+            foreach (var tabWatchdog in _tabWatchdogs.Values) tabWatchdog.NotifyBackendRestarted();
         }
         if (!started)
         {
@@ -467,6 +551,15 @@ public partial class MainWindow : Window
         _tabs.Add(tab);
         RebuildTabStrip();
         PersistOpenTabIds();
+
+        // Per explicit instruction (2026-09-08): a stuck tab must be
+        // recoverable on its own, without taking every other tab down --
+        // see BackendHealthWatchdog's own doc comment. One instance per
+        // open tab, disposed in CloseTabAsync.
+        var tabWatchdog = new BackendHealthWatchdog(BackendProcess.Port, tabId);
+        tabWatchdog.LogLine += line => Logger.Log(line);
+        tabWatchdog.TabFrozen += (frozenTabId, reason) => Dispatcher.Invoke(() => RecoverTab(frozenTabId, reason));
+        _tabWatchdogs[tabId] = tabWatchdog;
 
         await InitWebViewForTabAsync(tab);
         if (selectAfter) SelectTab(tab);
@@ -663,6 +756,10 @@ public partial class MainWindow : Window
         _tabs.Remove(tab);
         TabContentHost.Children.Remove(tab.ContentHost);
         try { tab.WebView?.Dispose(); } catch (Exception ex) { Logger.Log($"CloseTabAsync({tab.Id}): WebView.Dispose() threw: {ex}"); }
+        if (_tabWatchdogs.Remove(tab.Id, out var tabWatchdog))
+        {
+            try { tabWatchdog.Dispose(); } catch (Exception ex) { Logger.Log($"CloseTabAsync({tab.Id}): tab watchdog Dispose() threw: {ex}"); }
+        }
 
         if (wasActive && _tabs.Count > 0)
         {
@@ -1012,6 +1109,13 @@ public partial class MainWindow : Window
         _tray.Dispose();
         _hotkey?.Dispose();
         _healthWatchdog?.Dispose();
+        foreach (var tabWatchdog in _tabWatchdogs.Values)
+        {
+            try { tabWatchdog.Dispose(); }
+            catch (Exception ex) { Logger.Log($"MainWindow shutdown: tab watchdog Dispose() threw (ignored, exiting anyway): {ex.Message}"); }
+        }
+        _tabWatchdogs.Clear();
+        _statusHttp.Dispose();
         _appBrowserHost.Dispose();
         foreach (var tab in _tabs)
         {

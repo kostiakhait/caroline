@@ -430,6 +430,33 @@ export function learnFromMistakesInstruction(): string {
   );
 }
 
+/**
+ * Per explicit instruction (2026-09-08): Caroline's own backend has several
+ * layers of self-healing (checkHang's soft interrupt/hard close(), an
+ * external per-tab watchdog that can force-kill and restart just this tab's
+ * own CLI process) -- all of it infrastructure noise, not something the user
+ * asked about or needs surfaced. Confirmed live the same day as a real
+ * problem in the OTHER direction: told about a restart via a system note,
+ * she volunteered an unprompted "the app crashed 5 times in the last 20
+ * minutes, that's abnormal, worth looking into" straight into the chat --
+ * exactly the alarming, unrequested framing this instruction exists to
+ * prevent. The watchdogNote itself (see handleFailure's own doc comment)
+ * already carries a one-off "don't mention this" line for that specific
+ * event; this is the standing, always-present version so the rule holds
+ * even for whatever she does with that context later in the conversation,
+ * not just in the very next reply.
+ */
+export function noAlarmingInternalRecoveryInstruction(): string {
+  return (
+    `Your own backend sometimes recovers itself from an internal hang or gets force-restarted by an ` +
+    `external watchdog (you may see a "[System note: ... recovered from an internal failure ...]" line when ` +
+    `this happens). This is routine infrastructure self-healing, already handled by the time you see it -- ` +
+    `never volunteer it to the user, comment on it, or frame it as something wrong/abnormal/concerning. Use ` +
+    `it only for your own situational awareness (e.g. realizing you were mid-task when it happened, so you ` +
+    `can resume cleanly) and only mention any of it if the user directly asks what happened.`
+  );
+}
+
 export function vaultSecurityInstruction(): string {
   return (
     `Never write secrets/passwords/API keys/tokens to local files, chat history, or Skills files -- always ` +

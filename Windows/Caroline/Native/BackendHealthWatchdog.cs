@@ -18,16 +18,40 @@ namespace Caroline.Native;
 /// reliable all day -- meaning the event loop itself, not just one stuck
 /// turn, had stopped running entirely.
 ///
+/// Per explicit instruction (2026-09-08): this class used to check ONLY the
+/// primary tab's own turnPending/lastActivityMs (one representative signal
+/// for "is the backend frozen") and, on trouble, always killed the WHOLE
+/// backend process -- which took every other, perfectly healthy tab down
+/// with it. Confirmed live the same day: tab=2 hung repeatedly for 16
+/// minutes while tab=3 kept working fine, and the eventual whole-process
+/// restart (triggered because tab=1/primary ALSO degraded from the same
+/// shared-process resource contention) killed tab=3's own in-flight work
+/// too. Now split into two genuinely separate roles, matching the fact that
+/// "the process is completely unreachable" really is whole-process (there's
+/// no tab to blame it on), while "one tab's own turn is stuck" is not:
+///   - TabId == null: a single, shared instance that ONLY ever reacts to
+///     the HTTP call itself failing (connection refused/timeout/non-2xx) --
+///     the one case with no per-tab meaning at all. Fires Frozen; caller's
+///     only remedy is the same whole-process RestartBackend as before.
+///   - TabId != null: one instance PER OPEN TAB, created/disposed alongside
+///     that tab's own lifecycle (see MainWindow's AddTabAsync/CloseTabAsync).
+///     Only ever reacts to a SUCCESSFUL response showing THAT tab's own
+///     entry in /api/status's `tabs[]` array stuck past StuckTurnMs -- never
+///     to a connectivity failure (ambiguous for a single tab, left entirely
+///     to the TabId==null instance). Fires TabFrozen(tabId, reason); the
+///     caller's remedy is to kill just that tab's own cliProcessPid (see
+///     ChatSession.getStatus()), never the whole backend.
+///
 /// This class only detects; it doesn't touch anything else. Actually
-/// recovering (kill + restart the backend, show a message box) is the
-/// caller's job (see MainWindow's Frozen handler), matching BackendProcess's
-/// own Crashed event shape.
+/// recovering is the caller's job (see MainWindow's Frozen/TabFrozen
+/// handlers), matching BackendProcess's own Crashed event shape.
 /// </summary>
 public sealed class BackendHealthWatchdog : IDisposable
 {
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private readonly System.Threading.Timer _timer;
     private readonly int _port;
+    private readonly string? _tabId;
     private int _consecutiveBadChecks;
 
     // Two consecutive failed checks (~60s apart -> ~60-90s of real
@@ -80,8 +104,17 @@ public sealed class BackendHealthWatchdog : IDisposable
 
     /// <summary>Fired (on a background thread pool thread, not the UI thread --
     /// caller must Dispatcher.Invoke) once BadChecksBeforeAction consecutive
-    /// checks all indicate the backend is unresponsive or irrecoverably stuck.</summary>
+    /// checks all indicate the backend is completely unreachable. Only ever
+    /// fired by a TabId == null (whole-process) instance -- see this class's
+    /// own doc comment.</summary>
     public event Action<string>? Frozen;
+
+    /// <summary>Same idea as Frozen, but scoped to ONE tab: fired only by a
+    /// TabId != null instance, only when /api/status responds fine but THAT
+    /// tab's own entry shows a turn stuck past StuckTurnMs. Args are
+    /// (tabId, reason) -- caller's remedy is a tab-scoped kill, never
+    /// RestartBackend.</summary>
+    public event Action<string, string>? TabFrozen;
 
     /// <summary>Every check's outcome, healthy or not (same shape as
     /// BackendProcess.OutputLine) -- routed through MainWindow to Logger.Log
@@ -90,9 +123,13 @@ public sealed class BackendHealthWatchdog : IDisposable
     /// a background thread pool thread, same as Frozen.</summary>
     public event Action<string>? LogLine;
 
-    public BackendHealthWatchdog(int port)
+    /// <param name="tabId">null for the single, shared whole-process
+    /// (connectivity-only) instance; a specific tab id for a per-tab
+    /// instance watching only that tab's own /api/status entry.</param>
+    public BackendHealthWatchdog(int port, string? tabId = null)
     {
         _port = port;
+        _tabId = tabId;
         _timer = new System.Threading.Timer(_ => Tick(), null, CheckInterval, CheckInterval);
     }
 
@@ -121,46 +158,92 @@ public sealed class BackendHealthWatchdog : IDisposable
         if (_consecutiveBadChecks < BadChecksBeforeAction) return;
 
         _consecutiveBadChecks = 0; // don't fire again next tick for the same episode
-        LogLine?.Invoke($"[health-watchdog] tick #{tickNum}: {BadChecksBeforeAction} consecutive bad checks -- declaring the backend frozen: {badReason}. Invoking Frozen (subscriber count unknown from here, see MainWindow's own log line right after this one).");
-        try
+        if (_tabId == null)
         {
-            Frozen?.Invoke(badReason);
-            LogLine?.Invoke($"[health-watchdog] tick #{tickNum}: Frozen?.Invoke() returned normally");
+            LogLine?.Invoke($"[health-watchdog] tick #{tickNum}: {BadChecksBeforeAction} consecutive bad checks -- declaring the backend frozen: {badReason}. Invoking Frozen (subscriber count unknown from here, see MainWindow's own log line right after this one).");
+            try
+            {
+                Frozen?.Invoke(badReason);
+                LogLine?.Invoke($"[health-watchdog] tick #{tickNum}: Frozen?.Invoke() returned normally");
+            }
+            catch (Exception ex)
+            {
+                LogLine?.Invoke($"[health-watchdog] tick #{tickNum}: Frozen?.Invoke() THREW: {ex}");
+            }
         }
-        catch (Exception ex)
+        else
         {
-            LogLine?.Invoke($"[health-watchdog] tick #{tickNum}: Frozen?.Invoke() THREW: {ex}");
+            LogLine?.Invoke($"[health-watchdog] tick #{tickNum} (tab={_tabId}): {BadChecksBeforeAction} consecutive bad checks -- declaring tab {_tabId} frozen: {badReason}. Invoking TabFrozen.");
+            try
+            {
+                TabFrozen?.Invoke(_tabId, badReason);
+                LogLine?.Invoke($"[health-watchdog] tick #{tickNum} (tab={_tabId}): TabFrozen?.Invoke() returned normally");
+            }
+            catch (Exception ex)
+            {
+                LogLine?.Invoke($"[health-watchdog] tick #{tickNum} (tab={_tabId}): TabFrozen?.Invoke() THREW: {ex}");
+            }
         }
     }
 
-    /// <summary>Returns null if healthy, else a human-readable reason it isn't.</summary>
+    /// <summary>Returns null if healthy, else a human-readable reason it isn't.
+    /// A TabId == null instance only ever evaluates raw HTTP reachability
+    /// (never any tab's content -- see this class's own doc comment); a
+    /// TabId != null instance only ever evaluates ITS OWN tab's entry in a
+    /// SUCCESSFUL response's `tabs[]` array, never connectivity (ambiguous
+    /// for a single tab -- left entirely to the TabId==null instance, which
+    /// runs concurrently and already covers that case).</summary>
     private async Task<string?> CheckOnceAsync()
     {
+        JsonDocument doc;
         try
         {
             using var resp = await _http.GetAsync($"http://127.0.0.1:{_port}/api/status");
-            if (!resp.IsSuccessStatusCode) return $"HTTP {(int)resp.StatusCode} from /api/status";
-
-            var body = await resp.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(body);
-            var root = doc.RootElement;
-
-            var turnPending = root.TryGetProperty("turnPending", out var tp) && tp.GetBoolean();
-            var lastActivityMs = root.TryGetProperty("lastActivityMs", out var la) ? la.GetInt64() : 0;
-
-            if (turnPending && lastActivityMs > StuckTurnMs)
+            if (!resp.IsSuccessStatusCode)
             {
-                return $"A conversation turn has been stuck for {lastActivityMs / 1000}s with no recovery from the backend's own watchdog.";
+                return _tabId == null ? $"HTTP {(int)resp.StatusCode} from /api/status" : null;
             }
-            return null;
+            var body = await resp.Content.ReadAsStringAsync();
+            doc = JsonDocument.Parse(body);
         }
         catch (Exception ex)
         {
             // Connection refused, timeout, malformed response -- all mean
-            // "can't get a healthy answer right now", which is exactly what
-            // this class exists to detect. The specific exception type
-            // doesn't change what we do about it.
-            return $"/api/status did not respond: {ex.Message}";
+            // "can't get a healthy answer right now". Only actionable by the
+            // whole-process (TabId == null) instance -- a single tab's own
+            // instance has no way to tell "the whole thing is down" apart
+            // from "just this tick was unlucky for some unrelated reason",
+            // and acting on it here would be redundant with (and racing)
+            // the shared instance that already owns this case.
+            return _tabId == null ? $"/api/status did not respond: {ex.Message}" : null;
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+            if (_tabId == null) return null; // this instance only ever reacts to unreachability, checked above
+
+            JsonElement? tabEntry = null;
+            if (root.TryGetProperty("tabs", out var tabs) && tabs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var t in tabs.EnumerateArray())
+                {
+                    if (t.TryGetProperty("tabId", out var id) && id.GetString() == _tabId) { tabEntry = t; break; }
+                }
+            }
+            // Tab not present (closed backend-side, or a momentary gap right
+            // after a fresh backend process comes up before it's re-opened
+            // its saved tabs) -- nothing to check yet, not a bad check.
+            if (tabEntry == null) return null;
+
+            var turnPending = tabEntry.Value.TryGetProperty("turnPending", out var tp) && tp.GetBoolean();
+            var lastActivityMs = tabEntry.Value.TryGetProperty("lastActivityMs", out var la) ? la.GetInt64() : 0;
+
+            if (turnPending && lastActivityMs > StuckTurnMs)
+            {
+                return $"Tab {_tabId}'s conversation turn has been stuck for {lastActivityMs / 1000}s with no recovery from the backend's own watchdog.";
+            }
+            return null;
         }
     }
 

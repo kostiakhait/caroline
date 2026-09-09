@@ -64,6 +64,43 @@ async function writeDehydratedTextFile(workspaceDir: string, content: string): P
   return filePath;
 }
 
+// Duplicated from server.ts's own formatTimestampForModel (kept in sync
+// manually -- same convention as extractDehydratedFilePath's own doc comment
+// below explains for the frontend copy of THAT function): dehydrate.ts can't
+// import it directly without creating a server.ts <-> dehydrate.ts import
+// cycle (server.ts already imports this file).
+function formatTimestampForModel(d: Date): string {
+  return d.toLocaleString("en-US", {
+    weekday: "short", year: "numeric", month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit", timeZoneName: "short",
+  });
+}
+
+/**
+ * Per explicit instruction (2026-09-08): pushMessage's own "[Sent: ...]"
+ * line (server.ts) only ever lands on a real/proactive USER turn -- every
+ * OTHER entry (a tool_result-only user entry, every assistant entry) has no
+ * timestamp at all once it reaches the model, even though the CLI itself
+ * already records one on disk (entry.timestamp, never replayed to the model
+ * -- only message.content is). Without this, Caroline can see "the user
+ * just sent X" but has no way to tell how long ago HER OWN last reply, or a
+ * slow tool call, actually happened -- confirmed live as a real gap, not
+ * just theoretical. Stamped once per entry (not per block) here, in the
+ * same per-turn pass that already touches every entry's content exactly
+ * once (see dehydratePreviousTurns' alreadyThroughLine). Skipped for
+ * entries that already start with a "[Sent: " block so a real/proactive
+ * user turn is never double-stamped.
+ */
+function stampTimestampIfMissing(entry: RawEntry, content: ContentBlock[]): ContentBlock[] {
+  const first = content[0];
+  const alreadyStamped = first?.type === "text" && typeof first.text === "string" && first.text.startsWith("[Sent: ");
+  if (alreadyStamped || typeof entry.timestamp !== "string") return content;
+  const parsed = new Date(entry.timestamp);
+  if (Number.isNaN(parsed.getTime())) return content;
+  const stamp: ContentBlock = { type: "text", text: `[${formatTimestampForModel(parsed)}]` };
+  return [stamp, ...content];
+}
+
 /** Same tone/shape as compaction.ts's stubNote() -- kept as a SEPARATE function (not shared)
  *  since the two mean different things: that one says "aged out, not resent"; this one says
  *  "already on disk from THIS same turn, and won't be resent from here on". */
@@ -155,7 +192,6 @@ async function dehydrateEntry(entry: RawEntry, workspaceDir: string): Promise<{ 
     if (result.changed) anyChanged = true;
     newContent.push(result.block);
   }
-  if (!anyChanged) return { entry, changed: false };
   // Bug fix (2026-09-09): confirmed live that this is NOT a rare edge case --
   // a meaningful fraction of real assistant entries are ONE thinking block
   // and nothing else (the model's reasoning logged as its own transcript
@@ -166,7 +202,10 @@ async function dehydrateEntry(entry: RawEntry, workspaceDir: string): Promise<{ 
   // placeholder text block is unambiguously a valid, ordinary content shape
   // -- no guessing needed about whether the API accepts `content: []`.
   const finalContent = newContent.length > 0 ? newContent : [{ type: "text", text: "[мысли этого хода не сохраняются]" } as ContentBlock];
-  return { entry: { ...entry, message: { ...entry.message, content: finalContent } }, changed: true };
+  const stampedContent = stampTimestampIfMissing(entry, finalContent);
+  if (stampedContent !== finalContent) anyChanged = true;
+  if (!anyChanged) return { entry, changed: false };
+  return { entry: { ...entry, message: { ...entry.message, content: stampedContent } }, changed: true };
 }
 
 export interface DehydrationOutcome {

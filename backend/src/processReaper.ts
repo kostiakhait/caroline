@@ -47,13 +47,20 @@ async function listAllProcesses(): Promise<ProcessEntry[]> {
 
 /** Every OS process descended from rootPid, recursively (BFS over parentPid),
  *  not just its direct children -- diagnostic-only (see server.ts's call
- *  sites), so every restart trigger logs a concrete number instead of
- *  leaving "did the process tree leak" to be reconstructed by hand later.
- *  Returns -1 on any failure rather than throwing -- never allowed to be the
+ *  sites), so every restart trigger logs a concrete breakdown instead of
+ *  leaving "did the process tree leak, or is this legitimate fan-out (MCP
+ *  servers, active agents)" to be reconstructed by hand later, when the
+ *  actual processes are long gone. Confirmed live (2026-09-08): a bare COUNT
+ *  alone made that call impossible after the fact -- 54, or even 126, could
+ *  be a real leak or entirely legitimate depending on how many MCP servers/
+ *  agents were active at that moment, and a count alone can't tell those
+ *  apart. Returns "N (name=count, ...)", contributors sorted biggest-first;
+ *  "-1" on any failure rather than throwing -- never allowed to be the
  *  reason a restart itself fails. */
-export async function countDescendantProcesses(rootPid: number): Promise<number> {
+export async function describeDescendantProcesses(rootPid: number): Promise<string> {
   try {
     const procs = await listAllProcesses();
+    const byPid = new Map(procs.map((p) => [p.pid, p]));
     const ids = new Set<number>([rootPid]);
     let frontier = [rootPid];
     while (frontier.length > 0) {
@@ -62,10 +69,17 @@ export async function countDescendantProcesses(rootPid: number): Promise<number>
       for (const pid of fresh) ids.add(pid);
       frontier = fresh;
     }
-    return ids.size - 1; // exclude the root itself, count descendants only
+    ids.delete(rootPid); // exclude the root itself, describe descendants only
+    const counts = new Map<string, number>();
+    for (const pid of ids) {
+      const name = byPid.get(pid)?.name ?? "?";
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const breakdown = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => `${name}=${count}`).join(" ");
+    return `${ids.size} (${breakdown})`;
   } catch (err) {
-    console.error("[caroline] countDescendantProcesses failed (ignored):", err);
-    return -1;
+    console.error("[caroline] describeDescendantProcesses failed (ignored):", err);
+    return "-1";
   }
 }
 
