@@ -1024,14 +1024,18 @@
         stopHeartbeat();
       } else if (evt.status === "restart_backoff") {
         // Repeated failures with no actionable cause (not billing, not a rate
-        // limit -- those go through "error"/system_notice instead) -- per
-        // explicit instruction (2026-09-05), this must never escalate to a
-        // blocking dialog: a blocking panel is only for conditions the user
-        // can actually do something about (e.g. a depleted balance). This is
-        // just "still trying, slower" -- same yellow lamp as a plain restart,
-        // but with the actual backoff detail visible instead of staying
-        // silent about why recovery is taking a while.
-        setStatus(evt.reason || "Trouble reconnecting — retrying…", "restarting");
+        // limit -- those go through "error"/system_notice instead) -- must
+        // never escalate to a blocking dialog: a blocking panel is only for
+        // conditions the user can actually do something about (e.g. a
+        // depleted balance). Same calm "recovering session…" text as a plain
+        // restart -- per explicit instruction (2026-09-09), superseding an
+        // earlier decision (2026-09-05) to show the raw "failed N times in
+        // Mmin" detail here: confirmed live that surfacing the actual retry
+        // count/backoff timing to the user is alarming on its own, even
+        // though the condition itself is never dangerous or blocking. The
+        // detail still reaches caroline.log in full via setConnState's own
+        // logging -- only the user-facing text changed.
+        setStatus("recovering session…", "restarting");
         turnQueue = [];
         setBusy(false);
         stopHeartbeat();
