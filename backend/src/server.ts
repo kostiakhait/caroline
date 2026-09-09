@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { join, resolve, extname, sep } from "node:path";
 import { readFile as readFileAsync } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -583,6 +583,10 @@ class ChatSession {
   private restartForUnrecoverableSession = false;
   private unrecoverableSessionReplayText: string | null = null;
   private unrecoverableSessionReplayAttachments: Attachment[] = [];
+  /** See resolveResumeSessionId's own doc comment -- set by
+   *  resetUnrecoverableSession(), consumed (and cleared) by the very next
+   *  resolveResumeSessionId() call. */
+  private skipMigrationFallbackOnce = false;
   /** Same restart-without-cost mechanism as restartForChatSourceSwitch/
    *  restartForUrgentCompaction above -- per explicit instruction (2026-09-08):
    *  directly confirmed live that a running CLI subprocess keeps its
@@ -902,6 +906,7 @@ class ChatSession {
     console.error(`[caroline] tab ${this.tabId}: abandoning session (unrecoverable "tool use concurrency" error) -- clearing saved session id, starting fresh`);
     clearTabSessionId(workspaceDir, this.tabId);
     this.lastSavedSessionId = null;
+    this.skipMigrationFallbackOnce = true;
     this.unrecoverableSessionReplayText = replayText;
     this.unrecoverableSessionReplayAttachments = replayAttachments;
     this.restartForUnrecoverableSession = true;
@@ -1351,6 +1356,20 @@ class ChatSession {
   private resolveResumeSessionId(): string | undefined {
     const stored = loadTabSessionId(workspaceDir, this.tabId);
     if (stored) return stored;
+    // Bug fix (2026-09-09): confirmed live -- resetUnrecoverableSession()
+    // clears the stored id specifically to force a genuinely EMPTY session,
+    // but for the primary tab this fallback then immediately picked up
+    // findMostRecentClaudeSessionId's result instead (a completely different,
+    // pre-existing session file, in the observed case ALSO broken) --
+    // "no stored id" looked identical to the one-time pre-multi-tab migration
+    // case this fallback exists for, even though it wasn't. Skipped exactly
+    // once right after that reset so it behaves like every non-primary tab
+    // would: truly nothing to resume.
+    if (this.skipMigrationFallbackOnce) {
+      this.skipMigrationFallbackOnce = false;
+      console.error("[caroline] primary tab: no stored session id (unrecoverable-session reset) -- skipping migration fallback, starting genuinely empty");
+      return undefined;
+    }
     if (this.tabId !== PRIMARY_TAB_ID) return undefined;
     const migrated = findMostRecentClaudeSessionId(workspaceDir);
     if (migrated) {
@@ -2066,8 +2085,20 @@ class ChatSession {
           this.pendingAttachments = [];
           clearPendingTurn(workspaceDir, this.tabId);
           if (replayText !== null) {
-            console.error(`[caroline] tab=${this.tabId} replaying the turn that hit the unrecoverable error: ${truncateForLog(replayText)}`);
-            this.submit(replayText, replayAttachments, true, false, this.turnIsVoice);
+            // Per explicit instruction (2026-09-09): a brand-new session has
+            // ZERO history of its own to infer language from -- confirmed
+            // live as the actual cause of a Russian conversation coming back
+            // in English after exactly this reset. detectRecentLanguage()
+            // now falls back to the last PERSISTED language instead of a
+            // hardcoded "english" default (see its own doc comment), but a
+            // direct instruction here is cheap insurance on top of that, not
+            // a replacement for it.
+            const lang = await detectRecentLanguage();
+            const languageDirective = lang === "russian"
+              ? "[Continue this conversation in Russian -- that's the language it's been in.]\n\n"
+              : "";
+            console.error(`[caroline] tab=${this.tabId} replaying the turn that hit the unrecoverable error (lang=${lang}): ${truncateForLog(replayText)}`);
+            this.submit(`${languageDirective}${replayText}`, replayAttachments, true, false, this.turnIsVoice);
           } else {
             console.error(`[caroline] tab=${this.tabId} no captured turn to replay (pendingUserText was already null) -- nothing queued`);
           }
@@ -2374,42 +2405,73 @@ class ChatSession {
 
 type NudgeLanguage = "russian" | "english";
 
+// Bug fix (2026-09-09): confirmed live -- detectRecentLanguage's own fallback
+// (no recent history, API call fails/times out) hardcoded "english", which is
+// exactly the case a freshly-reset session (resetUnrecoverableSession, or any
+// brand-new tab that hasn't resumed anything yet) always hits: NO history to
+// read at all. A Russian conversation that then needed a self-heal reset came
+// back speaking English with nothing in its own fresh context to correct it.
+// Persists the last real detection (not the fallback guess itself) to a tiny
+// file in the workspace, read back whenever there's nothing else to go on --
+// "the language we were last actually speaking" is a far better default than
+// a hardcoded one, and this is cheap/local, no reason not to keep it current.
+const LAST_LANGUAGE_PATH = join(workspaceDir, "last-language.json");
+
+function loadPersistedLanguage(): NudgeLanguage | null {
+  try {
+    if (!existsSync(LAST_LANGUAGE_PATH)) return null;
+    const data = JSON.parse(readFileSync(LAST_LANGUAGE_PATH, "utf-8")) as { lang?: string };
+    return data.lang === "russian" || data.lang === "english" ? data.lang : null;
+  } catch (err) {
+    console.error("[caroline] loadPersistedLanguage: read/parse failed (ignored):", err);
+    return null;
+  }
+}
+
+function savePersistedLanguage(lang: NudgeLanguage): void {
+  try {
+    writeFileSync(LAST_LANGUAGE_PATH, JSON.stringify({ lang }, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error("[caroline] savePersistedLanguage: write failed (ignored):", err);
+  }
+}
+
 /**
  * Real language detection via Camerlengo's ai:detectLanguage (an actual
  * LLM call, see reforce's AI.py detectLanguage) -- deliberately NOT a
  * Cyrillic/Latin heuristic, per explicit instruction: language detection
- * must go through the real API everywhere in this codebase. Falls back to
- * "english" whenever the API can't tell (no recent text, the call fails,
- * or it genuinely doesn't recognize the sample) -- also per explicit
- * instruction. This project only ever actually switches between Russian
- * and English in its own instruction phrasing (CONTINUE_OR_SILENT_NUDGE,
- * STARTUP_GREETING_NUDGE below), so the real detected ISO code is
- * collapsed to that binary here; a wrong guess just means one proactive
- * message reads a little oddly, not a functional failure.
+ * must go through the real API everywhere in this codebase. This project
+ * only ever actually switches between Russian and English in its own
+ * instruction phrasing (CONTINUE_OR_SILENT_NUDGE, STARTUP_GREETING_NUDGE
+ * below), so the real detected ISO code is collapsed to that binary here;
+ * a wrong guess just means one proactive message reads a little oddly, not
+ * a functional failure.
  */
 async function detectRecentLanguage(): Promise<NudgeLanguage> {
   try {
     const entries = readRecentHistory(workspaceDir, 5);
     const lastText = entries.length > 0 ? entries[entries.length - 1].text : "";
-    if (!lastText.trim()) return "english";
+    if (!lastText.trim()) return loadPersistedLanguage() ?? "english";
     // detectLanguage() has its own internal 15s ceiling (see voice.ts's
     // callApi), which is fine for a real voice/STT pipeline but far too
     // generous here -- confirmed live (2026-09-05) it took ~20s for a
     // restarting session's recovery nudge to actually go out, delaying the
     // one thing (telling Caroline to pick back up) that's supposed to
     // happen as soon as possible after a restart. Getting the wrong
-    // language guess (falls back to "english") is a minor cosmetic
-    // annoyance; a slow recovery nudge is the actual problem this exists to
-    // avoid, so race it against a much shorter local timeout instead of
-    // waiting out the full 15s.
+    // language guess is a minor cosmetic annoyance; a slow recovery nudge is
+    // the actual problem this exists to avoid, so race it against a much
+    // shorter local timeout instead of waiting out the full 15s.
     const iso = await Promise.race([
       detectLanguage(lastText),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
     ]);
-    return iso === "ru" ? "russian" : "english";
+    if (iso === null) return loadPersistedLanguage() ?? "english"; // the race timed out -- no real signal either way
+    const lang: NudgeLanguage = iso === "ru" ? "russian" : "english";
+    savePersistedLanguage(lang);
+    return lang;
   } catch (err) {
-    console.error("[caroline] detectLanguage race failed, defaulting to english:", err);
-    return "english";
+    console.error("[caroline] detectLanguage race failed, falling back to last known language:", err);
+    return loadPersistedLanguage() ?? "english";
   }
 }
 

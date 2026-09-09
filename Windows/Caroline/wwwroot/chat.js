@@ -152,17 +152,27 @@
     }
   }
 
-  // Lamp 1 (backend/connection): red = error, yellow = connecting/
-  // reconnecting, green = connected, green-blinking = a turn is actively
-  // running. Driven by the same (text, cls) pairs setStatus already receives
-  // from every call site (WS open/close, caroline_status messages) --
-  // cls values are "connected" | "restarting" | "error" | undefined (the
-  // initial "connecting…" state before the first WS open).
+  // Lamp 1 (backend/connection): red = genuinely blocked (billing/limit --
+  // sending a message would just queue forever with no resolution), yellow =
+  // the WebSocket itself is down (nothing can be sent at all right now),
+  // green = connected, green-blinking = a turn is actively running.
+  //
+  // Bug fix (2026-09-09): this used to go yellow for cls "restarting" too
+  // (an internal backend session cycling -- dehydration, a routine restart,
+  // even a multi-minute restart_backoff loop) -- but per inputEl's own gating
+  // just below, the input field stays enabled the WHOLE time the WebSocket
+  // itself is open, since submit() just queues onto a durable queue that the
+  // backend drains once its internal retry succeeds. Confirmed live: the
+  // system genuinely WAS ready to accept and eventually answer a message
+  // during a restart_backoff stretch, but the lamp said otherwise. Now keyed
+  // on wsConnected (this page's own actual socket state) instead of the
+  // backend's internal churn -- "not ready to respond" means the socket
+  // itself is down, not that the backend is busy reconnecting a session.
   function updateBackendLamp() {
     let color;
-    if (lastConnCls === "connected") color = turnBusy ? "green-blink" : "green";
-    else if (lastConnCls === "error") color = "red";
-    else color = "yellow"; // "restarting" (reconnecting/recovering) or initial
+    if (lastConnCls === "error") color = "red";
+    else if (!wsConnected) color = "yellow";
+    else color = turnBusy ? "green-blink" : "green";
     lampBackend.className = "lamp lamp-" + color;
   }
 
@@ -1009,34 +1019,24 @@
 
     if (evt.type === "caroline_status") {
       if (evt.status === "connected") setStatus("connected", "connected");
-      else if (evt.status === "restarting") {
-        // Status bar only, no chat bubble -- per explicit instruction
-        // (2026-09-04), same reasoning as system_notice just above: a
-        // session restart (whatever caused it -- a real hang, or an hourly
-        // compaction cycle switching resume targets) is service-level
-        // noise, not a message from Caroline. It used to also post a
-        // "Session hiccup" line straight into the dialog, which got
-        // especially repetitive once compaction started restarting the
-        // session roughly once an hour on its own.
-        setStatus("recovering session…", "restarting");
+      else if (evt.status === "restarting" || evt.status === "restart_backoff") {
+        // Per explicit instruction (2026-09-09): this backend-internal
+        // session churn (a real hang recovering, an hourly compaction cycle,
+        // even a multi-minute restart_backoff loop) arrives over a
+        // WebSocket that never actually dropped -- the input field stays
+        // enabled the whole time (see inputEl's own gating in setStatus),
+        // since submit() just queues onto a durable queue the backend drains
+        // once its internal retry succeeds. Confirmed live: the system WAS
+        // genuinely ready to accept and eventually answer a message the
+        // whole time, but showing "recovering session…" here claimed
+        // otherwise. Only actually change the displayed status if the socket
+        // itself is down (ws.onclose's own "reconnecting…" already covers
+        // that case) -- otherwise leave the status bar/lamp exactly as they
+        // already read ("connected"/green), and let the reply's own eventual
+        // arrival be the only visible signal, same as any ordinary turn that
+        // just happens to take a while.
+        if (!wsConnected) setStatus("recovering session…", "restarting");
         turnQueue = []; // the session restarting means none of these will get their own "result"
-        setBusy(false);
-        stopHeartbeat();
-      } else if (evt.status === "restart_backoff") {
-        // Repeated failures with no actionable cause (not billing, not a rate
-        // limit -- those go through "error"/system_notice instead) -- must
-        // never escalate to a blocking dialog: a blocking panel is only for
-        // conditions the user can actually do something about (e.g. a
-        // depleted balance). Same calm "recovering session…" text as a plain
-        // restart -- per explicit instruction (2026-09-09), superseding an
-        // earlier decision (2026-09-05) to show the raw "failed N times in
-        // Mmin" detail here: confirmed live that surfacing the actual retry
-        // count/backoff timing to the user is alarming on its own, even
-        // though the condition itself is never dangerous or blocking. The
-        // detail still reaches caroline.log in full via setConnState's own
-        // logging -- only the user-facing text changed.
-        setStatus("recovering session…", "restarting");
-        turnQueue = [];
         setBusy(false);
         stopHeartbeat();
       } else if (evt.status === "stopped") {
