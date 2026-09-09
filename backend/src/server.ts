@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, statSync } from "node:fs";
 import { join, resolve, extname, sep } from "node:path";
 import { readFile as readFileAsync } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -58,7 +58,7 @@ import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundI
 console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js mtime=${statSync(fileURLToPath(import.meta.url)).mtime.toISOString()} startedAt=${new Date().toISOString()} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
 
 configureIsolatedGitBash();
-import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
+import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, findMostRecentClaudeSessionId, claudeProjectDir } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
 import { dehydratePreviousTurns, agePreviousTurnsInPlace, dehydratedDir } from "./dehydrate.js";
 import { classifyParallelSafety, runParallelBranch, buildBranchReportText, deleteSessionFile } from "./parallel.js";
@@ -178,10 +178,19 @@ const RESTART_WINDOW_MS = 10 * 60_000;
 const RESTART_BACKOFF_MS = 60_000;
 // How long an abandoned query()'s CLI process gets to exit on its own before
 // processReaper force-kills its whole tree -- see that module's own doc
-// comment for the confirmed live leak this covers. Long on purpose (per
-// explicit instruction, 2026-09-06): never wide enough to be mistaken for a
-// session that's merely slow to wind down.
-const REAP_GRACE_MS = 5 * 60_000;
+// comment for the confirmed live leak this covers. Was 5 minutes (per
+// explicit instruction, 2026-09-06: "never wide enough to be mistaken for a
+// session that's merely slow to wind down"), lowered per explicit
+// instruction (2026-09-09) after confirming live that 5 minutes is too slow
+// to keep pace with a bad night's restart cadence: with a new abandoned
+// process appearing every 20-170s but only reaped every 5 minutes, they pile
+// up faster than they're cleared -- confirmed live as descendantProcesses=52
+// (should be ~14-17 clean) directly correlating with a query() taking
+// 169 SECONDS just to reach 'init' (should be ~10s). close() is documented
+// to end the CLI's own process promptly when it cooperates at all; a
+// genuinely-still-winding-down session finishing within 60s is the normal
+// case, not the one this timer exists to protect.
+const REAP_GRACE_MS = 60_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -896,18 +905,52 @@ class ChatSession {
    * unlike runUrgentCompaction, there's no smaller/fixed version of this
    * session to resume: the whole point is that NOTHING about its own content
    * was found to be the cause after real bisection, and retrying identically
-   * fails identically forever. Abandons the tab's saved session id entirely
+   * fails identically forever. Abandons the tab's saved session id
    * (clearTabSessionId) so the next while-loop iteration's
-   * resolveResumeSessionId() finds nothing and starts a brand-new session --
-   * this tab's conversation history is lost, but a working tab beats a
-   * permanently wedged one, per explicit instruction (2026-09-09).
+   * resolveResumeSessionId() finds nothing and starts a brand-new session.
+   *
+   * Bug fix (2026-09-09): confirmed live -- the first version of this just
+   * wiped the pointer with no trace left behind, same as a genuinely fresh
+   * tab. The fresh session then had NO reference note at all (unlike normal
+   * age-budget/compaction, which always leaves ONE pointing at the archived
+   * prefix) -- not "the model won't follow the link", there was no link to
+   * follow. Confirmed live: Caroline correctly reported having zero context,
+   * while the user could still see the old conversation in their own chat
+   * (client-side localStorage, unrelated to what the model can see) and
+   * reasonably read that mismatch as a bug. Now archives the abandoned
+   * session's full content first (same convention as dehydrate.ts's own
+   * archive files) and prepends a matching reference note to the replay, so
+   * the fresh session can still Read its way back to real earlier context if
+   * the user's message actually needs it.
    */
   private resetUnrecoverableSession(replayText: string | null, replayAttachments: Attachment[]): void {
     console.error(`[caroline] tab ${this.tabId}: abandoning session (unrecoverable "tool use concurrency" error) -- clearing saved session id, starting fresh`);
+    let archiveNote = "";
+    const oldSessionId = loadTabSessionId(workspaceDir, this.tabId);
+    if (oldSessionId) {
+      try {
+        const oldPath = join(claudeProjectDir(workspaceDir), `${oldSessionId}.jsonl`);
+        if (existsSync(oldPath)) {
+          const dir = dehydratedDir(workspaceDir);
+          if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+          const archivePath = join(dir, `${randomUUID()}.txt`);
+          copyFileSync(oldPath, archivePath);
+          archiveNote =
+            `[System note: this session was just reset after an unrecoverable internal error -- for your own ` +
+            `situational awareness only, don't alarm the user about it (see the standing instruction on this). ` +
+            `The conversation from BEFORE this reset is fully preserved at ${archivePath} -- if the user's ` +
+            `message below refers to something earlier that you don't have in this fresh context, Read that ` +
+            `file to find it before saying you don't know.]\n\n`;
+          console.error(`[caroline] tab ${this.tabId}: archived abandoned session ${oldSessionId} -> ${archivePath}`);
+        }
+      } catch (err) {
+        console.error(`[caroline] tab ${this.tabId}: failed to archive abandoned session (ignored, resetting anyway):`, err);
+      }
+    }
     clearTabSessionId(workspaceDir, this.tabId);
     this.lastSavedSessionId = null;
     this.skipMigrationFallbackOnce = true;
-    this.unrecoverableSessionReplayText = replayText;
+    this.unrecoverableSessionReplayText = replayText !== null ? `${archiveNote}${replayText}` : archiveNote || null;
     this.unrecoverableSessionReplayAttachments = replayAttachments;
     this.restartForUnrecoverableSession = true;
     this.activeQuery?.close();
