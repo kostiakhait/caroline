@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, statSync } from "node:fs";
 import { join, resolve, extname, sep } from "node:path";
-import { readFile as readFileAsync } from "node:fs/promises";
+import { readFile as readFileAsync, readdir as readdirAsync, stat as statAsync } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -2590,6 +2590,8 @@ async function handleControlRequest(
     smtp2goSender?: string;
     enabled?: boolean;
     filePath?: string;
+    attachmentName?: string;
+    attachmentTs?: number;
   },
   send: (event: OutEvent) => void,
   // The session tied to whichever connection actually sent this request --
@@ -3007,6 +3009,67 @@ async function handleControlRequest(
           }
         } catch (err) {
           console.error(`[caroline] [expand_dehydrated_ref] failed to read ${requestedPath}:`, err);
+          send({ type: "control_response", op, ok: false, stderr: err instanceof Error ? err.message : String(err), requestId });
+        }
+        break;
+      }
+      // Per explicit instruction (2026-09-09): "all images/attachments must
+      // show in the dialog, even when they only reach the model as links" --
+      // covers TWO gaps at once: (a) an attachment sent before chat.js's own
+      // IndexedDB fix existed, whose real bytes were already stripped out of
+      // localStorage with no way back; (b) a get_history-recovered bubble,
+      // which only ever carries text, never attachment data. Every attachment
+      // Caroline receives is ALREADY saved once, permanently, to
+      // workspace/uploads/<uuid>-<name> (see saveAttachmentToUploads) --
+      // confirmed live that file survives independently of anything chat
+      // history/compaction/localStorage does. No id was ever handed back to
+      // the client to look it up by directly, so this searches by the two
+      // things a chat bubble DOES still have even after losing its own data:
+      // the original filename and roughly when it was sent. Falls back to
+      // workspace/dehydrated/ too (dehydrate.ts's own per-turn copy), in case
+      // the uploads/ one was ever cleaned up but a dehydrated copy survives.
+      case "find_attachment": {
+        const requestId = parsed.requestId;
+        const wantName = parsed.attachmentName;
+        const wantTs = parsed.attachmentTs;
+        if (!wantName || typeof wantTs !== "number") {
+          send({ type: "control_response", op, ok: false, stderr: "find_attachment requires attachmentName and attachmentTs", requestId });
+          break;
+        }
+        try {
+          const candidates: { path: string; diffMs: number }[] = [];
+          for (const dir of [UPLOADS_DIR, dehydratedDir(workspaceDir)]) {
+            if (!existsSync(dir)) continue;
+            const files = await readdirAsync(dir);
+            for (const f of files) {
+              // saveAttachmentToUploads names files "<uuid>-<originalName>" --
+              // a suffix match is exactly right and tolerant of either
+              // convention (dehydrate.ts's own archive files use a bare
+              // randomUUID().<ext>, which just won't match here, correctly).
+              if (!f.endsWith(wantName)) continue;
+              const full = join(dir, f);
+              const st = await statAsync(full);
+              candidates.push({ path: full, diffMs: Math.abs(st.mtimeMs - wantTs) });
+            }
+          }
+          candidates.sort((a, b) => a.diffMs - b.diffMs);
+          // 30 minutes is generous slack for clock skew/a slow send, while
+          // still ruling out a same-named file from a genuinely different,
+          // unrelated message days apart.
+          const best = candidates.find((c) => c.diffMs <= 30 * 60_000);
+          if (!best) {
+            console.error(`[caroline] [find_attachment] no match for name=${wantName} ts=${wantTs} (closest candidate diffMs=${candidates[0]?.diffMs ?? "none"})`);
+            send({ type: "control_response", op, ok: false, stderr: "No matching attachment found on disk", requestId });
+            break;
+          }
+          const bytes = await readFileAsync(best.path);
+          const ext = extname(best.path).toLowerCase().replace(".", "");
+          const mimeByExt: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf" };
+          const mimeType = mimeByExt[ext] || "application/octet-stream";
+          console.error(`[caroline] [find_attachment] matched name=${wantName} -> ${best.path} (diffMs=${best.diffMs}), ${bytes.length} bytes`);
+          send({ type: "control_response", op, ok: true, stdout: JSON.stringify({ mimeType, dataBase64: bytes.toString("base64") }), requestId });
+        } catch (err) {
+          console.error(`[caroline] [find_attachment] failed:`, err);
           send({ type: "control_response", op, ok: false, stderr: err instanceof Error ? err.message : String(err), requestId });
         }
         break;

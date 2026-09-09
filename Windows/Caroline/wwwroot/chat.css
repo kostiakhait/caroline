@@ -339,6 +339,16 @@ a.attachment-chip {
   border-color: #d3d6ea;
 }
 
+.attachment-chip-recoverable {
+  cursor: pointer;
+  border-style: dashed;
+}
+
+.attachment-chip-loading {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .composer {
   display: flex;
   align-items: flex-end;

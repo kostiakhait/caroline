@@ -498,11 +498,46 @@
     return out.join("\n");
   }
 
+  // requestId -> callback, for the find_attachment control op (below).
+  let findAttachmentSeq = 0;
+  const pendingFindAttachmentRequests = new Map();
+
+  // Per explicit instruction (2026-09-09): "all images/attachments must show
+  // in the dialog, even when they only reach the model as links" -- every
+  // attachment Caroline receives is saved once, permanently, to
+  // workspace/uploads/<uuid>-<name> server-side (independent of anything
+  // localStorage/compaction does), so a chip that lost its own payload isn't
+  // actually gone, just needs asking the backend to find it again by name +
+  // roughly when it was sent (see find_attachment's own doc comment).
+  function tryRecoverAttachment(chip, a, ts) {
+    chip.classList.add("attachment-chip-recoverable");
+    chip.title = "Click to load this attachment";
+    chip.addEventListener("click", (e) => {
+      e.preventDefault();
+      chip.title = "Loading…";
+      chip.classList.add("attachment-chip-loading");
+      const requestId = `find-att-${++findAttachmentSeq}`;
+      pendingFindAttachmentRequests.set(requestId, (ok, parsed) => {
+        pendingFindAttachmentRequests.delete(requestId);
+        chip.classList.remove("attachment-chip-loading");
+        if (!ok || !parsed) {
+          chip.title = "Couldn't find this attachment on disk";
+          return;
+        }
+        const recovered = renderAttachment({ name: a.name, mimeType: parsed.mimeType, dataBase64: parsed.dataBase64 }, ts);
+        chip.replaceWith(recovered);
+      });
+      sendControl("find_attachment", { attachmentName: a.name, attachmentTs: ts, requestId });
+    }, { once: true });
+  }
+
   // Full inline preview when the base64 payload is still in hand (a
-  // just-sent attachment); falls back to a plain named chip when it isn't
-  // (attachment history reloaded from the transcript, which deliberately
-  // doesn't persist the payload -- see saveTranscriptEntry).
-  function renderAttachment(a) {
+  // just-sent attachment, or one just recovered via tryRecoverAttachment);
+  // falls back to a clickable-to-recover named chip when it isn't (attachment
+  // history reloaded from the transcript before chat.js persisted real bytes
+  // to IndexedDB, or a get_history-recovered bubble, which never carries
+  // attachment data at all -- see saveTranscriptEntry's own doc comment).
+  function renderAttachment(a, ts) {
     const mime = a.mimeType || "";
     if (a.dataBase64 && mime.startsWith("image/")) {
       const img = document.createElement("img");
@@ -529,6 +564,7 @@
     }
     chip.innerHTML = `<span>${mime.startsWith("image/") ? "🖼️" : "📄"}</span><span class="name"></span>`;
     chip.querySelector(".name").textContent = a.name;
+    if (!a.dataBase64 && ts) tryRecoverAttachment(chip, a, ts);
     return chip;
   }
 
@@ -605,7 +641,7 @@
     const div = document.createElement("div");
     div.className = "bubble " + role;
     for (const a of attachments || []) {
-      div.appendChild(renderAttachment(a));
+      div.appendChild(renderAttachment(a, ts));
     }
     const textDiv = document.createElement("div");
     if (role === "assistant") textDiv.innerHTML = renderMarkdown(text);
@@ -1368,6 +1404,12 @@
     } else if (evt.op === "expand_dehydrated_ref") {
       const cb = pendingExpandRequests.get(evt.requestId);
       pendingExpandRequests.delete(evt.requestId);
+      let parsed = null;
+      try { parsed = evt.ok ? JSON.parse(evt.stdout || "null") : null; } catch { parsed = null; }
+      cb?.(evt.ok, parsed, evt.stderr);
+    } else if (evt.op === "find_attachment") {
+      const cb = pendingFindAttachmentRequests.get(evt.requestId);
+      pendingFindAttachmentRequests.delete(evt.requestId);
       let parsed = null;
       try { parsed = evt.ok ? JSON.parse(evt.stdout || "null") : null; } catch { parsed = null; }
       cb?.(evt.ok, parsed, evt.stderr);
