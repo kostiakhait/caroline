@@ -58,7 +58,7 @@ import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundI
 console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js mtime=${statSync(fileURLToPath(import.meta.url)).mtime.toISOString()} startedAt=${new Date().toISOString()} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
 
 configureIsolatedGitBash();
-import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
+import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
 import { dehydratePreviousTurns, agePreviousTurnsInPlace, dehydratedDir } from "./dehydrate.js";
 import { classifyParallelSafety, runParallelBranch, buildBranchReportText, deleteSessionFile } from "./parallel.js";
@@ -254,6 +254,28 @@ const CC_CLI_LIMIT_PATTERN = /hit your .*\blimit\b|monthly spend limit|cc_cli_li
 // for the hourly schedule, and replay the turn that hit it once the
 // now-smaller session is back up.
 const PROMPT_TOO_LONG_PATTERN = /^Prompt is too long\b/i;
+
+// Confirmed live (2026-09-09), after an entire night chasing this: a session
+// can reach a state where the API rejects EVERY resume attempt with a 400
+// ("API Error: 400 due to tool use concurrency issues."), synthesized by the
+// SDK as an assistant message the same way PROMPT_TOO_LONG_PATTERN's target
+// is. Extensive bisection (truncating a real broken transcript to find the
+// exact breaking entry, direct claude.exe invocations bypassing the SDK
+// entirely) found NO single content anomaly responsible -- tool_use/
+// tool_result pairing was intact, ids matched, no orphans, no duplicates;
+// removing the entry at the bisected boundary didn't fix it either. This
+// looks like a genuine SDK/API-side replay fragility (possibly related to
+// the "iterations"/parallel-tool-execution metadata Claude Code's newer
+// message format carries) rather than anything wrong with OUR OWN transcript
+// content -- and critically, retrying the SAME resume fails IDENTICALLY every
+// time (confirmed: one session did this for 6+ hours straight, hundreds of
+// attempts). Unlike PROMPT_TOO_LONG_PATTERN, there's nothing to shrink or
+// fork here -- forking would just copy the same broken history forward. The
+// only actual recovery is abandoning this session id entirely and starting
+// fresh (see resetUnrecoverableSession) -- loses this tab's history, but per
+// explicit instruction, a working system with lost history beats an
+// unrecoverable infinite retry loop.
+const TOOL_CONCURRENCY_ERROR_PATTERN = /tool use concurrency issues/i;
 // Standalone occurrences of the SAME underlying compaction-auth failure (no
 // "Prompt is too long" prefix this time) -- per explicit instruction: just
 // suppress it, no action needed (the account's real login state is fine;
@@ -552,6 +574,15 @@ class ChatSession {
   private restartForUrgentCompaction = false;
   private urgentCompactionReplayText: string | null = null;
   private urgentCompactionReplayAttachments: Attachment[] = [];
+  /** Same restart-without-cost mechanism as restartForUrgentCompaction above,
+   *  for TOOL_CONCURRENCY_ERROR_PATTERN's own doc comment -- resetUnrecoverable
+   *  Session() sets this right before force-closing activeQuery. Unlike
+   *  urgent compaction, this does NOT resume the (permanently broken) old
+   *  session -- clearTabSessionId already ran, so the next while-loop
+   *  iteration's resolveResumeSessionId() finds nothing and starts clean. */
+  private restartForUnrecoverableSession = false;
+  private unrecoverableSessionReplayText: string | null = null;
+  private unrecoverableSessionReplayAttachments: Attachment[] = [];
   /** Same restart-without-cost mechanism as restartForChatSourceSwitch/
    *  restartForUrgentCompaction above -- per explicit instruction (2026-09-08):
    *  directly confirmed live that a running CLI subprocess keeps its
@@ -854,6 +885,27 @@ class ChatSession {
     } finally {
       this.compactionInProgress = false;
     }
+  }
+
+  /**
+   * Recovery for TOOL_CONCURRENCY_ERROR_PATTERN (see its own doc comment) --
+   * unlike runUrgentCompaction, there's no smaller/fixed version of this
+   * session to resume: the whole point is that NOTHING about its own content
+   * was found to be the cause after real bisection, and retrying identically
+   * fails identically forever. Abandons the tab's saved session id entirely
+   * (clearTabSessionId) so the next while-loop iteration's
+   * resolveResumeSessionId() finds nothing and starts a brand-new session --
+   * this tab's conversation history is lost, but a working tab beats a
+   * permanently wedged one, per explicit instruction (2026-09-09).
+   */
+  private resetUnrecoverableSession(replayText: string | null, replayAttachments: Attachment[]): void {
+    console.error(`[caroline] tab ${this.tabId}: abandoning session (unrecoverable "tool use concurrency" error) -- clearing saved session id, starting fresh`);
+    clearTabSessionId(workspaceDir, this.tabId);
+    this.lastSavedSessionId = null;
+    this.unrecoverableSessionReplayText = replayText;
+    this.unrecoverableSessionReplayAttachments = replayAttachments;
+    this.restartForUnrecoverableSession = true;
+    this.activeQuery?.close();
   }
 
   /**
@@ -1675,6 +1727,22 @@ class ChatSession {
               void this.runUrgentCompaction(replayText, replayAttachments);
               continue; // never forward "Prompt is too long" as a chat bubble
             }
+            // See TOOL_CONCURRENCY_ERROR_PATTERN's own doc comment -- checked
+            // right alongside "Prompt is too long" for the same reason (a
+            // synthesized assistant error message, not a real reply), but
+            // handled completely differently: there's no smaller/fixed
+            // version of this session, so recovery abandons it entirely
+            // instead of compacting it.
+            const toolConcurrencyError = textBlocks.find((t) => TOOL_CONCURRENCY_ERROR_PATTERN.test(t));
+            if (toolConcurrencyError) {
+              console.error(`[caroline] tab=${this.tabId} "tool use concurrency" error detected, suppressing and abandoning this session: ${truncateForLog(toolConcurrencyError)}`);
+              this.setConnState("restarting", "Recovering (unrecoverable session)...");
+              const replayText = this.pendingUserText;
+              const replayAttachments = this.pendingAttachments;
+              console.error(`[caroline] tab=${this.tabId} captured turn for replay onto the fresh session: pendingUserText=${replayText !== null ? "set" : "null"} attachments=${replayAttachments.length}`);
+              this.resetUnrecoverableSession(replayText, replayAttachments);
+              continue; // never forward the raw API error as a chat bubble
+            }
             // Per explicit instruction: a STANDALONE occurrence of the same
             // underlying compaction-auth failure (see PROMPT_TOO_LONG_PATTERN's
             // doc comment) -- no "Prompt is too long" prefix this time, so no
@@ -1975,6 +2043,33 @@ class ChatSession {
             this.submit(replayText, replayAttachments, true, false, this.turnIsVoice);
           } else {
             console.error(`[caroline] [urgent-compaction] tab=${this.tabId} no captured turn to replay (pendingUserText was already null) -- nothing queued`);
+          }
+          continue; // fresh query() below, no restart-budget cost
+        }
+        // This session was deliberately closed above (in-stream) by
+        // resetUnrecoverableSession() -- see TOOL_CONCURRENCY_ERROR_PATTERN's
+        // own doc comment. clearTabSessionId already ran, so resumeSessionId
+        // resolves to undefined on the next loop iteration -- a genuinely
+        // fresh session, not a resume. This is the one restart flag that
+        // KNOWINGLY loses conversation history for this tab; still replays
+        // the turn that triggered this (if any) onto the fresh session so
+        // the user's actual question isn't silently dropped too.
+        if (this.restartForUnrecoverableSession) {
+          this.restartForUnrecoverableSession = false;
+          const replayText = this.unrecoverableSessionReplayText;
+          const replayAttachments = this.unrecoverableSessionReplayAttachments;
+          this.unrecoverableSessionReplayText = null;
+          this.unrecoverableSessionReplayAttachments = [];
+          console.error(`[caroline] runLoop catch: tab=${this.tabId} session closed for unrecoverable-session reset -- fresh query() will start a BRAND NEW session, replayText=${replayText !== null ? "set" : "null"}`);
+          this.turnPending = false;
+          this.pendingUserText = null;
+          this.pendingAttachments = [];
+          clearPendingTurn(workspaceDir, this.tabId);
+          if (replayText !== null) {
+            console.error(`[caroline] tab=${this.tabId} replaying the turn that hit the unrecoverable error: ${truncateForLog(replayText)}`);
+            this.submit(replayText, replayAttachments, true, false, this.turnIsVoice);
+          } else {
+            console.error(`[caroline] tab=${this.tabId} no captured turn to replay (pendingUserText was already null) -- nothing queued`);
           }
           continue; // fresh query() below, no restart-budget cost
         }
