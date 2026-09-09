@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { claudeProjectDir } from "./durability.js";
+import { RECENT_CONTENT_BUDGET_BYTES } from "./compaction.js";
 
 /**
  * Per-explicit-instruction (2026-09-08): unlike compaction.ts's routine/urgent
@@ -27,13 +28,15 @@ type ContentBlock = { type: string; [key: string]: unknown };
 
 interface RawEntry {
   type?: string;
+  timestamp?: string;
   message?: { role?: string; content?: string | ContentBlock[]; [key: string]: unknown };
   [key: string]: unknown;
 }
 
 const DEHYDRATED_DIR_NAME = "dehydrated";
 
-function dehydratedDir(workspaceDir: string): string {
+/** Exported so server.ts's expand-on-click handler can validate a requested path is actually inside this directory before reading it. */
+export function dehydratedDir(workspaceDir: string): string {
   return join(workspaceDir, DEHYDRATED_DIR_NAME);
 }
 
@@ -52,6 +55,15 @@ async function writeDehydratedFile(workspaceDir: string, mediaType: unknown, bas
   return filePath;
 }
 
+/** Same idea as writeDehydratedFile, for plain text/JSON content (tool_result/text blocks) instead of base64 binary. */
+async function writeDehydratedTextFile(workspaceDir: string, content: string): Promise<string> {
+  const dir = dehydratedDir(workspaceDir);
+  if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+  const filePath = join(dir, `${randomUUID()}.txt`);
+  await writeFile(filePath, content, "utf-8");
+  return filePath;
+}
+
 /** Same tone/shape as compaction.ts's stubNote() -- kept as a SEPARATE function (not shared)
  *  since the two mean different things: that one says "aged out, not resent"; this one says
  *  "already on disk from THIS same turn, and won't be resent from here on". */
@@ -61,6 +73,27 @@ function dehydratedNote(detail: string, filePath: string): ContentBlock {
     text: `[${detail}, вытеснено на диск по завершении хода -- не передаётся повторно модели. ` +
       `Сохранено в файле: ${filePath}. Прочитать через Read при необходимости.]`,
   };
+}
+
+/**
+ * Per explicit instruction (2026-09-09): a raw file path in prose isn't
+ * useful to a HUMAN reading a recovered chat bubble (history.ts's get_history
+ * fallback) -- nobody's going to go find and open the file by hand. This
+ * lets the frontend detect one of OUR OWN notes (any of the templates in
+ * this file -- "Сохранено"/"сохранена в файле: X." is the one substring
+ * they all share, despite differing grammatical gender) and pull out the
+ * exact path to offer as a clickable expand-in-place link instead. Single
+ * source of truth for the pattern, so the write side (these templates) and
+ * the read side (server.ts's expand_dehydrated_ref handler) can't drift.
+ */
+export function extractDehydratedFilePath(text: string): string | null {
+  // Bug fix (2026-09-09): \w in a JS regex without the "u" flag is ASCII-only
+  // (matches [A-Za-z0-9_]) -- it never matches Cyrillic letters at all, so
+  // this silently matched nothing against real note text. Match the actual
+  // gendered endings this file's templates use ("сохранено"/"сохранена")
+  // explicitly instead.
+  const m = text.match(/[Сс]охранен[оа] в файле: (.+?)\. /);
+  return m ? m[1] : null;
 }
 
 /** Recurses into tool_result.content (screenshots and similar tool-produced images live there,
@@ -92,6 +125,21 @@ async function dehydrateBlock(block: ContentBlock, workspaceDir: string): Promis
   return { block, changed: false };
 }
 
+/**
+ * Per explicit instruction (2026-09-09): a `thinking` block is scratch work
+ * for arriving at THAT turn's own answer -- once the turn is over, what
+ * matters going forward is the outcome (text/tool_use/tool_result), not the
+ * reasoning that produced it. The model doesn't need to re-read its own old
+ * thinking to converse well later, so (unlike text/tool_result, which DO
+ * carry real information worth keeping a reference to) this is dropped
+ * outright, every turn, for every already-completed entry -- no extraction,
+ * no stub note, nothing to point back at. Safe specifically because
+ * dehydrateEntry/dehydratePreviousTurns only ever runs on entries from
+ * ALREADY-COMPLETED turns (between-turn call sites only -- see this file's
+ * own top doc comment), never on a turn still mid-generation, so there's no
+ * live tool-use loop whose thinking block this could be pulling out from
+ * under.
+ */
 async function dehydrateEntry(entry: RawEntry, workspaceDir: string): Promise<{ entry: RawEntry; changed: boolean }> {
   if (entry.type !== "user" && entry.type !== "assistant") return { entry, changed: false };
   const content = entry.message?.content;
@@ -99,12 +147,26 @@ async function dehydrateEntry(entry: RawEntry, workspaceDir: string): Promise<{ 
   let anyChanged = false;
   const newContent: ContentBlock[] = [];
   for (const block of content) {
+    if (block.type === "thinking") {
+      anyChanged = true;
+      continue;
+    }
     const result = await dehydrateBlock(block, workspaceDir);
     if (result.changed) anyChanged = true;
     newContent.push(result.block);
   }
   if (!anyChanged) return { entry, changed: false };
-  return { entry: { ...entry, message: { ...entry.message, content: newContent } }, changed: true };
+  // Bug fix (2026-09-09): confirmed live that this is NOT a rare edge case --
+  // a meaningful fraction of real assistant entries are ONE thinking block
+  // and nothing else (the model's reasoning logged as its own transcript
+  // line, separate from the text/tool_use that follows in a LATER entry).
+  // The original version of this left those entries completely untouched
+  // ("don't risk an empty content array"), which silently defeated the
+  // whole point for exactly the entries most worth fixing. A single minimal
+  // placeholder text block is unambiguously a valid, ordinary content shape
+  // -- no guessing needed about whether the API accepts `content: []`.
+  const finalContent = newContent.length > 0 ? newContent : [{ type: "text", text: "[мысли этого хода не сохраняются]" } as ContentBlock];
+  return { entry: { ...entry, message: { ...entry.message, content: finalContent } }, changed: true };
 }
 
 export interface DehydrationOutcome {
@@ -179,4 +241,164 @@ export async function dehydratePreviousTurns(
   }
 
   return { changed: anyChanged, entriesChanged, linesRescanned: lines.length - alreadyThroughLine, newThroughLine: lines.length };
+}
+
+/**
+ * Per explicit instruction (2026-09-09) -- this is the ONLY correct shape for
+ * the recent-content budget, replacing two earlier wrong attempts (per-block,
+ * then per-entry stubbing -- both left large amounts of small content
+ * untouched "because a stub note wouldn't be any smaller", which defeats a
+ * budget just as badly whether it happens block-by-block or entry-by-entry):
+ *
+ * Split the transcript in exactly TWO pieces. Walk backward from the newest
+ * entry, accumulating real content bytes, until RECENT_CONTENT_BUDGET_BYTES
+ * is reached -- that entry is the split point. Everything OLDER than the
+ * split point (the whole prefix, as one contiguous chunk, in original
+ * request/response order) gets written to ONE file. That entire prefix is
+ * then removed from the live file and replaced by ONE reference entry --
+ * placed where the prefix used to be, i.e. right before the live tail --
+ * pointing at that one file. The live tail itself (the most recent ~budget
+ * bytes) is never touched.
+ *
+ * The reference entry reuses the LAST removed entry's own identity (type,
+ * uuid, timestamp, etc.) and only replaces its message.content -- this is
+ * exactly why it works safely: the live tail's first entry's parentUuid
+ * already equals that uuid (that's how the chain was built), so nothing
+ * downstream needs to change at all, only this one entry's payload shrinks.
+ * Same trick compaction.ts's own >1day rule already relies on.
+ */
+export interface AgeBudgetOutcome {
+  changed: boolean;
+  /** How many lines were collapsed into the one reference entry (0 if nothing was outside the budget). */
+  linesCollapsed: number;
+}
+
+/** True if `entry` is itself an earlier call's reference entry -- lets a later split re-sweep it (and everything after it up to the new split point) into a fresh combined file without any special-casing. */
+function isOwnReferenceEntry(entry: RawEntry): boolean {
+  const content = entry.message?.content;
+  return (
+    Array.isArray(content) &&
+    content.length === 1 &&
+    content[0].type === "text" &&
+    typeof content[0].text === "string" &&
+    content[0].text.includes(DEHYDRATED_NOTE_MARKER)
+  );
+}
+
+const DEHYDRATED_NOTE_MARKER = "вытеснено из истории по завершении хода";
+
+function referenceNote(extractedPath: string): ContentBlock {
+  return {
+    type: "text",
+    text: `[Более старая часть этого разговора ${DEHYDRATED_NOTE_MARKER} -- не передаётся повторно модели. ` +
+      `Полностью сохранена в файле: ${extractedPath}. Прочитать через Read при необходимости, если нужен более ранний контекст.]`,
+  };
+}
+
+/**
+ * In-place, per-turn equivalent of compaction.ts's recent-content byte
+ * budget (see that module's own RECENT_CONTENT_BUDGET_BYTES doc comment for
+ * why this exists -- the fork-based hourly/urgent version alone let real
+ * content blow past the budget for up to an hour at a time). Call AFTER
+ * dehydratePreviousTurns in the same pass -- images/documents/thinking
+ * should already be gone from live entries by the time this runs.
+ */
+export async function agePreviousTurnsInPlace(workspaceDir: string, sessionId: string): Promise<AgeBudgetOutcome> {
+  const filePath = join(claudeProjectDir(workspaceDir), `${sessionId}.jsonl`);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf-8");
+  } catch (err) {
+    console.error(`[caroline] age-budget: failed to read ${filePath} (skipping this pass):`, err);
+    return { changed: false, linesCollapsed: 0 };
+  }
+  const lines = raw.split("\n").filter((l) => l.length > 0);
+  const parsed: (RawEntry | null)[] = lines.map((line) => {
+    try {
+      return JSON.parse(line) as RawEntry;
+    } catch (err) {
+      console.error(`[caroline] age-budget: failed to parse a line in ${filePath} (leaving the whole pass untouched):`, err);
+      return null;
+    }
+  });
+  if (parsed.some((e) => e === null)) {
+    // Splitting requires a coherent view of the whole file (unlike
+    // dehydrate's per-line rewrite) -- a single malformed line makes the
+    // split point unreliable, so skip this pass entirely rather than risk
+    // collapsing the wrong range. Will retry next turn.
+    return { changed: false, linesCollapsed: 0 };
+  }
+  const entries = parsed as RawEntry[];
+
+  // Walk backward, accumulating real content bytes, to find the split index
+  // -- the first (oldest) entry that's still within budget. Everything
+  // before it (0..splitIndex) is the prefix to collapse.
+  let budgetRemaining = RECENT_CONTENT_BUDGET_BYTES;
+  let splitIndex = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const content = entry.message?.content;
+    const isBudgetEligible = (entry.type === "user" || entry.type === "assistant") && Array.isArray(content);
+    if (isBudgetEligible && budgetRemaining > 0) {
+      budgetRemaining -= Buffer.byteLength(JSON.stringify(content), "utf-8");
+    }
+    if (budgetRemaining <= 0) {
+      splitIndex = i;
+      break;
+    }
+  }
+
+  // Nothing to collapse: either the whole transcript already fits the
+  // budget (splitIndex never got set past 0), or the only thing before the
+  // split point is our own existing reference entry from a previous pass
+  // (re-wrapping a single reference entry into a new file gains nothing).
+  const nothingToDo = splitIndex === 0 || (splitIndex === 1 && isOwnReferenceEntry(entries[0]));
+  if (nothingToDo) {
+    return { changed: false, linesCollapsed: 0 };
+  }
+
+  const prefixLines = lines.slice(0, splitIndex);
+  const extractedPath = await writeDehydratedTextFile(workspaceDir, prefixLines.join("\n") + "\n");
+
+  // Bug fix (2026-09-09): confirmed live against real data that the
+  // conversation tree is NOT strictly linear -- 277 of 3559 entries in one
+  // real session had a parentUuid that did NOT point at the immediately
+  // preceding line (branches/retries sharing a common ancestor several
+  // lines back). Reusing just entries[splitIndex-1]'s own uuid only fixes
+  // the chain for whichever live-tail entry happens to point at THAT one
+  // uuid -- any OTHER live-tail entry whose parent is a DIFFERENT uuid
+  // somewhere in the collapsed range is left pointing at nothing. The only
+  // correct fix: find every such dangling reference across the WHOLE live
+  // tail and redirect all of them to the one new reference entry.
+  const collapsedUuids = new Set(entries.slice(0, splitIndex).map((e) => e.uuid).filter((u): u is string => typeof u === "string"));
+
+  const boundaryEntry = entries[splitIndex - 1];
+  const referenceEntry: RawEntry = {
+    ...boundaryEntry,
+    // No longer meaningful to point further back into the now-extracted
+    // prefix -- that whole chain is self-contained inside extractedPath.
+    parentUuid: null,
+    message: { ...boundaryEntry.message, content: [referenceNote(extractedPath)] },
+  };
+  if (referenceEntry.type === "assistant" && referenceEntry.message?.stop_reason === "tool_use") {
+    referenceEntry.message.stop_reason = "end_turn";
+  }
+
+  let redirected = 0;
+  const liveTail = entries.slice(splitIndex).map((entry, idx) => {
+    if (typeof entry.parentUuid === "string" && collapsedUuids.has(entry.parentUuid)) {
+      redirected++;
+      return JSON.stringify({ ...entry, parentUuid: referenceEntry.uuid });
+    }
+    return lines[splitIndex + idx];
+  });
+
+  const newLines = [JSON.stringify(referenceEntry), ...liveTail];
+  await writeFile(filePath, newLines.join("\n") + "\n", "utf-8");
+  console.error(
+    `[caroline] age-budget: session ${sessionId} collapsed ${splitIndex} old line(s) into ${extractedPath}, ` +
+      `redirected ${redirected} dangling parentUuid reference(s), ${newLines.length} line(s) remain (was ${lines.length})`,
+  );
+
+  return { changed: true, linesCollapsed: splitIndex };
 }

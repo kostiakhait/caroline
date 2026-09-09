@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, extname, sep } from "node:path";
+import { readFile as readFileAsync } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -59,10 +60,10 @@ console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js 
 configureIsolatedGitBash();
 import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, findMostRecentClaudeSessionId } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
-import { dehydratePreviousTurns } from "./dehydrate.js";
+import { dehydratePreviousTurns, agePreviousTurnsInPlace, dehydratedDir } from "./dehydrate.js";
 import { classifyParallelSafety, runParallelBranch, buildBranchReportText, deleteSessionFile } from "./parallel.js";
 import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, countDescendantProcesses } from "./processReaper.js";
-import { readRecentHistory } from "./history.js";
+import { readRecentHistory, readArchivedEntries } from "./history.js";
 
 const workspaceDir = await ensureWorkspace();
 const BACKUP_NUDGE = "Time for your periodic memory backup: if Notes is available, save your current persona/reminders/anything worth keeping into the \"Caroline:Vault\" folder now (see your system instructions). If Notes isn't available, do nothing.";
@@ -864,6 +865,15 @@ class ChatSession {
    * sites this is invoked from. `sessionId` is whatever this tab's CURRENT
    * live session id is -- undefined/null means nothing has been resumed/
    * started yet, nothing to do.
+   *
+   * Also runs agePreviousTurnsInPlace right after (2026-09-09, explicit
+   * instruction): compaction.ts's recent-content byte budget was only ever
+   * enforced by the hourly/urgent fork-based passes -- confirmed live that
+   * real content can blow past it in minutes during a busy stretch, long
+   * before the next hourly tick ever gets a chance to trim it back down.
+   * Runs AFTER dehydration on purpose -- images/documents should already be
+   * gone by the time it looks at what's left. Separate try/catch from
+   * dehydration above so a failure in one doesn't skip the other.
    */
   private async runDehydration(sessionId: string | null | undefined): Promise<void> {
     if (!sessionId) return;
@@ -882,6 +892,14 @@ class ChatSession {
       // Same "never take down the live conversation" guarantee as
       // compaction.ts -- this is optional housekeeping, log and move on.
       console.error(`[caroline] dehydrate: tab ${this.tabId} session ${sessionId} failed (ignored, will retry next turn):`, err);
+    }
+    try {
+      const budgetOutcome = await agePreviousTurnsInPlace(workspaceDir, sessionId);
+      if (budgetOutcome.changed) {
+        console.error(`[caroline] age-budget: tab ${this.tabId} session ${sessionId} linesCollapsed=${budgetOutcome.linesCollapsed}`);
+      }
+    } catch (err) {
+      console.error(`[caroline] age-budget: tab ${this.tabId} session ${sessionId} failed (ignored, will retry next turn):`, err);
     }
   }
 
@@ -2319,6 +2337,7 @@ async function handleControlRequest(
     smtp2goApiKey?: string;
     smtp2goSender?: string;
     enabled?: boolean;
+    filePath?: string;
   },
   send: (event: OutEvent) => void,
   // The session tied to whichever connection actually sent this request --
@@ -2700,6 +2719,44 @@ async function handleControlRequest(
         const entries = readRecentHistory(workspaceDir);
         console.error(`[caroline] [control:get_history] entries=${entries.length}`);
         send({ type: "control_response", op, ok: true, stdout: JSON.stringify(entries) });
+        break;
+      }
+      case "expand_dehydrated_ref": {
+        // Per explicit instruction (2026-09-09): a recovered chat bubble
+        // (get_history) that quotes one of dehydrate.ts's archive/dehydration
+        // notes is useless to a human as raw prose with a file path in it --
+        // this lets the frontend click-to-expand it in place. `filePath` is
+        // whatever chat.js pulled out of the note text client-side via the
+        // exact same regex dehydrate.ts exports (extractDehydratedFilePath) --
+        // never trust it blindly: resolve and require it to actually be
+        // inside workspace/dehydrated/ before touching the filesystem at all,
+        // since this is a path handed back by the client.
+        if (!parsed.filePath) throw new Error("expand_dehydrated_ref requires filePath");
+        const requestId = parsed.requestId;
+        const allowedDir = resolve(dehydratedDir(workspaceDir));
+        const requestedPath = resolve(String(parsed.filePath));
+        if (requestedPath !== allowedDir && !requestedPath.startsWith(allowedDir + sep)) {
+          console.error(`[caroline] [expand_dehydrated_ref] rejected path outside dehydrated/: ${requestedPath}`);
+          send({ type: "control_response", op, ok: false, stderr: "Path is not inside workspace/dehydrated/", requestId });
+          break;
+        }
+        try {
+          if (extname(requestedPath).toLowerCase() === ".txt") {
+            const entries = readArchivedEntries(requestedPath);
+            console.error(`[caroline] [expand_dehydrated_ref] text archive ${requestedPath}: ${entries.length} entries`);
+            send({ type: "control_response", op, ok: true, stdout: JSON.stringify({ kind: "text", entries }), requestId });
+          } else {
+            const bytes = await readFileAsync(requestedPath);
+            const ext = extname(requestedPath).toLowerCase().replace(".", "");
+            const mimeByExt: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf" };
+            const mimeType = mimeByExt[ext] || "application/octet-stream";
+            console.error(`[caroline] [expand_dehydrated_ref] media ${requestedPath}: ${bytes.length} bytes, mime=${mimeType}`);
+            send({ type: "control_response", op, ok: true, stdout: JSON.stringify({ kind: "media", mimeType, dataBase64: bytes.toString("base64") }), requestId });
+          }
+        } catch (err) {
+          console.error(`[caroline] [expand_dehydrated_ref] failed to read ${requestedPath}:`, err);
+          send({ type: "control_response", op, ok: false, stderr: err instanceof Error ? err.message : String(err), requestId });
+        }
         break;
       }
       default:

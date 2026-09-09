@@ -455,6 +455,71 @@
     return chip;
   }
 
+  // Per explicit instruction (2026-09-09): a recovered chat bubble
+  // (get_history) that quotes one of the backend's dehydration/archive notes
+  // is just a raw file path in prose -- useless to a human who isn't going
+  // to go find and open that file by hand. Same regex as dehydrate.ts's
+  // exported extractDehydratedFilePath -- must stay in sync with that
+  // file's note templates, since chat.js can't import a backend module.
+  function extractDehydratedFilePath(text) {
+    const m = typeof text === "string" ? text.match(/[Сс]охранен[оа] в файле: (.+?)\. /) : null;
+    return m ? m[1] : null;
+  }
+
+  let expandRequestSeq = 0;
+  const pendingExpandRequests = new Map(); // requestId -> callback(ok, parsedStdout, stderr)
+
+  /** Appends a "show more" link to `containerDiv` that fetches and inserts the referenced dehydrated content right after it, in place. */
+  function addExpandLink(containerDiv, filePath) {
+    const link = document.createElement("button");
+    link.className = "expand-dehydrated-link";
+    link.textContent = "Show archived content ▾";
+    link.addEventListener("click", () => {
+      link.disabled = true;
+      link.textContent = "Loading…";
+      const requestId = `expand-${++expandRequestSeq}`;
+      pendingExpandRequests.set(requestId, (ok, parsed, err) => {
+        pendingExpandRequests.delete(requestId);
+        if (!ok || !parsed) {
+          link.disabled = false;
+          link.textContent = "Show archived content ▾ (failed, retry)";
+          console.error("expand_dehydrated_ref failed:", err);
+          return;
+        }
+        const insertAfter = (el) => containerDiv.parentNode.insertBefore(el, containerDiv.nextSibling);
+        if (parsed.kind === "text") {
+          // Insert in original order, each right after the previous one, so
+          // the whole archived stretch reads top-to-bottom after the link.
+          let anchor = containerDiv;
+          for (const entry of parsed.entries) {
+            const sub = document.createElement("div");
+            sub.className = "bubble " + entry.role + " archived";
+            const textDiv = document.createElement("div");
+            if (entry.role === "assistant") textDiv.innerHTML = renderMarkdown(entry.text);
+            else textDiv.textContent = entry.text;
+            sub.appendChild(textDiv);
+            anchor.parentNode.insertBefore(sub, anchor.nextSibling);
+            anchor = sub;
+          }
+        } else if (parsed.kind === "media" && parsed.mimeType && parsed.mimeType.startsWith("image/")) {
+          const img = document.createElement("img");
+          img.className = "archived-image";
+          img.src = `data:${parsed.mimeType};base64,${parsed.dataBase64}`;
+          insertAfter(img);
+        } else {
+          const note = document.createElement("div");
+          note.className = "bubble system archived";
+          note.textContent = `[${parsed.mimeType || "file"} -- open manually: ${filePath}]`;
+          insertAfter(note);
+        }
+        link.remove();
+        scrollToEnd();
+      });
+      sendControl("expand_dehydrated_ref", { filePath, requestId });
+    });
+    containerDiv.appendChild(link);
+  }
+
   function addBubble(role, text, attachments, opts) {
     const ts = (opts && opts.ts) || Date.now();
     if (!opts || opts.persist !== false) saveTranscriptEntry(role, text, attachments, ts);
@@ -1051,7 +1116,9 @@
         try {
           const entries = JSON.parse(evt.stdout || "[]");
           for (const entry of entries) {
-            addBubble(entry.role, entry.text, [], { persist: true, ts: entry.ts });
+            const div = addBubble(entry.role, entry.text, [], { persist: true, ts: entry.ts });
+            const filePath = extractDehydratedFilePath(entry.text);
+            if (filePath) addExpandLink(div, filePath);
           }
           if (entries.length > 0) addStatusLine("— earlier conversation restored —");
         } catch { /* leave the chat empty rather than show garbage */ }
@@ -1215,6 +1282,12 @@
       if (!evt.ok) addBanner(`Could not transcribe audio: ${evt.stderr || "unknown error"}`);
     } else if (evt.op === "open_file") {
       if (!evt.ok) addBanner(`Could not open that file: ${evt.stderr || "unknown error"}`);
+    } else if (evt.op === "expand_dehydrated_ref") {
+      const cb = pendingExpandRequests.get(evt.requestId);
+      pendingExpandRequests.delete(evt.requestId);
+      let parsed = null;
+      try { parsed = evt.ok ? JSON.parse(evt.stdout || "null") : null; } catch { parsed = null; }
+      cb?.(evt.ok, parsed, evt.stderr);
     }
   }
 
