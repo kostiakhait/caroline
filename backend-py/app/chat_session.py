@@ -388,6 +388,36 @@ def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
     asyncio.ensure_future(_run())
 
 
+# Bug fix (2026-09-10): confirmed live -- ClaudeAgentOptions.settings is a
+# PATH TO A SETTINGS JSON FILE ("Equivalent to the --settings CLI flag"),
+# not raw JSON content. The previous code passed
+# json.dumps({"autoCompactEnabled": True}) directly as this value, which
+# the CLI would have tried to open as a literal filename -- so
+# autoCompactEnabled was never actually communicated to the CLI at all,
+# in either direction, ever (this exact same bug already existed
+# pre-Stage-B, where the intent was the opposite: explicitly disabling it
+# for non-own-anthropic sources). Confirmed via logs: the PreCompact hook
+# never fired even once after this session's own native-compaction
+# rollout, while one real tab's session file grew unbounded to 6.5MB+.
+# Real fix: write an actual settings.json file once and pass its real
+# path. Content is static, so this only needs to happen once per
+# workspace, not per query() -- re-checked cheaply every call in case the
+# file is ever missing (a fresh install, a cleared workspace).
+_SETTINGS_FILE_NAME = "caroline-settings.json"
+_SETTINGS_FILE_CONTENT = json.dumps({"autoCompactEnabled": True})
+
+
+def _ensure_settings_file(workspace_dir: str) -> str:
+    path = Path(workspace_dir) / _SETTINGS_FILE_NAME
+    try:
+        if not path.exists() or path.read_text(encoding="utf-8") != _SETTINGS_FILE_CONTENT:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_SETTINGS_FILE_CONTENT, encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "settings_file_write_failed", error=str(exc))
+    return str(path)
+
+
 class ChatSession:
     def __init__(self, tab_id: str, workspace_dir: str, send: SendFn) -> None:
         self.tab_id = tab_id
@@ -1140,7 +1170,10 @@ class ChatSession:
                     # Claude's own native auto-compaction handles context
                     # ageing now -- explicitly on, and one long-lived client
                     # across turns (no per-turn transcript rewrite/restart).
-                    "settings": json.dumps({"autoCompactEnabled": True}),
+                    # settings wants a FILE PATH, not raw JSON -- see
+                    # _ensure_settings_file's own docstring for the bug this
+                    # fixes.
+                    "settings": _ensure_settings_file(self.workspace_dir),
                     "hooks": {"PreCompact": [HookMatcher(hooks=[self._pre_compact_hook])]},
                 }
                 if anthropic_env:
