@@ -853,6 +853,21 @@ class ChatSession:
                     lines = _usable_lines(read_archived_entries(archive_path)) + lines
                 except Exception as exc:
                     log_event("engine", "progress_narration_archive_read_failed", tab_id=self.tab_id, path=archive_path, error=str(exc))
+
+        # Bug fix (2026-09-10): confirmed live -- the disk-persisted
+        # transcript doesn't yet contain a real user message that's merely
+        # QUEUED (submitted but not yet consumed/flushed by the CLI, e.g.
+        # because this tab's query() is still stuck resuming). The
+        # narrator then only ever saw Caroline's OWN earlier turn and
+        # reacted to nothing the user actually just said -- reading as if
+        # she'd lost track of their answer entirely. Always make sure the
+        # most recent real question is represented as the LAST line,
+        # appending it if the disk read didn't already surface it.
+        if self.last_real_user_question:
+            question = self.last_real_user_question.strip()
+            if not lines or question not in lines[-1]:
+                lines.append(f"User: {question}")
+
         return "\n".join(lines[-limit:])
 
     async def _check_progress_narration(self) -> None:
@@ -882,9 +897,10 @@ class ChatSession:
         self.last_visible_output_at = now  # claim this tick immediately -- a slow ai:resolve call must not let a second tick double-fire
         from app.plugins.voice_api import generate_progress_comment
 
+        # _gather_recent_dialogue_for_narration always includes
+        # last_real_user_question (guaranteed non-empty here, checked
+        # above), so dialogue is never empty by construction.
         dialogue = self._gather_recent_dialogue_for_narration()
-        if not dialogue:
-            dialogue = f"User: {self.last_real_user_question}"
         log_event("engine", "progress_narration_context", tab_id=self.tab_id, dialogue_chars=len(dialogue), dialogue_preview=dialogue[-300:])
         try:
             comment = await generate_progress_comment(dialogue, current_language_name(self.tab_id))

@@ -185,8 +185,10 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
         "would: add a real, specific thought connected to what's being discussed -- a relevant detail, a "
         "follow-up angle, a small observation -- not a generic placeholder that could fit any conversation.\n\n"
         f"Here is the real recent conversation between her and the user (oldest first):\n---\n{recent_dialogue}\n---\n\n"
-        f"Write ONE short, natural sentence (two at most), in first person, speaking directly to the user, "
-        f"in {language}. Reply with ONLY that sentence, nothing else -- no quotes, no preamble."
+        "Write ONE short, natural sentence (two at most), in first person, speaking directly to the user. "
+        "Reply in the SAME language the conversation above is written in -- read it directly off those "
+        f"messages, don't guess a different one. Only if the conversation above gives no usable signal at "
+        f"all, default to {language}. Reply with ONLY that sentence, nothing else -- no quotes, no preamble."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:

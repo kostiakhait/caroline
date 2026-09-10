@@ -3,7 +3,7 @@ API (see d:/REPO/reforce/API/Api2EmailCommands.py) rather than any local
 IMAP/SMTP client. Camerlengo does the actual IMAP/SMTP work but stores
 NOTHING itself (2026-09-10, per explicit instruction: it's a stateless
 RESTful API, no server-side account table, ever) -- every operation below
-takes the full mailbox credentials (password/imapServer/...) as ordinary
+takes the full mailbox credentials (password/imapHost/...) as ordinary
 required parameters, passed straight through to Camerlengo on every call.
 
 Per explicit instruction (2026-09-10): there is deliberately no separate
@@ -16,6 +16,21 @@ reads or writes them itself.
 Every command still requires a Camerlengo session (`auth: user_role`) --
 that identifies the CALLER for abuse-prevention/logging, unrelated to
 which mailbox credentials are being operated on.
+
+Bug fix (2026-09-10): a real send failed 3/3 tries with a confusing SMTP/TLS
+error. Root cause: Camerlengo silently reused the IMAP host as the SMTP host
+whenever smtpServer was omitted (fixed server-side too, in
+Api2EmailCommands.py -- it now rejects a missing smtpServer explicitly
+instead of guessing wrong). On this side: the tool's own params were named
+imapServer/smtpServer while the actual credential notes already in use
+store imapHost/smtpHost -- not a naming confusion the model needs help
+with (it maps synonyms fine), but renamed to match anyway, on the theory
+that removing an unnecessary translation step removes one more place a
+field can silently get dropped. The instructions below now say explicitly:
+fill in EVERY field this tool asks for, matching by MEANING against
+whatever a credential source actually calls it (imapHost/imap_host/"IMAP
+server"/etc. are all the same field) -- never skip one just because a
+source's exact wording doesn't match this tool's own parameter name.
 """
 
 from __future__ import annotations
@@ -38,11 +53,16 @@ _ACCOUNT_PARAM_NOTE = (
 
 
 def _creds_kwargs(args: dict[str, Any]) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"address": args["address"], "password": args["password"], "imapServer": args["imapServer"]}
+    """Tool-facing param names are imapHost/smtpHost (renamed 2026-09-10,
+    see this plugin's own module docstring) -- translated to Camerlengo's
+    existing wire field names (imapServer/smtpServer) here, at the one
+    boundary that needs to know both, so Camerlengo's own API contract
+    doesn't have to change."""
+    kwargs: dict[str, Any] = {"address": args["address"], "password": args["password"], "imapServer": args["imapHost"]}
     if args.get("imapPort") is not None:
         kwargs["imapPort"] = args["imapPort"]
-    if args.get("smtpServer"):
-        kwargs["smtpServer"] = args["smtpServer"]
+    if args.get("smtpHost"):
+        kwargs["smtpServer"] = args["smtpHost"]
     if args.get("smtpPort") is not None:
         kwargs["smtpPort"] = args["smtpPort"]
     return kwargs
@@ -177,12 +197,18 @@ def _credentials_convention_instruction() -> str:
         'already use for everything else, never through an email-specific adapter. The convention: one note '
         'per mailbox, in folder "Claude Credentials", titled exactly "vault:email:<address>" (e.g. '
         '"vault:email:kostia.khait@gmail.com"), with the rest of the note\'s text being a single-line JSON '
-        'object: {"password": "...", "imapServer": "...", "imapPort": 993, "smtpServer": "...", "smtpPort": 587} '
-        "(imapPort/smtpServer/smtpPort are optional). Before calling ANY other tool in this plugin for a given "
-        "address, you MUST look up that note first (notes_search or notes_list on that folder) and pass its "
-        "password/imapServer/imapPort/smtpServer/smtpPort straight through as this tool's own parameters -- "
-        "never invent, guess, or omit them. If the user gives you a new mailbox's credentials to use, save them "
-        "yourself via notes_create in exactly this format before using them."
+        'object: {"password": "...", "imapHost": "...", "imapPort": 993, "smtpHost": "...", "smtpPort": 587}. '
+        "Before calling ANY other tool in this plugin for a given address, you MUST look up that note first "
+        "(notes_search or notes_list on that folder).\n\n"
+        "Fill in EVERY field this tool asks for -- match a saved note's (or the user's own) fields to this "
+        "tool's parameters BY MEANING, not by requiring an identical spelling: \"imapHost\"/\"imap_host\"/\"IMAP "
+        "server\" are all the same thing as this tool's imapHost parameter, and likewise for smtpHost. Never "
+        "skip a field just because a source you're reading happened to phrase it differently, and never treat "
+        "smtpHost as skippable or assume it equals imapHost -- real providers almost always use two DIFFERENT "
+        "hosts for IMAP vs. SMTP (e.g. Gmail: imap.gmail.com vs. smtp.gmail.com); omitting or guessing it wrong "
+        "breaks sending with a confusing low-level error instead of a clear one. If the user gives you a new "
+        "mailbox's credentials to use, save them yourself via notes_create in exactly this format before using "
+        "them, translating whatever they call each field into this convention's own names."
     )
 
 
@@ -219,8 +245,8 @@ def _usage_instructions() -> str:
 
 
 _CREDENTIAL_PARAMS = {
-    "address": str, "password": str, "imapServer": str,
-    "imapPort": int | None, "smtpServer": str | None, "smtpPort": int | None,
+    "address": str, "password": str, "imapHost": str,
+    "imapPort": int | None, "smtpHost": str | None, "smtpPort": int | None,
 }
 
 
@@ -285,14 +311,18 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "email_send",
-            "Sends an email via Camerlengo. Pass address/password/imapServer(+imapPort/smtpServer/smtpPort) "
-            "to authenticate as one of YOUR OWN mailboxes (own SMTP creds, own From, a Sent-folder copy); "
-            'omit all of them to relay through the shared no_reply@partners.solutions identity instead. Use '
-            "`from` to set a different display From header while still authenticating as `address` -- "
-            "double-check they match the identity you intend before sending.",
+            "Sends an email via Camerlengo. To authenticate as one of YOUR OWN mailboxes (own SMTP creds, own "
+            "From, a Sent-folder copy), pass ALL of address/password/imapHost/smtpHost together -- these are "
+            "not independently optional, and smtpHost is NOT the same host as imapHost for real providers "
+            "(e.g. Gmail: imap.gmail.com vs. smtp.gmail.com) -- a saved credential note has every one of these "
+            "fields, look it up and pass all four rather than sending with some of them missing. Omit ALL of "
+            "them together to relay through the shared no_reply@partners.solutions identity instead (no "
+            "mailbox authentication, no Sent-folder copy). Use `from` to set a different display From header "
+            "while still authenticating as `address` -- double-check they match the identity you intend "
+            "before sending.",
             {
-                "address": str | None, "password": str | None, "imapServer": str | None,
-                "imapPort": int | None, "smtpServer": str | None, "smtpPort": int | None,
+                "address": str | None, "password": str | None, "imapHost": str | None,
+                "imapPort": int | None, "smtpHost": str | None, "smtpPort": int | None,
                 "to": list, "subject": str, "from": str | None,
                 "text": str | None, "html": str | None, "cc": list | None, "bcc": list | None,
                 "attachments": list | None, "inReplyTo": str | None, "references": list | None,
