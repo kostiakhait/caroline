@@ -3,7 +3,7 @@
   // sent to the backend right after connect (see "client_diag" below) and
   // logged server-side, purely so a stale-cache suspicion can be confirmed
   // or ruled out from caroline.log alone, with zero UI interaction needed.
-  const CHAT_JS_VERSION = "2026-09-09-image-autorecover-3-wsrace-fix";
+  const CHAT_JS_VERSION = "2026-09-10-client-log-bridge";
   const port = new URLSearchParams(location.search).get("port") || "8765";
   // Which tab this WebView2 instance belongs to (see MainWindow's tab strip,
   // each tab navigates to chat.html?tab=<id>) -- threaded into the WS URL so
@@ -12,6 +12,25 @@
   // below so tabs sharing one WebView2 profile/origin don't overwrite each
   // other's chat history.
   const tabId = new URLSearchParams(location.search).get("tab") || "1";
+
+  // Bug fix (2026-09-10): confirmed live -- chat.js's own console.log/error
+  // never reached caroline.log at all (browser-console only, invisible
+  // without live DevTools access), which made a real Visual Mode failure
+  // (permanently falling back to plain audio) undiagnosable from logs
+  // alone. Routes through the SAME native WebView2 bridge every other
+  // postMessage in this file already uses -- MainWindow.xaml.cs's
+  // OnWebMessageReceived writes it straight into Logger.Log, landing in
+  // the same combined caroline.log stream as the backend's own logs.
+  // Always also does a plain console.log (harmless, still useful with
+  // DevTools attached) -- the postMessage is best-effort on top, never
+  // required for the log to at least exist somewhere.
+  function clog(message, extra) {
+    const line = extra !== undefined ? `${message} ${JSON.stringify(extra)}` : message;
+    console.log(`[caroline] ${line}`);
+    try {
+      if (window.chrome?.webview) window.chrome.webview.postMessage({ type: "client_log", tabId, message: line });
+    } catch { /* best-effort only -- logging itself must never break anything */ }
+  }
   // Native/WPF-only setting (MainWindow.Topmost) -- the backend has no stake in it at
   // all, so it's read once, synchronously, from the query string MainWindow.xaml.cs
   // already stamps onto this page's own URL, same as port/tab above, rather than
@@ -908,6 +927,12 @@
     return new Promise((resolve) => {
       const useVisual = shouldUseVisualMode(btn);
       const requestId = `tts-${++ttsRequestSeq}`;
+      clog(`playOneSpeech requestId=${requestId} scheme=${useVisual ? "visual" : "plain-audio"}`, {
+        visualModeEnabled: visualModeState.enabled,
+        visualModeAvailable: visualModeState.available,
+        hasWebview: !!window.chrome?.webview,
+        textLen: text.length,
+      });
       const entry = { btn, audio: null, aborted: false, resolveQueue: resolve, visual: useVisual, requestId };
       activeSpeech = entry;
       btn?.classList.add("speaking");
@@ -2060,12 +2085,16 @@
         const pending = pendingVisualDone.get(data.requestId);
         if (pending) {
           pendingVisualDone.delete(data.requestId);
+          clog(`visual_speech_done requestId=${data.requestId} played=${data.played}`);
           if (data.played === false) {
             // Visual playback didn't happen (model not warmed yet, or render/
             // playback failed natively) -- fall back to plain audio instead of
             // leaving this reply silent. Confirmed live (2026-09-03): right
             // after a restart the model can still be warming up when the
-            // first voice reply comes in.
+            // first voice reply comes in. The native side (VisualModeManager.cs)
+            // logs the specific reason for this fallback itself, right before
+            // posting visual_speech_done -- see caroline.log around this
+            // same requestId for "signaling fallback" / the exact cause.
             playAudioBase64(pending.base64, pending.entry, pending.onDone);
           } else {
             if (activeSpeech === pending.entry) activeSpeech = null;

@@ -83,6 +83,7 @@ _ratatosk_turn_got_reply = False
 # since which tabs existed last run isn't known until each one's WS
 # connection arrives and says its own tabId.
 _has_greeted = False
+_has_sent_visual_mode_config = False
 _resumed_unfinished_turn_for_tab: set[str] = set()
 
 
@@ -706,6 +707,25 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     await session.start()
 
     await websocket.send_json({"type": "caroline_status", "status": "connected"})
+
+    # Bug fix (2026-09-10): confirmed live -- this was never ported from
+    # server.ts at all (flagged as a known gap in the migration plan and
+    # never circled back to). Without it, VisualModeManager.Configure()
+    # (Windows/Caroline/VisualModeManager.cs) never runs, the render model
+    # never warms up, and EVERY Visual Mode attempt permanently falls back
+    # to plain audio (confirmed live: "HandleAudioAsync -- model not
+    # warmed (yet), signaling fallback." on 3/3 real TTS calls, even
+    # though visual_mode_is_enabled/resolve_model both correctly reported
+    # true). Sent once per backend-process lifetime, primary tab only --
+    # same scope as the startup greeting below, matches server.ts exactly
+    # (hasSentVisualModeConfig).
+    global _has_sent_visual_mode_config
+    if tab_id == PRIMARY_TAB_ID and not _has_sent_visual_mode_config:
+        _has_sent_visual_mode_config = True
+        vm_enabled = is_visual_mode_enabled(WORKSPACE_DIR)
+        vm_model = resolve_visual_model(WORKSPACE_DIR)
+        log_event("engine", "visual_mode_config_sent", enabled=vm_enabled, model_path=(vm_model or {}).get("modelPath"))
+        await websocket.send_json({"type": "visual_mode_config", "enabled": vm_enabled, "modelPath": (vm_model or {}).get("modelPath")})
 
     # Per explicit instruction: Caroline must never come back up silently.
     # Fires once per backend-process lifetime, tied to the primary tab.

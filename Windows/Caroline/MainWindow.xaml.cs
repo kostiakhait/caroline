@@ -928,6 +928,19 @@ public partial class MainWindow : Window
             var type = root.GetProperty("type").GetString();
             Logger.Log($"MainWindow: OnWebMessageReceived type={type ?? "null"}");
 
+            if (type == "client_log")
+            {
+                // Bug fix (2026-09-10): chat.js's own console.log/error never
+                // reached caroline.log at all before this -- see chat.js's
+                // clog() for why. Written with a distinct "chat.js:" prefix
+                // (not "MainWindow:") so it reads as the client's own voice
+                // in the combined log, not this class's.
+                var tabIdForLog = root.TryGetProperty("tabId", out var t) ? t.GetString() : "?";
+                var clientMessage = root.TryGetProperty("message", out var m) ? m.GetString() : "";
+                Logger.Log($"chat.js[tab={tabIdForLog}]: {clientMessage}");
+                return;
+            }
+
             if (type == "open_login")
             {
                 OnOpenLogin(webView, root);
