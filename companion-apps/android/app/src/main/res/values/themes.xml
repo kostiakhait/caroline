@@ -1,0 +1,13 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Compose (ui/theme/Theme.kt) owns the actual palette/typography; this
+         is only the pre-Compose window theme AndroidManifest.xml references
+         (splash background, status bar) before the first Composable draws. -->
+    <!-- Plain platform theme (no DayNight variant; that's an AppCompat/
+         Material Components concept, not a raw android: framework
+         resource, and this project pulls in neither library). Compose
+         fully repaints over this at runtime via CarolineCompanionTheme;
+         this only has to be valid, not final. -->
+    <style name="Theme.CarolineCompanion" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>

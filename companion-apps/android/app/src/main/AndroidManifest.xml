@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Requested at runtime, behind the consent screen (see the plan's own
+         Phase 3 notes); declared here only. NOT the default SMS app: these
+         three permissions are enough to send, read the existing content://sms
+         provider, and receive new incoming SMS, without implementing the
+         SmsProvider-compatible UI components the default-handler role needs. -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- TODO: real launcher icon; @android:drawable/sym_def_app_icon below is
+         a system placeholder; the real Caroline art lives in the main repo's
+         art/ directory. -->
+    <application
+        android:name=".CompanionApplication"
+        android:allowBackup="false"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.CarolineCompanion"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.CarolineCompanion">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Phase 3 TODO (not wired yet, see companion-apps/android/README.md):
+             SmsReceiver (SMS_RECEIVED broadcast, new incoming mail) and the
+             foreground polling Service belong here once built. -->
+
+    </application>
+
+</manifest>
