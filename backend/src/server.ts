@@ -46,7 +46,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, taskCompletionMemoryInstruction, proactiveContextRecoveryInstruction, continuityPointerInstruction, compactionPointerInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, taskCompletionMemoryInstruction, proactiveContextRecoveryInstruction, noInternalMechanicsToUserInstruction, continuityPointerInstruction, compactionPointerInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -1600,9 +1600,10 @@ class ChatSession {
               timestampAwarenessInstruction(),
               noAlarmingInternalRecoveryInstruction(),
               proactiveContextRecoveryInstruction(),
+              noInternalMechanicsToUserInstruction(),
               continuityPointerInstruction(loadTabContinuityArchive(workspaceDir, this.tabId)),
               compactionPointerInstruction(compactionNote.parentPath, compactionNote.compactedAtIso),
-              languageHintInstruction(currentLanguageName()),
+              languageHintInstruction(currentLanguageName(this.tabId)),
               noUpdateSentinelInstruction(),
               embeddedBrowserInstruction(),
               noFullFilesystemSearchInstruction(),
@@ -1881,11 +1882,14 @@ class ChatSession {
             }
           }
           if (!this.silentTurn) {
-            if (message.type === "result") {
-              console.error(`[caroline] [transcript] result: isVoice=${this.turnIsVoice} silentTurn=${this.silentTurn}`);
-              this.send({ type: "sdk_message", message, isVoice: this.turnIsVoice });
-            } else {
-              this.send({ type: "sdk_message", message });
+            const clean = stripNoUpdateFromMessage(message);
+            if (clean !== null) {
+              if (clean.type === "result") {
+                console.error(`[caroline] [transcript] result: isVoice=${this.turnIsVoice} silentTurn=${this.silentTurn}`);
+                this.send({ type: "sdk_message", message: clean, isVoice: this.turnIsVoice });
+              } else {
+                this.send({ type: "sdk_message", message: clean });
+              }
             }
           }
           // Reset to true ("assume silent"), not false -- see silentTurn's doc comment.
@@ -2080,7 +2084,7 @@ class ChatSession {
             // (currentLanguageName(), synchronous, instant) in its own
             // system prompt. Just kick off a background refresh so the NEXT
             // reset/turn has the freshest possible hint too.
-            refreshLanguageInBackground();
+            refreshLanguageInBackground(this.tabId);
             console.error(`[caroline] tab=${this.tabId} replaying the turn that hit the unrecoverable error: ${truncateForLog(replayText)}`);
             this.submit(replayText, replayAttachments, true, false, this.turnIsVoice);
           } else {
@@ -2316,7 +2320,7 @@ class ChatSession {
       // multi-second await here, but this pendingUserText re-check is kept
       // regardless as cheap insurance against a real message queued by some
       // other earlier await in this same handler.
-      const lang = currentLanguageName();
+      const lang = currentLanguageName(this.tabId);
       if (this.pendingUserText !== null) {
         // The real message that just appeared will get its own normal
         // submit() turn (not through here), which never sees watchdogNote --
@@ -2326,7 +2330,7 @@ class ChatSession {
         this.injectProactive(watchdogNote, true);
       } else {
         console.error(`[caroline] handleFailure: no pendingUserText -- injecting continue-or-silent nudge (lang=${lang})`);
-        refreshLanguageInBackground();
+        refreshLanguageInBackground(this.tabId);
         this.injectProactive(`${watchdogNote}\n\n${CONTINUE_OR_SILENT_NUDGE_TEMPLATE.replace("{LANGUAGE}", lang)}`, false);
       }
     }
@@ -2389,12 +2393,20 @@ class ChatSession {
 // hardcoded ru/en binary -- any non-empty string is accepted, since the
 // nudge templates below are no longer collapsed to two prewritten variants
 // either. Kept as its own tiny file in the workspace, same as before.
-const LAST_LANGUAGE_PATH = join(workspaceDir, "last-language.json");
+// Bug fix (2026-09-10): this used to be ONE file shared by every open tab
+// -- confirmed live, with 3 tabs open, whichever tab's background
+// language-refresh finished last silently overwrote the language for ALL
+// of them, including tabs mid-conversation in a different language. Now
+// per-tab, same pattern as durability.ts's own per-tab files.
+function lastLanguagePath(tabId: string): string {
+  return join(workspaceDir, `last-language-${tabId.replace(/[^a-zA-Z0-9_-]/g, "_") || "default"}.json`);
+}
 
-function loadPersistedLanguage(): string | null {
+function loadPersistedLanguage(tabId: string): string | null {
   try {
-    if (!existsSync(LAST_LANGUAGE_PATH)) return null;
-    const data = JSON.parse(readFileSync(LAST_LANGUAGE_PATH, "utf-8")) as { lang?: string };
+    const p = lastLanguagePath(tabId);
+    if (!existsSync(p)) return null;
+    const data = JSON.parse(readFileSync(p, "utf-8")) as { lang?: string };
     return typeof data.lang === "string" && data.lang.trim() ? data.lang.trim() : null;
   } catch (err) {
     console.error("[caroline] loadPersistedLanguage: read/parse failed (ignored):", err);
@@ -2402,9 +2414,9 @@ function loadPersistedLanguage(): string | null {
   }
 }
 
-function savePersistedLanguage(lang: string): void {
+function savePersistedLanguage(tabId: string, lang: string): void {
   try {
-    writeFileSync(LAST_LANGUAGE_PATH, JSON.stringify({ lang }, null, 2) + "\n", "utf-8");
+    writeFileSync(lastLanguagePath(tabId), JSON.stringify({ lang }, null, 2) + "\n", "utf-8");
   } catch (err) {
     console.error("[caroline] savePersistedLanguage: write failed (ignored):", err);
   }
@@ -2446,8 +2458,8 @@ function isSyntheticHistoryText(rawText: string): boolean {
  * silently fell back to hardcoded "english" regardless of the real (usually
  * Russian) conversation.
  */
-function currentLanguageName(): string {
-  return loadPersistedLanguage() ?? "English";
+function currentLanguageName(tabId: string): string {
+  return loadPersistedLanguage(tabId) ?? "English";
 }
 
 /**
@@ -2462,7 +2474,7 @@ function currentLanguageName(): string {
  * languageHintInstruction/currentLanguageName, per explicit instruction
  * ("результат... передавать в системном промпте на следующем ходу").
  */
-function refreshLanguageInBackground(): void {
+function refreshLanguageInBackground(tabId: string): void {
   try {
     const entries = readRecentHistory(workspaceDir, 50);
     const recentTexts: string[] = [];
@@ -2474,8 +2486,8 @@ function refreshLanguageInBackground(): void {
     resolveUserLanguage(recentTexts.join("\n---\n"))
       .then((name) => {
         if (name) {
-          console.error(`[caroline] refreshLanguageInBackground: resolved "${name}"`);
-          savePersistedLanguage(name);
+          console.error(`[caroline] refreshLanguageInBackground: tab ${tabId} resolved "${name}"`);
+          savePersistedLanguage(tabId, name);
         }
       })
       .catch((err) => console.error("[caroline] refreshLanguageInBackground: resolveUserLanguage threw:", err));
@@ -2487,6 +2499,36 @@ function refreshLanguageInBackground(): void {
 const CONTINUE_OR_SILENT_NUDGE_TEMPLATE =
   "Continue any unfinished work, if there is any. If not, do nothing and reply with exactly [[NO_UPDATE]], with " +
   "no explanation. Reply in {LANGUAGE}.";
+
+const NO_UPDATE_SENTINEL = "[[NO_UPDATE]]";
+
+/**
+ * Per explicit instruction (2026-09-10): NOTHING containing the [[NO_UPDATE]]
+ * sentinel (see noUpdateSentinelInstruction / CONTINUE_OR_SILENT_NUDGE_TEMPLATE)
+ * may ever reach the user-visible dialog -- filter it out server-side here,
+ * not only in chat.js, so an old/cached client can't leak it either.
+ * Substring match, not exact equality: the model doesn't always reply with
+ * ONLY the sentinel. Returns the message with offending text blocks removed,
+ * or null if that empties an assistant message of everything worth showing.
+ */
+function stripNoUpdateFromMessage(message: SDKMessage): SDKMessage | null {
+  if (message.type === "assistant") {
+    const content = (message as any).message?.content ?? [];
+    const kept = content.filter(
+      (b: any) => !(b && b.type === "text" && typeof b.text === "string" && b.text.includes(NO_UPDATE_SENTINEL)),
+    );
+    if (kept.length === content.length) return message;
+    if (!kept.some((b: any) => b && (b.type === "text" || b.type === "tool_use"))) return null;
+    return { ...(message as any), message: { ...(message as any).message, content: kept } } as SDKMessage;
+  }
+  if (message.type === "result") {
+    const r = (message as any).result;
+    if (typeof r === "string" && r.includes(NO_UPDATE_SENTINEL)) {
+      return { ...(message as any), result: "" } as SDKMessage;
+    }
+  }
+  return message;
+}
 
 /**
  * Static (never routed through the model -- see handleBalanceExhausted's doc
@@ -3224,10 +3266,10 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   // resolve-based-language-detection plan).
   if (tabId === PRIMARY_TAB_ID && !hasGreeted) {
     hasGreeted = true;
-    const lang = currentLanguageName();
+    const lang = currentLanguageName(tabId);
     console.error(`[caroline] wss connection: sending startup greeting (lang=${lang})`);
     session.injectProactive(STARTUP_GREETING_NUDGE_TEMPLATE.replace("{LANGUAGE}", lang), false);
-    refreshLanguageInBackground();
+    refreshLanguageInBackground(tabId);
   }
 
   if (!resumedUnfinishedTurnForTab.has(tabId)) {

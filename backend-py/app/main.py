@@ -669,10 +669,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
         from app.durability import load_tab_session_id
         recent_session_id = load_tab_session_id(WORKSPACE_DIR, PRIMARY_TAB_ID)
-        lang = current_language_name()
+        lang = current_language_name(PRIMARY_TAB_ID)
         log_event("engine", "startup_greeting", lang=lang)
         session.inject_proactive(STARTUP_GREETING_NUDGE_TEMPLATE.format(language=lang), False)
-        refresh_language_in_background(recent_session_id)
+        refresh_language_in_background(recent_session_id, PRIMARY_TAB_ID)
 
     # Survives a FULL app restart (not just this backend's own in-process
     # watchdog restart, which ChatSession's own failure handling already

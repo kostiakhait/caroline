@@ -67,6 +67,7 @@ win_subprocess_patch.apply()
 from app.compaction import compact_session_if_due, get_session_file_size_bytes
 from app.dehydrate import age_previous_turns_in_place, dehydrate_previous_turns
 from app.durability import (
+    _sanitize_tab_id,
     claude_project_dir,
     clear_pending_turn,
     clear_tab_continuity_archive,
@@ -213,24 +214,64 @@ def _epoch_ms_to_iso(epoch_ms: float) -> str:
     return datetime.fromtimestamp(epoch_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _last_language_path() -> Path:
-    return Path(WORKSPACE_DIR) / "last-language.json"
+_NO_UPDATE_SENTINEL = "[[NO_UPDATE]]"
 
 
-def _load_persisted_language() -> str | None:
+def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-09-10): NOTHING containing the
+    [[NO_UPDATE]] sentinel (see no_update_sentinel_instruction /
+    CONTINUE_OR_SILENT_NUDGE_TEMPLATE) may ever reach the user-visible
+    dialog -- filter it out server-side here, not only in chat.js, so an
+    old/cached client can't leak it either. Substring match, not exact
+    equality: the model doesn't always reply with ONLY the sentinel.
+    Returns the wire with offending text blocks removed, or None if that
+    empties an assistant message of everything worth showing."""
+    kind = wire.get("type")
+    if kind == "assistant":
+        content = wire.get("message", {}).get("content", [])
+        kept = [
+            b for b in content
+            if not (isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str) and _NO_UPDATE_SENTINEL in b["text"])
+        ]
+        if len(kept) == len(content):
+            return wire
+        if not any(isinstance(b, dict) and b.get("type") in ("text", "tool_use") for b in kept):
+            return None  # nothing left the user should see
+        wire["message"]["content"] = kept
+        return wire
+    if kind == "result":
+        result_text = wire.get("result")
+        if isinstance(result_text, str) and _NO_UPDATE_SENTINEL in result_text:
+            wire["result"] = ""
+        return wire
+    return wire
+
+
+def _last_language_path(tab_id: str) -> Path:
+    # Bug fix (2026-09-10): this used to be ONE file shared by every open
+    # tab -- confirmed live, with 3 tabs open, whichever tab's background
+    # language-refresh finished last silently overwrote the language for
+    # ALL of them, including tabs having a completely unrelated
+    # conversation in a different language. Same per-tab-file pattern as
+    # tab-session-<id>.json etc. in durability.py.
+    return Path(WORKSPACE_DIR) / f"last-language-{_sanitize_tab_id(tab_id)}.json"
+
+
+def _load_persisted_language(tab_id: str) -> str | None:
     try:
-        data = json.loads(_last_language_path().read_text(encoding="utf-8"))
+        data = json.loads(_last_language_path(tab_id).read_text(encoding="utf-8"))
         lang = data.get("lang")
         return lang.strip() if isinstance(lang, str) and lang.strip() else None
     except Exception:
         return None
 
 
-def _save_persisted_language(lang: str) -> None:
+def _save_persisted_language(tab_id: str, lang: str) -> None:
     try:
-        _last_language_path().write_text(json.dumps({"lang": lang}, indent=2) + "\n", encoding="utf-8")
+        _last_language_path(tab_id).write_text(json.dumps({"lang": lang}, indent=2) + "\n", encoding="utf-8")
     except Exception as exc:
-        log_event("engine", "save_persisted_language_failed", error=str(exc))
+        log_event("engine", "save_persisted_language_failed", tab_id=tab_id, error=str(exc))
 
 
 # --- attachments -------------------------------------------------------
@@ -307,7 +348,7 @@ def _read_recent_history_texts(session_id: str | None, limit: int = 50) -> list[
     return texts
 
 
-def current_language_name() -> str:
+def current_language_name(tab_id: str) -> str:
     """Redesign (2026-09-09, see the resolve-based-language-detection plan):
     synchronous, instant, no network call -- just whatever was last
     actually resolved (see refresh_language_in_background), or "English" if
@@ -315,18 +356,21 @@ def current_language_name() -> str:
     detect_recent_language(), which raced a real API call against a
     3-second timeout and lost that race 100% of the time under real load
     on the TS side (confirmed live, 2026-09-09) -- ported here directly
-    rather than porting that same bug first."""
-    return _load_persisted_language() or "English"
+    rather than porting that same bug first. Per-tab (2026-09-10 fix, see
+    _last_language_path's own docstring) -- one tab's language never
+    leaks into another's."""
+    return _load_persisted_language(tab_id) or "English"
 
 
-def refresh_language_in_background(session_id: str | None) -> None:
+def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
     """Fire-and-forget: gathers the last 5 non-synthetic history entries and
     asks resolve_user_language (Camerlengo's ai:resolve, NOT
     ai:detectLanguage) what language the user is actually writing in. Never
     awaited by any caller and carries no timeout of its own beyond
     resolve_user_language's own leak-prevention ceiling -- whatever it
     manages to persist simply becomes visible on the NEXT query()
-    construction via language_hint_instruction/current_language_name."""
+    construction via language_hint_instruction/current_language_name, for
+    THIS SAME tab only."""
     from app.plugins.voice_api import resolve_user_language
 
     async def _run() -> None:
@@ -343,8 +387,8 @@ def refresh_language_in_background(session_id: str | None) -> None:
                 return
             name = await resolve_user_language("\n---\n".join(recent_texts))
             if name:
-                log_event("engine", "language_resolved", language=name)
-                _save_persisted_language(name)
+                log_event("engine", "language_resolved", tab_id=tab_id, language=name)
+                _save_persisted_language(tab_id, name)
         except Exception as exc:
             log_event("engine", "refresh_language_in_background_failed", error=str(exc))
 
@@ -991,13 +1035,13 @@ class ChatSession:
             # redesign) -- this pending_user_text re-check is kept regardless
             # as cheap insurance against a real message queued by some other
             # earlier await in this same handler.
-            lang = current_language_name()
+            lang = current_language_name(self.tab_id)
             if self.pending_user_text is not None:
                 log_event("engine", "handle_failure_real_message_arrived_before_nudge", tab_id=self.tab_id)
                 self.inject_proactive(watchdog_note, True)
             else:
                 log_event("engine", "handle_failure_continue_or_silent_nudge", tab_id=self.tab_id, lang=lang)
-                refresh_language_in_background(self.last_saved_session_id)
+                refresh_language_in_background(self.last_saved_session_id, self.tab_id)
                 self.inject_proactive(f"{watchdog_note}\n\n{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang)}", False)
         log_event("engine", "handle_failure_done", tab_id=self.tab_id)
 
@@ -1073,7 +1117,7 @@ class ChatSession:
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     compaction_pointer_instruction(*load_tab_compaction_note(self.workspace_dir, self.tab_id)),
-                    language_hint_instruction(current_language_name()),
+                    language_hint_instruction(current_language_name(self.tab_id)),
                 ]
                 system_prompt_append = "\n\n".join(p for p in system_prompt_parts if p)
 
@@ -1256,9 +1300,11 @@ class ChatSession:
 
                     wire = message_to_wire(message)
                     if not self.silent_turn and wire is not None:
-                        await self.send({"type": "sdk_message", "message": wire})
-                        if wire.get("type") in ("assistant", "result") and not self.real_user_turn_answered:
-                            self.real_user_turn_answered = True
+                        wire = _strip_no_update_from_wire(wire)
+                        if wire is not None:
+                            await self.send({"type": "sdk_message", "message": wire})
+                            if wire.get("type") in ("assistant", "result") and not self.real_user_turn_answered:
+                                self.real_user_turn_answered = True
 
                     if isinstance(message, ResultMessage):
                         self.silent_turn = True
@@ -1281,7 +1327,7 @@ class ChatSession:
                             self.inject_proactive(
                                 "[Internal: you just successfully returned to your own Anthropic subscription "
                                 "after a temporary fallback -- nobody asked you this, it's automatic.] "
-                                + CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name()),
+                                + CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id)),
                                 True,
                             )
                         # A failed server here behaves the same way it would in
@@ -1366,7 +1412,7 @@ class ChatSession:
                         # (current_language_name(), synchronous, instant) in
                         # its own system prompt. Just kick off a background
                         # refresh for the next reset/turn.
-                        refresh_language_in_background(self.last_saved_session_id)
+                        refresh_language_in_background(self.last_saved_session_id, self.tab_id)
                         self.submit(replay_text, replay_attachments, True, False, self.turn_is_voice)
                     continue
 

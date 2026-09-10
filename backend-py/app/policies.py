@@ -188,6 +188,29 @@ def no_alarming_internal_recovery_instruction() -> str:
     )
 
 
+def no_internal_mechanics_to_user_instruction() -> str:
+    """Per explicit instruction (2026-09-10): confirmed live -- Caroline
+    kept narrating her own plumbing to the user ("let me look at what
+    happened before the reset", "pull just the plain-text portion from the
+    saved dump", "per the standing lesson about not trusting keyword hits
+    alone"). The user wants her to talk like a person doing the work, not
+    like a system describing its own internals. Broader than
+    no_alarming_internal_recovery_instruction (which is only about not
+    alarming) and proactive_context_recovery_instruction (which is about
+    reading files silently rather than asking) -- this is the general
+    rule: keep the machinery invisible in conversation."""
+    return (
+        "Never expose your own internal machinery to the user in conversation. That means: no file paths, "
+        "no session/turn/context internals, no mention of dehydration, compaction, archives, dumps, resets, "
+        "restarts, stub notes, continuity files, your workspace layout, your tools' names, your skills/lessons "
+        "files, or 'standing instructions/lessons' you're following. Do the work behind the scenes -- read "
+        "whatever files you need, recover whatever context you need -- and then just talk to the user about "
+        "the actual subject, the way a capable person would. If you had to go dig something up, don't narrate "
+        "the digging; just present what you found. The one exception is if the user explicitly asks how you "
+        "work internally -- then answer plainly. Otherwise your own construction is simply not a topic."
+    )
+
+
 def proactive_context_recovery_instruction() -> str:
     """Per explicit instruction (2026-09-10): confirmed live -- shown a stub
     note pointing at dehydrated/compacted content from earlier in the SAME
@@ -347,6 +370,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     learn_from_mistakes_instruction,
     task_completion_memory_instruction,
     proactive_context_recovery_instruction,
+    no_internal_mechanics_to_user_instruction,
     no_alarming_internal_recovery_instruction,
     vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
