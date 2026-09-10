@@ -825,12 +825,14 @@ class ChatSession:
 
     def _handle_rate_limit_rejected(self, source: str, info: dict[str, Any]) -> None:
         resets_at = info.get("resets_at")
-        # NOTE (2026-09-10, NOT fixed here -- out of scope for this pass,
-        # flagged separately): confirmed live this produces a bogus 1970
-        # date ("Resets: 1970-01-21T...") -- resets_at appears to already
-        # be in seconds, and dividing by 1000 again lands ~20 days after
-        # the epoch. Left as-is; only the language changed in this pass.
-        reset_text = f" Resets: {datetime.fromtimestamp(resets_at / 1000).isoformat()}." if resets_at else ""
+        # Bug fix (2026-09-10): confirmed live this produced a bogus 1970
+        # date ("Resets: 1970-01-21T..."). The SDK's own RateLimitInfo
+        # docs just say "Unix timestamp" (ambiguous on paper), but
+        # dividing by 1000 landed ~20 days after the epoch -- resets_at is
+        # already in SECONDS (the standard meaning of "Unix timestamp",
+        # and what datetime.fromtimestamp() itself expects), not
+        # milliseconds. No division.
+        reset_text = f" Resets: {datetime.fromtimestamp(resets_at).isoformat()}." if resets_at else ""
         type_text = f" ({info.get('rate_limit_type')})" if info.get("rate_limit_type") else ""
         text = f"Hit the Claude usage limit{type_text}.{reset_text} Retrying automatically."
         log_event("engine", "rate_limit_rejected", tab_id=self.tab_id, source=source)
