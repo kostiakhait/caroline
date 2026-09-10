@@ -159,9 +159,14 @@ STARTUP_GREETING_NUDGE_TEMPLATE = (
     "startup message. Greet them in {language}."
 )
 
+# Bug fix (2026-09-10): confirmed live -- this and the rate-limit text
+# below were Russian, but system_notice/status-bar text is app UI chrome,
+# not conversation -- it must stay in one fixed language (English) like
+# the rest of the app's chrome, regardless of what language the user is
+# actually talking to Caroline in.
 BALANCE_EXHAUSTED_MESSAGE = (
-    "Не смогла ответить — на вашем аккаунте Anthropic закончились кредиты/лимит. Пополнить можно в разделе "
-    "Billing на console.anthropic.com. Как только доступ вернётся, отвечу автоматически."
+    "Couldn't reply -- your Anthropic account is out of credits/quota. Top up at console.anthropic.com's "
+    "Billing section. I'll answer automatically once it's available again."
 )
 
 # --- detect_recent_language's synthetic-text filter (ported verbatim from
@@ -640,7 +645,17 @@ class ChatSession:
         elif kind in ("restarting", "restart_backoff"):
             await self.send({"type": "caroline_status", "status": kind, "reason": reason})
         elif kind == "limited":
-            await self.send({"type": "system_notice", "text": reason or "", "cls": "restarting"})
+            # Bug fix (2026-09-10): this used to reuse cls "restarting" --
+            # same value the routine internal-churn caroline_status path
+            # produces, which chat.js deliberately keeps the lamp green
+            # for (a hang/dehydration restart the socket survives, self-
+            # resolves in seconds). "limited" is categorically different:
+            # a real block (rate limit / usage-window cap) where no turn
+            # CAN complete until it clears, possibly hours away. Its own
+            # distinct cls lets chat.js tell the two apart and show yellow
+            # ("work is impossible right now, but waiting on it") instead
+            # of green ("everything's fine").
+            await self.send({"type": "system_notice", "text": reason or "", "cls": "limited"})
         elif kind == "billing_blocked":
             await self.send({"type": "system_notice", "text": reason or ""})
 
@@ -810,9 +825,14 @@ class ChatSession:
 
     def _handle_rate_limit_rejected(self, source: str, info: dict[str, Any]) -> None:
         resets_at = info.get("resets_at")
-        reset_text = f" Сброс: {datetime.fromtimestamp(resets_at / 1000).isoformat()}." if resets_at else ""
+        # NOTE (2026-09-10, NOT fixed here -- out of scope for this pass,
+        # flagged separately): confirmed live this produces a bogus 1970
+        # date ("Resets: 1970-01-21T...") -- resets_at appears to already
+        # be in seconds, and dividing by 1000 again lands ~20 days after
+        # the epoch. Left as-is; only the language changed in this pass.
+        reset_text = f" Resets: {datetime.fromtimestamp(resets_at / 1000).isoformat()}." if resets_at else ""
         type_text = f" ({info.get('rate_limit_type')})" if info.get("rate_limit_type") else ""
-        text = f"Достигнут лимит использования Claude{type_text}.{reset_text} Повторяю автоматически."
+        text = f"Hit the Claude usage limit{type_text}.{reset_text} Retrying automatically."
         log_event("engine", "rate_limit_rejected", tab_id=self.tab_id, source=source)
         self._set_conn_state("limited", text)
         self._schedule_api_retry(f"rate_limit_rejected:{source}", self.turn_is_voice)
@@ -1329,11 +1349,30 @@ class ChatSession:
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
                         self.consecutive_auth_retry_failures = 0
-                        self._clear_api_retry_timer()
+                        # Bug fix (2026-09-10): confirmed live -- a
+                        # RateLimitEvent(rejected) schedules a 90s retry
+                        # timer and sets ignore_next_result_recovery=True
+                        # specifically so the ResultMessage the SDK still
+                        # sends for that same failed turn doesn't get
+                        # mistaken for real recovery. That flag protected
+                        # conn_state (stayed "limited", correctly) but NOT
+                        # this retry timer -- _clear_api_retry_timer() ran
+                        # unconditionally right here and silently cancelled
+                        # the just-scheduled retry in the same breath it
+                        # was created. Nothing ever rescheduled a fresh
+                        # one, so the tab sat in "limited" forever with a
+                        # dead retry mechanism (confirmed live: 3/3 real
+                        # incidents show reset_at.reschedule.reset_at with
+                        # no api_retry_firing ever following). Now the
+                        # whole "this ResultMessage isn't real recovery"
+                        # branch, including the retry timer, is gated on
+                        # the SAME flag.
                         if self.ignore_next_result_recovery:
                             self.ignore_next_result_recovery = False
-                        elif self.conn_state.get("kind") != "connected":
-                            self._set_conn_state("connected")
+                        else:
+                            self._clear_api_retry_timer()
+                            if self.conn_state.get("kind") != "connected":
+                                self._set_conn_state("connected")
 
                     wire = message_to_wire(message)
                     if not self.silent_turn and wire is not None:
@@ -1460,7 +1499,7 @@ class ChatSession:
                     log_event("engine", "silent_death_rate_limit", tab_id=self.tab_id)
                     self.turn_pending = False
                     clear_pending_turn(self.workspace_dir, self.tab_id)
-                    self._set_conn_state("limited", "Достигнут лимит использования Claude. Повторяю автоматически.")
+                    self._set_conn_state("limited", "Hit the Claude usage limit. Retrying automatically.")
                     self._schedule_api_retry("api_retry:rate_limit", self.turn_is_voice)
                     continue
 

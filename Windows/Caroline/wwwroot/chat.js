@@ -3,7 +3,7 @@
   // sent to the backend right after connect (see "client_diag" below) and
   // logged server-side, purely so a stale-cache suspicion can be confirmed
   // or ruled out from caroline.log alone, with zero UI interaction needed.
-  const CHAT_JS_VERSION = "2026-09-10-client-log-bridge";
+  const CHAT_JS_VERSION = "2026-09-10-limited-lamp-yellow";
   const port = new URLSearchParams(location.search).get("port") || "8765";
   // Which tab this WebView2 instance belongs to (see MainWindow's tab strip,
   // each tab navigates to chat.html?tab=<id>) -- threaded into the WS URL so
@@ -195,6 +195,14 @@
   function updateBackendLamp() {
     let color;
     if (lastConnCls === "error") color = "red";
+    // Bug fix (2026-09-10): "limited" (a real rate-limit/usage-window
+    // block -- backend's own conn_state "limited", distinct from the
+    // "restarting" cls a routine internal restart uses) used to be
+    // indistinguishable from routine churn and stayed green here. A turn
+    // genuinely CANNOT complete while this is active -- possibly for
+    // hours -- so it gets its own yellow, same meaning as "socket down":
+    // work is impossible right now, but this resolves on its own.
+    else if (lastConnCls === "limited") color = "yellow";
     else if (!wsConnected) color = "yellow";
     else color = turnBusy ? "green-blink" : "green";
     lampBackend.className = "lamp lamp-" + color;
