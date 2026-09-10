@@ -621,6 +621,16 @@ class ChatSession:
 
     # ------------------------------------------------------------- helpers --
 
+    def has_live_dialog(self, idle_threshold_s: float = 5 * 60) -> bool:
+        """Bug fix (2026-09-10): confirmed live -- deleted along with the
+        homegrown compaction loop (its only OTHER caller), but main.py's
+        _on_reminder_due still calls this to decide whether a "background"
+        priority reminder (e.g. the hourly vault-backup nudge) should wait
+        for the user to go quiet instead of interrupting a live turn."""
+        if self.conn_state.get("kind") == "restart_backoff":
+            return False
+        return self.turn_pending or (time.monotonic() - self.last_user_activity) < idle_threshold_s
+
     def _clear_api_retry_timer(self) -> None:
         if self.api_retry_timer:
             self.api_retry_timer.cancel()
@@ -1280,7 +1290,18 @@ class ChatSession:
                     if not self.silent_turn and wire is not None:
                         wire = _strip_no_update_from_wire(wire)
                         if wire is not None:
-                            await self.send({"type": "sdk_message", "message": wire})
+                            # Bug fix (2026-09-10): confirmed live -- voice-reply
+                            # auto-play/animation (chat.js checks evt.isVoice on
+                            # the "result" event) never fired, because this send
+                            # site never attached isVoice at all. server.ts's
+                            # original does: { type: "sdk_message", message,
+                            # isVoice: this.turnIsVoice } specifically on the
+                            # "result" message -- ported that shape here; every
+                            # other message type is sent exactly as before.
+                            envelope: dict[str, Any] = {"type": "sdk_message", "message": wire}
+                            if wire.get("type") == "result":
+                                envelope["isVoice"] = self.turn_is_voice
+                            await self.send(envelope)
                             if wire.get("type") in ("assistant", "result"):
                                 if not self.real_user_turn_answered:
                                     self.real_user_turn_answered = True
