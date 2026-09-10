@@ -425,6 +425,16 @@ class ChatSession:
             asyncio.create_task(self._safe_interrupt())
         self._queue_event.set()
 
+    def force_restart(self) -> None:
+        """Forces this session down the same way hang-escalation's own hard-
+        close does (disconnect() -> _run_loop's own exception handling ->
+        a fresh session on the SAME session id) -- for a human or a script
+        to trigger directly over /api/control instead of having to kill OS
+        processes by hand. See main.py's "force_restart" control op."""
+        log_event("engine", "force_restart_requested", tab_id=self.tab_id)
+        if self.client:
+            asyncio.create_task(self._safe_disconnect(self.client))
+
     async def _safe_interrupt(self) -> None:
         try:
             if self.client:

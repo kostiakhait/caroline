@@ -114,7 +114,18 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
 
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(local_tts_url(), json={"text": text, "voice": voice})
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                res = await client.post(local_tts_url(), json={"text": text, "voice": voice})
+                break
+            except httpx.TransportError as exc:
+                last_err = exc
+                if attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        else:
+            raise last_err  # type: ignore[misc]
         if res.status_code >= 400:
             raise VoiceApiError(f"local TTS server returned {res.status_code}: {res.text[:300]}")
         return base64.b64encode(res.content).decode("ascii")
