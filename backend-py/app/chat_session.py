@@ -932,30 +932,46 @@ class ChatSession:
         parent / continuity-archive file (both real past .jsonl-shaped
         transcripts, per-tab, never shared) when the live file alone is
         thin."""
-        entries: list[dict[str, Any]] = []
+        def _usable_lines(entries: list[dict[str, Any]]) -> list[str]:
+            out: list[str] = []
+            for entry in entries:
+                raw_text = str(entry.get("text") or "")
+                clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
+                if not clean_text or _is_synthetic_history_text(raw_text):
+                    continue
+                # A clean_text that is one lone bracketed expression is a
+                # dehydration/placeholder marker, never real conversational
+                # content -- dehydrate.py replaces a stripped turn's body
+                # with "[мысли этого хода не сохраняются]", and an
+                # aged-out turn collapses to just its "[<timestamp>]".
+                # Language-agnostic on purpose (don't hardcode that one
+                # Russian string).
+                if clean_text.startswith("[") and clean_text.endswith("]") and "\n" not in clean_text:
+                    continue
+                speaker = "User" if entry.get("role") == "user" else "Caroline"
+                out.append(f"{speaker}: {clean_text}")
+            return out
+
+        lines: list[str] = []
         if self.last_saved_session_id:
             path = claude_project_dir(self.workspace_dir) / f"{self.last_saved_session_id}.jsonl"
             try:
-                entries = _extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path))
+                lines = _usable_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)))
             except Exception as exc:
                 log_event("engine", "progress_narration_history_read_failed", tab_id=self.tab_id, error=str(exc))
-        if len(entries) < limit:
+        # Gate on USABLE line count, not raw entry count -- after aggressive
+        # per-turn dehydration the live file can be many entries yet hold
+        # almost no real text, which is exactly when the older
+        # compaction-parent / continuity-archive context matters most.
+        if len(lines) < limit:
             parent_path, _ = load_tab_compaction_note(self.workspace_dir, self.tab_id)
             archive_path = load_tab_continuity_archive(self.workspace_dir, self.tab_id)
             for older_path in (parent_path, archive_path):
-                if older_path and len(entries) < limit:
+                if older_path and len(lines) < limit:
                     try:
-                        entries = read_archived_entries(older_path) + entries
+                        lines = _usable_lines(read_archived_entries(older_path)) + lines
                     except Exception as exc:
                         log_event("engine", "progress_narration_archive_read_failed", tab_id=self.tab_id, path=older_path, error=str(exc))
-        lines: list[str] = []
-        for entry in entries:
-            raw_text = str(entry.get("text") or "")
-            clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
-            if not clean_text or _is_synthetic_history_text(raw_text):
-                continue
-            speaker = "User" if entry.get("role") == "user" else "Caroline"
-            lines.append(f"{speaker}: {clean_text}")
         return "\n".join(lines[-limit:])
 
     async def _check_progress_narration(self) -> None:
