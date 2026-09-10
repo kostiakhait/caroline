@@ -22,7 +22,7 @@ from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, curre
 from app.durability import peek_pending_turn
 from app.login_api import is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
-from app.persona_gender import get_persona_gender
+from app.persona import get_persona_gender
 from app.plugins.notes_api import load_credentials
 from app.plugins.office_editor import finish_office_edit_session
 from app.plugins.ratatosk_api import find_or_create_dm, send_message

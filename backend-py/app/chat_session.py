@@ -24,6 +24,11 @@ Known, documented gaps vs. the original (tracked, not silently dropped):
   and in policies.py/voice_api.py -- see current_language_name/
   refresh_language_in_background below, and languageHintInstruction's TS
   twin in policies.ts (also implemented the same day).
+- (RESOLVED 2026-09-09) persona.ts's personaSystemPromptAppend() is now
+  ported and wired in (app/persona.py) -- was a real, live-confirmed gap,
+  not hypothetical: without it, the model has no fixed identity/gender for
+  itself and drifts, reproduced live as Caroline using masculine
+  self-referential verbs in Russian before this fix.
 """
 
 from __future__ import annotations
@@ -86,6 +91,7 @@ from app.failure_classification import (
 )
 from app.logging_setup import log_event
 from app.plugins.loader import build_mcp_servers
+from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction
 from app.session_context import set_send
 from app.sw_gate import require_sw_or_prompt
@@ -971,6 +977,7 @@ class ChatSession:
 
                 mcp_servers = build_mcp_servers()
                 system_prompt_parts = [
+                    persona_system_prompt_append(get_persona(self.workspace_dir)),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     language_hint_instruction(current_language_name()),
