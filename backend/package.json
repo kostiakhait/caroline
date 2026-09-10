@@ -11,18 +11,12 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.251",
-    "imapflow": "^1.0.171",
-    "mailparser": "^3.7.2",
-    "mcp-vault-client": "file:./vault-client",
-    "nodemailer": "^9.0.3",
     "playwright-core": "^1.62.1",
     "ws": "^8.18.0",
     "zod": "^4.5.2"
   },
   "devDependencies": {
-    "@types/mailparser": "^3.4.5",
     "@types/node": "^22.10.5",
-    "@types/nodemailer": "^6.4.17",
     "@types/ws": "^8.5.13",
     "esbuild": "^0.24.2",
     "typescript": "^5.7.3"

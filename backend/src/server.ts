@@ -39,7 +39,6 @@ async function swSessionOrUndefined(): Promise<string | undefined> {
     return undefined;
   }
 }
-import { createEmailTool } from "./email/index.js";
 import { createAppBrowserTool } from "./appBrowser.js";
 import { createRatatoskTools } from "./ratatoskTools.js";
 import { createConsultTools } from "./consultTools.js";
@@ -1510,12 +1509,15 @@ class ChatSession {
           "caroline-files": createFileOpenerTool(),
           "caroline-viewer": createViewerTool((event) => this.send(event)),
           "caroline-login": createLoginTool((event) => this.send(event)),
-          // Caroline's own in-process fork of MCP/email (see
-          // Caroline/backend/src/email/index.ts) -- action calls
-          // (send/delete/move/mark/download) return immediately and
-          // report their real outcome via a proactive follow-up instead
-          // of blocking the turn on a slow IMAP/SMTP round trip.
-          "caroline-email": createEmailTool((text) => this.injectProactive(text, false)),
+          // Node's own local-IMAP email tool (backend/src/email/,
+          // backend/vault-client/) removed 2026-09-10 -- superseded by
+          // backend-py/app/plugins/email_plugin.py (Camerlengo-backed,
+          // fully stateless: no server-side account table, no client-side
+          // vault/adapter either -- the model finds/saves mailbox
+          // credentials as ordinary Notes via the same general-purpose
+          // notes_* tools it already uses for everything else, and passes
+          // them through explicitly on every email_* call). Not re-added
+          // here: the Node backend is legacy/rollback-only at this point.
           "caroline-appbrowser": createAppBrowserTool(),
           "caroline-ratatosk": createRatatoskTools(workspaceDir, (event) => this.send(event)),
           "caroline-consult": createConsultTools((event) => this.send(event)),
