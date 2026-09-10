@@ -111,6 +111,19 @@ function extractEntriesFromJsonl(raw: string, sourceLabel: string): HistoryEntry
       if (obj.type !== "user" && obj.type !== "assistant") continue;
       const { text, attachments } = extractTextAndAttachments(obj.message?.content);
       if (!text.trim() && attachments.length === 0) continue;
+      // Bug fix (2026-09-09): this rebuild path is entirely separate from
+      // the live sdk_message stream's own [[NO_UPDATE]] suppression (see
+      // chat.js's assistant-message handler) -- confirmed live, a
+      // no-update turn's full text (explanation + trailing sentinel) was
+      // leaking into the visible chat every time a tab reconnected and
+      // replayed history via get_history, even after the live-path fix.
+      // Checked as a substring, not exact equality, same reasoning as the
+      // client-side fix: the model doesn't always reply with ONLY the
+      // sentinel. Filtered here (server side, the single source both
+      // readRecentHistory and readArchivedEntries draw from) rather than
+      // only in chat.js's get_history handler, so a no-update turn never
+      // even reaches the client as part of the user-visible transcript.
+      if (obj.type === "assistant" && text.includes("[[NO_UPDATE]]")) continue;
       const ts = obj.timestamp ? Date.parse(obj.timestamp) : Date.now();
       entries.push({
         role: obj.type,

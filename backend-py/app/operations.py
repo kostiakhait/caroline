@@ -31,6 +31,7 @@ from typing import Any, Awaitable, Callable
 from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server, tool as sdk_tool
 
 from app.logging_setup import log_event
+from app.session_context import get_tab_id
 
 # How long dispatch() waits before giving up on returning a "done" result
 # synchronously and instead returning a bare operation_id for polling.
@@ -59,6 +60,15 @@ class Operation:
     error: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     task: "asyncio.Task[Any] | None" = None
+    # Per explicit instruction (2026-09-10): which tab's turn started this
+    # operation (session_context.py's get_tab_id(), sampled once at
+    # creation time) -- lets ChatSession.stop() cancel exactly ITS OWN
+    # tab's in-flight background operations without touching another
+    # tab's still-running work, since this registry is process-wide, not
+    # per-tab. None if dispatch() was somehow called outside a live
+    # ChatSession turn (a throwaway test script) -- such an operation is
+    # simply never matched by any tab's stop().
+    tab_id: str | None = None
 
 
 class OperationRegistry:
@@ -69,8 +79,8 @@ class OperationRegistry:
     def __init__(self) -> None:
         self._ops: dict[str, Operation] = {}
 
-    def create(self, tool_name: str) -> Operation:
-        op = Operation(id=uuid.uuid4().hex[:12], tool_name=tool_name)
+    def create(self, tool_name: str, tab_id: str | None = None) -> Operation:
+        op = Operation(id=uuid.uuid4().hex[:12], tool_name=tool_name, tab_id=tab_id)
         self._ops[op.id] = op
         return op
 
@@ -79,6 +89,20 @@ class OperationRegistry:
 
     def forget(self, operation_id: str) -> None:
         self._ops.pop(operation_id, None)
+
+    def cancel_for_tab(self, tab_id: str) -> int:
+        """Cancels every still-running operation tagged with this tab_id --
+        called from ChatSession.stop() alongside client.interrupt() so
+        Stop actually reaches a tool call that already crossed dispatch()'s
+        fast-path window and became a detached background task (interrupt()
+        alone only stops the model's own generation stream, not that
+        task). Returns how many were actually cancelled, for logging."""
+        cancelled = 0
+        for op in self._ops.values():
+            if op.tab_id == tab_id and op.status == "running" and op.task is not None and not op.task.done():
+                op.task.cancel()
+                cancelled += 1
+        return cancelled
 
 
 REGISTRY = OperationRegistry()
@@ -89,7 +113,7 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
     Always logs call/result/error/duration at the engine level (see
     plugins/loader.py's wrap_tool, which calls this) -- individual plugins
     never implement their own polling/cancellation plumbing."""
-    op = REGISTRY.create(tool_name)
+    op = REGISTRY.create(tool_name, tab_id=get_tab_id())
 
     def report_progress(data: Any) -> None:
         op.partial = data

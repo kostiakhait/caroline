@@ -86,6 +86,22 @@ def _extract_entries_from_jsonl(raw: str, source_label: str) -> list[dict[str, A
             text, attachments = _extract_text_and_attachments((obj.get("message") or {}).get("content"))
             if not text.strip() and not attachments:
                 continue
+            # Bug fix (2026-09-09): this rebuild path is entirely separate
+            # from the live sdk_message stream's own [[NO_UPDATE]]
+            # suppression (see chat.js's assistant-message handler) --
+            # confirmed live, a no-update turn's full text (explanation +
+            # trailing sentinel) was leaking into the visible chat every
+            # time a tab reconnected and replayed history via
+            # get_history, even after the live-path fix. Checked as a
+            # substring, not exact equality, same reasoning as the
+            # client-side fix: the model doesn't always reply with ONLY
+            # the sentinel. Filtered here (server side, the single source
+            # both read_recent_history and read_archived_entries draw
+            # from) rather than only in chat.js's get_history handler, so
+            # a no-update turn never even reaches the client as part of
+            # the user-visible transcript.
+            if obj.get("type") == "assistant" and "[[NO_UPDATE]]" in text:
+                continue
             ts_raw = obj.get("timestamp")
             ts_ms: float | None = None
             if ts_raw:

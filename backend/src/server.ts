@@ -46,7 +46,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, taskCompletionMemoryInstruction, continuityPointerInstruction, compactionPointerInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, taskCompletionMemoryInstruction, proactiveContextRecoveryInstruction, continuityPointerInstruction, compactionPointerInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -1599,6 +1599,7 @@ class ChatSession {
               bashBackgroundInstruction(),
               timestampAwarenessInstruction(),
               noAlarmingInternalRecoveryInstruction(),
+              proactiveContextRecoveryInstruction(),
               continuityPointerInstruction(loadTabContinuityArchive(workspaceDir, this.tabId)),
               compactionPointerInstruction(compactionNote.parentPath, compactionNote.compactedAtIso),
               languageHintInstruction(currentLanguageName()),

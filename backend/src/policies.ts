@@ -458,6 +458,32 @@ export function noAlarmingInternalRecoveryInstruction(): string {
 }
 
 /**
+ * Per explicit instruction (2026-09-10): confirmed live -- shown a stub
+ * note pointing at dehydrated/compacted content from earlier in the SAME
+ * conversation, the model said "let me pull up context from the previous
+ * session", then asked the user to re-describe something they'd already
+ * attached, instead of just reading the referenced file itself. Distinct
+ * from continuityPointerInstruction (which only fires when there's an
+ * actual archived-session pointer): this is a general, always-on habit
+ * covering the much more common case -- ordinary dehydration/compaction
+ * stub notes, which appear in nearly every long-running session, not just
+ * after an unrecoverable error.
+ */
+export function proactiveContextRecoveryInstruction(): string {
+  return (
+    `Your own history-management mechanisms (dehydration, compaction) leave placeholder/stub notes behind ` +
+    `that point to a file with the full original content -- see each note's own text. These are ALWAYS ` +
+    `part of THIS SAME ongoing conversation, never a separate or 'previous' session, even though the ` +
+    `content was moved out of view. Whenever you need something a stub note points at, or the user ` +
+    `references a fact/attachment/detail you don't currently see inline, your default move is to go read ` +
+    `the referenced file yourself (the Read tool) BEFORE asking the user to repeat, resend, or remind you ` +
+    `of it. Only ask the user if you've actually checked and the file genuinely doesn't have what you ` +
+    `need. Never tell the user you're pulling up 'a previous session' or 'an earlier session' -- there is ` +
+    `no previous session here, just older parts of this same one that got moved to disk.`
+  );
+}
+
+/**
  * Bug fix (2026-09-09): confirmed live -- a session abandoned after an
  * unrecoverable internal error (see noAlarmingInternalRecoveryInstruction)
  * gets ONE archive-reference note attached to the single turn that triggered

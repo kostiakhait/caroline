@@ -95,7 +95,8 @@ from app.logging_setup import log_event
 from app.plugins.loader import build_mcp_servers
 from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, compaction_pointer_instruction, continuity_pointer_instruction, language_hint_instruction
-from app.session_context import set_send
+from app.operations import REGISTRY
+from app.session_context import set_send, set_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     OWN_ANTHROPIC_RECHECK_INTERVAL_MS,
@@ -449,6 +450,7 @@ class ChatSession:
         self._clear_mcp_reconnect_timers()
         if self.client:
             asyncio.create_task(self._safe_interrupt())
+        REGISTRY.cancel_for_tab(self.tab_id)
         self._queue_event.set()
 
     def force_restart(self) -> None:
@@ -524,6 +526,17 @@ class ChatSession:
         self.user_stop_requested = True
         if self.client:
             asyncio.create_task(self._safe_interrupt())
+        # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
+        # only stops the model's own generation stream. A tool call that
+        # already crossed dispatch()'s fast-path window (app/operations.py)
+        # became a detached background asyncio.Task in the process-wide
+        # REGISTRY, entirely decoupled from this turn/session -- Stop never
+        # reached it, so it kept running to completion regardless. This
+        # cancels exactly THIS tab's own still-running background
+        # operations alongside the interrupt.
+        cancelled = REGISTRY.cancel_for_tab(self.tab_id)
+        if cancelled:
+            log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
 
     def _push_message(self, text: str, attachments: list[Any], is_voice: bool) -> None:
         sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}"
@@ -907,6 +920,14 @@ class ChatSession:
                     await self.client.interrupt()
             except Exception as exc:
                 log_event("engine", "hang_soft_interrupt_failed", tab_id=self.tab_id, error=str(exc))
+            # Same reasoning as stop()'s own fix -- a hang is plausibly
+            # caused by exactly a detached background operation that never
+            # completes/never gets polled again, so cancel this tab's
+            # in-flight operations here too, not just on an explicit user
+            # Stop.
+            cancelled = REGISTRY.cancel_for_tab(self.tab_id)
+            if cancelled:
+                log_event("engine", "hang_soft_interrupt_cancelled_operations", tab_id=self.tab_id, count=cancelled)
             return
 
         if time.monotonic() - self.hang_interrupted_at < HANG_ESCALATION_GRACE_MS / 1000:
@@ -998,6 +1019,7 @@ class ChatSession:
 
     async def _run_loop(self) -> None:
         set_send(lambda message: self.send(message))
+        set_tab_id(self.tab_id)
         while not self.ended:
             try:
                 self.hang_count = 0
