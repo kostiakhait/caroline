@@ -205,7 +205,17 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     re.compile(r"^Continue from where you left off\.?$", re.IGNORECASE),
     re.compile(r"^Continue any unfinished work, if there is any\.", re.IGNORECASE),
     re.compile(r"^You just started up \(or restarted\)\.", re.IGNORECASE),
-    re.compile(r"^\[Internal: automatic recheck", re.IGNORECASE),
+    # Bug fix (2026-09-10): confirmed live -- this used to be the narrow
+    # "^\[Internal: automatic recheck" (one specific nudge's own text).
+    # Two OTHER "[Internal: ...]" nudges (the 90s silent-user-wait nudge,
+    # and the own-Anthropic-recovery nudge added the same day) weren't
+    # covered at all, so their English text leaked into
+    # refresh_language_in_background's sampling as if it were real recent
+    # conversation -- confirmed live as the actual cause of language
+    # detection flapping to/getting stuck on English mid-conversation.
+    # Broadened to the whole "[Internal: ...]" convention so this can't
+    # recur for whatever internal nudge gets added next either.
+    re.compile(r"^\[Internal:", re.IGNORECASE),
     re.compile(r"^\[The user just stopped what you were doing", re.IGNORECASE),
     re.compile(r"^No response requested\.?$", re.IGNORECASE),
     re.compile(r"^<"),  # XML/HTML-ish wrapped system content
@@ -987,11 +997,15 @@ class ChatSession:
             return
         log_event("engine", "silent_user_wait_nudge", tab_id=self.tab_id, elapsed_s=round(elapsed, 1))
         self.silence_nudge_sent_for_turn = True
+        # Bug fix (2026-09-10): confirmed live -- unlike CONTINUE_OR_SILENT_NUDGE_TEMPLATE
+        # (used by the other internal nudges), this text never told the model which
+        # language to answer in at all, so a reply to it could land in the wrong
+        # language even once current_language_name() itself is correct.
         self.submit(
             "[Internal: it's been over 90 seconds since the user's message and nothing has reached them yet. If "
             "you're already working on something (a tool call, research, a multi-step task), just continue -- "
             "don't restart from scratch. If you actually finished and simply didn't reply, or lost track, answer "
-            "them now, directly. Don't mention this note itself.]",
+            f"them now, directly, in {current_language_name(self.tab_id)}. Don't mention this note itself.]",
             [], False, True, False,
         )
 

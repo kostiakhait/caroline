@@ -2453,6 +2453,12 @@ const SYNTHETIC_HISTORY_TEXT_PATTERNS = [
   /^\[Caroline was restarted/i,
   /^Continue from where you left off\.?$/i,
   /^No response requested\.?$/i,
+  // Bug fix (2026-09-10, ported from the Python backend): broad on purpose
+  // -- covers every "[Internal: ...]" injected nudge, present and future,
+  // rather than one narrow literal string at a time (confirmed live on the
+  // Python side: a narrow match let two other such nudges' English text
+  // leak into language-detection sampling as if it were real conversation).
+  /^\[Internal:/i,
   /^</, // XML/HTML-ish wrapped system content, e.g. <task-notification>...
 ];
 
