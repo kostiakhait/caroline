@@ -1,8 +1,15 @@
-"""Ports backend/src/subscriptionMode.ts -- resolves which "chat source"
-(own-Anthropic OAuth, a manually-pasted own-Anthropic key, the
-SquirrelWisdom proxy, or none) a turn should use, the own-Anthropic
-exhaustion fallback bookkeeping, Options.env construction, SW account
-status, and top-up checkout creation.
+"""Resolves which "chat source" a turn uses for the Claude Agent SDK.
+
+Per explicit instruction (2026-09-10): Claude is ONLY ever reached through
+the user's own subscription -- own-Anthropic OAuth (`claude` CLI login),
+or a manually-pasted own-Anthropic API key. The SquirrelWisdom proxy is no
+longer a Claude backend at all (it stays a client for Notes/email/ratatosk/
+voice/consult -- those hit SW's own services, not the Agent SDK). There is
+no cross-source fallback anymore: if the user's own quota is exhausted the
+tab just shows "limited" and keeps retrying.
+
+Also here: Options.env construction, SW wallet status (for the auxiliary
+ai:* services), and top-up checkout.
 """
 
 from __future__ import annotations
@@ -11,7 +18,6 @@ import asyncio
 import json
 import os
 import subprocess
-import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Literal
@@ -34,13 +40,12 @@ from app.plugins.sw_api import API_URL, mint_v2_session
 
 SQUIRRELWISDOM_ORIGIN = "https://www.squirrelwisdom.com"
 
-# Same scoped key minted for "caroline-desktop" (scopes: user:verify,
-# anthropic:messages, wallet:getBalance) -- narrow grant, not the account
-# password, same reasoning as every other hardcoded service key in this
-# port.
+# Scoped key for "caroline-desktop" (scopes: user:verify, wallet:getBalance)
+# -- narrow grant, not the account password. Only used now for the wallet
+# status/top-up UI; NOT for reaching Claude.
 SW_SERVICE_KEY = "fytZDwOTaBo8I173IS2DaY_qgzm0IFvqvnxJGvC5QrE"
 
-ChatSource = Literal["own-anthropic-oauth", "own-anthropic-key", "sw-proxy", "none"]
+ChatSource = Literal["own-anthropic-oauth", "own-anthropic-key", "none"]
 
 # The Python SDK ships its own bundled claude.exe (a sibling package to the
 # Node SDK's own copy) -- same binary family, just resolved via this
@@ -113,88 +118,33 @@ async def _has_own_anthropic_oauth(cwd: str) -> bool:
         return False
 
 
-# --- own-Anthropic exhaustion fallback --------------------------------------
-# Own-Anthropic (OAuth, then a manually-pasted key) still always wins over
-# the SquirrelWisdom proxy when it's actually USABLE. Once own-Anthropic is
-# CONFIRMED exhausted (a real billing_error/rate_limit_event, never
-# speculatively), fall back to sw-proxy -- but keep actively re-probing.
-#
-# Per explicit instruction (2026-09-09, after a live incident where one tab
-# sat on a broken sw-proxy connection for minutes while own-Anthropic was
-# actually available the whole time -- confirmed live, since this exact
-# Claude Code conversation kept working throughout): each tab tracks its
-# OWN exhaustion independently (keyed by tab_id, not a single shared
-# module-level flag -- the previous design let whichever tab restarted
-# first "use up" the one shared recheck window for everyone), and probes
-# again on a flat, short, unconditional cadence -- never a long cooldown
-# (no 30-minute default, and the SDK's own resetsAt is no longer trusted
-# either -- real availability can flap on a much shorter cycle than
-# resetsAt claims, and a stale multi-hour block was exactly what caused
-# this incident).
-OWN_ANTHROPIC_RECHECK_INTERVAL_MS = 90_000  # 90 seconds, per tab, unconditional.
-
-_own_anthropic_blocked_since_by_tab: dict[str, float] = {}
-
-
-def mark_own_anthropic_exhausted(tab_id: str) -> None:
-    """Call once own-Anthropic has actually failed on a real request for
-    THIS tab -- never speculatively. Per-tab: does not affect any other
-    tab's own probing."""
-    _own_anthropic_blocked_since_by_tab[tab_id] = time.time() * 1000
-    log_event("engine", "own_anthropic_exhausted", tab_id=tab_id)
-
-
-def clear_own_anthropic_exhausted(tab_id: str) -> None:
-    """Call when THIS tab's session actually resolved to own-Anthropic and
-    proved itself alive -- if this turns out to be wrong, the very next
-    real request re-blocks it via mark_own_anthropic_exhausted, same
-    self-heal as any other misjudged recovery in this module."""
-    if tab_id not in _own_anthropic_blocked_since_by_tab:
-        return
-    log_event("engine", "own_anthropic_recovered", tab_id=tab_id)
-    del _own_anthropic_blocked_since_by_tab[tab_id]
-
-
 async def resolve_mode(workspace_dir: str, tab_id: str) -> ResolvedMode:
-    """Neither own-Anthropic nor SW available -> "none": the caller
-    (chat_session.py) checks for exactly this chatSource before creating
-    query() and proactively opens the native login window itself -- this
-    can't be left to the model to notice, since it can't run any tool
-    call at all without a chat source to run it with."""
+    """own-Anthropic OAuth wins, then a manually-pasted own-Anthropic key,
+    else "none". "none" -> the caller (chat_session.py) opens the native
+    login window itself before creating query(), since the model can't run
+    any tool call at all without a chat source. `tab_id` is unused now
+    (kept in the signature so call sites don't churn) -- there's no
+    per-tab exhaustion state anymore."""
     sw_logged_in = load_credentials() is not None
-    now = time.time() * 1000
-    blocked_since = _own_anthropic_blocked_since_by_tab.get(tab_id)
-    own_anthropic_blocked = blocked_since is not None and now - blocked_since < OWN_ANTHROPIC_RECHECK_INTERVAL_MS
-    if own_anthropic_blocked and sw_logged_in:
-        return ResolvedMode("sw-proxy", sw_logged_in)
-    # Blocked but no SW to fall back to -- nothing to lose by trying
-    # own-Anthropic anyway below, same as if it were never blocked.
     if await _has_own_anthropic_oauth(workspace_dir):
         return ResolvedMode("own-anthropic-oauth", sw_logged_in)
     if get_own_anthropic_api_key(workspace_dir):
         return ResolvedMode("own-anthropic-key", sw_logged_in)
-    if sw_logged_in:
-        return ResolvedMode("sw-proxy", sw_logged_in)
     return ResolvedMode("none", sw_logged_in)
 
 
 async def build_options_env(workspace_dir: str, mode: ResolvedMode) -> dict[str, str] | None:
     """Options.env REPLACES the subprocess's environment entirely when
     provided (per the SDK's own contract), it does not merge with the
-    process environment automatically -- every branch here that returns a
+    process environment automatically -- the branch here that returns a
     value spreads os.environ itself; callers must not do it again on top
-    of this."""
+    of this. own-anthropic-oauth needs nothing (the CLI's own stored
+    login is used) -> returns None."""
     if mode.chat_source == "own-anthropic-key":
         key = get_own_anthropic_api_key(workspace_dir)
         if not key:
             return None  # race: setting was cleared between resolve_mode() and here
         return {**os.environ, "ANTHROPIC_API_KEY": key}
-    if mode.chat_source == "sw-proxy":
-        creds = load_credentials()
-        if not creds:
-            return None
-        session = await mint_v2_session(creds["email"], creds["password"])
-        return {**os.environ, "ANTHROPIC_BASE_URL": SQUIRRELWISDOM_ORIGIN, "ANTHROPIC_API_KEY": f"{SW_SERVICE_KEY}.{session}"}
     return None
 
 
