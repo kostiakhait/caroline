@@ -32,6 +32,7 @@ from app.plugins.notes_api import load_credentials
 from app.plugins.office_editor import finish_office_edit_session
 from app.plugins.ratatosk_api import find_or_create_dm, send_message
 from app.plugins.ratatosk_own_account import ensure_own_ratatosk_account, get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
+from app.plugins.companion_api import resume_companion_operations, start_companion_inbox_loop
 from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -109,6 +110,25 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     return delivered
 
 
+def _inject_companion_message(tab_id: str, text: str) -> bool:
+    """Callback for companion_api.start_companion_inbox_loop: inject a
+    phone-originated message into the named tab's live session, exactly as
+    if the user had typed it locally. Returns False (leave it in the phone
+    inbox, retry next tick) if that tab has no live session right now."""
+    session = sessions.get(tab_id)
+    if session is None:
+        return False
+    return session.inject_proactive(
+        f"[The user sent this from their phone via the Caroline companion app]: {text}", False
+    )
+
+
+def _companion_history_snapshot() -> list[dict[str, Any]]:
+    """Callback for the same loop: the recent visible transcript to mirror
+    to the phone so it can render the tab without its own history logic."""
+    return read_recent_history(WORKSPACE_DIR)
+
+
 @app.on_event("startup")
 async def _start_ratatosk_background_loops() -> None:
     # Needs a running event loop (asyncio.create_task inside both) -- can't
@@ -121,6 +141,15 @@ async def _start_ratatosk_background_loops() -> None:
     # due while the app was closed); a reminder is only marked fired once
     # it's actually been injected into a live session (see _on_reminder_due).
     start_due_check_loop(_on_reminder_due)
+    # Android companion app: drain phone-originated messages from
+    # tabs/<tabId>/inbox into live sessions, and mirror recent history back
+    # out to tabs/<tabId>/history. No-op while not logged into SW.
+    start_companion_inbox_loop(WORKSPACE_DIR, _inject_companion_message, _companion_history_snapshot)
+    # Resume any companion operation (SMS send, sms/contacts lookup) that
+    # was still in flight when the backend last went down -- see
+    # companion_api.py's own module docstring for the never-gives-up
+    # protocol this is completing the restart-survival half of.
+    await resume_companion_operations(WORKSPACE_DIR, _inject_companion_message)
 
 
 def primary_session() -> ChatSession | None:
