@@ -48,9 +48,10 @@ that builds and runs, not a finished app.
 ## Verification
 
 `./gradlew assembleDebug` succeeds cleanly (2026-09-10) and produces a real
-`app-debug.apk` (~19.7MB) — confirms the project structure, Gradle config,
-and every Kotlin file actually compile together. **Not** run on a real
-device or emulator from this environment, though — installing/launching/
-tapping through the login and tab screens hasn't been verified at all.
+`app-debug.apk` (~19.7MB). Installed and launched on a real emulator
+(`Medium_Phone_API_36.0`, API 36): the process starts and stays alive (no
+crash in logcat), and the login screen renders correctly, themed, with a
+working email/password form. Not yet exercised past that — no login
+attempt against a real account, no tab bar / chat screen seen live yet.
 `local.properties` (machine-local SDK path) is gitignored; anyone building
 this needs their own pointing at a real Android SDK.
