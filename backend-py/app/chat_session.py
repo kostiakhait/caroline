@@ -47,6 +47,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     RateLimitEvent,
     ResultMessage,
     SystemMessage,
@@ -64,20 +65,17 @@ from app import win_subprocess_patch
 # open a visible console window without this).
 win_subprocess_patch.apply()
 
-from app.compaction import compact_session_if_due, get_session_file_size_bytes
-from app.dehydrate import age_previous_turns_in_place, dehydrate_previous_turns
 from app.durability import (
     _sanitize_tab_id,
     claude_project_dir,
     clear_pending_turn,
     clear_tab_continuity_archive,
     clear_tab_session_id,
+    dehydrated_dir,
     find_most_recent_claude_session_id,
-    load_tab_compaction_note,
     load_tab_continuity_archive,
     load_tab_session_id,
     save_pending_turn,
-    save_tab_compaction_note,
     save_tab_continuity_archive,
     save_tab_session_id,
 )
@@ -89,14 +87,13 @@ from app.failure_classification import (
     PROMPT_TOO_LONG_PATTERN,
     SESSION_NOT_FOUND_PATTERN,
     TOOL_CONCURRENCY_ERROR_PATTERN,
-    URGENT_COMPACTION_SIZE_THRESHOLD_BYTES,
     detect_balance_exhaustion,
     extract_classifier_refusal_category,
 )
 from app.logging_setup import log_event
 from app.plugins.loader import build_mcp_servers
 from app.persona import get_persona, persona_system_prompt_append
-from app.policies import ALWAYS_ON_INSTRUCTIONS, compaction_pointer_instruction, continuity_pointer_instruction, language_hint_instruction
+from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction
 from app.operations import REGISTRY
 from app.session_context import set_send, set_tab_id
 from app.sw_gate import require_sw_or_prompt
@@ -119,8 +116,6 @@ MAX_RESTARTS_PER_WINDOW = 5
 RESTART_WINDOW_MS = 10 * 60_000
 RESTART_BACKOFF_MS = 60_000
 API_RETRY_INTERVAL_MS = 90_000
-COMPACTION_CHECK_INTERVAL_MS = 60 * 60_000
-COMPACTION_STARTUP_DELAY_MS = 60_000
 MCP_RECONNECT_INTERVAL_MS = 15_000
 # Per explicit instruction (2026-09-09): if 90s pass after a REAL user
 # message with nothing sent back to them yet, nudge the model to continue/
@@ -210,10 +205,6 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
 def _is_synthetic_history_text(raw_text: str) -> bool:
     text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
     return any(p.match(text) for p in _SYNTHETIC_HISTORY_TEXT_PATTERNS)
-
-
-def _epoch_ms_to_iso(epoch_ms: float) -> str:
-    return datetime.fromtimestamp(epoch_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 _NO_UPDATE_SENTINEL = "[[NO_UPDATE]]"
@@ -441,15 +432,17 @@ class ChatSession:
         # restart budget
         self.restart_timestamps: list[float] = []
 
-        # session-id / dehydration / compaction tracking
+        # session-id tracking. Context ageing is Claude's own native
+        # auto-compaction now (see _run_loop's options: autoCompactEnabled)
+        # -- no per-turn transcript rewrite, no per-turn CLI restart.
         self.last_saved_session_id: str | None = None
-        self.dehydrated_for_session_id: str | None = None
-        self.dehydrated_through_line = 0
-        self.last_compacted_at: float | None = None
-        self.pending_compaction = False
-        self.compaction_in_progress = False
 
         self.current_chat_source: str | None = None
+        # The language hint baked into the CURRENT query()'s system prompt.
+        # A long-lived client doesn't re-read it every turn anymore, so a
+        # real user turn that finds the persisted language has changed
+        # sets restart_pending to pick the new one up (see submit()).
+        self._system_prompt_language: str | None = None
 
         # Consecutive "authentication_failed" api_retry messages on the
         # CURRENT connection -- see AUTH_RETRY_ESCALATION_THRESHOLD below.
@@ -457,17 +450,12 @@ class ChatSession:
 
         # deliberate-restart flags. restart_pending is the generic "tear the
         # query down and rebuild it cleanly next _run_loop iteration" signal
-        # (auth-failure escalation, a settings change) -- was
-        # restart_for_chat_source_switch back when a source switch existed.
+        # (auth-failure escalation, a settings/language change).
         self.restart_pending = False
-        self.restart_for_urgent_compaction = False
-        self.urgent_compaction_replay_text: str | None = None
-        self.urgent_compaction_replay_attachments: list[Any] = []
         self.restart_for_unrecoverable_session = False
         self.unrecoverable_session_replay_text: str | None = None
         self.unrecoverable_session_replay_attachments: list[Any] = []
         self.skip_migration_fallback_once = False
-        self.restart_for_dehydration = False
 
         # conn state / api retry / rate limit memory
         self.conn_state: dict[str, Any] = {"kind": "connected"}
@@ -479,22 +467,18 @@ class ChatSession:
 
         self._run_loop_task: asyncio.Task[None] | None = None
         self._watchdog_task: asyncio.Task[None] | None = None
-        self._compaction_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------- lifecycle --
 
     async def start(self) -> None:
         self._run_loop_task = asyncio.create_task(self._run_loop())
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-        self._compaction_task = asyncio.create_task(self._compaction_loop())
 
     def dispose(self) -> None:
         log_event("engine", "dispose", tab_id=self.tab_id)
         self.ended = True
         if self._watchdog_task:
             self._watchdog_task.cancel()
-        if self._compaction_task:
-            self._compaction_task.cancel()
         self._clear_api_retry_timer()
         self._clear_mcp_reconnect_timers()
         if self.client:
@@ -611,11 +595,6 @@ class ChatSession:
                 self._queue_event.clear()
                 await self._queue_event.wait()
                 continue
-            # Awaited HERE, before shifting/yielding the next queued item --
-            # the CLI only ever asks this generator for its next prompt once
-            # it has fully finished the PREVIOUS turn, so no turn is in
-            # flight right now.
-            await self._run_dehydration(self.last_saved_session_id)
             item = self.queue.pop(0)
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
             yield item["message"]
@@ -641,11 +620,6 @@ class ChatSession:
         asyncio.create_task(self._apply_conn_state(kind, reason))
 
     # ------------------------------------------------------------- helpers --
-
-    def has_live_dialog(self, idle_threshold_s: float = 5 * 60) -> bool:
-        if self.conn_state.get("kind") == "restart_backoff":
-            return False
-        return self.turn_pending or (time.monotonic() - self.last_user_activity) < idle_threshold_s
 
     def _clear_api_retry_timer(self) -> None:
         if self.api_retry_timer:
@@ -731,23 +705,6 @@ class ChatSession:
             save_tab_session_id(self.workspace_dir, self.tab_id, migrated)
         return migrated
 
-    async def _run_dehydration(self, session_id: str | None) -> None:
-        if not session_id:
-            return
-        if session_id != self.dehydrated_for_session_id:
-            log_event("engine", "dehydrate_session_switch", tab_id=self.tab_id, from_session=self.dehydrated_for_session_id, to_session=session_id)
-            self.dehydrated_for_session_id = session_id
-            self.dehydrated_through_line = 0
-        try:
-            outcome = await dehydrate_previous_turns(self.workspace_dir, session_id, self.dehydrated_through_line)
-            self.dehydrated_through_line = outcome.new_through_line
-        except Exception as exc:
-            log_event("engine", "dehydrate_pass_failed", tab_id=self.tab_id, session_id=session_id, error=str(exc))
-        try:
-            await age_previous_turns_in_place(self.workspace_dir, session_id)
-        except Exception as exc:
-            log_event("engine", "age_budget_pass_failed", tab_id=self.tab_id, session_id=session_id, error=str(exc))
-
     def _reset_unrecoverable_session(self, replay_text: str | None, replay_attachments: list[Any]) -> None:
         log_event("engine", "reset_unrecoverable_session", tab_id=self.tab_id)
         archive_note = ""
@@ -756,7 +713,6 @@ class ChatSession:
             try:
                 old_path = claude_project_dir(self.workspace_dir) / f"{old_session_id}.jsonl"
                 if old_path.exists():
-                    from app.dehydrate import dehydrated_dir
                     import shutil
                     directory = dehydrated_dir(self.workspace_dir)
                     directory.mkdir(parents=True, exist_ok=True)
@@ -782,62 +738,28 @@ class ChatSession:
         if self.client:
             asyncio.create_task(self._safe_disconnect(self.client))
 
-    async def _run_urgent_compaction(self, replay_text: str | None, replay_attachments: list[Any]) -> None:
-        if self.compaction_in_progress:
-            log_event("engine", "urgent_compaction_already_in_progress", tab_id=self.tab_id)
-            return
-        session_id = load_tab_session_id(self.workspace_dir, self.tab_id)
-        if not session_id:
-            log_event("engine", "urgent_compaction_no_session", tab_id=self.tab_id)
-            return
-        self.compaction_in_progress = True
+    async def _pre_compact_hook(self, hook_input: Any, tool_use_id: Any, context: Any) -> dict[str, Any]:
+        """Fires just before Claude's own auto-compaction summarises older
+        turns. Copies the current transcript to workspace/dehydrated/ and
+        points the continuity pointer at it, so if the summary ever drops
+        something the user asks about, Caroline has a real file to Read
+        (main.py's expand_dehydrated_ref serves it back). Best-effort;
+        never blocks or fails compaction."""
         try:
-            result = await compact_session_if_due(self.workspace_dir, session_id, self.last_compacted_at, force=True)
-            if not result:
-                log_event("engine", "urgent_compaction_noop", tab_id=self.tab_id)
-                return
-            self.last_compacted_at = result.compacted_at
-            save_tab_session_id(self.workspace_dir, self.tab_id, result.new_session_id)
-            save_tab_compaction_note(self.workspace_dir, self.tab_id, result.parent_path, _epoch_ms_to_iso(result.compacted_at))
-            self.urgent_compaction_replay_text = replay_text
-            self.urgent_compaction_replay_attachments = replay_attachments
-            self.restart_for_urgent_compaction = True
-            if self.client:
-                await self.client.disconnect()
+            trigger = hook_input.get("trigger") if isinstance(hook_input, dict) else None
+            transcript_path = hook_input.get("transcript_path") if isinstance(hook_input, dict) else None
+            if trigger != "auto" or not transcript_path or not Path(transcript_path).exists():
+                return {}
+            import shutil
+            directory = dehydrated_dir(self.workspace_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            archive_path = str(directory / f"{uuid_mod.uuid4()}.txt")
+            shutil.copyfile(transcript_path, archive_path)
+            save_tab_continuity_archive(self.workspace_dir, self.tab_id, archive_path)
+            log_event("engine", "pre_compact_archived", tab_id=self.tab_id, archive_path=archive_path)
         except Exception as exc:
-            log_event("engine", "urgent_compaction_failed", tab_id=self.tab_id, error=str(exc))
-            self._set_conn_state("restarting", "Compaction failed, retrying...")
-            self._schedule_api_retry("urgent_compaction_failed", self.turn_is_voice)
-        finally:
-            self.compaction_in_progress = False
-
-    def _maybe_compact(self) -> None:
-        if self.has_live_dialog():
-            self.pending_compaction = True
-            return
-        asyncio.create_task(self._run_compaction())
-
-    async def _run_compaction(self) -> None:
-        if self.compaction_in_progress:
-            log_event("engine", "compaction_already_in_progress", tab_id=self.tab_id)
-            return
-        session_id = load_tab_session_id(self.workspace_dir, self.tab_id)
-        if not session_id:
-            return
-        self.compaction_in_progress = True
-        try:
-            result = await compact_session_if_due(self.workspace_dir, session_id, self.last_compacted_at, force=False)
-            if result:
-                self.last_compacted_at = result.compacted_at
-                save_tab_session_id(self.workspace_dir, self.tab_id, result.new_session_id)
-                save_tab_compaction_note(self.workspace_dir, self.tab_id, result.parent_path, _epoch_ms_to_iso(result.compacted_at))
-                log_event("engine", "compaction_done", tab_id=self.tab_id, new_session_id=result.new_session_id)
-                if self.client:
-                    await self.client.disconnect()
-        except Exception as exc:
-            log_event("engine", "compaction_failed", tab_id=self.tab_id, error=str(exc))
-        finally:
-            self.compaction_in_progress = False
+            log_event("engine", "pre_compact_hook_failed", tab_id=self.tab_id, error=str(exc))
+        return {}
 
     def _handle_balance_exhausted(self) -> str:
         """Own-Anthropic credits/quota ran out. Nothing to fall back to and
@@ -886,12 +808,11 @@ class ChatSession:
         could silently pull another tab's transcript. Stays scoped to
         THIS tab's own resumed session id throughout, same as
         refresh_language_in_background/_read_recent_history_texts.
-        Also per explicit correction: a post-compaction session file only
-        holds the fragment since the fork, which starved this of context
-        on a long-running tab -- falls back to this tab's own compaction
-        parent / continuity-archive file (both real past .jsonl-shaped
-        transcripts, per-tab, never shared) when the live file alone is
-        thin."""
+        When the live session file alone is thin (right after a native
+        auto-compaction, whose isCompactSummary replaces older turns), it
+        falls back to this tab's own continuity-archive file (the
+        pre-compaction transcript the PreCompact hook saved, per-tab,
+        never shared)."""
         def _usable_lines(entries: list[dict[str, Any]]) -> list[str]:
             out: list[str] = []
             for entry in entries:
@@ -900,12 +821,8 @@ class ChatSession:
                 if not clean_text or _is_synthetic_history_text(raw_text):
                     continue
                 # A clean_text that is one lone bracketed expression is a
-                # dehydration/placeholder marker, never real conversational
-                # content -- dehydrate.py replaces a stripped turn's body
-                # with "[мысли этого хода не сохраняются]", and an
-                # aged-out turn collapses to just its "[<timestamp>]".
-                # Language-agnostic on purpose (don't hardcode that one
-                # Russian string).
+                # placeholder/marker (a bare "[<timestamp>]" line, a
+                # compaction stub), never real conversational content.
                 if clean_text.startswith("[") and clean_text.endswith("]") and "\n" not in clean_text:
                     continue
                 speaker = "User" if entry.get("role") == "user" else "Caroline"
@@ -919,19 +836,13 @@ class ChatSession:
                 lines = _usable_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)))
             except Exception as exc:
                 log_event("engine", "progress_narration_history_read_failed", tab_id=self.tab_id, error=str(exc))
-        # Gate on USABLE line count, not raw entry count -- after aggressive
-        # per-turn dehydration the live file can be many entries yet hold
-        # almost no real text, which is exactly when the older
-        # compaction-parent / continuity-archive context matters most.
         if len(lines) < limit:
-            parent_path, _ = load_tab_compaction_note(self.workspace_dir, self.tab_id)
             archive_path = load_tab_continuity_archive(self.workspace_dir, self.tab_id)
-            for older_path in (parent_path, archive_path):
-                if older_path and len(lines) < limit:
-                    try:
-                        lines = _usable_lines(read_archived_entries(older_path)) + lines
-                    except Exception as exc:
-                        log_event("engine", "progress_narration_archive_read_failed", tab_id=self.tab_id, path=older_path, error=str(exc))
+            if archive_path:
+                try:
+                    lines = _usable_lines(read_archived_entries(archive_path)) + lines
+                except Exception as exc:
+                    log_event("engine", "progress_narration_archive_read_failed", tab_id=self.tab_id, path=archive_path, error=str(exc))
         return "\n".join(lines[-limit:])
 
     async def _check_progress_narration(self) -> None:
@@ -1060,20 +971,6 @@ class ChatSession:
         except Exception as exc:
             log_event("engine", "hang_escalation_close_failed", tab_id=self.tab_id, error=str(exc))
 
-    # ----------------------------------------------------------- compaction --
-
-    async def _compaction_loop(self) -> None:
-        try:
-            await asyncio.sleep(COMPACTION_STARTUP_DELAY_MS / 1000)
-            if not self.ended:
-                self._maybe_compact()
-            while not self.ended:
-                await asyncio.sleep(COMPACTION_CHECK_INTERVAL_MS / 1000)
-                if not self.ended:
-                    self._maybe_compact()
-        except asyncio.CancelledError:
-            pass
-
     # ------------------------------------------------------------- failure --
 
     async def _handle_failure(self, exc: BaseException) -> None:
@@ -1094,7 +991,6 @@ class ChatSession:
                 f"Trouble reconnecting (failed {len(self.restart_timestamps)} times in {RESTART_WINDOW_MS // 60_000}min) "
                 f"-- retrying in {RESTART_BACKOFF_MS // 1000}s",
             )
-            self._maybe_compact()
             await asyncio.sleep(RESTART_BACKOFF_MS / 1000)
         self._set_conn_state("restarting", str(exc))
         watchdog_note = (
@@ -1193,30 +1089,13 @@ class ChatSession:
                 if resume_session_id:
                     self.last_saved_session_id = resume_session_id
 
-                if resume_session_id:
-                    size_bytes = await get_session_file_size_bytes(self.workspace_dir, resume_session_id)
-                    log_event("engine", "urgent_compaction_size_check", tab_id=self.tab_id, session_id=resume_session_id, size_bytes=size_bytes)
-                    if size_bytes is not None and size_bytes >= URGENT_COMPACTION_SIZE_THRESHOLD_BYTES:
-                        self._set_conn_state("restarting", "Urgent compaction...")
-                        try:
-                            result = await compact_session_if_due(self.workspace_dir, resume_session_id, self.last_compacted_at, force=True)
-                            if result:
-                                self.last_compacted_at = result.compacted_at
-                                save_tab_session_id(self.workspace_dir, self.tab_id, result.new_session_id)
-                                save_tab_compaction_note(self.workspace_dir, self.tab_id, result.parent_path, _epoch_ms_to_iso(result.compacted_at))
-                                resume_session_id = result.new_session_id
-                                self.last_saved_session_id = result.new_session_id
-                        except Exception as exc:
-                            log_event("engine", "pre_resume_compaction_failed", tab_id=self.tab_id, error=str(exc))
-                    await self._run_dehydration(resume_session_id)
-
                 mcp_servers = build_mcp_servers()
+                self._system_prompt_language = current_language_name(self.tab_id)
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
-                    compaction_pointer_instruction(*load_tab_compaction_note(self.workspace_dir, self.tab_id)),
-                    language_hint_instruction(current_language_name(self.tab_id)),
+                    language_hint_instruction(self._system_prompt_language),
                 ]
                 system_prompt_append = "\n\n".join(p for p in system_prompt_parts if p)
 
@@ -1232,11 +1111,14 @@ class ChatSession:
                     "mcp_servers": mcp_servers,
                     "disallowed_tools": ["mcp__caroline-notes__notes_login"],
                     "stderr": _stderr_handler,
+                    # Claude's own native auto-compaction handles context
+                    # ageing now -- explicitly on, and one long-lived client
+                    # across turns (no per-turn transcript rewrite/restart).
+                    "settings": json.dumps({"autoCompactEnabled": True}),
+                    "hooks": {"PreCompact": [HookMatcher(hooks=[self._pre_compact_hook])]},
                 }
                 if anthropic_env:
                     options_kwargs["env"] = anthropic_env
-                if mode.chat_source != "own-anthropic-oauth":
-                    options_kwargs["settings"] = json.dumps({"autoCompactEnabled": False})
                 if resume_session_id:
                     options_kwargs["resume"] = resume_session_id
                 if system_prompt_append:
@@ -1296,10 +1178,14 @@ class ChatSession:
                         text_blocks = [b.text for b in message.content if isinstance(b, TextBlock)]
                         prompt_too_long = next((t for t in text_blocks if PROMPT_TOO_LONG_PATTERN.search(t)), None)
                         if prompt_too_long:
+                            # Native auto-compaction should keep the context
+                            # under the limit; if this still fires, the
+                            # session is somehow past saving -- abandon it and
+                            # start fresh (the pre-reset transcript is archived
+                            # for Read, same as any unrecoverable reset).
                             log_event("engine", "prompt_too_long", tab_id=self.tab_id, text=prompt_too_long[:200])
-                            self._set_conn_state("restarting", "Urgent compaction...")
-                            replay_text, replay_attachments = self.pending_user_text, self.pending_attachments
-                            asyncio.create_task(self._run_urgent_compaction(replay_text, replay_attachments))
+                            self._set_conn_state("restarting", "Recovering (context overflow)...")
+                            self._reset_unrecoverable_session(self.pending_user_text, self.pending_attachments)
                             continue
                         tool_concurrency = next((t for t in text_blocks if TOOL_CONCURRENCY_ERROR_PATTERN.search(t)), None)
                         if tool_concurrency:
@@ -1389,9 +1275,6 @@ class ChatSession:
                             self.ignore_next_result_recovery = False
                         elif self.conn_state.get("kind") != "connected":
                             self._set_conn_state("connected")
-                        if self.pending_compaction and not self.has_live_dialog():
-                            self.pending_compaction = False
-                            asyncio.create_task(self._run_compaction())
 
                     wire = message_to_wire(message)
                     if not self.silent_turn and wire is not None:
@@ -1405,12 +1288,11 @@ class ChatSession:
                                     self.last_visible_output_at = time.monotonic()
 
                     if isinstance(message, ResultMessage):
+                        # One long-lived client now -- the turn is done, but
+                        # the stream stays open for the next queued turn
+                        # (_input_stream yields it). No per-turn restart.
                         self.silent_turn = True
                         self.turn_is_voice = False
-                        await self._run_dehydration(sid or self.last_saved_session_id)
-                        self.restart_for_dehydration = True
-                        if self.client:
-                            await self.client.disconnect()
 
                     if isinstance(message, SystemMessage) and message.subtype == "init":
                         self.has_seen_init = True
@@ -1458,21 +1340,10 @@ class ChatSession:
 
                 if self.restart_pending:
                     self.restart_pending = False
-                    log_event("engine", "restart_pending_handled", tab_id=self.tab_id)
+                    replay_text = self.pending_user_text
+                    replay_attachments = self.pending_attachments
+                    log_event("engine", "restart_pending_handled", tab_id=self.tab_id, has_replay=replay_text is not None)
                     self.last_rate_limit_info = None
-                    self.turn_pending = False
-                    self.pending_user_text = None
-                    self.pending_attachments = []
-                    clear_pending_turn(self.workspace_dir, self.tab_id)
-                    continue
-
-                if self.restart_for_urgent_compaction:
-                    self.restart_for_urgent_compaction = False
-                    replay_text = self.urgent_compaction_replay_text
-                    replay_attachments = self.urgent_compaction_replay_attachments
-                    self.urgent_compaction_replay_text = None
-                    self.urgent_compaction_replay_attachments = []
-                    log_event("engine", "restart_urgent_compaction", tab_id=self.tab_id, has_replay=replay_text is not None)
                     self.turn_pending = False
                     self.pending_user_text = None
                     self.pending_attachments = []
@@ -1501,11 +1372,6 @@ class ChatSession:
                         # refresh for the next reset/turn.
                         refresh_language_in_background(self.last_saved_session_id, self.tab_id)
                         self.submit(replay_text, replay_attachments, True, False, self.turn_is_voice)
-                    continue
-
-                if self.restart_for_dehydration:
-                    self.restart_for_dehydration = False
-                    log_event("engine", "restart_dehydration", tab_id=self.tab_id)
                     continue
 
                 balance_source = detect_balance_exhaustion(str(exc))

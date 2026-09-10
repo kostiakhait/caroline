@@ -21,8 +21,7 @@ from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, auth_status as cli_auth_status, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
-from app.dehydrate import dehydrated_dir, extract_dehydrated_file_path
-from app.durability import peek_pending_turn
+from app.durability import dehydrated_dir, peek_pending_turn
 from app.history import read_archived_entries, read_recent_history
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event

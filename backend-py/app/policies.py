@@ -256,33 +256,6 @@ def continuity_pointer_instruction(archive_path: str | None) -> str:
     )
 
 
-def compaction_pointer_instruction(parent_path: str | None, compacted_at_iso: str | None) -> str:
-    """Companion to continuity_pointer_instruction, but for the OTHER
-    reason a session's history can look thin: routine age-based compaction
-    (compaction.py's compact_session_if_due), not an error. Without this,
-    a compacted session carries no top-level explanation at all -- only
-    per-block stub notes (compaction.py's _stub_note) where something
-    specific got aged out -- so nothing tells the model the RESTART itself
-    (new session id, same conversation) was deliberate housekeeping rather
-    than a sign something went wrong. Persistent for the session's
-    lifetime, same reasoning as continuity_pointer_instruction: a later
-    turn may reference something now stubbed, not just the first one.
-    Only present when a compaction has actually happened for this tab;
-    absent (returns "") otherwise."""
-    if not parent_path:
-        return ""
-    return (
-        f'Note: this session was routinely compacted at {compacted_at_iso} to keep its context size in check -- '
-        'this is normal, automatic housekeeping, NOT a failure or an error, and NOT something to mention to the '
-        'user unless they ask. Older/heavier parts of the conversation (old screenshots, old tool results, old '
-        'turns) were replaced with short placeholder notes to save context space; you may see some of those '
-        'placeholders as you scroll back through this conversation. The full original, uncompacted content is '
-        f'preserved verbatim at: {parent_path}\n'
-        'If you need something no longer inline -- the exact old text of a tool result, an old screenshot, the '
-        'full wording of something said a while back -- read that file rather than assuming it\'s lost.'
-    )
-
-
 def task_completion_memory_instruction() -> str:
     """Per explicit instruction (2026-09-09): distinct from
     learn_from_mistakes_instruction (which is specifically for a mistake/
@@ -291,8 +264,8 @@ def task_completion_memory_instruction() -> str:
     completed task, success or not, into Notes (Caroline's own long-term
     memory -- see PROJECT.md: "Notes ... long-term memory"), so future-you
     can recall what was actually done without it still being in this
-    session's own history (which, per compaction_pointer_instruction
-    above, eventually ages out anyway)."""
+    session's own history (which Claude's native auto-compaction ages
+    out anyway)."""
     return (
         "After finishing any real task the user asked for -- not a one-line question you answered directly, but "
         "something that took actual work (multiple steps, tool calls, a nontrivial decision) -- write a short "

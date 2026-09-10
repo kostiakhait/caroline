@@ -60,13 +60,6 @@ CC_CLI_LIMIT_PATTERN = re.compile(r"hit your .*\blimit\b|monthly spend limit|cc_
 # session, the turn fails with this text instead of a real reply.
 PROMPT_TOO_LONG_PATTERN = re.compile(r"^Prompt is too long\b", re.IGNORECASE)
 
-# Plain filesystem-size check for the SAME failure mode, used proactively
-# (before ever creating query()) since a session too big to even load can
-# silently stall for minutes with zero SDK output -- confirmed live as a
-# 326-second silent stall. Shared with compaction.py's own constant
-# semantics (this one is a size THRESHOLD, not the recent-content budget).
-URGENT_COMPACTION_SIZE_THRESHOLD_BYTES = 8 * 1024 * 1024  # 8MB
-
 # --- tool-use-concurrency session corruption --------------------------------
 # Extensive bisection (a real broken transcript, direct claude.exe
 # invocation bypassing the SDK) found NO single content anomaly --
