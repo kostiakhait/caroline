@@ -96,20 +96,38 @@ _TIMESTAMP_STAMP_PATTERN = re.compile(r"^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat)
 
 
 def _stamp_timestamp_if_missing(entry: dict[str, Any], content: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    first = content[0] if content else None
-    already_stamped = bool(
-        first and first.get("type") == "text" and isinstance(first.get("text"), str)
-        and _TIMESTAMP_STAMP_PATTERN.match(first["text"])
-    )
-    timestamp = entry.get("timestamp")
-    if already_stamped or not isinstance(timestamp, str):
+    if not content:
         return content
+    timestamp = entry.get("timestamp")
+    if not isinstance(timestamp, str):
+        return content
+    # Bug fix (2026-09-10): confirmed live as the root cause of a chronic
+    # "API Error: 400 due to tool use concurrency issues." (262 hits in one
+    # prod-log window). With the interleaved-thinking beta active (CLI
+    # 2.1.x default, effort=high), the Anthropic API is strict about the
+    # SHAPE of any assistant message that carries a tool_use block when
+    # it's replayed on resume: a leading `thinking`/`redacted_thinking`
+    # block must stay first, and you may not slip a bare `text` block in
+    # front of a `tool_use` that has no preceding thinking. This function
+    # used to just splice the stamp in at index 0 unconditionally, which
+    # did exactly that on every tool-call turn. Now: skip any leading
+    # thinking run, and only stamp if the block landed on is itself a
+    # `text` block -- never ahead of a tool_use / tool_result / image /
+    # bare thinking entry.
+    insert_at = 0
+    while insert_at < len(content) and content[insert_at].get("type") in ("thinking", "redacted_thinking"):
+        insert_at += 1
+    anchor = content[insert_at] if insert_at < len(content) else None
+    if not (anchor and anchor.get("type") == "text" and isinstance(anchor.get("text"), str)):
+        return content
+    if _TIMESTAMP_STAMP_PATTERN.match(anchor["text"]):
+        return content  # already stamped (this entry, or an earlier rescan)
     try:
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         return content
     stamp = {"type": "text", "text": f"[{_format_timestamp_for_model(parsed)}]"}
-    return [stamp, *content]
+    return [*content[:insert_at], stamp, *content[insert_at:]]
 
 
 def _dehydrated_note(detail: str, file_path: str) -> dict[str, Any]:
@@ -170,12 +188,20 @@ def _dehydrate_block(block: dict[str, Any], workspace_dir: str) -> tuple[dict[st
 
 
 def _dehydrate_entry(entry: dict[str, Any], workspace_dir: str) -> tuple[dict[str, Any], bool]:
-    """A `thinking` block is scratch work for arriving at THAT turn's own
-    answer -- once the turn is over, what matters going forward is the
-    outcome, not the reasoning. Dropped outright, every turn, for every
-    already-completed entry -- no extraction, no stub note. Safe
-    specifically because this only ever runs on entries from
-    ALREADY-COMPLETED turns (between-turn call sites only)."""
+    """Replaces raw image/document bytes with an on-disk reference, per turn.
+
+    Bug fix (2026-09-10): this USED to also strip every `thinking` block
+    ("scratch work, the outcome is what matters going forward"). That was
+    the other half of a chronic "API Error: 400 due to tool use
+    concurrency issues." on resume (262 hits in one prod-log window):
+    with interleaved extended thinking on (CLI 2.1.x default), a tool-call
+    assistant turn MUST still carry its leading `thinking` block when the
+    session is resumed -- stripping it (or, see _stamp_timestamp_if_missing,
+    shoving a text block in front of it) makes the API reject the whole
+    replayed transcript. Genuinely old thinking still gets reclaimed
+    wholesale by age_previous_turns_in_place once the transcript grows
+    past the recent-content byte budget; it just isn't picked apart
+    block-by-block on the live tail anymore."""
     if entry.get("type") not in ("user", "assistant"):
         return entry, False
     content = (entry.get("message") or {}).get("content")
@@ -184,18 +210,11 @@ def _dehydrate_entry(entry: dict[str, Any], workspace_dir: str) -> tuple[dict[st
     any_changed = False
     new_content: list[dict[str, Any]] = []
     for block in content:
-        if block.get("type") == "thinking":
-            any_changed = True
-            continue
         new_block, changed = _dehydrate_block(block, workspace_dir)
         if changed:
             any_changed = True
         new_content.append(new_block)
-    # A meaningful fraction of real assistant entries are ONE thinking
-    # block and nothing else -- an entry left with zero content blocks
-    # after stripping thinking would silently defeat the point. A single
-    # minimal placeholder is an unambiguously valid content shape.
-    final_content = new_content if new_content else [{"type": "text", "text": "[мысли этого хода не сохраняются]"}]
+    final_content = new_content if new_content else [{"type": "text", "text": "[пустой ход]"}]
     stamped_content = _stamp_timestamp_if_missing(entry, final_content)
     if stamped_content is not final_content:
         any_changed = True
@@ -291,8 +310,10 @@ def _reference_note(extracted_path: str) -> dict[str, Any]:
 async def age_previous_turns_in_place(workspace_dir: str, session_id: str) -> AgeBudgetOutcome:
     """In-place, per-turn equivalent of compaction.py's recent-content
     byte budget. Call AFTER dehydrate_previous_turns in the same pass --
-    images/documents/thinking should already be gone from live entries by
-    the time this runs."""
+    raw image/document bytes should already be off the live entries by
+    the time this runs (thinking blocks are deliberately left intact on
+    the tail now -- see _dehydrate_entry -- and get reclaimed here,
+    wholesale, along with everything else past the budget)."""
     from app.compaction import RECENT_CONTENT_BUDGET_BYTES
 
     file_path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
