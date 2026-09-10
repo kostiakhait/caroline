@@ -106,14 +106,28 @@ function formatTimestampForModel(d: Date): string {
  * rescanned.
  */
 const TIMESTAMP_STAMP_PATTERN = /^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )/;
+// Bug fix (2026-09-10, mirrored from backend-py/app/dehydrate.py): with the
+// interleaved-thinking beta active (CLI 2.1.x default, effort=high) the API
+// rejects a replayed assistant message on resume if a `thinking` block was
+// pushed out of first position, or a bare `text` block sits ahead of a
+// `tool_use` with no preceding thinking. Blindly splicing the stamp in at
+// index 0 did exactly that on every tool-call turn -- root cause of a chronic
+// "400 tool use concurrency" (262 hits in one prod-log window). Skip any
+// leading thinking run, and only stamp when the block landed on is itself a
+// `text` block.
 function stampTimestampIfMissing(entry: RawEntry, content: ContentBlock[]): ContentBlock[] {
-  const first = content[0];
-  const alreadyStamped = first?.type === "text" && typeof first.text === "string" && TIMESTAMP_STAMP_PATTERN.test(first.text);
-  if (alreadyStamped || typeof entry.timestamp !== "string") return content;
+  if (content.length === 0 || typeof entry.timestamp !== "string") return content;
+  let insertAt = 0;
+  while (insertAt < content.length && (content[insertAt].type === "thinking" || content[insertAt].type === "redacted_thinking")) {
+    insertAt++;
+  }
+  const anchor = content[insertAt];
+  if (!anchor || anchor.type !== "text" || typeof anchor.text !== "string") return content;
+  if (TIMESTAMP_STAMP_PATTERN.test(anchor.text)) return content;
   const parsed = new Date(entry.timestamp);
   if (Number.isNaN(parsed.getTime())) return content;
   const stamp: ContentBlock = { type: "text", text: `[${formatTimestampForModel(parsed)}]` };
-  return [stamp, ...content];
+  return [...content.slice(0, insertAt), stamp, ...content.slice(insertAt)];
 }
 
 /** Same tone/shape as compaction.ts's stubNote() -- kept as a SEPARATE function (not shared)
@@ -180,19 +194,17 @@ async function dehydrateBlock(block: ContentBlock, workspaceDir: string): Promis
 }
 
 /**
- * Per explicit instruction (2026-09-09): a `thinking` block is scratch work
- * for arriving at THAT turn's own answer -- once the turn is over, what
- * matters going forward is the outcome (text/tool_use/tool_result), not the
- * reasoning that produced it. The model doesn't need to re-read its own old
- * thinking to converse well later, so (unlike text/tool_result, which DO
- * carry real information worth keeping a reference to) this is dropped
- * outright, every turn, for every already-completed entry -- no extraction,
- * no stub note, nothing to point back at. Safe specifically because
- * dehydrateEntry/dehydratePreviousTurns only ever runs on entries from
- * ALREADY-COMPLETED turns (between-turn call sites only -- see this file's
- * own top doc comment), never on a turn still mid-generation, so there's no
- * live tool-use loop whose thinking block this could be pulling out from
- * under.
+ * Replaces raw image/document bytes with an on-disk reference, per turn.
+ *
+ * Bug fix (2026-09-10, mirrored from backend-py/app/dehydrate.py): this USED
+ * to also strip every `thinking` block ("the outcome is what matters going
+ * forward"). That was the other half of a chronic "400 tool use concurrency"
+ * on resume (262 hits in one prod-log window): with interleaved extended
+ * thinking on (CLI 2.1.x default), a tool-call assistant turn must still
+ * carry its leading `thinking` block when the session is resumed. Genuinely
+ * old thinking still gets reclaimed wholesale by agePreviousTurnsInPlace once
+ * past the recent-content byte budget; it just isn't picked apart
+ * block-by-block on the live tail anymore.
  */
 async function dehydrateEntry(entry: RawEntry, workspaceDir: string): Promise<{ entry: RawEntry; changed: boolean }> {
   if (entry.type !== "user" && entry.type !== "assistant") return { entry, changed: false };
@@ -201,24 +213,11 @@ async function dehydrateEntry(entry: RawEntry, workspaceDir: string): Promise<{ 
   let anyChanged = false;
   const newContent: ContentBlock[] = [];
   for (const block of content) {
-    if (block.type === "thinking") {
-      anyChanged = true;
-      continue;
-    }
     const result = await dehydrateBlock(block, workspaceDir);
     if (result.changed) anyChanged = true;
     newContent.push(result.block);
   }
-  // Bug fix (2026-09-09): confirmed live that this is NOT a rare edge case --
-  // a meaningful fraction of real assistant entries are ONE thinking block
-  // and nothing else (the model's reasoning logged as its own transcript
-  // line, separate from the text/tool_use that follows in a LATER entry).
-  // The original version of this left those entries completely untouched
-  // ("don't risk an empty content array"), which silently defeated the
-  // whole point for exactly the entries most worth fixing. A single minimal
-  // placeholder text block is unambiguously a valid, ordinary content shape
-  // -- no guessing needed about whether the API accepts `content: []`.
-  const finalContent = newContent.length > 0 ? newContent : [{ type: "text", text: "[мысли этого хода не сохраняются]" } as ContentBlock];
+  const finalContent = newContent.length > 0 ? newContent : [{ type: "text", text: "[пустой ход]" } as ContentBlock];
   const stampedContent = stampTimestampIfMissing(entry, finalContent);
   if (stampedContent !== finalContent) anyChanged = true;
   if (!anyChanged) return { entry, changed: false };
@@ -358,8 +357,10 @@ function referenceNote(extractedPath: string): ContentBlock {
  * budget (see that module's own RECENT_CONTENT_BUDGET_BYTES doc comment for
  * why this exists -- the fork-based hourly/urgent version alone let real
  * content blow past the budget for up to an hour at a time). Call AFTER
- * dehydratePreviousTurns in the same pass -- images/documents/thinking
- * should already be gone from live entries by the time this runs.
+ * dehydratePreviousTurns in the same pass -- raw image/document bytes should
+ * already be off the live entries by then (thinking blocks are deliberately
+ * left on the tail now -- see dehydrateEntry -- and get reclaimed here,
+ * wholesale, along with everything else past the budget).
  */
 export async function agePreviousTurnsInPlace(workspaceDir: string, sessionId: string): Promise<AgeBudgetOutcome> {
   const filePath = join(claudeProjectDir(workspaceDir), `${sessionId}.jsonl`);
