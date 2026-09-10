@@ -55,9 +55,9 @@ internal static class PythonInstaller
     // new package gets pip-installed for backend-py, or a real install will work on
     // the dev machine and be broken everywhere else.
     // NOTE: entries here MUST be plain package names, not pip extras syntax
-    // (e.g. "uvicorn[standard]") -- ArePackagesInstalled() below checks for a
-    // Lib/site-packages/<name> directory literally matching each entry
-    // (hyphens->underscores), which a "pkg[extra]" string would never match.
+    // (e.g. "uvicorn[standard]") -- IsPackageImportable() below needs the
+    // real PyPI distribution name to find its dist-info folder, which a
+    // "pkg[extra]" string would never match.
     // uvicorn's WebSocket support just needs `websockets` importable -- listed
     // here as its own top-level package instead, same practical effect.
     private static readonly string[] PythonPackages =
@@ -76,8 +76,46 @@ internal static class PythonInstaller
     private static bool ArePackagesInstalled()
     {
         if (!File.Exists(PipExe)) return false;
-        return PythonPackages.All(pkg =>
-            Directory.Exists(Path.Combine(AppPaths.PythonDir, "Lib", "site-packages", pkg.Replace('-', '_'))));
+        var sitePackagesDir = Path.Combine(AppPaths.PythonDir, "Lib", "site-packages");
+        return PythonPackages.All(pkg => IsPackageImportable(sitePackagesDir, pkg));
+    }
+
+    /// <summary>
+    /// A PyPI distribution name has no fixed relationship to the module(s) it
+    /// actually installs -- this is the norm, not an edge case (confirmed
+    /// live, 2026-09-09: "python-dotenv" installs as plain `dotenv`, not
+    /// `python_dotenv` -- same story as beautifulsoup4/bs4, PyYAML/yaml,
+    /// Pillow/PIL, and plenty of others). Guessing via hyphens->underscores
+    /// silently fails a real, fully-successful install. The authoritative
+    /// answer is pip's own <dist>-<version>.dist-info/top_level.txt, which
+    /// lists every top-level importable name that distribution actually
+    /// installs -- read that first, and only fall back to the naive guess
+    /// if no matching dist-info is found at all (an install that hasn't
+    /// happened yet, or an unusual package with no top_level.txt).
+    /// </summary>
+    private static bool IsPackageImportable(string sitePackagesDir, string package)
+    {
+        if (!Directory.Exists(sitePackagesDir)) return false;
+        var normalizedPrefix = package.Replace('-', '_');
+        foreach (var distInfoDir in Directory.GetDirectories(sitePackagesDir, $"{normalizedPrefix}-*.dist-info"))
+        {
+            var topLevelPath = Path.Combine(distInfoDir, "top_level.txt");
+            if (!File.Exists(topLevelPath)) continue;
+            foreach (var rawName in File.ReadAllLines(topLevelPath))
+            {
+                var name = rawName.Trim();
+                if (name.Length == 0) continue;
+                if (Directory.Exists(Path.Combine(sitePackagesDir, name)) ||
+                    File.Exists(Path.Combine(sitePackagesDir, $"{name}.py")))
+                {
+                    return true;
+                }
+            }
+        }
+        // Fallback: no dist-info/top_level.txt found at all -- covers the
+        // common case where the distribution name IS the module name, and
+        // any packaging that predates top_level.txt.
+        return Directory.Exists(Path.Combine(sitePackagesDir, normalizedPrefix));
     }
 
     public static async Task InstallAsync(Downloader downloader,
