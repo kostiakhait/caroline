@@ -72,9 +72,11 @@ from app.durability import (
     clear_tab_continuity_archive,
     clear_tab_session_id,
     find_most_recent_claude_session_id,
+    load_tab_compaction_note,
     load_tab_continuity_archive,
     load_tab_session_id,
     save_pending_turn,
+    save_tab_compaction_note,
     save_tab_continuity_archive,
     save_tab_session_id,
 )
@@ -92,10 +94,11 @@ from app.failure_classification import (
 from app.logging_setup import log_event
 from app.plugins.loader import build_mcp_servers
 from app.persona import get_persona, persona_system_prompt_append
-from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction
+from app.policies import ALWAYS_ON_INSTRUCTIONS, compaction_pointer_instruction, continuity_pointer_instruction, language_hint_instruction
 from app.session_context import set_send
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
+    OWN_ANTHROPIC_RECHECK_INTERVAL_MS,
     build_options_env,
     clear_own_anthropic_exhausted,
     create_topup_checkout_url,
@@ -130,6 +133,12 @@ MCP_RECONNECT_INTERVAL_MS = 15_000
 # is just as stuck as the original message until hang-detection's own,
 # separate recovery kicks in.
 SILENT_USER_WAIT_NUDGE_MS = 90_000
+
+# How many consecutive "authentication_failed" system/api_retry messages on
+# one connection before forcing a restart (which re-mints a fresh sw-proxy
+# session / re-resolves own-Anthropic) instead of retrying the same doomed
+# request forever. Own choice, not a specified value.
+AUTH_RETRY_ESCALATION_THRESHOLD = 3
 
 CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
     "Continue any unfinished work, if there is any. If not, do nothing and reply with exactly [[NO_UPDATE]], with "
@@ -197,6 +206,10 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
 def _is_synthetic_history_text(raw_text: str) -> bool:
     text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
     return any(p.match(text) for p in _SYNTHETIC_HISTORY_TEXT_PATTERNS)
+
+
+def _epoch_ms_to_iso(epoch_ms: float) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _last_language_path() -> Path:
@@ -381,6 +394,19 @@ class ChatSession:
         self.last_compacted_at: float | None = None
         self.pending_compaction = False
         self.compaction_in_progress = False
+
+        # own-Anthropic recovery probing (per explicit instruction, 2026-09-09):
+        # this tab's own last probe time and whether the CURRENT restart-in-
+        # progress was specifically triggered by that probe (so the post-
+        # recovery silent nudge only fires for a genuine recovery, not any
+        # other restart that happens to land on own-anthropic-oauth).
+        self.current_chat_source: str | None = None
+        self.last_own_anthropic_probe_at: float | None = None
+        self.own_anthropic_recovery_restart_pending = False
+
+        # Consecutive "authentication_failed" api_retry messages on the
+        # CURRENT connection -- see AUTH_RETRY_ESCALATION_THRESHOLD below.
+        self.consecutive_auth_retry_failures = 0
 
         # deliberate-restart flags
         self.restart_for_chat_source_switch = False
@@ -708,6 +734,7 @@ class ChatSession:
                 return
             self.last_compacted_at = result.compacted_at
             save_tab_session_id(self.workspace_dir, self.tab_id, result.new_session_id)
+            save_tab_compaction_note(self.workspace_dir, self.tab_id, result.parent_path, _epoch_ms_to_iso(result.compacted_at))
             self.urgent_compaction_replay_text = replay_text
             self.urgent_compaction_replay_attachments = replay_attachments
             self.restart_for_urgent_compaction = True
@@ -739,6 +766,7 @@ class ChatSession:
             if result:
                 self.last_compacted_at = result.compacted_at
                 save_tab_session_id(self.workspace_dir, self.tab_id, result.new_session_id)
+                save_tab_compaction_note(self.workspace_dir, self.tab_id, result.parent_path, _epoch_ms_to_iso(result.compacted_at))
                 log_event("engine", "compaction_done", tab_id=self.tab_id, new_session_id=result.new_session_id)
                 if self.client:
                     await self.client.disconnect()
@@ -758,7 +786,7 @@ class ChatSession:
             except Exception as exc:
                 log_event("engine", "topup_checkout_failed", tab_id=self.tab_id, error=str(exc))
         elif source == "anthropic" and sw_logged_in:
-            mark_own_anthropic_exhausted()
+            mark_own_anthropic_exhausted(self.tab_id)
             fell_back_to_sw = True
         text = BALANCE_EXHAUSTED_MESSAGE[source](payment_opened, fell_back_to_sw)
         log_event("engine", "balance_exhausted", tab_id=self.tab_id, source=source, payment_opened=payment_opened, fell_back=fell_back_to_sw)
@@ -767,7 +795,7 @@ class ChatSession:
     def _handle_rate_limit_rejected(self, source: str, info: dict[str, Any], chat_source: str, sw_logged_in: bool) -> bool:
         fell_back_to_sw = chat_source in ("own-anthropic-oauth", "own-anthropic-key") and sw_logged_in
         if fell_back_to_sw:
-            mark_own_anthropic_exhausted(info.get("resets_at"))
+            mark_own_anthropic_exhausted(self.tab_id)
         resets_at = info.get("resets_at")
         reset_text = f" Resets: {datetime.fromtimestamp(resets_at / 1000).isoformat()}." if resets_at else ""
         type_text = f" ({info.get('rate_limit_type')})" if info.get("rate_limit_type") else ""
@@ -792,8 +820,36 @@ class ChatSession:
                     return
                 await self._check_hang()
                 self._check_user_wait_nudge()
+                await self._check_own_anthropic_recovery()
         except asyncio.CancelledError:
             pass
+
+    async def _check_own_anthropic_recovery(self) -> None:
+        """Per explicit instruction (2026-09-09, after a live incident where
+        this tab sat on a broken sw-proxy connection for minutes while
+        own-Anthropic was actually available the whole time): every open
+        tab probes independently, every 90s, whether it can return to its
+        own Anthropic subscription -- no dependency on any other tab, no
+        long cooldown. Does nothing if this tab is already on
+        own-anthropic-oauth, or if less than 90s have passed since this
+        tab's own last probe (resolve_mode() itself enforces the same 90s
+        per-tab cooldown via subscription_mode's own state -- this re-
+        evaluates it on a LIVE session instead of waiting for some
+        unrelated restart to happen to re-resolve it)."""
+        if self.ended or self.current_chat_source == "own-anthropic-oauth":
+            return
+        now = time.monotonic()
+        if self.last_own_anthropic_probe_at is not None and now - self.last_own_anthropic_probe_at < OWN_ANTHROPIC_RECHECK_INTERVAL_MS / 1000:
+            return
+        self.last_own_anthropic_probe_at = now
+        mode = await resolve_mode(self.workspace_dir, self.tab_id)
+        if mode.chat_source != "own-anthropic-oauth":
+            return
+        log_event("engine", "own_anthropic_recovery_restart", tab_id=self.tab_id, was=self.current_chat_source)
+        self.own_anthropic_recovery_restart_pending = True
+        self.restart_for_chat_source_switch = True
+        if self.client:
+            await self._safe_disconnect(self.client)
 
     def _check_user_wait_nudge(self) -> None:
         """Separate from hang-detection above -- that guards against a
@@ -948,7 +1004,10 @@ class ChatSession:
                 self.has_seen_init = False
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
-                mode = await resolve_mode(self.workspace_dir)
+                mode = await resolve_mode(self.workspace_dir, self.tab_id)
+                self.current_chat_source = mode.chat_source
+                recovery_nudge_pending = self.own_anthropic_recovery_restart_pending and mode.chat_source == "own-anthropic-oauth"
+                self.own_anthropic_recovery_restart_pending = False
                 if mode.chat_source == "none":
                     # query() is about to fail on its very first real request no
                     # matter what -- there's no chat source to even try. Checked
@@ -979,6 +1038,7 @@ class ChatSession:
                             if result:
                                 self.last_compacted_at = result.compacted_at
                                 save_tab_session_id(self.workspace_dir, self.tab_id, result.new_session_id)
+                                save_tab_compaction_note(self.workspace_dir, self.tab_id, result.parent_path, _epoch_ms_to_iso(result.compacted_at))
                                 resume_session_id = result.new_session_id
                                 self.last_saved_session_id = result.new_session_id
                         except Exception as exc:
@@ -990,6 +1050,7 @@ class ChatSession:
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
+                    compaction_pointer_instruction(*load_tab_compaction_note(self.workspace_dir, self.tab_id)),
                     language_hint_instruction(current_language_name()),
                 ]
                 system_prompt_append = "\n\n".join(p for p in system_prompt_parts if p)
@@ -1098,7 +1159,7 @@ class ChatSession:
                         if limit_text:
                             fell_back = mode.chat_source == "own-anthropic-oauth" and mode.sw_logged_in
                             if fell_back:
-                                mark_own_anthropic_exhausted()
+                                mark_own_anthropic_exhausted(self.tab_id)
                             text = f"{limit_text} Switching to SquirrelWisdom for now -- I'll switch back automatically." if fell_back else limit_text
                             log_event("engine", "cc_cli_limit_message", tab_id=self.tab_id, fell_back=fell_back)
                             self._set_conn_state("limited", text, arm_ignore_next_result=True)
@@ -1127,6 +1188,25 @@ class ChatSession:
                     if isinstance(message, SystemMessage) and message.subtype == "api_retry":
                         self.last_api_retry_error = message.data.get("error")
                         log_event("engine", "api_retry_system_message", tab_id=self.tab_id, error=self.last_api_retry_error)
+                        # Real incident (2026-09-09): an "authentication_failed" api_retry
+                        # is just logged-and-waited here, with NOTHING that ever tears the
+                        # connection down -- the CLI keeps retrying the exact same doomed
+                        # request against the exact same (possibly stale) session/env
+                        # forever. Confirmed live that a FRESH sw-proxy session mint
+                        # authenticates fine, so the fix is: after a bounded number of
+                        # consecutive auth failures on this connection, force a restart --
+                        # the next _run_loop iteration calls build_options_env() again,
+                        # which for sw-proxy mints a brand-new session. Own choice of
+                        # threshold (3), not a value given by anyone -- flagged as such.
+                        if self.last_api_retry_error == "authentication_failed":
+                            self.consecutive_auth_retry_failures += 1
+                            log_event("engine", "auth_retry_failure_streak", tab_id=self.tab_id, count=self.consecutive_auth_retry_failures)
+                            if self.consecutive_auth_retry_failures >= AUTH_RETRY_ESCALATION_THRESHOLD:
+                                log_event("engine", "auth_retry_escalation_force_restart", tab_id=self.tab_id, chat_source=mode.chat_source)
+                                self.consecutive_auth_retry_failures = 0
+                                self.restart_for_chat_source_switch = True
+                                if self.client:
+                                    await self._safe_disconnect(self.client)
                         continue
 
                     # --- session id capture ---
@@ -1142,6 +1222,7 @@ class ChatSession:
                         clear_pending_turn(self.workspace_dir, self.tab_id)
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
+                        self.consecutive_auth_retry_failures = 0
                         self._clear_api_retry_timer()
                         if self.ignore_next_result_recovery:
                             self.ignore_next_result_recovery = False
@@ -1171,7 +1252,16 @@ class ChatSession:
                         if self.conn_state.get("kind") != "connected":
                             self._set_conn_state("connected")
                         if mode.chat_source in ("own-anthropic-oauth", "own-anthropic-key"):
-                            clear_own_anthropic_exhausted()
+                            clear_own_anthropic_exhausted(self.tab_id)
+                        if recovery_nudge_pending:
+                            recovery_nudge_pending = False
+                            log_event("engine", "own_anthropic_recovery_nudge", tab_id=self.tab_id)
+                            self.inject_proactive(
+                                "[Internal: you just successfully returned to your own Anthropic subscription "
+                                "after a temporary fallback -- nobody asked you this, it's automatic.] "
+                                + CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name()),
+                                True,
+                            )
                         # A failed server here behaves the same way it would in
                         # an interactive `claude` session: unavailable, but
                         # everything else still works -- previously this would
@@ -1266,7 +1356,7 @@ class ChatSession:
                 balance_source = detect_balance_exhaustion(str(exc))
                 if balance_source:
                     log_event("engine", "thrown_balance_exhaustion", tab_id=self.tab_id, source=balance_source)
-                    recent_mode = await resolve_mode(self.workspace_dir)
+                    recent_mode = await resolve_mode(self.workspace_dir, self.tab_id)
                     explanation, fell_back = await self._handle_balance_exhausted(balance_source, recent_mode.sw_logged_in)
                     self.turn_pending = False
                     self.pending_user_text = None
@@ -1288,7 +1378,7 @@ class ChatSession:
                     log_event("engine", "silent_death_rate_limit_rejected", tab_id=self.tab_id)
                     self.turn_pending = False
                     clear_pending_turn(self.workspace_dir, self.tab_id)
-                    recent_mode = await resolve_mode(self.workspace_dir)
+                    recent_mode = await resolve_mode(self.workspace_dir, self.tab_id)
                     self._handle_rate_limit_rejected("silent-stream-death", self.last_rate_limit_info, recent_mode.chat_source, recent_mode.sw_logged_in)
                     continue
 

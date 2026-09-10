@@ -431,7 +431,7 @@ async def handle_control_request(
             session.force_restart()
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "mode_get":
-        mode = await resolve_mode(WORKSPACE_DIR)
+        mode = await resolve_mode(WORKSPACE_DIR, (session.tab_id if session is not None else PRIMARY_TAB_ID))
         stdout = json.dumps({"chatSource": mode.chat_source, "swLoggedIn": mode.sw_logged_in})
         log_event("engine", "mode_get", stdout=stdout)
         return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}

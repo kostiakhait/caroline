@@ -117,66 +117,54 @@ async def _has_own_anthropic_oauth(cwd: str) -> bool:
 # Own-Anthropic (OAuth, then a manually-pasted key) still always wins over
 # the SquirrelWisdom proxy when it's actually USABLE. Once own-Anthropic is
 # CONFIRMED exhausted (a real billing_error/rate_limit_event, never
-# speculatively), fall back to sw-proxy -- but keep actively re-probing
-# rather than trusting the SDK's own resetsAt and waiting it out (real
-# availability can flap on a much shorter cycle than resetsAt suggests).
-# Module-level, process-wide state (matching the original's module-level
-# `let` variables), not per-tab.
-_own_anthropic_blocked_until: float | None = None
-_own_anthropic_last_recheck_at: float | None = None
+# speculatively), fall back to sw-proxy -- but keep actively re-probing.
+#
+# Per explicit instruction (2026-09-09, after a live incident where one tab
+# sat on a broken sw-proxy connection for minutes while own-Anthropic was
+# actually available the whole time -- confirmed live, since this exact
+# Claude Code conversation kept working throughout): each tab tracks its
+# OWN exhaustion independently (keyed by tab_id, not a single shared
+# module-level flag -- the previous design let whichever tab restarted
+# first "use up" the one shared recheck window for everyone), and probes
+# again on a flat, short, unconditional cadence -- never a long cooldown
+# (no 30-minute default, and the SDK's own resetsAt is no longer trusted
+# either -- real availability can flap on a much shorter cycle than
+# resetsAt claims, and a stale multi-hour block was exactly what caused
+# this incident).
+OWN_ANTHROPIC_RECHECK_INTERVAL_MS = 90_000  # 90 seconds, per tab, unconditional.
 
-# Used when the real reset time isn't known.
-OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS = 30 * 60_000  # 30 minutes
-# How often resolve_mode() lets a real attempt through to own-Anthropic
-# while still nominally blocked, regardless of how far off resetsAt is.
-OWN_ANTHROPIC_RECHECK_INTERVAL_MS = 2 * 60_000  # 2 minutes
-
-
-def mark_own_anthropic_exhausted(resets_at_ms: float | None = None) -> None:
-    """Call once own-Anthropic has actually failed on a real request --
-    never speculatively. resets_at_ms, when the SDK's own rate-limit info
-    supplied one, is honored exactly; otherwise falls back to the default
-    cooldown. Also arms the next recheck window."""
-    global _own_anthropic_blocked_until, _own_anthropic_last_recheck_at
-    now = time.time() * 1000
-    until = resets_at_ms if resets_at_ms and resets_at_ms > now else now + OWN_ANTHROPIC_DEFAULT_COOLDOWN_MS
-    _own_anthropic_blocked_until = until
-    _own_anthropic_last_recheck_at = now
-    log_event("engine", "own_anthropic_exhausted", blocked_until_ms=until)
+_own_anthropic_blocked_since_by_tab: dict[str, float] = {}
 
 
-def clear_own_anthropic_exhausted() -> None:
-    """Call when a session actually resolved to own-Anthropic and proved
-    itself alive -- if this turns out to be wrong, the very next real
-    request re-blocks it via mark_own_anthropic_exhausted, same self-heal
-    as any other misjudged recovery in this module."""
-    global _own_anthropic_blocked_until, _own_anthropic_last_recheck_at
-    if _own_anthropic_blocked_until is None:
+def mark_own_anthropic_exhausted(tab_id: str) -> None:
+    """Call once own-Anthropic has actually failed on a real request for
+    THIS tab -- never speculatively. Per-tab: does not affect any other
+    tab's own probing."""
+    _own_anthropic_blocked_since_by_tab[tab_id] = time.time() * 1000
+    log_event("engine", "own_anthropic_exhausted", tab_id=tab_id)
+
+
+def clear_own_anthropic_exhausted(tab_id: str) -> None:
+    """Call when THIS tab's session actually resolved to own-Anthropic and
+    proved itself alive -- if this turns out to be wrong, the very next
+    real request re-blocks it via mark_own_anthropic_exhausted, same
+    self-heal as any other misjudged recovery in this module."""
+    if tab_id not in _own_anthropic_blocked_since_by_tab:
         return
-    log_event("engine", "own_anthropic_recovered")
-    _own_anthropic_blocked_until = None
-    _own_anthropic_last_recheck_at = None
+    log_event("engine", "own_anthropic_recovered", tab_id=tab_id)
+    del _own_anthropic_blocked_since_by_tab[tab_id]
 
 
-async def resolve_mode(workspace_dir: str) -> ResolvedMode:
+async def resolve_mode(workspace_dir: str, tab_id: str) -> ResolvedMode:
     """Neither own-Anthropic nor SW available -> "none": the caller
     (chat_session.py) checks for exactly this chatSource before creating
     query() and proactively opens the native login window itself -- this
     can't be left to the model to notice, since it can't run any tool
     call at all without a chat source to run it with."""
-    global _own_anthropic_last_recheck_at
     sw_logged_in = load_credentials() is not None
     now = time.time() * 1000
-    nominally_blocked = _own_anthropic_blocked_until is not None and now < _own_anthropic_blocked_until
-    recheck_due = nominally_blocked and (_own_anthropic_last_recheck_at is None or now - _own_anthropic_last_recheck_at >= OWN_ANTHROPIC_RECHECK_INTERVAL_MS)
-    if recheck_due:
-        # This round's own-Anthropic attempt (if it goes that far, below)
-        # IS the probe -- record it now so a burst of near-simultaneous
-        # resolve_mode() calls (multiple tabs restarting together)
-        # doesn't let them all through at once.
-        _own_anthropic_last_recheck_at = now
-        log_event("engine", "own_anthropic_recheck_due")
-    own_anthropic_blocked = nominally_blocked and not recheck_due
+    blocked_since = _own_anthropic_blocked_since_by_tab.get(tab_id)
+    own_anthropic_blocked = blocked_since is not None and now - blocked_since < OWN_ANTHROPIC_RECHECK_INTERVAL_MS
     if own_anthropic_blocked and sw_logged_in:
         return ResolvedMode("sw-proxy", sw_logged_in)
     # Blocked but no SW to fall back to -- nothing to lose by trying

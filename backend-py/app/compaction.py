@@ -150,6 +150,7 @@ def process_entry(entry: dict[str, Any], now_ms: float, parent_path: str, keep_l
 class CompactionResult:
     new_session_id: str
     compacted_at: float
+    parent_path: str
 
 
 async def compact_session_if_due(
@@ -227,7 +228,7 @@ async def compact_session_if_due(
             rewritten.append(line)
     fork_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
 
-    return CompactionResult(new_session_id=new_session_id, compacted_at=now)
+    return CompactionResult(new_session_id=new_session_id, compacted_at=now, parent_path=parent_path)
 
 
 async def get_session_file_size_bytes(workspace_dir: str, session_id: str) -> int | None:

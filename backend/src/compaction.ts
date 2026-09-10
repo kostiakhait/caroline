@@ -181,6 +181,7 @@ export function processEntry(entry: RawEntry, nowMs: number, parentPath: string,
 export interface CompactionResult {
   newSessionId: string;
   compactedAt: number;
+  parentPath: string;
 }
 
 /**
@@ -273,7 +274,7 @@ export async function compactSessionIfDue(
   });
   await writeFile(forkPath, rewritten.join("\n") + "\n", "utf-8");
 
-  return { newSessionId, compactedAt: now };
+  return { newSessionId, compactedAt: now, parentPath };
 }
 
 /**

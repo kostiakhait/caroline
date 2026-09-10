@@ -1306,7 +1306,12 @@
           // (see policies.ts's noUpdateSentinelInstruction) -- suppress just
           // the bubble; tool calls/heartbeat/turn bookkeeping in this same
           // loop still proceed normally, only the text block is skipped.
-          if (block.text.trim() === "[[NO_UPDATE]]") continue;
+          // Checked as a SUBSTRING, not exact equality (2026-09-09,
+          // explicit instruction) -- the model doesn't always reply with
+          // ONLY the sentinel and nothing else (extra punctuation/
+          // whitespace, a stray word alongside it), and an exact-match
+          // check let those variants leak through as a real chat bubble.
+          if (block.text.includes("[[NO_UPDATE]]")) continue;
           if (hasToolUse) continue;
           addBubble("assistant", block.text);
           if (turn) turn.assistantText += (turn.assistantText ? "\n\n" : "") + block.text;

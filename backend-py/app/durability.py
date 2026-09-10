@@ -178,6 +178,38 @@ def clear_tab_continuity_archive(workspace_dir: str, tab_id: str) -> None:
         log_event("engine", "clear_tab_continuity_archive_failed", tab_id=tab_id, error=str(exc))
 
 
+# --- per-tab compaction pointer --------------------------------------------
+# Same pattern/reasoning as the continuity-archive pointer above, but for
+# routine age-based compaction (see compaction.py) instead of an
+# unrecoverable-session error -- see policies.py's
+# compaction_pointer_instruction. Naturally overwritten on every
+# subsequent compaction; no separate clear function needed.
+
+def _tab_compaction_note_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"tab-compaction-{_sanitize_tab_id(tab_id)}.json"
+
+
+def load_tab_compaction_note(workspace_dir: str, tab_id: str) -> tuple[str | None, str | None]:
+    path = _tab_compaction_note_path(workspace_dir, tab_id)
+    if not path.exists():
+        return (None, None)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return (data.get("parentPath"), data.get("compactedAtIso"))
+    except Exception as exc:
+        log_event("engine", "load_tab_compaction_note_failed", tab_id=tab_id, error=str(exc))
+        return (None, None)
+
+
+def save_tab_compaction_note(workspace_dir: str, tab_id: str, parent_path: str, compacted_at_iso: str) -> None:
+    try:
+        path = _tab_compaction_note_path(workspace_dir, tab_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"parentPath": parent_path, "compactedAtIso": compacted_at_iso}, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "save_tab_compaction_note_failed", tab_id=tab_id, error=str(exc))
+
+
 def find_most_recent_claude_session_id(workspace_dir: str) -> str | None:
     """One-time migration for users upgrading from pre-multi-tab Caroline:
     reads Claude Code's own session transcript directory for this

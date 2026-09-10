@@ -491,6 +491,62 @@ export function continuityPointerInstruction(archivePath: string | null): string
 }
 
 /**
+ * Companion to continuityPointerInstruction, but for the OTHER reason a
+ * session's history can look thin: routine age-based compaction
+ * (compaction.ts's compactSessionIfDue), not an error. Without this, a
+ * compacted session carries no top-level explanation at all -- only
+ * per-block stub notes (compaction.ts's own stub-note helper) where
+ * something specific got aged out -- so nothing tells the model the
+ * RESTART itself (new session id, same conversation) was deliberate
+ * housekeeping rather than a sign something went wrong. Persistent for
+ * the session's lifetime, same reasoning as continuityPointerInstruction:
+ * a later turn may reference something now stubbed, not just the first
+ * one. Only present when a compaction has actually happened for this
+ * tab; absent (returns "") otherwise.
+ */
+export function compactionPointerInstruction(parentPath: string | null, compactedAtIso: string | null): string {
+  if (!parentPath) return "";
+  return (
+    `Note: this session was routinely compacted at ${compactedAtIso} to keep its context size in check -- ` +
+    `this is normal, automatic housekeeping, NOT a failure or an error, and NOT something to mention to the ` +
+    `user unless they ask. Older/heavier parts of the conversation (old screenshots, old tool results, old ` +
+    `turns) were replaced with short placeholder notes to save context space; you may see some of those ` +
+    `placeholders as you scroll back through this conversation. The full original, uncompacted content is ` +
+    `preserved verbatim at: ${parentPath}\n` +
+    `If you need something no longer inline -- the exact old text of a tool result, an old screenshot, the ` +
+    `full wording of something said a while back -- read that file rather than assuming it's lost.`
+  );
+}
+
+/**
+ * Per explicit instruction (2026-09-09): distinct from
+ * learnFromMistakesInstruction (which is specifically for a mistake/
+ * problem, written to Skills/lessons-learned/ as an actionable lesson) --
+ * this is a general habit of recording what happened for ANY real
+ * completed task, success or not, into Notes (Caroline's own long-term
+ * memory -- see PROJECT.md: "Notes ... long-term memory"), so future-you
+ * can recall what was actually done without it still being in this
+ * session's own history (which, per compactionPointerInstruction above,
+ * eventually ages out anyway).
+ */
+export function taskCompletionMemoryInstruction(): string {
+  return (
+    `After finishing any real task the user asked for -- not a one-line question you answered directly, but ` +
+    `something that took actual work (multiple steps, tool calls, a nontrivial decision) -- write a short ` +
+    `summary of it to your own long-term memory, so future-you can recall what happened without it needing ` +
+    `to still be in this session's history. If the Notes tool is available and logged in, create a note in ` +
+    `the "Caroline:Memory" folder (create the folder if it doesn't exist yet), one note per task, title ` +
+    `format "memory:<short-topic>-<YYYY-MM-DD>". Cover: what the task was and what you actually did, how you ` +
+    `did it (the approach/tools used), any problems or obstacles you ran into along the way, and how -- and ` +
+    `specifically what -- the final result was. This is for your OWN future recall, not a user-facing ` +
+    `report -- write it plainly, don't pad it out. If Notes isn't available (not logged in), skip this ` +
+    `silently rather than pestering the user about it. This is separate from learnFromMistakesInstruction: ` +
+    `that's for a specific lesson to actively apply next time; this is a general record of what happened, ` +
+    `for any completed task, mistake or not.`
+  );
+}
+
+/**
  * Redesign (2026-09-09, see the resolve-based-language-detection plan):
  * replaces the old ad-hoc per-nudge language lookups with one standing,
  * always-visible hint, rebuilt fresh on every query() construction from

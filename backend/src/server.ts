@@ -46,7 +46,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, continuityPointerInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, taskCompletionMemoryInstruction, continuityPointerInstruction, compactionPointerInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -58,7 +58,7 @@ import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, langu
 console.error(`[caroline] === PROCESS STARTING === pid=${process.pid} server.js mtime=${statSync(fileURLToPath(import.meta.url)).mtime.toISOString()} startedAt=${new Date().toISOString()} descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
 
 configureIsolatedGitBash();
-import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, loadTabContinuityArchive, saveTabContinuityArchive, findMostRecentClaudeSessionId, claudeProjectDir } from "./durability.js";
+import { savePendingTurn, clearPendingTurn, peekPendingTurn, loadTabSessionId, saveTabSessionId, clearTabSessionId, loadTabContinuityArchive, saveTabContinuityArchive, loadTabCompactionNote, saveTabCompactionNote, findMostRecentClaudeSessionId, claudeProjectDir } from "./durability.js";
 import { compactSessionIfDue, getSessionFileSizeBytes } from "./compaction.js";
 import { dehydratePreviousTurns, agePreviousTurnsInPlace, dehydratedDir } from "./dehydrate.js";
 import { snapshotDirectChildPids, findNewPid, scheduleReapIfStale, describeDescendantProcesses } from "./processReaper.js";
@@ -833,6 +833,7 @@ class ChatSession {
       if (!result) return;
       this.lastCompactedAt = result.compactedAt;
       saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
+      saveTabCompactionNote(workspaceDir, this.tabId, result.parentPath, new Date(result.compactedAt).toISOString());
       console.error(`[caroline] compaction: tab ${this.tabId} forked ${sessionId} -> ${result.newSessionId}, restarting session, descendantProcesses=${await describeDescendantProcesses(process.pid)}`);
       this.forceRestart();
     } catch (err) {
@@ -883,6 +884,7 @@ class ChatSession {
       }
       this.lastCompactedAt = result.compactedAt;
       saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
+      saveTabCompactionNote(workspaceDir, this.tabId, result.parentPath, new Date(result.compactedAt).toISOString());
       console.error(`[caroline] urgent compaction: tab ${this.tabId} forked ${sessionId} -> ${result.newSessionId}, restarting session`);
       this.urgentCompactionReplayText = replayText;
       this.urgentCompactionReplayAttachments = replayAttachments;
@@ -1459,6 +1461,7 @@ class ChatSession {
               if (result) {
                 this.lastCompactedAt = result.compactedAt;
                 saveTabSessionId(workspaceDir, this.tabId, result.newSessionId);
+                saveTabCompactionNote(workspaceDir, this.tabId, result.parentPath, new Date(result.compactedAt).toISOString());
                 console.error(`[caroline] [urgent-compaction] tab=${this.tabId} pre-resume compaction done: ${resumeSessionId} -> ${result.newSessionId}`);
                 resumeSessionId = result.newSessionId;
                 this.lastSavedSessionId = result.newSessionId; // keep inputStream()'s own dehydration call in sync too -- see the sync above's doc comment
@@ -1513,6 +1516,7 @@ class ChatSession {
         // Notes MCP server, which has no such rule. Every other notes_*
         // tool is unaffected.
         const disallowedTools = ["mcp__caroline-notes__notes_login"];
+        const compactionNote = loadTabCompactionNote(workspaceDir, this.tabId);
 
         const options: Options = {
           ...(anthropicEnv ? { env: anthropicEnv } : {}),
@@ -1596,6 +1600,7 @@ class ChatSession {
               timestampAwarenessInstruction(),
               noAlarmingInternalRecoveryInstruction(),
               continuityPointerInstruction(loadTabContinuityArchive(workspaceDir, this.tabId)),
+              compactionPointerInstruction(compactionNote.parentPath, compactionNote.compactedAtIso),
               languageHintInstruction(currentLanguageName()),
               noUpdateSentinelInstruction(),
               embeddedBrowserInstruction(),
@@ -1614,6 +1619,7 @@ class ChatSession {
               taskDecompositionInstruction(),
               scriptOrSubagentDelegationInstruction(),
               learnFromMistakesInstruction(),
+              taskCompletionMemoryInstruction(),
             ].filter(Boolean).join("\n\n"),
           },
           // Lets Caroline discover/invoke skills seeded into her workspace's

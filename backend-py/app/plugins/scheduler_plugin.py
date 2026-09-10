@@ -1,24 +1,27 @@
 """scheduler -- ports backend/src/scheduler.ts's schedule_reminder/
-list_reminders/cancel_reminder tools. Storage is workspace/schedule.json,
-survives both a session restart and a full app restart.
-
-NOT yet ported: the actual proactive-firing mechanism (startDueCheckLoop/
-nextOccurrence/ensureRecurringBackup in the original) -- a background poll
-loop that injects a due reminder as a new message into a live chat session
-(hasLiveDialog-aware background/priority distinction). That's genuine
-session/engine-level infrastructure (proactive-turn injection), Phase 3
-scope, not a plugin concern -- reminders can be scheduled/listed/cancelled
-today via these tools, but won't fire on their own until that's wired up.
+list_reminders/cancel_reminder tools, PLUS (2026-09-09) the proactive-firing
+mechanism (startDueCheckLoop/nextOccurrence/ensureRecurringBackup in the
+original) -- a background poll loop that injects a due reminder as a new
+message into a live chat session (hasLiveDialog-aware background/priority
+distinction). This is genuine session/engine-level infrastructure, not a
+per-tool concern, so start_due_check_loop/ensure_recurring_backup are called
+from app/main.py (which owns primary_session()), not from here -- this
+module just exposes them, same file-organization choice scheduler.ts itself
+made (tool-creation and the due-check loop coexist in one file there too).
+Storage is workspace/schedule.json, survives both a session restart and a
+full app restart.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -78,6 +81,111 @@ async def cancel_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     _save_reminders(after)
     removed = len(after) < len(before)
     return {"text": f"Cancelled {args['id']}." if removed else f"No pending reminder with id {args['id']}."}
+
+
+def _next_occurrence(reminder: dict[str, Any]) -> datetime:
+    """Ported verbatim from scheduler.ts's nextOccurrence: calendar recurrence
+    advances by whole calendar days (1 or 7) in LOCAL time so "every day/
+    Saturday at 17:30" keeps landing on 17:30 local time across a DST
+    transition, instead of drifting the way a fixed 24h/7-day timedelta
+    would. Falls back to the plain millisecond interval otherwise. If the
+    app was closed long enough to miss one or more occurrences, skips
+    straight to the next one still in the future rather than firing a burst
+    of catch-up reminders for every missed day/week."""
+    now = datetime.now().astimezone()
+    calendar = reminder.get("recurringCalendar")
+    if calendar:
+        step_days = 7 if calendar == "weekly" else 1
+        base = datetime.fromisoformat(reminder["dueAtIso"])
+        if base.tzinfo is None:
+            base = base.astimezone()
+        while True:
+            base = base + timedelta(days=step_days)
+            if base > now:
+                return base
+    recurring_ms = reminder.get("recurringMs") or 0
+    return now + timedelta(milliseconds=recurring_ms)
+
+
+def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: float = 20.0) -> asyncio.Task[None]:
+    """Ported from scheduler.ts's startDueCheckLoop. Polls workspace/
+    schedule.json and calls on_due for every reminder whose time has
+    passed. on_due returns whether it actually got delivered (e.g. there's
+    a live chat session to inject it into) -- a reminder is only marked
+    fired when that's true, so one that comes due while the app happens to
+    be between sessions (or fully closed) stays pending and fires on the
+    very next check instead of being silently dropped."""
+
+    def _check() -> None:
+        reminders = _load_reminders()
+        now = datetime.now().astimezone()
+        changed = False
+        new_reminders: list[dict[str, Any]] = []
+        for r in reminders:
+            if r.get("fired"):
+                continue
+            due = datetime.fromisoformat(r["dueAtIso"])
+            if due.tzinfo is None:
+                due = due.astimezone()
+            if due > now:
+                continue
+            try:
+                delivered = on_due(r)
+            except Exception as exc:
+                log_event("engine", "due_check_on_due_failed", reminder_id=r.get("id"), error=str(exc))
+                delivered = False
+            if delivered:
+                r["fired"] = True
+                changed = True
+                if r.get("recurringCalendar") or r.get("recurringMs"):
+                    new_reminders.append({
+                        "id": uuid.uuid4().hex,
+                        "dueAtIso": _next_occurrence(r).isoformat(),
+                        "note": r["note"],
+                        "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "fired": False,
+                        "priority": r.get("priority"),
+                        "recurringMs": r.get("recurringMs"),
+                        "recurringCalendar": r.get("recurringCalendar"),
+                        "kind": r.get("kind"),
+                    })
+        if new_reminders:
+            reminders.extend(new_reminders)
+            changed = True
+        if changed:
+            _save_reminders(reminders)
+
+    async def _loop() -> None:
+        _check()  # catch up on anything already overdue right away, don't wait a full interval
+        while True:
+            await asyncio.sleep(interval_s)
+            _check()
+
+    log_event("engine", "due_check_loop_starting", interval_s=interval_s)
+    return asyncio.create_task(_loop())
+
+
+def ensure_recurring_backup(note: str, interval_s: float = 60 * 60) -> None:
+    """Ported from scheduler.ts's ensureRecurringBackup: seeds an hourly
+    recurring "back up your memory" reminder exactly once, detected via the
+    `kind` tag, so restarting the app never piles up duplicate recurring
+    chains. Safe to call on every startup."""
+    kind = "vault-backup-hourly"
+    reminders = _load_reminders()
+    if any(r.get("kind") == kind for r in reminders):
+        log_event("engine", "ensure_recurring_backup_already_seeded")
+        return
+    log_event("engine", "ensure_recurring_backup_seeding", interval_s=interval_s)
+    reminders.append({
+        "id": uuid.uuid4().hex,
+        "dueAtIso": (datetime.now(timezone.utc) + timedelta(seconds=interval_s)).isoformat().replace("+00:00", "Z"),
+        "note": note,
+        "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "fired": False,
+        "recurringMs": interval_s * 1000,
+        "kind": kind,
+    })
+    _save_reminders(reminders)
 
 
 def _usage_instructions() -> str:

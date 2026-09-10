@@ -183,6 +183,36 @@ export function clearTabContinuityArchive(workspaceDir: string, tabId: string): 
   }
 }
 
+// --- per-tab compaction pointer --------------------------------------------
+// Same pattern/reasoning as the continuity-archive pointer above, but for
+// routine age-based compaction (see compaction.ts) instead of an
+// unrecoverable-session error -- see policies.ts's
+// compactionPointerInstruction. Naturally overwritten on every subsequent
+// compaction; no separate clear function needed.
+function tabCompactionNotePath(workspaceDir: string, tabId: string): string {
+  return join(workspaceDir, `tab-compaction-${sanitizeTabId(tabId)}.json`);
+}
+
+export function loadTabCompactionNote(workspaceDir: string, tabId: string): { parentPath: string | null; compactedAtIso: string | null } {
+  const path = tabCompactionNotePath(workspaceDir, tabId);
+  if (!existsSync(path)) return { parentPath: null, compactedAtIso: null };
+  try {
+    const data = JSON.parse(readFileSync(path, "utf-8")) as { parentPath?: string; compactedAtIso?: string };
+    return { parentPath: data.parentPath ?? null, compactedAtIso: data.compactedAtIso ?? null };
+  } catch (err) {
+    console.error(`[caroline] loadTabCompactionNote: read/parse failed for tab ${tabId} (treating as none):`, err);
+    return { parentPath: null, compactedAtIso: null };
+  }
+}
+
+export function saveTabCompactionNote(workspaceDir: string, tabId: string, parentPath: string, compactedAtIso: string): void {
+  try {
+    writeFileSync(tabCompactionNotePath(workspaceDir, tabId), JSON.stringify({ parentPath, compactedAtIso }, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error(`[caroline] saveTabCompactionNote: write failed for tab ${tabId} (ignored):`, err);
+  }
+}
+
 /**
  * One-time migration for users upgrading from pre-multi-tab Caroline: before
  * this, the single conversation was resumed via continue:true (whichever
