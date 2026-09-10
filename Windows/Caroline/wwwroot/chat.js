@@ -306,7 +306,19 @@
   function loadTranscript() {
     try {
       const raw = localStorage.getItem(TRANSCRIPT_KEY);
-      return raw ? JSON.parse(raw) : [];
+      const list = raw ? JSON.parse(raw) : [];
+      // Per explicit instruction (2026-09-10): scrub the [[NO_UPDATE]]
+      // sentinel out of ALREADY-STORED history too, not just new messages
+      // (see the server-side strip). A no-update turn that leaked into the
+      // transcript before the filters existed should not keep rendering.
+      // Substring match, same as the other filters. Re-persist only when
+      // something was actually removed, so this is a cheap idempotent
+      // self-heal on every load.
+      const cleaned = list.filter((e) => !(e && typeof e.text === "string" && e.text.includes("[[NO_UPDATE]]")));
+      if (cleaned.length !== list.length) {
+        try { localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(cleaned)); } catch { /* quota/private mode */ }
+      }
+      return cleaned;
     } catch {
       return [];
     }
