@@ -104,16 +104,6 @@ class OperationRegistry:
                 cancelled += 1
         return cancelled
 
-    def running_tool_names_for_tab(self, tab_id: str) -> list[str]:
-        """Read-only: which tool(s) are still genuinely running (crossed
-        dispatch()'s fast-path window into a real background task) for this
-        tab right now. Most individual calls finish well within the
-        fast-path window and never show up here at all -- this only ever
-        reflects the genuinely slow ones. Used for progress-narration
-        context (chat_session.py's _check_progress_narration), never for
-        control flow."""
-        return [op.tool_name for op in self._ops.values() if op.tab_id == tab_id and op.status == "running"]
-
 
 REGISTRY = OperationRegistry()
 

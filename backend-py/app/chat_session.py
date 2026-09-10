@@ -81,6 +81,7 @@ from app.durability import (
     save_tab_continuity_archive,
     save_tab_session_id,
 )
+from app.history import _extract_entries_from_jsonl, read_archived_entries
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -908,6 +909,55 @@ class ChatSession:
         except asyncio.CancelledError:
             pass
 
+    def _gather_recent_dialogue_for_narration(self, limit: int = 8) -> str:
+        """Per explicit correction (2026-09-10): the first version of
+        _check_progress_narration fed generate_progress_comment only the
+        single original question plus a list of currently-running tool
+        names -- confirmed live (screenshots), this produced bland,
+        near-identical, operation-sounding remarks every time ("I'm
+        checking the phone-related messages...", "let me pull up that
+        operation...") instead of anything that actually engaged with the
+        conversation, and stayed generic turn after turn since none of its
+        inputs ever changed mid-turn. Rebuilt to hand the model the REAL
+        recent back-and-forth instead. Deliberately does NOT reuse
+        history.read_recent_history() (keyed only by workspace_dir, picks
+        whichever .jsonl in the shared project dir was modified most
+        recently) -- with multiple tabs sharing one workspace dir, that
+        could silently pull another tab's transcript. Stays scoped to
+        THIS tab's own resumed session id throughout, same as
+        refresh_language_in_background/_read_recent_history_texts.
+        Also per explicit correction: a post-compaction session file only
+        holds the fragment since the fork, which starved this of context
+        on a long-running tab -- falls back to this tab's own compaction
+        parent / continuity-archive file (both real past .jsonl-shaped
+        transcripts, per-tab, never shared) when the live file alone is
+        thin."""
+        entries: list[dict[str, Any]] = []
+        if self.last_saved_session_id:
+            path = claude_project_dir(self.workspace_dir) / f"{self.last_saved_session_id}.jsonl"
+            try:
+                entries = _extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path))
+            except Exception as exc:
+                log_event("engine", "progress_narration_history_read_failed", tab_id=self.tab_id, error=str(exc))
+        if len(entries) < limit:
+            parent_path, _ = load_tab_compaction_note(self.workspace_dir, self.tab_id)
+            archive_path = load_tab_continuity_archive(self.workspace_dir, self.tab_id)
+            for older_path in (parent_path, archive_path):
+                if older_path and len(entries) < limit:
+                    try:
+                        entries = read_archived_entries(older_path) + entries
+                    except Exception as exc:
+                        log_event("engine", "progress_narration_archive_read_failed", tab_id=self.tab_id, path=older_path, error=str(exc))
+        lines: list[str] = []
+        for entry in entries:
+            raw_text = str(entry.get("text") or "")
+            clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
+            if not clean_text or _is_synthetic_history_text(raw_text):
+                continue
+            speaker = "User" if entry.get("role") == "user" else "Caroline"
+            lines.append(f"{speaker}: {clean_text}")
+        return "\n".join(lines[-limit:])
+
     async def _check_progress_narration(self) -> None:
         """Per explicit instruction (2026-09-10): the user must see SOME
         comment from Caroline at least once a minute while a real turn of
@@ -935,18 +985,18 @@ class ChatSession:
         self.last_visible_output_at = now  # claim this tick immediately -- a slow ai:resolve call must not let a second tick double-fire
         from app.plugins.voice_api import generate_progress_comment
 
-        running_tools = REGISTRY.running_tool_names_for_tab(self.tab_id)
-        activity = ", ".join(running_tools) if running_tools else None
+        dialogue = self._gather_recent_dialogue_for_narration()
+        if not dialogue:
+            dialogue = f"User: {self.last_real_user_question}"
+        log_event("engine", "progress_narration_context", tab_id=self.tab_id, dialogue_chars=len(dialogue), dialogue_preview=dialogue[-300:])
         try:
-            comment = await generate_progress_comment(
-                self.last_real_user_question, activity, current_language_name(self.tab_id),
-            )
+            comment = await generate_progress_comment(dialogue, current_language_name(self.tab_id))
         except Exception as exc:
             log_event("engine", "progress_narration_failed", tab_id=self.tab_id, error=str(exc))
             return
         if not comment:
             return
-        log_event("engine", "progress_narration_sent", tab_id=self.tab_id, activity=activity)
+        log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment)
         wire = {
             "type": "assistant",
             "message": {"role": "assistant", "content": [{"type": "text", "text": comment}], "model": None, "stop_reason": None},
@@ -1161,6 +1211,15 @@ class ChatSession:
                 # self-perpetuating trap this tab could never escape. A fresh
                 # attempt deserves its own fresh clock.
                 self.last_activity = time.monotonic()
+                # Bug fix (2026-09-10): confirmed live -- progress narration
+                # (_check_progress_narration) fired 5s after a fresh restart
+                # (mid tool-use-concurrency recovery), because
+                # last_visible_output_at was still whatever stale value it
+                # had from BEFORE the whole restart cascade -- the 60s clock
+                # needs to restart from a genuine restart too, not just a
+                # real user submit() or an actual assistant reply, or it can
+                # fire almost immediately with stale/pre-restart context.
+                self.last_visible_output_at = time.monotonic()
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
                 mode = await resolve_mode(self.workspace_dir, self.tab_id)
@@ -1369,8 +1428,23 @@ class ChatSession:
                         continue
 
                     # --- session id capture ---
+                    # Bug fix (2026-09-10): confirmed live -- tab 1 was stuck
+                    # in a ~13s tool-use-concurrency restart loop, reusing the
+                    # SAME condemned session id every time. Root cause: once
+                    # _reset_unrecoverable_session() clears the tab's session
+                    # id (self.last_saved_session_id = None) and schedules the
+                    # client's disconnect in the background, this receive_messages()
+                    # loop keeps running for a moment on the SAME still-alive
+                    # client -- and its trailing messages still carry the OLD
+                    # (now-condemned) session_id. Since last_saved_session_id
+                    # had just become None, "sid != self.last_saved_session_id"
+                    # was true again, so this block immediately re-saved the
+                    # poisoned id, undoing the reset before the next restart
+                    # even got a chance to start genuinely fresh. Guarded now:
+                    # once a reset has been triggered this cycle, no further
+                    # session_id from this doomed client is trusted.
                     sid = getattr(message, "session_id", None)
-                    if sid and sid != self.last_saved_session_id:
+                    if sid and sid != self.last_saved_session_id and not self.restart_for_unrecoverable_session:
                         self.last_saved_session_id = sid
                         save_tab_session_id(self.workspace_dir, self.tab_id, sid)
 

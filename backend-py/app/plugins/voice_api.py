@@ -112,9 +112,31 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name or None
 
 
-async def generate_progress_comment(
-    user_question: str, current_activity: str | None, language: str, session: str | None = None,
-) -> str | None:
+# Guards against two confirmed-live failure modes rather than trusting any
+# non-empty .result blindly: (1) a raw API/catalog-lookup error text once
+# leaked straight through as if it were a valid reply (the "didn't find a
+# matching entry ... in the available catalog" incident) -- these phrases
+# don't belong in a warm in-character remark, so their presence is treated
+# as a bad response, not surfaced to the user. (2) the model padding out
+# into something far longer than "one short sentence, two at most" -- also
+# rejected rather than shown, since a placeholder remark that rambles
+# defeats its own purpose.
+_NARRATION_GARBAGE_PATTERNS = [
+    re.compile(r"\bmatching entry\b", re.IGNORECASE),
+    re.compile(r"\bavailable catalog\b", re.IGNORECASE),
+    re.compile(r"\berrcode\b", re.IGNORECASE),
+    re.compile(r"^\s*[{\[]"),  # raw JSON/array leaking through
+]
+_NARRATION_MAX_CHARS = 400
+
+
+def _looks_like_narration_garbage(text: str) -> bool:
+    if len(text) > _NARRATION_MAX_CHARS:
+        return True
+    return any(p.search(text) for p in _NARRATION_GARBAGE_PATTERNS)
+
+
+async def generate_progress_comment(recent_dialogue: str, language: str, session: str | None = None) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
     without genuinely disrupting whatever she's doing (the SDK only
@@ -126,18 +148,32 @@ async def generate_progress_comment(
     drafts a short in-character remark on her behalf, sent straight to
     the client as its own chat message. The real session never sees or
     knows about this -- it's a cosmetic stand-in for "I'm still working
-    on it", not something she said or will remember. Returns None on any
-    failure (network, bad response, SW unavailable) -- always a silent
-    skip, never surfaced as an error to the user."""
-    activity_line = f'She is currently in the middle of: {current_activity}. ' if current_activity else ""
+    on it", not something she said or will remember.
+
+    Redesigned (2026-09-10) after live evidence (screenshots) that the
+    original single-question + tool-names-as-"activity" version produced
+    bland, repetitive, OPERATION-sounding remarks ("I'm checking the
+    phone-related messages...", "let me pull up that operation...")
+    instead of something addressed to the user that actually engages with
+    what's being discussed. Now takes the real recent back-and-forth
+    (chat_session.py's _gather_recent_dialogue_for_narration) instead of
+    a single frozen question, so each call has fresh material to react to
+    and the model can speak to the actual substance instead of describing
+    internal mechanics. Returns None on any failure (network, bad
+    response, SW unavailable, or a response that fails the garbage check
+    below) -- always a silent skip, never surfaced as an error."""
     prompt = (
-        "You are drafting ONE short, natural, in-character placeholder remark on behalf of an AI assistant "
-        "who is silently in the middle of a longer task and hasn't said anything to the user in over a "
-        "minute -- this is NOT her speaking directly, you're standing in for her so the user knows she's "
-        f'still working. The user originally asked: "{user_question}". {activity_line}'
-        "Write ONE short, casual sentence (two at most), in first person, connecting what she's doing back "
-        "to the user's original request -- no technical or internal details (tool names, file paths, "
-        f"code, session/system mechanics). Reply in {language}. Reply with ONLY that sentence, nothing else."
+        "You are standing in, for a moment, on behalf of an AI assistant who is mid-conversation with a "
+        "specific person and has been quietly working on their last message for over a minute now without "
+        "saying anything back yet. Draft ONE short remark in her voice to keep the conversation feeling "
+        "alive. This is NOT a status update about internal work -- never say things like \"I'm checking/"
+        "pulling up/sorting through/looking into/working on X\", never mention tools, files, operations, or "
+        "how long anything is taking. Instead, react like someone genuinely engaged with the actual topic "
+        "would: add a real, specific thought connected to what's being discussed -- a relevant detail, a "
+        "follow-up angle, a small observation -- not a generic placeholder that could fit any conversation.\n\n"
+        f"Here is the real recent conversation between her and the user (oldest first):\n---\n{recent_dialogue}\n---\n\n"
+        f"Write ONE short, natural sentence (two at most), in first person, speaking directly to the user, "
+        f"in {language}. Reply with ONLY that sentence, nothing else -- no quotes, no preamble."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:
@@ -151,7 +187,13 @@ async def generate_progress_comment(
         log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))
         return None
     text = data["result"].strip()
-    return text or None
+    if not text:
+        return None
+    if _looks_like_narration_garbage(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300])
+        return None
+    log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=text)
+    return text
 
 
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
