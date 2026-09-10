@@ -818,6 +818,39 @@ public partial class MainWindow : Window
     {
         _settings.OpenTabIds = _tabs.Select(t => t.Id).ToList();
         _settingsService.Save(_settings);
+        SyncTabListToBackend();
+    }
+
+    /// <summary>
+    /// Tab id + display name are otherwise known ONLY here (WPF's own
+    /// _tabs/AppSettings.TabNames) -- the backend never sees a tab's name,
+    /// just the bare tabId a WebView2 connects with. Per explicit
+    /// instruction (2026-09-10, the Android companion app's UI needs a
+    /// dynamic, never-hardcoded tab directory to render its own tab bar
+    /// from): mirror the CURRENT full tab list to the backend on every
+    /// add/close/rename, via the same /api/control channel every other
+    /// WPF->backend control op already uses. Fire-and-forget -- a failure
+    /// here must never block the tab strip UI; the backend treats this as
+    /// best-effort (silently no-ops while not logged into SquirrelWisdom,
+    /// same as every other companion-app sync).
+    /// </summary>
+    private async void SyncTabListToBackend()
+    {
+        try
+        {
+            var tabs = _tabs.Select(t => new { id = t.Id, name = t.Name }).ToList();
+            var payload = JsonSerializer.Serialize(new { op = "tab_list_set", tabs });
+            using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
+            using var resp = await _statusHttp.PostAsync($"http://127.0.0.1:{BackendProcess.Port}/api/control", content);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Logger.Log($"MainWindow.SyncTabListToBackend: /api/control returned {(int)resp.StatusCode}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"MainWindow.SyncTabListToBackend: failed (ignored): {ex}");
+        }
     }
 
     /// <summary>
@@ -860,6 +893,7 @@ public partial class MainWindow : Window
                     tab.HeaderButton.Content = newName;
                     _settings.TabNames[tab.Id] = newName;
                     _settingsService.Save(_settings);
+                    SyncTabListToBackend();
                     Logger.Log($"MainWindow.BeginRenameTab: tab {tab.Id} renamed to \"{newName}\"");
                 }
             }
