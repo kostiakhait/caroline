@@ -112,26 +112,39 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name or None
 
 
-# Guards against two confirmed-live failure modes rather than trusting any
-# non-empty .result blindly: (1) a raw API/catalog-lookup error text once
-# leaked straight through as if it were a valid reply (the "didn't find a
-# matching entry ... in the available catalog" incident) -- these phrases
-# don't belong in a warm in-character remark, so their presence is treated
-# as a bad response, not surfaced to the user. (2) the model padding out
-# into something far longer than "one short sentence, two at most" -- also
-# rejected rather than shown, since a placeholder remark that rambles
-# defeats its own purpose.
+# Guards against the failure modes seen live rather than trusting any
+# non-empty .result blindly (screenshots, tab 2):
+#  - the SMALL model REFUSING the task ("I'm sorry, I can't help with
+#    that.") and that refusal getting shown as a Caroline chat bubble;
+#  - a raw API/catalog-lookup error leaking straight through (the "didn't
+#    find a matching entry ... in the available catalog" incident);
+#  - a reply in the wrong SCRIPT entirely (Chinese "正在打开文档。" for a
+#    Russian conversation);
+#  - raw JSON, or a reply far longer than "one short sentence".
+# Any of these -> treat as no usable response, show nothing.
 _NARRATION_GARBAGE_PATTERNS = [
+    re.compile(r"\bi(?:'m| am)\s+sorry\b", re.IGNORECASE),
+    re.compile(r"\bi\s+(?:can(?:'t|not)|won'?t|am unable to|cannot)\s+(?:help|assist|do that|provide|comply)", re.IGNORECASE),
+    re.compile(r"\bas an? (?:ai|language model)\b", re.IGNORECASE),
+    re.compile(r"\bне могу (?:помочь|это сделать|выполнить)\b", re.IGNORECASE),
+    re.compile(r"\bизвини(?:те)?[,.\s].{0,40}\bне могу\b", re.IGNORECASE),
+    re.compile(r"\bкак (?:ИИ|языковая модель)\b", re.IGNORECASE),
     re.compile(r"\bmatching entry\b", re.IGNORECASE),
     re.compile(r"\bavailable catalog\b", re.IGNORECASE),
     re.compile(r"\berrcode\b", re.IGNORECASE),
     re.compile(r"^\s*[{\[]"),  # raw JSON/array leaking through
 ]
 _NARRATION_MAX_CHARS = 400
+# Han / Hiragana / Katakana / Hangul. Progress narration for this product
+# is only ever asked for in a European language; a CJK reply is the SMALL
+# model flailing, never legitimate here.
+_CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
 
 
-def _looks_like_narration_garbage(text: str) -> bool:
+def _looks_like_narration_garbage(text: str, language: str = "") -> bool:
     if len(text) > _NARRATION_MAX_CHARS:
+        return True
+    if _CJK_RE.search(text) and not re.search(r"chin|japan|korea|mandarin|中文", language, re.IGNORECASE):
         return True
     return any(p.search(text) for p in _NARRATION_GARBAGE_PATTERNS)
 
@@ -189,7 +202,7 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     text = data["result"].strip()
     if not text:
         return None
-    if _looks_like_narration_garbage(text):
+    if _looks_like_narration_garbage(text, language):
         log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300])
         return None
     log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=text)
