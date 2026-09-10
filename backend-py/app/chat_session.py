@@ -915,10 +915,20 @@ class ChatSession:
         # she'd lost track of their answer entirely. Always make sure the
         # most recent real question is represented as the LAST line,
         # appending it if the disk read didn't already surface it.
-        if self.last_real_user_question:
-            question = self.last_real_user_question.strip()
-            if not lines or question not in lines[-1]:
-                lines.append(f"User: {question}")
+        # Also (2026-09-10): last_real_user_question is only ever set by a
+        # REAL submit() (is_real_user=True), so a proactively-injected turn
+        # (inject_proactive() always passes is_real_user=False -- startup
+        # greeting, reminders, ratatosk nudges, crash-resume) left this None
+        # on a fresh process with no real user turn yet this lifetime, so
+        # narration had nothing to anchor on and never fired even for a
+        # long-running proactive turn. pending_user_text is set
+        # unconditionally by submit() for EVERY turn, real or proactive, for
+        # exactly as long as one is pending -- falls back to it so this
+        # works for any in-flight turn, not just ones a real user directly
+        # started.
+        question = (self.last_real_user_question or self.pending_user_text or "").strip()
+        if question and (not lines or question not in lines[-1]):
+            lines.append(f"User: {question}")
 
         return "\n".join(lines[-limit:])
 
@@ -941,7 +951,17 @@ class ChatSession:
         resets whenever the real model actually says something of its own
         (see the "assistant" wire-send site) or a real new user message
         starts a fresh turn."""
-        if self.ended or not self.turn_pending or self.silent_turn or not self.last_real_user_question:
+        # Bug fix (2026-09-10): confirmed live -- gating this on
+        # last_real_user_question specifically meant a proactively-injected
+        # turn (inject_proactive() always passes is_real_user=False --
+        # startup greeting, reminders, ratatosk nudges, crash-resume) never
+        # got narration at all on a fresh process, even a long one (e.g.
+        # resuming an unfinished image-generation + document task after a
+        # crash). _gather_recent_dialogue_for_narration now also falls back
+        # to pending_user_text (set for every pending turn, real or
+        # proactive), so the emptiness check below on the actual gathered
+        # dialogue is the real, general guard now -- not this field.
+        if self.ended or not self.turn_pending or self.silent_turn:
             return
         now = time.monotonic()
         if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
@@ -949,10 +969,12 @@ class ChatSession:
         self.last_visible_output_at = now  # claim this tick immediately -- a slow ai:resolve call must not let a second tick double-fire
         from app.plugins.voice_api import generate_progress_comment
 
-        # _gather_recent_dialogue_for_narration always includes
-        # last_real_user_question (guaranteed non-empty here, checked
-        # above), so dialogue is never empty by construction.
         dialogue = self._gather_recent_dialogue_for_narration()
+        if not dialogue.strip():
+            # Nothing to narrate about yet (first-ever turn, nothing on disk,
+            # no pending text either) -- skip rather than call ai:resolve with
+            # empty context for a comment that couldn't mean anything.
+            return
         log_event("engine", "progress_narration_context", tab_id=self.tab_id, dialogue_chars=len(dialogue), dialogue_preview=dialogue[-300:])
         try:
             comment = await generate_progress_comment(dialogue, current_language_name(self.tab_id))

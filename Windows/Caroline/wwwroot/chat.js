@@ -1241,6 +1241,18 @@
       // backup reminder landing between a voice message and its reply ate the voice
       // turn's queue slot, so isVoice got lost and its TTS never fired).
       turnQueue.push({ isVoice: false, assistantText: "" });
+      // Bug fix (2026-09-10): confirmed live -- this used to only push the
+      // placeholder and rely on the "assistant" handler's own fallback
+      // (turnQueue.length === 0 -> setBusy(true)/startHeartbeat()) to pick up
+      // the busy state once real activity showed up. But the placeholder just
+      // pushed above makes that fallback's own condition false from the start,
+      // so it NEVER fires for a proactively-injected turn -- the lamp stayed
+      // static (no blink) and the heartbeat/progress-narration timer never
+      // started for the whole turn, even a long-running one (e.g. resuming
+      // unfinished work after a crash). Both calls are no-ops if already
+      // busy/running, so this is safe to call unconditionally here too.
+      setBusy(true);
+      startHeartbeat();
       return;
     }
 

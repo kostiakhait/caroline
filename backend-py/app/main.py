@@ -749,12 +749,25 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         unfinished_turn = peek_pending_turn(WORKSPACE_DIR, tab_id)
         if unfinished_turn:
             log_event("engine", "resuming_unfinished_turn", tab_id=tab_id, text_len=len(unfinished_turn.text))
+            # Bug fix (2026-09-10): confirmed live -- this is the real
+            # question the user originally asked, just replayed after a
+            # restart rather than arriving via a live submit(); setting it
+            # here (inject_proactive() itself always passes
+            # is_real_user=False, so it never would) lets
+            # _check_progress_narration/_gather_recent_dialogue_for_narration
+            # (chat_session.py) anchor periodic progress narration on it --
+            # previously this stayed None all process lifetime and a
+            # long-running resumed task (e.g. regenerating a presentation)
+            # got no narration at all.
+            session.last_real_user_question = unfinished_turn.text
+            resume_lang = current_language_name(tab_id)
             session.inject_proactive(
                 "[Caroline was restarted (app closed or crashed) while still working on this, and it was never "
                 f'finished or answered:\n\n"{unfinished_turn.text}"\n\nResume it now and answer the user -- they '
                 "don't know this happened yet, so tell them you got interrupted and pick up where you left off. "
                 "Don't just re-run everything from scratch if you're not sure what already completed -- check "
-                "first where that makes sense (e.g. was an email already sent, a file already written).]",
+                "first where that makes sense (e.g. was an email already sent, a file already written). Reply in "
+                f"{resume_lang}.]",
             )
 
     try:
