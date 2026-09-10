@@ -1068,6 +1068,22 @@ class ChatSession:
             try:
                 self.hang_count = 0
                 self.has_seen_init = False
+                # Bug fix (2026-09-10): confirmed live -- last_activity is only
+                # ever refreshed by submit() (a real user message) or a message
+                # actually arriving on the wire. Once a session starts failing
+                # and replaying its pending turn via _push_message (NOT
+                # submit(), see handle_failure), last_activity goes stale and
+                # NEVER updates again while nothing streams in. Every fresh
+                # query() this loop creates then inherits that ancient
+                # timestamp -- _check_hang sees an "elapsed" of many minutes
+                # (confirmed live: 3246s and climbing) against the 300s
+                # startup timeout, so it judges the brand-new query "hung" on
+                # its very first watchdog tick and force-closes it around 22s
+                # in, long before even a legitimately slow resume (tab 1 has
+                # needed 128-280s for a real one) can ever finish -- a
+                # self-perpetuating trap this tab could never escape. A fresh
+                # attempt deserves its own fresh clock.
+                self.last_activity = time.monotonic()
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
                 mode = await resolve_mode(self.workspace_dir, self.tab_id)

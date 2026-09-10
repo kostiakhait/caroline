@@ -1382,6 +1382,19 @@ class ChatSession {
         // be left over from the previous session's hangs.
         this.hangCount = 0;
         this.hasSeenInit = false;
+        // Bug fix (2026-09-10): confirmed live -- lastActivity is only ever
+        // refreshed by submit() (a real user message) or a message actually
+        // arriving on the wire. Once a session starts failing and replaying
+        // its pending turn via pushMessage() (NOT submit(), see
+        // handleFailure), lastActivity goes stale and never updates again
+        // while nothing streams in. Every fresh query() this loop creates
+        // then inherits that ancient timestamp -- checkHang() sees an
+        // "elapsed" of many minutes against the 300s startup timeout, so it
+        // judges the brand-new query "hung" on its very first watchdog tick
+        // and force-closes it around 22s in, long before even a legitimately
+        // slow resume can ever finish -- a self-perpetuating trap. A fresh
+        // attempt deserves its own fresh clock.
+        this.lastActivity = Date.now();
         console.error("[caroline] runLoop: starting a fresh session (hangCount reset)");
 
         // Own-Anthropic (OAuth, then a manually-pasted key) always wins when

@@ -1267,7 +1267,21 @@
           setBusy(false);
           stopHeartbeat();
         }
-        turnQueue = []; // the session restarting means none of these will get their own "result"
+        // Bug fix (2026-09-10): confirmed live -- emptying turnQueue to []
+        // outright (instead of collapsing it) left the lamp correctly
+        // blinking through the restart itself, but then died the moment
+        // ANY "result" next arrived (even a stray one for the OLD,
+        // now-abandoned turn): the "result" handler does
+        // turnQueue.shift()/setBusy(turnQueue.length > 0), and an empty
+        // queue makes that setBusy(false) -- even though the backend is
+        // about to silently replay the user's actual pending turn into the
+        // fresh session and a real reply is still coming. The backend only
+        // ever replays ONE pending turn (see handleFailure's own
+        // pendingUserText), so if there was anything queued, collapse it to
+        // exactly one placeholder instead of wiping it -- that placeholder
+        // absorbs the stray/old "result" cleanly and keeps the lamp
+        // blinking straight through to the replayed turn's own real one.
+        turnQueue = turnQueue.length > 0 ? [{ isVoice: false, assistantText: "" }] : [];
       } else if (evt.status === "stopped") {
         turnQueue.shift(); // the interrupted turn won't get a "result" of its own
         // The backend immediately injects a synthetic message telling Caroline
