@@ -114,6 +114,16 @@ API_RETRY_INTERVAL_MS = 90_000
 COMPACTION_CHECK_INTERVAL_MS = 60 * 60_000
 COMPACTION_STARTUP_DELAY_MS = 60_000
 MCP_RECONNECT_INTERVAL_MS = 15_000
+# Per explicit instruction (2026-09-09): if 90s pass after a REAL user
+# message with nothing sent back to them yet, nudge the model to continue/
+# answer -- distinct from hang-detection (which guards against a dead
+# transport) this guards against a live transport where the model itself
+# went quiet without ever replying (finished a turn with no text, lost
+# track mid-task, etc.). Deliberately does NOT help a fully hung/
+# never-initialized query() -- a nudge queued behind a stuck input stream
+# is just as stuck as the original message until hang-detection's own,
+# separate recovery kicks in.
+SILENT_USER_WAIT_NUDGE_MS = 90_000
 
 CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
     "Continue any unfinished work, if there is any. If not, do nothing and reply with exactly [[NO_UPDATE]], with "
@@ -348,6 +358,13 @@ class ChatSession:
         self.hang_interrupted_at: float | None = None
         self.hang_count = 0
 
+        # silent user-wait nudge (see SILENT_USER_WAIT_NUDGE_MS) -- tracks
+        # only REAL user-typed messages (submit()'s is_real_user=True),
+        # not proactive/reminder/retry turns
+        self.last_real_user_turn_at: float | None = None
+        self.real_user_turn_answered = False
+        self.silence_nudge_sent_for_turn = False
+
         # restart budget
         self.restart_timestamps: list[float] = []
 
@@ -409,6 +426,29 @@ class ChatSession:
         except Exception as exc:
             log_event("engine", "dispose_interrupt_failed", tab_id=self.tab_id, error=str(exc))
 
+    async def _safe_disconnect(self, client: ClaudeSDKClient) -> None:
+        """Fire-and-forget disconnect wrapper -- claude_agent_sdk's own
+        subprocess_cli.py's close() has a confirmed live bug (2026-09-09):
+        it doesn't guard against self._process already being None (a
+        concurrent close from elsewhere, or the process having already
+        exited), so it can throw a bare AttributeError
+        ('NoneType' object has no attribute 'terminate'/'returncode') from
+        deep inside the SDK's own internals. A disconnect() awaited
+        directly is already covered by whatever try/except wraps its own
+        call site (or _run_loop's own outer exception handler); this
+        wrapper exists specifically for callers that fire disconnect() via
+        asyncio.create_task() without awaiting it -- without a wrapper
+        like this, that exception becomes an unretrieved Task exception
+        (confirmed live: 'Task finished ... exception=AttributeError' with
+        no owner to catch it), which is silent noise at best and, if the
+        SDK's own internal state ends up inconsistent as a result, a
+        plausible contributor to the process-level hangs seen the same
+        night (see the migration plan's own incident writeup)."""
+        try:
+            await client.disconnect()
+        except Exception as exc:
+            log_event("engine", "safe_disconnect_failed", tab_id=self.tab_id, error=str(exc))
+
     # --------------------------------------------------------------- submit --
 
     def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, silent: bool = False, is_voice: bool = False) -> None:
@@ -421,6 +461,9 @@ class ChatSession:
         self.last_activity = time.monotonic()
         if is_real_user:
             self.last_user_activity = time.monotonic()
+            self.last_real_user_turn_at = time.monotonic()
+            self.real_user_turn_answered = False
+            self.silence_nudge_sent_for_turn = False
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
         self._push_message(text, attachments, is_voice)
 
@@ -631,7 +674,7 @@ class ChatSession:
         self.unrecoverable_session_replay_attachments = replay_attachments
         self.restart_for_unrecoverable_session = True
         if self.client:
-            asyncio.create_task(self.client.disconnect())
+            asyncio.create_task(self._safe_disconnect(self.client))
 
     async def _run_urgent_compaction(self, replay_text: str | None, replay_attachments: list[Any]) -> None:
         if self.compaction_in_progress:
@@ -732,8 +775,33 @@ class ChatSession:
                 if self.ended:
                     return
                 await self._check_hang()
+                self._check_user_wait_nudge()
         except asyncio.CancelledError:
             pass
+
+    def _check_user_wait_nudge(self) -> None:
+        """Separate from hang-detection above -- that guards against a
+        DEAD transport (no init, or nothing streaming at all); this guards
+        against a LIVE transport where the model itself went quiet without
+        ever replying to a real user message (finished a turn with no
+        text, lost track mid-task, etc.). Deliberately does nothing for a
+        fully hung/never-initialized query(): the nudge this queues via
+        submit() sits behind the same stuck input stream as the original
+        message until hang-detection's own, separate recovery runs."""
+        if self.last_real_user_turn_at is None or self.real_user_turn_answered or self.silence_nudge_sent_for_turn:
+            return
+        elapsed = time.monotonic() - self.last_real_user_turn_at
+        if elapsed < SILENT_USER_WAIT_NUDGE_MS / 1000:
+            return
+        log_event("engine", "silent_user_wait_nudge", tab_id=self.tab_id, elapsed_s=round(elapsed, 1))
+        self.silence_nudge_sent_for_turn = True
+        self.submit(
+            "[Internal: it's been over 90 seconds since the user's message and nothing has reached them yet. If "
+            "you're already working on something (a tool call, research, a multi-step task), just continue -- "
+            "don't restart from scratch. If you actually finished and simply didn't reply, or lost track, answer "
+            "them now, directly. Don't mention this note itself.]",
+            [], False, True, False,
+        )
 
     async def _check_hang(self) -> None:
         effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
@@ -1069,6 +1137,8 @@ class ChatSession:
                     wire = message_to_wire(message)
                     if not self.silent_turn and wire is not None:
                         await self.send({"type": "sdk_message", "message": wire})
+                        if wire.get("type") in ("assistant", "result") and not self.real_user_turn_answered:
+                            self.real_user_turn_answered = True
 
                     if isinstance(message, ResultMessage):
                         self.silent_turn = True
