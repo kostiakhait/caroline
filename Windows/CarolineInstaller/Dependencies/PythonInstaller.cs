@@ -46,7 +46,28 @@ internal static class PythonInstaller
     // the local (non-SquirrelWisdom) text-to-speech path -- see Caroline/backend/src/
     // voice.ts and its local_tts_server.py companion -- added specifically to cut
     // per-call latency (no Camerlengo round trip), not to save money.
-    private static readonly string[] PythonPackages = ["edge-tts"];
+    //
+    // fastapi/uvicorn/httpx/claude-agent-sdk/pydantic/python-dotenv: the new Python
+    // backend (see backend-py/, replacing backend/'s Node.js one -- 2026-09-09 plan,
+    // "Rewrite Caroline's backend from Node.js/TypeScript to Python"). Kept in sync
+    // with backend-py's own actual dependencies AS THEY'RE ADDED during that
+    // migration, not as a one-time end-of-project sweep -- add here the same turn a
+    // new package gets pip-installed for backend-py, or a real install will work on
+    // the dev machine and be broken everywhere else.
+    // NOTE: entries here MUST be plain package names, not pip extras syntax
+    // (e.g. "uvicorn[standard]") -- ArePackagesInstalled() below checks for a
+    // Lib/site-packages/<name> directory literally matching each entry
+    // (hyphens->underscores), which a "pkg[extra]" string would never match.
+    // uvicorn's WebSocket support just needs `websockets` importable -- listed
+    // here as its own top-level package instead, same practical effect.
+    private static readonly string[] PythonPackages =
+        ["edge-tts", "fastapi", "uvicorn", "websockets", "httpx", "claude-agent-sdk", "pydantic", "python-dotenv",
+         // playwright's own browser binaries are NOT needed here -- the
+         // embedded-browser plugin only ever connects to an EXISTING remote
+         // CDP endpoint (AppBrowserWindow's own WebView2 instance) via
+         // connect_over_cdp(), never launches a local browser itself. The
+         // pip package alone ships the driver that requires.
+         "playwright"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 

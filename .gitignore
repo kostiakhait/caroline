@@ -45,6 +45,24 @@ deploy.mk
 # reproduction/verification during development (e.g. test-dehydrate.mjs,
 # analyze-session-size.mjs) -- not a real test suite, never meant to ship.
 backend/*.mjs
+# Same idea, .ps1 flavor -- machine-specific throwaway diagnostics (hardcoded
+# local paths/app-hash directories), e.g. bisect.ps1 from the tool-use-
+# concurrency investigation.
+backend/*.ps1
+
+# --- backend-py (Python backend) --------------------------------------------
+# Local copy of Caroline's own bundled embeddable Python runtime + every pip
+# dependency installed into it -- the Python equivalent of backend/node_modules/,
+# same reasoning: huge, regenerable, never meant to ship in the repo itself.
+backend-py/python-runtime/
+# Isolated per-tab state (schedule.json, session ids, dehydrated transcripts,
+# etc.) from ad-hoc plugin/engine testing against an explicit
+# CAROLINE_WORKSPACE_DIR override -- never the real user's workspace, but
+# still not repo content.
+backend-py/test-workspace/
+# Throwaway Phase-1 WS round-trip verification script -- not a real test
+# suite, same spirit as the backend/*.mjs scripts above.
+backend-py/test_roundtrip.py
 
 # --- Misc build/debug artifacts --------------------------------------------
 *.log

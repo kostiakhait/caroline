@@ -213,6 +213,41 @@ export async function synthesizeSpeech(text: string, voice = "Nova", session?: s
 }
 
 /**
+ * Redesign (2026-09-09, see the resolve-based-language-detection plan):
+ * determines what language the USER (not Caroline) is writing in, via
+ * Camerlengo's general-purpose ai:resolve (the same command
+ * consultLargeModel/cleanTextForSpeech already use) rather than
+ * ai:detectLanguage -- returns the language's own English name (e.g.
+ * "Russian", "Spanish"), not an ISO code, and is NOT collapsed to a
+ * ru/en binary the way the old detectRecentLanguage() was. Deliberately no
+ * artificial local timeout wrapper here (unlike detectLanguage's callers) --
+ * this is only ever called fire-and-forget from server.ts's
+ * refreshLanguageInBackground, never awaited synchronously in a user-facing
+ * path, so a slow response just means the persisted hint updates a little
+ * later, not a delayed reply. The 30s callApi ceiling below is pure
+ * leak-prevention, not a UX concern.
+ */
+export async function resolveUserLanguage(recentText: string, session?: string): Promise<string | null> {
+  try {
+    const prompt =
+      "Determine what language the USER is writing in, based on their most recent messages below (ignore any " +
+      "assistant/system text mixed in -- focus only on the user's own words). Reply with ONLY the language's " +
+      'English name (e.g. "Russian", "Spanish", "English") and nothing else -- no punctuation, no explanation.\n\n' +
+      recentText;
+    const data = await callApi({ command: "ai:resolve", question: prompt, ...(session ? { session } : {}) }, 30_000);
+    if (data[".status"] !== "ok" || typeof data.result !== "string") {
+      console.error(`[caroline] [voice] resolveUserLanguage: ai:resolve failed: ${(data as any)[".reason"] ?? JSON.stringify(data)}`);
+      return null;
+    }
+    const name = data.result.trim();
+    return name || null;
+  } catch (err) {
+    console.error("[caroline] [voice] resolveUserLanguage failed:", err);
+    return null;
+  }
+}
+
+/**
  * Real LLM-backed language detection (Camerlengo's ai:detectLanguage, see
  * reforce's API/Api2AICommands.py cmdV2DetectLanguage / AI.py's
  * detectLanguage) -- deliberately NOT a Cyrillic/Latin heuristic: per

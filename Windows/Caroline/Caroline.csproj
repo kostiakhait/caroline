@@ -67,13 +67,36 @@
        silently came back empty because the running backend didn't have
        the persona_get op yet. This only copies the small compiled .js
        files, not node_modules/mcp-servers (those need build.bat's full
-       copy if they ever change). -->
+       copy if they ever change). Kept even though BackendProcess.cs no
+       longer launches Node: the Node backend still ships in the packaged
+       output as a rollback (see BackendProcess.cs's own doc comment), and
+       this keeps that copy from silently going stale during the
+       transition period the same way it always did for active dev work. -->
   <Target Name="SyncBackendDist" AfterTargets="Build">
     <ItemGroup>
       <BackendDistFiles Include="..\..\backend\dist\**\*.js" />
     </ItemGroup>
     <Copy SourceFiles="@(BackendDistFiles)"
           DestinationFolder="$(OutDir)backend\dist\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- Same dev-time convenience, now for the ACTUAL live backend
+       (backend-py, see BackendProcess.cs). Without this, editing
+       backend-py/app/*.py updates only the source tree, not this build
+       output's own copy, so `dotnet build` + relaunch keeps running stale
+       Python code with no error: the exact same silent-staleness trap
+       SyncBackendDist exists to prevent for the Node copy above. -->
+  <Target Name="SyncBackendPy" AfterTargets="Build">
+    <ItemGroup>
+      <BackendPyFiles Include="..\..\backend-py\app\**\*.py" Exclude="..\..\backend-py\app\**\__pycache__\**" />
+      <BackendPyEntry Include="..\..\backend-py\run_server.py" />
+    </ItemGroup>
+    <Copy SourceFiles="@(BackendPyFiles)"
+          DestinationFolder="$(OutDir)backend-py\app\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(BackendPyEntry)"
+          DestinationFolder="$(OutDir)backend-py"
           SkipUnchangedFiles="true" />
   </Target>
 

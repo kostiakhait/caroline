@@ -13,7 +13,7 @@ import {
   getPersona, getPersonaEditState, setProfileKey, saveCustomPersona, saveProfileOverride, resetProfile,
   personaSystemPromptAppend, type Persona,
 } from "./persona.js";
-import { transcribeAudio, synthesizeSpeech, voiceForGender, detectLanguage, cleanTextForSpeech } from "./voice.js";
+import { transcribeAudio, synthesizeSpeech, voiceForGender, resolveUserLanguage, cleanTextForSpeech } from "./voice.js";
 import { createSchedulerTool, startDueCheckLoop, ensureRecurringBackup, type Reminder } from "./scheduler.js";
 import { createFileOpenerTool, openFileWithDefaultApp } from "./files.js";
 import { createViewerTool, takeViewerRequest, type OfficeConfig } from "./viewer.js";
@@ -46,7 +46,7 @@ import { createConsultTools } from "./consultTools.js";
 import { startRatatoskOwnerChannel, startRatatoskPresenceHeartbeat, getRatatoskChannelStatus } from "./ratatoskChannel.js";
 import { hasOwnRatatoskAccount, ownRatatoskEmail, ensureOwnRatatoskAccount, getOwnV2Session } from "./ratatoskOwnAccount.js";
 import { findOrCreateDM, sendMessage } from "./ratatosk.js";
-import { vaultSecurityInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, continuityPointerInstruction, configureIsolatedGitBash } from "./policies.js";
+import { vaultSecurityInstruction, noUnauthorizedSecretChangesInstruction, languageHintInstruction, progressNarrationInstruction, bashBackgroundInstruction, timestampAwarenessInstruction, noAlarmingInternalRecoveryInstruction, noUpdateSentinelInstruction, embeddedBrowserInstruction, noFullFilesystemSearchInstruction, recurringTasksInstruction, preferWindowTargetedInputInstruction, tableSizeGuidanceInstruction, cheapImageDescriptionInstruction, readContentNotHeadersInstruction, preferCroppedScreenshotsInstruction, consultLargeModelInstruction, noRemoteFilesystemScansInstruction, taskDecompositionInstruction, scriptOrSubagentDelegationInstruction, markDiscussedEmailsReadInstruction, checkSentMailTooInstruction, closeWindowsAfterTaskInstruction, learnFromMistakesInstruction, continuityPointerInstruction, configureIsolatedGitBash } from "./policies.js";
 
 // First thing this process ever does, before anything else runs. Confirmed
 // live (2026-09-05) as a real, costly gap: with no explicit version marker
@@ -1229,7 +1229,7 @@ class ChatSession {
     if (fellBackToSw) markOwnAnthropicExhausted(info.resetsAt);
     // Status-bar/system_notice text is UI chrome, not a chat reply -- always
     // English, regardless of what language the conversation itself is in
-    // (see detectRecentLanguage for that separate concern).
+    // (see currentLanguageName/languageHintInstruction for that separate concern).
     const resetText = info.resetsAt ? ` Resets: ${new Date(info.resetsAt).toLocaleString("en-US")}.` : "";
     const typeText = info.rateLimitType ? ` (${info.rateLimitType})` : "";
     const text = fellBackToSw
@@ -1590,11 +1590,13 @@ class ChatSession {
             append: [
               personaSystemPromptAppend(getPersona(workspaceDir)),
               vaultSecurityInstruction(),
+              noUnauthorizedSecretChangesInstruction(),
               progressNarrationInstruction(),
               bashBackgroundInstruction(),
               timestampAwarenessInstruction(),
               noAlarmingInternalRecoveryInstruction(),
               continuityPointerInstruction(loadTabContinuityArchive(workspaceDir, this.tabId)),
+              languageHintInstruction(currentLanguageName()),
               noUpdateSentinelInstruction(),
               embeddedBrowserInstruction(),
               noFullFilesystemSearchInstruction(),
@@ -2065,17 +2067,15 @@ class ChatSession {
             // Per explicit instruction (2026-09-09): a brand-new session has
             // ZERO history of its own to infer language from -- confirmed
             // live as the actual cause of a Russian conversation coming back
-            // in English after exactly this reset. detectRecentLanguage()
-            // now falls back to the last PERSISTED language instead of a
-            // hardcoded "english" default (see its own doc comment), but a
-            // direct instruction here is cheap insurance on top of that, not
-            // a replacement for it.
-            const lang = await detectRecentLanguage();
-            const languageDirective = lang === "russian"
-              ? "[Continue this conversation in Russian -- that's the language it's been in.]\n\n"
-              : "";
-            console.error(`[caroline] tab=${this.tabId} replaying the turn that hit the unrecoverable error (lang=${lang}): ${truncateForLog(replayText)}`);
-            this.submit(`${languageDirective}${replayText}`, replayAttachments, true, false, this.turnIsVoice);
+            // in English after exactly this reset. Redesign (2026-09-09):
+            // no per-call directive text needed anymore -- the fresh query()
+            // this replay lands in already carries languageHintInstruction
+            // (currentLanguageName(), synchronous, instant) in its own
+            // system prompt. Just kick off a background refresh so the NEXT
+            // reset/turn has the freshest possible hint too.
+            refreshLanguageInBackground();
+            console.error(`[caroline] tab=${this.tabId} replaying the turn that hit the unrecoverable error: ${truncateForLog(replayText)}`);
+            this.submit(replayText, replayAttachments, true, false, this.turnIsVoice);
           } else {
             console.error(`[caroline] tab=${this.tabId} no captured turn to replay (pendingUserText was already null) -- nothing queued`);
           }
@@ -2304,27 +2304,23 @@ class ChatSession {
       // instruction landing after a Russian conversation (or vice versa)
       // risked knocking her into replying in the wrong language, confirmed
       // as a real (if minor) annoyance, not just a theoretical one.
-      const lang = await detectRecentLanguage();
-      // Re-check -- detectRecentLanguage() is async and confirmed live
-      // (2026-09-04) to take several seconds; a real user message can
-      // arrive and get queued (via submit(), setting pendingUserText)
-      // during that gap. Injecting this nudge on top of it lands both in
-      // the same turn, and the model reliably obeys the nudge's strict
-      // "reply exactly [[NO_UPDATE]]" instruction over answering the real
-      // question -- confirmed live: a genuine user message got silently
-      // swallowed this way, with only "[[NO_UPDATE]]" (itself suppressed
-      // from the UI) coming back. If a real message showed up in the
-      // meantime, let it get its own normal turn instead.
+      // currentLanguageName() is synchronous/instant (2026-09-09 redesign,
+      // see the resolve-based-language-detection plan) -- no more
+      // multi-second await here, but this pendingUserText re-check is kept
+      // regardless as cheap insurance against a real message queued by some
+      // other earlier await in this same handler.
+      const lang = currentLanguageName();
       if (this.pendingUserText !== null) {
         // The real message that just appeared will get its own normal
         // submit() turn (not through here), which never sees watchdogNote --
         // queue it separately so the context still isn't lost, same
         // reasoning as the branch above.
-        console.error("[caroline] handleFailure: pendingUserText appeared during language detection -- skipping the continue-or-silent nudge, injecting watchdogNote on its own instead");
+        console.error("[caroline] handleFailure: pendingUserText appeared before the continue-or-silent nudge -- injecting watchdogNote on its own instead");
         this.injectProactive(watchdogNote, true);
       } else {
         console.error(`[caroline] handleFailure: no pendingUserText -- injecting continue-or-silent nudge (lang=${lang})`);
-        this.injectProactive(`${watchdogNote}\n\n${CONTINUE_OR_SILENT_NUDGE[lang]}`, false);
+        refreshLanguageInBackground();
+        this.injectProactive(`${watchdogNote}\n\n${CONTINUE_OR_SILENT_NUDGE_TEMPLATE.replace("{LANGUAGE}", lang)}`, false);
       }
     }
     console.error("[caroline] handleFailure: done, returning to runLoop");
@@ -2380,32 +2376,26 @@ class ChatSession {
   }
 }
 
-type NudgeLanguage = "russian" | "english";
-
-// Bug fix (2026-09-09): confirmed live -- detectRecentLanguage's own fallback
-// (no recent history, API call fails/times out) hardcoded "english", which is
-// exactly the case a freshly-reset session (resetUnrecoverableSession, or any
-// brand-new tab that hasn't resumed anything yet) always hits: NO history to
-// read at all. A Russian conversation that then needed a self-heal reset came
-// back speaking English with nothing in its own fresh context to correct it.
-// Persists the last real detection (not the fallback guess itself) to a tiny
-// file in the workspace, read back whenever there's nothing else to go on --
-// "the language we were last actually speaking" is a far better default than
-// a hardcoded one, and this is cheap/local, no reason not to keep it current.
+// Redesign (2026-09-09, see the resolve-based-language-detection plan):
+// persisted value is now a plain free-form English language name (whatever
+// resolveUserLanguage/ai:resolve returns, e.g. "Russian", "Spanish"), not a
+// hardcoded ru/en binary -- any non-empty string is accepted, since the
+// nudge templates below are no longer collapsed to two prewritten variants
+// either. Kept as its own tiny file in the workspace, same as before.
 const LAST_LANGUAGE_PATH = join(workspaceDir, "last-language.json");
 
-function loadPersistedLanguage(): NudgeLanguage | null {
+function loadPersistedLanguage(): string | null {
   try {
     if (!existsSync(LAST_LANGUAGE_PATH)) return null;
     const data = JSON.parse(readFileSync(LAST_LANGUAGE_PATH, "utf-8")) as { lang?: string };
-    return data.lang === "russian" || data.lang === "english" ? data.lang : null;
+    return typeof data.lang === "string" && data.lang.trim() ? data.lang.trim() : null;
   } catch (err) {
     console.error("[caroline] loadPersistedLanguage: read/parse failed (ignored):", err);
     return null;
   }
 }
 
-function savePersistedLanguage(lang: NudgeLanguage): void {
+function savePersistedLanguage(lang: string): void {
   try {
     writeFileSync(LAST_LANGUAGE_PATH, JSON.stringify({ lang }, null, 2) + "\n", "utf-8");
   } catch (err) {
@@ -2413,31 +2403,16 @@ function savePersistedLanguage(lang: NudgeLanguage): void {
   }
 }
 
-// Bug fix (2026-09-09): confirmed live -- detectRecentLanguage always picked
-// the SINGLE most recent history entry's text, but every call site that
-// matters (resetUnrecoverableSession, runUrgentCompaction) runs by
-// definition right after the CLI's own "API Error: ... tool use concurrency
-// issues." lands as the last assistant turn, or right after our own
-// hardcoded-English "[System note: this session was just reset ...]" note
-// gets pushed. So the "most recent" entry was tautologically ALWAYS one of
-// these two English synthetic texts, never the actual (often Russian)
-// conversation -- confirmed live as a 100%-reproducible "lang=english" on
-// every single reset tonight, regardless of the real conversation's
-// language, silently poisoning the persisted fallback too. Now walks
-// backward past known synthetic entries to the last one that looks like
-// real conversational content. Every genuine send also carries a leading
-// "[Sent: ...]"/"[Wed, ...]" timestamp stamp (see dehydrate.ts's own
-// TIMESTAMP_STAMP_PATTERN) -- stripped first so it doesn't hide a
-// synthetic payload behind it (confirmed live: the crash-recovery replay
-// nudge below is ALWAYS stamped this way, and very nearly slipped past the
-// first version of this fix for exactly that reason).
+// Every genuine send carries a leading "[Sent: ...]"/"[Wed, ...]" timestamp
+// stamp (see dehydrate.ts's own TIMESTAMP_STAMP_PATTERN) -- stripped first so
+// it doesn't hide a synthetic payload behind it (confirmed live: a
+// crash-recovery replay nudge is ALWAYS stamped this way).
 const HISTORY_STAMP_PATTERN = /^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )[^\]]*\]\s*/i;
 // Best-effort, not exhaustive -- new synthetic wrapper shapes keep turning up
 // (confirmed live: a background-task <task-notification> block was the very
 // next one found after fixing the first two). A wrong guess here just means
-// one proactive message reads a little oddly (see this function's own doc
-// comment), so each confirmed instance gets added here rather than chasing
-// a provably complete list up front.
+// one proactive message reads a little oddly, so each confirmed instance
+// gets added here rather than chasing a provably complete list up front.
 const SYNTHETIC_HISTORY_TEXT_PATTERNS = [
   /^API Error:/i,
   /^\[System note:/i,
@@ -2453,59 +2428,58 @@ function isSyntheticHistoryText(rawText: string): boolean {
 }
 
 /**
- * Real language detection via Camerlengo's ai:detectLanguage (an actual
- * LLM call, see reforce's AI.py detectLanguage) -- deliberately NOT a
- * Cyrillic/Latin heuristic, per explicit instruction: language detection
- * must go through the real API everywhere in this codebase. This project
- * only ever actually switches between Russian and English in its own
- * instruction phrasing (CONTINUE_OR_SILENT_NUDGE, STARTUP_GREETING_NUDGE
- * below), so the real detected ISO code is collapsed to that binary here;
- * a wrong guess just means one proactive message reads a little oddly, not
- * a functional failure.
+ * Redesign (2026-09-09, see the resolve-based-language-detection plan):
+ * synchronous, instant, no network call -- just whatever was last actually
+ * resolved (see refreshLanguageInBackground), or "English" if nothing has
+ * been persisted yet. Used everywhere a language name is needed RIGHT NOW
+ * (a nudge template, languageHintInstruction at query() construction).
+ * Deliberately replaces the old detectRecentLanguage(), which raced a real
+ * API call against a 3-second timeout and lost that race 100% of the time
+ * under real load (confirmed live, 2026-09-09) -- every reset that night
+ * silently fell back to hardcoded "english" regardless of the real (usually
+ * Russian) conversation.
  */
-async function detectRecentLanguage(): Promise<NudgeLanguage> {
+function currentLanguageName(): string {
+  return loadPersistedLanguage() ?? "English";
+}
+
+/**
+ * Fire-and-forget: gathers the last 5 non-synthetic history entries (see
+ * isSyntheticHistoryText's own doc comment for why a single most-recent
+ * entry can't be trusted -- a restart cadence can leave several synthetic
+ * entries in a row) and asks resolveUserLanguage (Camerlengo's ai:resolve,
+ * NOT ai:detectLanguage) what language the user is actually writing in.
+ * Never awaited by any caller and carries no timeout of its own beyond
+ * resolveUserLanguage's own leak-prevention ceiling -- whatever it manages
+ * to persist simply becomes visible on the NEXT query() construction via
+ * languageHintInstruction/currentLanguageName, per explicit instruction
+ * ("результат... передавать в системном промпте на следующем ходу").
+ */
+function refreshLanguageInBackground(): void {
   try {
-    // Read a wider window than just "the last one" -- see
-    // SYNTHETIC_HISTORY_TEXT_PATTERNS's own doc comment for why the single
-    // most recent entry can't be trusted, and tonight's restart cadence
-    // could plausibly leave several synthetic entries in a row.
     const entries = readRecentHistory(workspaceDir, 50);
-    let lastText = "";
-    for (let i = entries.length - 1; i >= 0; i--) {
+    const recentTexts: string[] = [];
+    for (let i = entries.length - 1; i >= 0 && recentTexts.length < 5; i--) {
       const text = entries[i].text.trim();
-      if (text && !isSyntheticHistoryText(text)) {
-        lastText = text;
-        break;
-      }
+      if (text && !isSyntheticHistoryText(text)) recentTexts.unshift(text);
     }
-    if (!lastText.trim()) return loadPersistedLanguage() ?? "english";
-    // detectLanguage() has its own internal 15s ceiling (see voice.ts's
-    // callApi), which is fine for a real voice/STT pipeline but far too
-    // generous here -- confirmed live (2026-09-05) it took ~20s for a
-    // restarting session's recovery nudge to actually go out, delaying the
-    // one thing (telling Caroline to pick back up) that's supposed to
-    // happen as soon as possible after a restart. Getting the wrong
-    // language guess is a minor cosmetic annoyance; a slow recovery nudge is
-    // the actual problem this exists to avoid, so race it against a much
-    // shorter local timeout instead of waiting out the full 15s.
-    const iso = await Promise.race([
-      detectLanguage(lastText),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
-    ]);
-    if (iso === null) return loadPersistedLanguage() ?? "english"; // the race timed out -- no real signal either way
-    const lang: NudgeLanguage = iso === "ru" ? "russian" : "english";
-    savePersistedLanguage(lang);
-    return lang;
+    if (recentTexts.length === 0) return;
+    resolveUserLanguage(recentTexts.join("\n---\n"))
+      .then((name) => {
+        if (name) {
+          console.error(`[caroline] refreshLanguageInBackground: resolved "${name}"`);
+          savePersistedLanguage(name);
+        }
+      })
+      .catch((err) => console.error("[caroline] refreshLanguageInBackground: resolveUserLanguage threw:", err));
   } catch (err) {
-    console.error("[caroline] detectLanguage race failed, falling back to last known language:", err);
-    return loadPersistedLanguage() ?? "english";
+    console.error("[caroline] refreshLanguageInBackground: failed to gather history (ignored):", err);
   }
 }
 
-const CONTINUE_OR_SILENT_NUDGE: Record<NudgeLanguage, string> = {
-  russian: "Продолжи неоконченную работу, если она есть. Если нет — ничего не делай и ответь ровно [[NO_UPDATE]], без пояснений.",
-  english: "Continue any unfinished work, if there is any. If not, do nothing and reply with exactly [[NO_UPDATE]], with no explanation.",
-};
+const CONTINUE_OR_SILENT_NUDGE_TEMPLATE =
+  "Continue any unfinished work, if there is any. If not, do nothing and reply with exactly [[NO_UPDATE]], with " +
+  "no explanation. Reply in {LANGUAGE}.";
 
 /**
  * Static (never routed through the model -- see handleBalanceExhausted's doc
@@ -2547,14 +2521,10 @@ const BALANCE_EXHAUSTED_MESSAGE: Record<"sw" | "anthropic", (paymentOpened: bool
  * personality/gender-agreement rules -- this only supplies the language and
  * the occasion, not scripted wording).
  */
-const STARTUP_GREETING_NUDGE: Record<NudgeLanguage, string> = {
-  russian: "Ты только что запустилась (или перезапустилась). Поприветствуй пользователя проактивно, в своём " +
-    "обычном стиле и с учётом своей личности — дай понять, что ты снова на связи и готова к работе. Коротко, " +
-    "без лишних пояснений о том, что это стартовое сообщение.",
-  english: "You just started up (or restarted). Proactively greet the user in your own voice and personality -- " +
-    "let them know you're back online and ready to work. Keep it brief, and don't explain that this is a " +
-    "startup message.",
-};
+const STARTUP_GREETING_NUDGE_TEMPLATE =
+  "You just started up (or restarted). Proactively greet the user in your own voice and personality -- " +
+  "let them know you're back online and ready to work. Keep it brief, and don't explain that this is a " +
+  "startup message. Greet them in {LANGUAGE}.";
 
 /**
  * Handles the Settings-screen operations (login, MCP server add/remove) by
@@ -3241,16 +3211,16 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   // Per explicit instruction: Caroline must never come back up silently.
   // Fires once per backend-process lifetime (hasGreeted), tied to the
   // primary tab specifically -- same channel reminders/handleFailure treat
-  // as "Caroline herself" (see primarySession()). Language is resolved via
-  // the real detectLanguage API (see detectRecentLanguage's doc comment),
-  // not guessed, and doesn't block accepting the connection.
+  // as "Caroline herself" (see primarySession()). Language comes from
+  // currentLanguageName() -- synchronous, instant, doesn't block accepting
+  // the connection (2026-09-09 redesign, see the
+  // resolve-based-language-detection plan).
   if (tabId === PRIMARY_TAB_ID && !hasGreeted) {
     hasGreeted = true;
-    void (async () => {
-      const lang = await detectRecentLanguage();
-      console.error(`[caroline] wss connection: sending startup greeting (lang=${lang})`);
-      session.injectProactive(STARTUP_GREETING_NUDGE[lang], false);
-    })();
+    const lang = currentLanguageName();
+    console.error(`[caroline] wss connection: sending startup greeting (lang=${lang})`);
+    session.injectProactive(STARTUP_GREETING_NUDGE_TEMPLATE.replace("{LANGUAGE}", lang), false);
+    refreshLanguageInBackground();
   }
 
   if (!resumedUnfinishedTurnForTab.has(tabId)) {

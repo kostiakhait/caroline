@@ -487,10 +487,49 @@ export function continuityPointerInstruction(archivePath: string | null): string
   );
 }
 
+/**
+ * Redesign (2026-09-09, see the resolve-based-language-detection plan):
+ * replaces the old ad-hoc per-nudge language lookups with one standing,
+ * always-visible hint, rebuilt fresh on every query() construction from
+ * whatever server.ts's currentLanguageName() last had persisted --
+ * mirrors continuityPointerInstruction's pattern exactly (a value computed
+ * synchronously at construction time, not a network call in the critical
+ * path). No timeouts, no blocking: the actual language RESOLUTION happens
+ * separately, asynchronously, in the background (server.ts's
+ * refreshLanguageInBackground), and whatever it last managed to persist
+ * simply shows up here on the next session/turn automatically.
+ */
+export function languageHintInstruction(lang: string): string {
+  return (
+    `The user's conversation has most recently been in ${lang}. Default to replying in ${lang} unless the ` +
+    `user's own message is clearly in a different language, in which case follow their lead instead.`
+  );
+}
+
 export function vaultSecurityInstruction(): string {
   return (
     `Never write secrets/passwords/API keys/tokens to local files, chat history, or Skills files -- always ` +
     `save them as a note in the "Caroline:Vault" Notes folder instead (see the vault-backups skill for the ` +
     `exact mechanics, and squirrelwisdom-login for getting Notes available in the first place).`
+  );
+}
+
+/**
+ * Standing rule (2026-09-09), stated by the user as hard and categorical
+ * after a real incident: a password Caroline set for someone else's mailbox
+ * turned out wrong, and the account owner (not Caroline) had to be asked for
+ * the real one. Never repeat that shape of mistake -- this is a permission
+ * rule, not a competence one; it applies even when Caroline is fully capable
+ * of picking or changing a credential correctly.
+ */
+export function noUnauthorizedSecretChangesInstruction(): string {
+  return (
+    `ABSOLUTE RULE, no exceptions: never invent, assign, or pick a password or other secret for anyone other ` +
+    `than your own accounts on your own initiative -- confirm with a real person first, every single time, no ` +
+    `matter how confident you are or how routine it looks. Beyond that, never CHANGE a password or any other ` +
+    `secret at all -- your own accounts included -- without that person's explicit, specific approval for that ` +
+    `exact change, given in the moment. A general grant to manage credentials, a past approval for a similar ` +
+    `action, or your own judgment that a change is obviously correct or overdue is NEVER sufficient on its own ` +
+    `-- ask and wait for a real answer before touching any secret, every time, without exception.`
   );
 }

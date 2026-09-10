@@ -4,10 +4,16 @@ using System.IO;
 namespace Caroline.Native;
 
 /// <summary>
-/// Spawns and supervises the Node backend sidecar (Caroline/backend, shipped
-/// as a "backend" folder next to this exe -- see Caroline/README.md). Mirrors
+/// Spawns and supervises the Python backend sidecar (Caroline/backend-py,
+/// shipped as a "backend-py" folder next to this exe -- see the migration
+/// plan at C:\Users\khait\.claude\plans\foamy-sniffing-pixel.md). Mirrors
 /// the shape of Ratatosk's SncManager: a child process this window owns the
 /// whole lifetime of, started on load and killed on exit.
+///
+/// Cutover from the Node backend (2026-09-09): this class no longer launches
+/// Node at all (the old ResolveNodeExe/dist/server.js path is gone) -- the
+/// Node "backend" folder still ships in the packaged output for now (see the
+/// Makefile) purely as a git-revert-this-file rollback, not a live fallback.
 /// </summary>
 public sealed class BackendProcess : IDisposable
 {
@@ -19,31 +25,31 @@ public sealed class BackendProcess : IDisposable
 
     public event Action<string>? OutputLine;
     /// <summary>Fired when the backend process exits on its own (crash, uncaught exception killing the whole
-    /// node process) -- never fired for a deliberate Dispose()/shutdown. See MainWindow for the restart policy.</summary>
+    /// python process) -- never fired for a deliberate Dispose()/shutdown. See MainWindow for the restart policy.</summary>
     public event Action? Crashed;
 
     public BackendProcess()
     {
-        _backendDir = Path.Combine(AppContext.BaseDirectory, "backend");
+        _backendDir = Path.Combine(AppContext.BaseDirectory, "backend-py");
     }
 
     public bool Start()
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         OutputLine?.Invoke($"[BackendProcess] Start() entered (thread={Environment.CurrentManagedThreadId})");
-        var entry = Path.Combine(_backendDir, "dist", "server.js");
+        var entry = Path.Combine(_backendDir, "run_server.py");
         if (!File.Exists(entry))
         {
             OutputLine?.Invoke($"[BackendProcess] not found: {entry}");
             return false;
         }
 
-        var nodeExe = ResolveNodeExe();
-        OutputLine?.Invoke($"[BackendProcess] resolved node exe: {nodeExe} (exists={File.Exists(nodeExe)})");
+        var pythonwExe = ResolvePythonwExe();
+        OutputLine?.Invoke($"[BackendProcess] resolved pythonw exe: {pythonwExe} (exists={File.Exists(pythonwExe)})");
 
         var psi = new ProcessStartInfo
         {
-            FileName = nodeExe,
+            FileName = pythonwExe,
             Arguments = $"\"{entry}\"",
             WorkingDirectory = _backendDir,
             UseShellExecute = false,
@@ -71,8 +77,12 @@ public sealed class BackendProcess : IDisposable
         psi.Environment["CAROLINE_FFMPEG_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "ffmpeg", "ffmpeg.exe");
 
         // Same reasoning again -- the embeddable Python runtime (CarolineInstaller.
-        // AppPaths.PythonExe) lives at Root\runtime\python\python.exe, backs the local
-        // edge-tts server (see localTtsServer.ts) this process spawns as its own child.
+        // AppPaths.PythonExe) lives at Root\runtime\python\python.exe, i.e. this IS the
+        // interpreter this process itself now runs under via pythonwExe below (a
+        // sibling in the same directory). Still passed through explicitly: the backend's
+        // own local_tts_launcher.py reads this exact env var to spawn the separate local
+        // edge-tts server subprocess, matching the original's own convention rather than
+        // hardcoding sys.executable there.
         psi.Environment["CAROLINE_PYTHON_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "python.exe");
 
         OutputLine?.Invoke($"[BackendProcess] calling Process.Start() (elapsed so far: {sw.Elapsed.TotalSeconds:F1}s)...");
@@ -82,7 +92,7 @@ public sealed class BackendProcess : IDisposable
         }
         catch (Exception ex)
         {
-            OutputLine?.Invoke($"[BackendProcess] Process.Start() threw after {sw.Elapsed.TotalSeconds:F1}s (is Node.js installed?): {ex}");
+            OutputLine?.Invoke($"[BackendProcess] Process.Start() threw after {sw.Elapsed.TotalSeconds:F1}s (is the isolated Python runtime installed?): {ex}");
             return false;
         }
         OutputLine?.Invoke($"[BackendProcess] Process.Start() returned after {sw.Elapsed.TotalSeconds:F1}s, pid={_process?.Id.ToString() ?? "null"}");
@@ -116,18 +126,27 @@ public sealed class BackendProcess : IDisposable
     }
 
     /// <summary>
-    /// CarolineInstaller provisions an isolated Node.js at
-    /// %LocalAppData%\Caroline\runtime\node\node.exe (a sibling of this
-    /// exe's own "app" install folder) precisely so Caroline never depends
-    /// on -- or fights with -- a Node.js the machine happens to already
-    /// have. Prefer that; fall back to "node" on PATH for dev/debug runs
-    /// where the installer was never involved (e.g. `dotnet build` straight
-    /// from the source tree).
+    /// CarolineInstaller provisions an isolated embeddable Python at
+    /// %LocalAppData%\Caroline\runtime\python\ (a sibling of this exe's own
+    /// "app" install folder) precisely so Caroline never depends on -- or
+    /// fights with -- a Python the machine happens to already have. Prefer
+    /// pythonw.exe there (a sibling of the installer's own python.exe, same
+    /// embeddable distribution ships both); fall back to "pythonw" on PATH
+    /// for dev/debug runs where the installer was never involved (e.g.
+    /// `dotnet build` straight from the source tree).
+    ///
+    /// pythonw.exe specifically, not python.exe: it's compiled as a
+    /// GUI-subsystem executable and never allocates a console window under
+    /// any circumstances -- a stronger, simpler guarantee than relying on
+    /// CreateNoWindow/UseShellExecute alone. Confirmed live: launching via
+    /// pythonw.exe with RedirectStandardOutput/RedirectStandardError still
+    /// captures stdout/stderr exactly like python.exe does -- no loss of
+    /// the logging pipe into OutputLine above.
     /// </summary>
-    private static string ResolveNodeExe()
+    private static string ResolvePythonwExe()
     {
-        var isolated = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "node", "node.exe");
-        return File.Exists(isolated) ? Path.GetFullPath(isolated) : "node";
+        var isolated = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "pythonw.exe");
+        return File.Exists(isolated) ? Path.GetFullPath(isolated) : "pythonw";
     }
 
     public void Dispose()
