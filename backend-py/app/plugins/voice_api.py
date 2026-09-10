@@ -112,6 +112,48 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name or None
 
 
+async def generate_progress_comment(
+    user_question: str, current_activity: str | None, language: str, session: str | None = None,
+) -> str | None:
+    """Per explicit instruction (2026-09-10): Caroline has no way to
+    interrupt her own main session mid-turn just to narrate progress
+    without genuinely disrupting whatever she's doing (the SDK only
+    delivers a new injected message once the CURRENT turn -- the whole
+    tool-call chain -- has fully finished; interrupt() is a real abort,
+    not a "pause and continue" signal). This sidesteps that entirely: a
+    SEPARATE, lightweight ai:resolve call (model SMALL, per explicit
+    instruction -- this is filler narration, not worth full price)
+    drafts a short in-character remark on her behalf, sent straight to
+    the client as its own chat message. The real session never sees or
+    knows about this -- it's a cosmetic stand-in for "I'm still working
+    on it", not something she said or will remember. Returns None on any
+    failure (network, bad response, SW unavailable) -- always a silent
+    skip, never surfaced as an error to the user."""
+    activity_line = f'She is currently in the middle of: {current_activity}. ' if current_activity else ""
+    prompt = (
+        "You are drafting ONE short, natural, in-character placeholder remark on behalf of an AI assistant "
+        "who is silently in the middle of a longer task and hasn't said anything to the user in over a "
+        "minute -- this is NOT her speaking directly, you're standing in for her so the user knows she's "
+        f'still working. The user originally asked: "{user_question}". {activity_line}'
+        "Write ONE short, casual sentence (two at most), in first person, connecting what she's doing back "
+        "to the user's original request -- no technical or internal details (tool names, file paths, "
+        f"code, session/system mechanics). Reply in {language}. Reply with ONLY that sentence, nothing else."
+    )
+    body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body)
+    except Exception as exc:
+        log_event("plugin:voice", "generate_progress_comment_request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
+        log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))
+        return None
+    text = data["result"].strip()
+    return text or None
+
+
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         last_err: Exception | None = None

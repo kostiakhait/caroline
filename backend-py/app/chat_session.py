@@ -136,6 +136,13 @@ MCP_RECONNECT_INTERVAL_MS = 15_000
 # separate recovery kicks in.
 SILENT_USER_WAIT_NUDGE_MS = 90_000
 
+# How often (at minimum) the user must see SOME comment from Caroline while
+# a real turn of hers is still running -- see _check_progress_narration's
+# own doc comment for why this can't be done by injecting into her own live
+# session mid-turn, and generate_progress_comment (voice_api.py) for the
+# actual cosmetic-comment mechanism this drives.
+PROGRESS_NARRATION_INTERVAL_MS = 60_000
+
 # How many consecutive "authentication_failed" system/api_retry messages on
 # one connection before forcing a restart (which re-mints a fresh sw-proxy
 # session / re-resolves own-Anthropic) instead of retrying the same doomed
@@ -429,6 +436,13 @@ class ChatSession:
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
 
+        # periodic mid-turn progress narration (see PROGRESS_NARRATION_INTERVAL_MS)
+        # -- when a real user's own question was last actually shown something
+        # (a real reply OR a generated stand-in progress comment), and what
+        # that question was, so a comment (if generated) can tie back to it.
+        self.last_visible_output_at: float | None = None
+        self.last_real_user_question: str | None = None
+
         # restart budget
         self.restart_timestamps: list[float] = []
 
@@ -552,6 +566,8 @@ class ChatSession:
             self.last_real_user_turn_at = time.monotonic()
             self.real_user_turn_answered = False
             self.silence_nudge_sent_for_turn = False
+            self.last_visible_output_at = time.monotonic()
+            self.last_real_user_question = text
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
         self._push_message(text, attachments, is_voice)
 
@@ -878,8 +894,55 @@ class ChatSession:
                 await self._check_hang()
                 self._check_user_wait_nudge()
                 await self._check_own_anthropic_recovery()
+                await self._check_progress_narration()
         except asyncio.CancelledError:
             pass
+
+    async def _check_progress_narration(self) -> None:
+        """Per explicit instruction (2026-09-10): the user must see SOME
+        comment from Caroline at least once a minute while a real turn of
+        hers is still running, even deep in a long tool-call chain --
+        confirmed there is no safe way to inject anything into her own
+        live session mid-turn to make that happen: the SDK's own input
+        stream only ever delivers a newly-submitted message once the
+        CURRENT turn (the whole tool-call chain) has fully finished (see
+        _input_stream's own comment), and interrupt() is a genuine abort,
+        not a "pause, say something, then resume" signal -- using it every
+        minute would repeatedly disrupt real in-progress work. Sidesteps
+        the problem entirely instead: a separate, lightweight ai:resolve
+        call (generate_progress_comment, voice_api.py) drafts a short
+        cosmetic stand-in remark, sent straight to the client. The real
+        session never sees or knows about this. Repeats every
+        PROGRESS_NARRATION_INTERVAL_MS as long as the turn keeps running;
+        resets whenever the real model actually says something of its own
+        (see the "assistant" wire-send site) or a real new user message
+        starts a fresh turn."""
+        if self.ended or not self.turn_pending or self.silent_turn or not self.last_real_user_question:
+            return
+        now = time.monotonic()
+        if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
+            return
+        self.last_visible_output_at = now  # claim this tick immediately -- a slow ai:resolve call must not let a second tick double-fire
+        from app.plugins.voice_api import generate_progress_comment
+
+        running_tools = REGISTRY.running_tool_names_for_tab(self.tab_id)
+        activity = ", ".join(running_tools) if running_tools else None
+        try:
+            comment = await generate_progress_comment(
+                self.last_real_user_question, activity, current_language_name(self.tab_id),
+            )
+        except Exception as exc:
+            log_event("engine", "progress_narration_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        if not comment:
+            return
+        log_event("engine", "progress_narration_sent", tab_id=self.tab_id, activity=activity)
+        wire = {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": comment}], "model": None, "stop_reason": None},
+            "session_id": None, "parent_tool_use_id": None,
+        }
+        await self.send({"type": "sdk_message", "message": wire})
 
     async def _check_own_anthropic_recovery(self) -> None:
         """Per explicit instruction (2026-09-09, after a live incident where
@@ -1319,8 +1382,11 @@ class ChatSession:
                         wire = _strip_no_update_from_wire(wire)
                         if wire is not None:
                             await self.send({"type": "sdk_message", "message": wire})
-                            if wire.get("type") in ("assistant", "result") and not self.real_user_turn_answered:
-                                self.real_user_turn_answered = True
+                            if wire.get("type") in ("assistant", "result"):
+                                if not self.real_user_turn_answered:
+                                    self.real_user_turn_answered = True
+                                if wire.get("type") == "assistant":
+                                    self.last_visible_output_at = time.monotonic()
 
                     if isinstance(message, ResultMessage):
                         self.silent_turn = True
