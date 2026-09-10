@@ -1234,10 +1234,28 @@
         // already read ("connected"/green), and let the reply's own eventual
         // arrival be the only visible signal, same as any ordinary turn that
         // just happens to take a while.
-        if (!wsConnected) setStatus("recovering session…", "restarting");
+        //
+        // Bug fix (2026-09-09): setBusy(false)/stopHeartbeat() used to run
+        // here UNCONDITIONALLY, contradicting the very reasoning just above
+        // -- every internal restart (and these can be frequent: dehydration,
+        // a transient "tool use concurrency" self-heal, etc.) blinked the
+        // lamp off and hid the Stop button for a beat, even though the
+        // backend silently replays the in-flight turn into the fresh
+        // session and a real reply is still genuinely coming. turnQueue
+        // still has to be cleared (the OLD entries can never match a
+        // "result" from the NEW session), but busy/heartbeat now only stop
+        // when the socket itself is actually down -- otherwise the
+        // "turnQueue.length === 0" fallback a few lines below (an assistant
+        // message arriving with no queue entry) picks it right back up,
+        // and since setBusy(true)/startHeartbeat() are both no-ops when
+        // already busy/running, the lamp just keeps blinking through the
+        // whole restart with no visible gap.
+        if (!wsConnected) {
+          setStatus("recovering session…", "restarting");
+          setBusy(false);
+          stopHeartbeat();
+        }
         turnQueue = []; // the session restarting means none of these will get their own "result"
-        setBusy(false);
-        stopHeartbeat();
       } else if (evt.status === "stopped") {
         turnQueue.shift(); // the interrupted turn won't get a "result" of its own
         // The backend immediately injects a synthetic message telling Caroline

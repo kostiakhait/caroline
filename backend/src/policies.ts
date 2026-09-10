@@ -481,9 +481,12 @@ export function continuityPointerInstruction(archivePath: string | null): string
     `you have no memory of what happened there unless you go look. The full prior conversation (including any ` +
     `real-world actions already taken -- files changed, emails sent, passwords reset, anything) is preserved ` +
     `verbatim at: ${archivePath}\n` +
-    `Before claiming you haven't done something, don't know about something, or that "this is the first ` +
-    `message" whenever the user references anything that isn't in your immediate visible context -- Read that ` +
-    `file first. This applies to every turn in this session, not just the first one after the reset.`
+    `If the user says anything that presupposes a prior fact, decision, or event you don't recognize -- a ` +
+    `name, a project, something they say you already agreed to or did -- your FIRST move is to read that ` +
+    `file, not to ask a clarifying question about it. Only ask the user if the archive genuinely has ` +
+    `nothing relevant. Never claim you haven't done something, don't know about something, or that "this ` +
+    `is the first message" without having checked it first. This applies to every turn in this session, ` +
+    `not just the first one after the reset.`
   );
 }
 
