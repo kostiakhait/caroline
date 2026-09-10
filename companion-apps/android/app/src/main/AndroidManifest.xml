@@ -38,6 +38,16 @@
             </intent-filter>
         </activity>
 
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <!-- Phase 3 TODO (not wired yet, see companion-apps/android/README.md):
              SmsReceiver (SMS_RECEIVED broadcast, new incoming mail) and the
              foreground polling Service belong here once built. -->

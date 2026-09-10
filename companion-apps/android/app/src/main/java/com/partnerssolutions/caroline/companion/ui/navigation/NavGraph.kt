@@ -24,7 +24,13 @@ fun NavGraph(navController: NavHostController = rememberNavController()) {
             )
         }
         composable(Screen.Tabs.route) {
-            CompanionTabsScreen()
+            CompanionTabsScreen(
+                onLogout = {
+                    navController.navigate(Screen.Login.route) {
+                        popUpTo(0) { inclusive = true }
+                    }
+                },
+            )
         }
     }
 }

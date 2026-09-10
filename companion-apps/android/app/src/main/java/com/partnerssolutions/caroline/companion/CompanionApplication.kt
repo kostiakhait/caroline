@@ -1,6 +1,7 @@
 package com.partnerssolutions.caroline.companion
 
 import android.app.Application
+import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
  * Skeleton (2026-09-10) -- see companion-apps/android/README.md and the
@@ -9,10 +10,11 @@ import android.app.Application
  * source of truth, a WorkManager-driven background sync against
  * Camerlengo's var:*Mine commands, an actual tab bar fed from the
  * backend-published `tabs_list` (never hardcoded).
- *
- * Nothing is wired up yet -- no DI container, no Room database instance,
- * no sync worker registration. This class exists so AndroidManifest.xml
- * has a real android:name to point at from day one, instead of adding it
- * later as a breaking change.
  */
-class CompanionApplication : Application()
+class CompanionApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        Logger.init(this)
+        Logger.i("CompanionApplication started")
+    }
+}

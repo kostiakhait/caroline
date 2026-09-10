@@ -8,7 +8,9 @@ import androidx.lifecycle.viewModelScope
 import com.partnerssolutions.caroline.companion.data.model.ChatMessage
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.data.remote.SessionHolder
+import com.partnerssolutions.caroline.companion.util.Logger
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 /**
  * Reads tabs/<tabId>/history/<index> (companion_api.py's _sync_history --
@@ -28,9 +30,48 @@ class ChatViewModel(
         private set
     var error by mutableStateOf<String?>(null)
         private set
+    var isSending by mutableStateOf(false)
+        private set
+    var sendError by mutableStateOf<String?>(null)
+        private set
 
     init {
         refresh()
+    }
+
+    /**
+     * Writes a phone-originated message to tabs/<tabId>/inbox/<id> --
+     * companion_api.py's _drain_inbox picks it up and injects it into the
+     * tab's live desktop session as if typed there. One key per message,
+     * deleted by the backend once consumed.
+     */
+    fun sendMessage(text: String, onSent: () -> Unit) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        val session = SessionHolder.session ?: run {
+            sendError = "Not logged in."
+            return
+        }
+        isSending = true
+        sendError = null
+        viewModelScope.launch {
+            try {
+                val id = UUID.randomUUID().toString().replace("-", "")
+                repository.setMine(
+                    session,
+                    "tabs/$tabId/inbox/$id",
+                    mapOf("text" to trimmed, "ts" to System.currentTimeMillis()),
+                )
+                Logger.i("sent message into tab $tabId inbox ($id)")
+                onSent()
+                refresh()
+            } catch (exc: Exception) {
+                Logger.e("send failed for tab $tabId", exc)
+                sendError = exc.message ?: "Send failed."
+            } finally {
+                isSending = false
+            }
+        }
     }
 
     fun refresh() {
