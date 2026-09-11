@@ -827,6 +827,23 @@ class ChatSession:
             self.silence_nudge_sent_for_turn = False
             self.last_visible_output_at = time.monotonic()
             self.last_real_user_question = text
+            # Bug fix (2026-09-11), per explicit instruction: language must
+            # be tracked CONTINUOUSLY, not resolved once and left alone --
+            # confirmed live a tab can legitimately switch languages
+            # mid-conversation (e.g. the user asking for a contract drafted
+            # in three languages), and a one-shot resolution (at startup,
+            # or only as a side effect of an unrecoverable-session-reset)
+            # can never catch that. Every real user turn re-triggers it --
+            # fire-and-forget, same mechanism as before, just called far
+            # more often (as often as the user actually talks) instead of
+            # a handful of one-off lifecycle events. Reads whatever's on
+            # disk as of THIS call (not including the text being submitted
+            # right now, which hasn't been flushed to the transcript yet)
+            # -- a real language switch shows up starting from the
+            # FOLLOWING turn, not instantly; an acceptable lag, not a
+            # correctness gap (current_language_name() is only ever read
+            # at the next query()/narration tick anyway).
+            refresh_language_in_background(self.last_saved_session_id, self.tab_id)
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
         # last_real_user_question/the saved pending-turn file above -- those

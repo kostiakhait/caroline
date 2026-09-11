@@ -22,6 +22,29 @@ import sys
 import time
 from typing import Any
 
+# Bug fix (2026-09-11), confirmed live: pythonw.exe with RedirectStandardOutput
+# (not a real console) doesn't default sys.stdout/stderr to UTF-8 on Windows --
+# without PYTHONIOENCODING set, Python falls back to the process's ANSI
+# codepage. log_event below deliberately writes real Cyrillic (ensure_ascii=
+# False, for readability) any time a caller logs actual dialogue/comment
+# text (e.g. _check_progress_narration's dialogue_preview/comment fields) --
+# on that codepage, print() then throws UnicodeEncodeError ("'charmap' codec
+# can't encode characters..."). Confirmed live: this silently aborted the
+# progress narrator's watchdog tick every single time it tried to log
+# anything with Cyrillic in it (~once a minute, every attempt, for the
+# whole length of an active Russian conversation) -- caught by the outer
+# per-tick guard so it didn't crash the process, but no narration comment
+# ever got sent, making an actively-working tab look completely frozen to
+# the user (nothing else stood in for it). One-time fix, right here, at
+# import time -- log_event is the single choke point every log call in the
+# whole backend goes through, so this covers all of them, not just
+# narration's own calls.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # best-effort -- a stream that can't reconfigure just keeps its old encoding
+
 
 def log_event(component: str, event: str, **fields: Any) -> None:
     """Writes one JSON-lines record to stdout. `component` is e.g.

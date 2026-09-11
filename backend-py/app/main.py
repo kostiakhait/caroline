@@ -92,6 +92,18 @@ _resumed_unfinished_turn_for_tab: set[str] = set()
 # (chat_session.py) for why forced compaction exists and what this flag
 # actually triggers once set.
 _forced_startup_compaction_for_tab: set[str] = set()
+# Bug fix (2026-09-11), confirmed live: refresh_language_in_background used
+# to only ever run for PRIMARY_TAB_ID (tied to the startup greeting) or as a
+# side effect of a tab's OWN unrecoverable-session-reset recovery path --
+# meaning a non-primary tab that never hit that recovery path had its
+# language NEVER resolved, ever: current_language_name() falls back to a
+# hardcoded "English" default, and that's what actually steered the real
+# session's system prompt (and the narrator) the whole conversation. A
+# non-primary tab (e.g. "Кураев", tab 4) confirmed replying in English
+# throughout a Russian conversation -- checked its persisted-language file
+# directly: it never existed at all. Now every tab gets its own refresh
+# once per process, same "once, not per reconnect" shape as the sets above.
+_language_refreshed_for_tab: set[str] = set()
 
 
 def _on_reminder_due(reminder: dict[str, Any]) -> bool:
@@ -770,12 +782,13 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     if tab_id == PRIMARY_TAB_ID and not _has_greeted:
         _has_greeted = True
 
-        from app.durability import load_tab_session_id
-        recent_session_id = load_tab_session_id(WORKSPACE_DIR, PRIMARY_TAB_ID)
         lang = current_language_name(PRIMARY_TAB_ID)
         log_event("engine", "startup_greeting", lang=lang)
         session.inject_proactive(STARTUP_GREETING_NUDGE_TEMPLATE.format(language=lang))
-        refresh_language_in_background(recent_session_id, PRIMARY_TAB_ID)
+        # refresh_language_in_background for THIS tab now happens in the
+        # general per-tab block below (covers every tab, not just this
+        # one) -- no longer called here directly, avoids double-firing it
+        # for the primary tab specifically.
 
     # Survives a FULL app restart (not just this backend's own in-process
     # watchdog restart, which ChatSession's own failure handling already
@@ -820,6 +833,16 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     if tab_id not in _forced_startup_compaction_for_tab:
         _forced_startup_compaction_for_tab.add(tab_id)
         session.needs_startup_compaction = True
+
+    # Language refresh at startup, per tab -- see _language_refreshed_for_tab's
+    # own comment above for the bug this closes (a non-primary tab could go
+    # its entire process lifetime without ever resolving a real language,
+    # silently defaulting to English for both the real session and the
+    # narrator).
+    if tab_id not in _language_refreshed_for_tab:
+        _language_refreshed_for_tab.add(tab_id)
+        recent_session_id = load_tab_session_id(WORKSPACE_DIR, tab_id)
+        refresh_language_in_background(recent_session_id, tab_id)
 
     try:
         while True:
