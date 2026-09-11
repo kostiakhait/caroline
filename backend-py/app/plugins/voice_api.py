@@ -161,16 +161,12 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     drafts a short in-character remark on her behalf, sent straight to
     the client as its own chat message.
 
-    TEMPORARY (2026-09-11, per explicit instruction): Camerlengo's SMALL
-    category currently resolves to a model (thinkingmachines/inkling-small:
-    free) that 403s on every call ("only available on agentic harnesses"),
-    so this narrator path was silently dead -- generate_progress_comment
-    always returned None. Bypassing the SMALL alias here with a literal
-    OpenRouter model id (AI.resolveModelCategory in reforce passes any
-    non-category string through unchanged, so this skips category
-    resolution entirely for just this one call site, without touching
-    Camerlengo's SMALL assignment or any other caller of it). Revert to
-    "SMALL" once the category itself points at a working model again.
+    Reverted (2026-09-11) back to "SMALL" -- the temporary openai/gpt5-nano
+    bypass (added when Camerlengo's SMALL category resolved to a 403ing
+    model) is no longer needed: live-tested against SMALL directly (a
+    narrator-shaped prompt, an arithmetic question, and a trick question)
+    and got coherent, correctly-languaged, non-garbage answers, confirming
+    the category now points at a working model again.
 
     The real session never sees or knows about this -- it's a cosmetic
     stand-in for "I'm still working on it", not something she said or
@@ -207,11 +203,17 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
         "looking that could turn out to be false.\n\n"
         f"Here is the real recent conversation between her and the user (oldest first):\n---\n{recent_dialogue}\n---\n\n"
         "Write ONE short, natural sentence (two at most), in first person, speaking directly to the user. "
-        "Reply in the SAME language the conversation above is written in -- read it directly off those "
-        f"messages, don't guess a different one. Only if the conversation above gives no usable signal at "
-        f"all, default to {language}. Reply with ONLY that sentence, nothing else -- no quotes, no preamble."
+        "Reply in whatever language the USER's OWN lines (marked \"User:\") above are written in -- ignore "
+        "what language Caroline's own lines happen to use, even if they dominate the text (e.g. she may be "
+        "quoting or analyzing English-language technical/legal material mid-conversation while the user "
+        "themselves is writing in a different language entirely -- go by the user's words, not the topic's). "
+        f"Only if there are no \"User:\" lines at all above, default to {language}. Reply with ONLY that "
+        "sentence, nothing else -- no quotes, no preamble."
     )
-    body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "openai/gpt5-nano"}
+    # Bug fix (2026-09-11), per explicit instruction: reverted to "SMALL"
+    # (the openai/gpt5-nano bypass above is no longer needed -- see this
+    # function's own docstring).
+    body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:
         body["session"] = session
     try:
