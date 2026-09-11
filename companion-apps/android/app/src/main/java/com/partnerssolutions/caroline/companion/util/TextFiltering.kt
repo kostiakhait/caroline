@@ -43,6 +43,17 @@ object TextFiltering {
         Regex("""^<"""),
         Regex("""^⏰ Reminder due"""), // "⏰ Reminder due"
         Regex("""^The app is closing right now\.""", RegexOption.IGNORE_CASE),
+        // Confirmed live (2026-09-11, Android companion app): the backend's
+        // own history extraction only keeps top-level type=="text" blocks
+        // of a "user" JSONL entry (a genuine tool_result wrapper block is
+        // already excluded there) -- but Claude Code's own CLI represents
+        // some tool/skill invocations (e.g. the Skill tool loading a
+        // SKILL.md) as a plain text block within a synthetic "user" turn,
+        // indistinguishable in shape from something the human typed. This
+        // is a CLI-internal implementation detail, not one of Caroline's
+        // own nudges, so it's not covered by _SYNTHETIC_TURN_MARKER either
+        // -- caught here by its own stable, observed prefix instead.
+        Regex("""^Base directory for this skill:""", RegexOption.IGNORE_CASE),
     )
 
     /** Strips a leading "[Sent: ...]" stamp for DISPLAY only. */

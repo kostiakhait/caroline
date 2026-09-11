@@ -171,7 +171,7 @@ private fun MessageBubble(message: ChatMessage) {
                         detectTapGestures(onLongPress = { menuOpen = true })
                     },
             ) {
-                Text(message.text, color = textColor)
+                MarkdownText(message.text, color = textColor)
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
