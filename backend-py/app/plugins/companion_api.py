@@ -72,6 +72,7 @@ from typing import Any, Callable
 from app.login_api import get_v2_session, is_logged_in
 from app.logging_setup import log_event
 from app.plugins.sw_api import SessionExpiredError, SwApiError, call_v2
+from app.task_supervisor import supervise
 
 # --- tunables (explicit instruction, 2026-09-10) ---------------------------
 PHASE1_POLL_INTERVAL_S = 60.0  # accept-wait cadence -- forever, never gives up
@@ -490,4 +491,4 @@ def start_companion_inbox_loop(
             except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
                 log_event("plugin:companion", "inbox_loop_tick_failed", error=str(exc))
 
-    return asyncio.create_task(_loop())
+    return supervise("companion_inbox", _loop)

@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
+from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
 
@@ -155,14 +156,27 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
         if changed:
             _save_reminders(reminders)
 
+    def _check_safe() -> None:
+        # Bug fix (2026-09-10): confirmed live elsewhere (chat_session.py's
+        # watchdog loop) that a "while True" background loop with no
+        # per-tick guard dies completely silently the moment ANYTHING
+        # inside one tick raises -- _load_reminders()/date parsing here
+        # aren't otherwise guarded (only on_due() itself was). A single
+        # corrupted schedule.json entry must not cost every future
+        # reminder check for the rest of the process's lifetime.
+        try:
+            _check()
+        except Exception as exc:  # noqa: BLE001 -- must log, never let this tick die silently
+            log_event("engine", "due_check_tick_failed", error=str(exc), error_type=type(exc).__name__)
+
     async def _loop() -> None:
-        _check()  # catch up on anything already overdue right away, don't wait a full interval
+        _check_safe()  # catch up on anything already overdue right away, don't wait a full interval
         while True:
             await asyncio.sleep(interval_s)
-            _check()
+            _check_safe()
 
     log_event("engine", "due_check_loop_starting", interval_s=interval_s)
-    return asyncio.create_task(_loop())
+    return supervise("due_check", _loop)
 
 
 def ensure_recurring_backup(note: str, interval_s: float = 60 * 60) -> None:

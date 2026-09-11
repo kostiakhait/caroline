@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable
 from app.logging_setup import log_event
 from app.plugins.ratatosk_api import get_recent_messages, get_server_now, list_conversations, send_presence_heartbeat
 from app.plugins.ratatosk_own_account import get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
+from app.task_supervisor import supervise
 
 # No push from Ratatosk -- its own UI polls every 4-5s; this owner-DM
 # control channel is far less latency-sensitive (it's "give Caroline an
@@ -177,7 +178,7 @@ def start_ratatosk_owner_channel(workspace_dir: str, inject_from_owner: Callable
             await asyncio.sleep(POLL_INTERVAL_MS / 1000)
             await _owner_channel_tick(workspace_dir, inject_from_owner)
 
-    return asyncio.create_task(_loop())
+    return supervise("ratatosk_owner_channel", _loop)
 
 
 def start_ratatosk_presence_heartbeat(workspace_dir: str) -> asyncio.Task[None]:
@@ -200,4 +201,4 @@ def start_ratatosk_presence_heartbeat(workspace_dir: str) -> asyncio.Task[None]:
             except Exception as exc:
                 log_event("plugin:ratatosk-presence", "tick_failed", tick=tick_count, error=str(exc))
 
-    return asyncio.create_task(_loop())
+    return supervise("ratatosk_presence", _loop)

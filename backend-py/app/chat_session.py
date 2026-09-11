@@ -93,6 +93,7 @@ from app.failure_classification import (
 )
 from app.logging_setup import log_event
 from app.plugins.loader import build_mcp_servers
+from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction
 from app.operations import REGISTRY
@@ -632,8 +633,17 @@ class ChatSession:
     # ------------------------------------------------------------- lifecycle --
 
     async def start(self) -> None:
-        self._run_loop_task = asyncio.create_task(self._run_loop())
-        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        # Bug fix (2026-09-10): confirmed live -- _watchdog_loop's task
+        # died silently (no exception logged anywhere) and was never
+        # restarted, permanently disabling hang-detection/progress-
+        # narration/the silent-user-wait nudge/the idle-task-drift check
+        # for that tab for the rest of the process's lifetime, unnoticed
+        # for 20+ minutes. supervise() (task_supervisor.py) is the
+        # standing fix: log any crash in full and restart the loop, for
+        # every long-running background loop in this backend, not just
+        # this one -- see its own module docstring.
+        self._run_loop_task = supervise("run_loop", self._run_loop, self.tab_id)
+        self._watchdog_task = supervise("watchdog", self._watchdog_loop, self.tab_id)
 
     def dispose(self) -> None:
         log_event("engine", "dispose", tab_id=self.tab_id)
@@ -981,10 +991,28 @@ class ChatSession:
                 await asyncio.sleep(WATCHDOG_INTERVAL_MS / 1000)
                 if self.ended:
                     return
-                await self._check_hang()
-                self._check_user_wait_nudge()
-                await self._check_progress_narration()
-                self._check_idle_task_drift()
+                # Bug fix (2026-09-10): confirmed live -- one of these four
+                # checks raising ANYTHING other than CancelledError used to
+                # end this whole loop silently (only CancelledError was
+                # caught below), permanently disabling hang-detection,
+                # progress narration, the silent-user-wait nudge, AND the
+                # idle-task-drift check for this tab for the rest of the
+                # process's lifetime -- no log, no restart, unnoticed for
+                # 20+ minutes until the downstream symptoms (no narrator
+                # comments, a lamp that never blinks) got reported. A
+                # single bad tick must never cost this tab everything these
+                # four checks are responsible for -- log it and keep
+                # ticking. supervise() (start(), task_supervisor.py) is the
+                # outer safety net if this task ever dies anyway.
+                try:
+                    await self._check_hang()
+                    self._check_user_wait_nudge()
+                    await self._check_progress_narration()
+                    self._check_idle_task_drift()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- must log, never let this tick die silently
+                    log_event("engine", "watchdog_tick_failed", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
         except asyncio.CancelledError:
             pass
 
