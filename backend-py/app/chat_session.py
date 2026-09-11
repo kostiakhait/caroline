@@ -118,6 +118,15 @@ MAX_RESTARTS_PER_WINDOW = 5
 RESTART_WINDOW_MS = 10 * 60_000
 RESTART_BACKOFF_MS = 60_000
 API_RETRY_INTERVAL_MS = 90_000
+# Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
+# API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
+# is "keep retrying forever because the operation never even started" (a
+# real rejection: no balance, or an in-flight rate-limit rejection); this
+# one is "the operation genuinely completed, just check ONCE more for
+# unfinished work, then stop regardless of the answer" (see
+# _schedule_one_shot_followup_check). Kept separate so the two can diverge
+# later without conflating what they mean.
+ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS = 90_000
 MCP_RECONNECT_INTERVAL_MS = 15_000
 # Per explicit instruction (2026-09-09): if 90s pass after a REAL user
 # message with nothing sent back to them yet, nudge the model to continue/
@@ -668,6 +677,11 @@ class ChatSession:
         self.conn_state: dict[str, Any] = {"kind": "connected"}
         self.ignore_next_result_recovery = False
         self.api_retry_timer: asyncio.TimerHandle | None = None
+        # See _schedule_one_shot_followup_check's own doc comment -- a
+        # separate timer from api_retry_timer above, deliberately never
+        # re-armed by its own firing (unlike api_retry_timer, which keeps
+        # rescheduling itself).
+        self.one_shot_followup_timer: asyncio.TimerHandle | None = None
         self.last_rate_limit_info: dict[str, Any] | None = None
         self.last_api_retry_error: str | None = None
         self.mcp_reconnect_timers: dict[str, asyncio.TimerHandle] = {}
@@ -696,6 +710,7 @@ class ChatSession:
         if self._watchdog_task:
             self._watchdog_task.cancel()
         self._clear_api_retry_timer()
+        self._clear_one_shot_followup_timer()
         self._clear_mcp_reconnect_timers()
         if self.client:
             asyncio.create_task(self._safe_interrupt())
@@ -986,6 +1001,52 @@ class ChatSession:
 
         loop = asyncio.get_event_loop()
         self.api_retry_timer = loop.call_later(API_RETRY_INTERVAL_MS / 1000, _fire)
+
+    def _schedule_one_shot_followup_check(self, reason: str, is_voice: bool) -> None:
+        """Per explicit instruction (2026-09-11): distinguishes "the
+        operation never even started" (a genuine rejection -- no balance,
+        or an in-flight rate-limit rejection -- see _schedule_api_retry,
+        which correctly keeps retrying every 90s forever for THAT case,
+        since nothing costs anything until a request actually gets
+        through) from "the operation genuinely completed" (a real
+        AssistantMessage came through -- e.g. the CC CLI's own "you've hit
+        your session limit" reply -- the turn is over, just concluded by
+        reporting a cap). For the second case, _schedule_api_retry's
+        forever-retry is wrong: confirmed live, it kept firing every 90s
+        for HOURS after a tab's real task was already finished, because it
+        couldn't tell "completed" from "never ran" apart. This is the
+        correct shape for "completed" instead: ONE follow-up check, fired
+        once, that never re-arms itself no matter what the model replies
+        (a genuine [[NO_UPDATE]], a real answer, or nothing at all) --
+        unlike api_retry_timer, which reschedules itself every time it
+        fires until something clears it."""
+        if self.one_shot_followup_timer:
+            log_event("engine", "one_shot_followup_already_pending", tab_id=self.tab_id, reason=reason)
+            return
+        log_event(
+            "engine", "one_shot_followup_scheduled", tab_id=self.tab_id, reason=reason,
+            delay_ms=ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS,
+        )
+
+        def _fire() -> None:
+            self.one_shot_followup_timer = None
+            if self.ended:
+                return
+            log_event("engine", "one_shot_followup_firing", tab_id=self.tab_id, reason=reason)
+            self.inject_proactive(
+                f"[Internal: one-time follow-up check -- your previous turn concluded by reporting a usage cap.] "
+                f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
+                is_voice,
+            )
+            # Deliberately no rescheduling here -- this is the whole point.
+
+        loop = asyncio.get_event_loop()
+        self.one_shot_followup_timer = loop.call_later(ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS / 1000, _fire)
+
+    def _clear_one_shot_followup_timer(self) -> None:
+        if self.one_shot_followup_timer:
+            self.one_shot_followup_timer.cancel()
+            self.one_shot_followup_timer = None
 
     def _clear_mcp_reconnect_timers(self) -> None:
         for t in self.mcp_reconnect_timers.values():
@@ -1764,8 +1825,21 @@ class ChatSession:
                         limit_text = next((t for t in text_blocks if CC_CLI_LIMIT_PATTERN.search(t)), None)
                         if limit_text:
                             log_event("engine", "cc_cli_limit_message", tab_id=self.tab_id)
-                            self._set_conn_state("limited", limit_text, arm_ignore_next_result=True)
-                            self._schedule_api_retry("cc_cli_limit_message", self.turn_is_voice)
+                            # Bug fix (2026-09-11), per explicit instruction: this is
+                            # NOT the same shape as a rate-limit REJECTION (no
+                            # arm_ignore_next_result here, deliberately) -- a real
+                            # AssistantMessage came through, meaning the turn
+                            # genuinely completed; the model just concluded it by
+                            # reporting a usage cap. The trailing ResultMessage is
+                            # therefore a REAL completion, not a fake one -- let it
+                            # clear turn_pending normally instead of pretending the
+                            # turn never happened. _schedule_api_retry (which retries
+                            # every 90s FOREVER, correct only for "the operation never
+                            # even started" -- a true rejection, no balance) does not
+                            # apply here; see _schedule_one_shot_followup_check's own
+                            # doc comment for the distinction.
+                            self._set_conn_state("limited", limit_text)
+                            self._schedule_one_shot_followup_check("cc_cli_limit_message", self.turn_is_voice)
                             continue
 
                     # --- structured rate-limit event ---
