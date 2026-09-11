@@ -159,9 +159,22 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     SEPARATE, lightweight ai:resolve call (model SMALL, per explicit
     instruction -- this is filler narration, not worth full price)
     drafts a short in-character remark on her behalf, sent straight to
-    the client as its own chat message. The real session never sees or
-    knows about this -- it's a cosmetic stand-in for "I'm still working
-    on it", not something she said or will remember.
+    the client as its own chat message.
+
+    TEMPORARY (2026-09-11, per explicit instruction): Camerlengo's SMALL
+    category currently resolves to a model (thinkingmachines/inkling-small:
+    free) that 403s on every call ("only available on agentic harnesses"),
+    so this narrator path was silently dead -- generate_progress_comment
+    always returned None. Bypassing the SMALL alias here with a literal
+    OpenRouter model id (AI.resolveModelCategory in reforce passes any
+    non-category string through unchanged, so this skips category
+    resolution entirely for just this one call site, without touching
+    Camerlengo's SMALL assignment or any other caller of it). Revert to
+    "SMALL" once the category itself points at a working model again.
+
+    The real session never sees or knows about this -- it's a cosmetic
+    stand-in for "I'm still working on it", not something she said or
+    will remember.
 
     Redesigned (2026-09-10) after live evidence (screenshots) that the
     original single-question + tool-names-as-"activity" version produced
@@ -198,7 +211,7 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
         f"messages, don't guess a different one. Only if the conversation above gives no usable signal at "
         f"all, default to {language}. Reply with ONLY that sentence, nothing else -- no quotes, no preamble."
     )
-    body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
+    body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "openai/gpt5-nano"}
     if session:
         body["session"] = session
     try:
