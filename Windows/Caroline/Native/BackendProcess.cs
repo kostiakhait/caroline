@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Threading.Tasks;
 
 namespace Caroline.Native;
 
@@ -149,6 +150,24 @@ public sealed class BackendProcess : IDisposable
         return File.Exists(isolated) ? Path.GetFullPath(isolated) : "pythonw";
     }
 
+    /// <summary>
+    /// Bug fix (2026-09-11), per a real live incident: this used to do the Kill()+Dispose()
+    /// work inline and could hang INDEFINITELY -- confirmed live, 40+ minutes, freezing the
+    /// entire WPF window (not just the backend) because MainWindow.RestartBackend called this
+    /// synchronously on the UI thread. Two known System.Diagnostics.Process gotchas can cause
+    /// this: (a) a surviving grandchild process that inherited the redirected stdout/stderr
+    /// pipe handle keeps that pipe's write end open, so the async output reader never sees
+    /// EOF and Process.Dispose() waits on it forever; (b) calling Dispose()/Kill() reentrantly
+    /// from within the SAME Process's own Exited callback (which is exactly what happened here
+    /// -- Crashed fired from Process.Exited, MainWindow used to marshal onto the UI thread with
+    /// a BLOCKING Dispatcher.Invoke, and RestartBackend's Dispose() call landed back on that
+    /// same Process object while its Exited machinery was still "in progress") deadlocks on
+    /// Process's internal wait-handle unregistration. (b) is fixed at the call site too
+    /// (MainWindow now uses Dispatcher.BeginInvoke for Crashed/Frozen, so RestartBackend never
+    /// runs nested inside Process's own callback) -- the bound below stays regardless, as a
+    /// backstop: Dispose() must never again be able to hang its caller, whatever future
+    /// Process-internal edge case might cause it.
+    /// </summary>
     public void Dispose()
     {
         OutputLine?.Invoke($"[BackendProcess] Dispose() entered (thread={Environment.CurrentManagedThreadId}, _process={(_process == null ? "null" : $"pid={_process.Id}")})");
@@ -158,24 +177,44 @@ public sealed class BackendProcess : IDisposable
             return;
         }
         _intentionalStop = true;
+        var process = _process;
+        _process = null; // detach immediately -- Start() can be called again right after this
+                          // method returns, even if the background cleanup below is still stuck.
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        try
+        var cleanupTask = Task.Run(() =>
         {
-            var hasExited = _process.HasExited;
-            OutputLine?.Invoke($"[BackendProcess] Dispose(): HasExited={hasExited}");
-            if (!hasExited)
+            try
             {
-                OutputLine?.Invoke("[BackendProcess] Dispose(): calling Kill(entireProcessTree:true)...");
-                _process.Kill(entireProcessTree: true);
-                OutputLine?.Invoke($"[BackendProcess] Dispose(): Kill() returned after {sw.Elapsed.TotalSeconds:F1}s");
+                var hasExited = process.HasExited;
+                OutputLine?.Invoke($"[BackendProcess] Dispose(): HasExited={hasExited}");
+                if (!hasExited)
+                {
+                    OutputLine?.Invoke("[BackendProcess] Dispose(): calling Kill(entireProcessTree:true)...");
+                    process.Kill(entireProcessTree: true);
+                    OutputLine?.Invoke($"[BackendProcess] Dispose(): Kill() returned after {sw.Elapsed.TotalSeconds:F1}s");
+                }
             }
-        }
-        catch (Exception ex)
+            catch (Exception ex)
+            {
+                OutputLine?.Invoke($"[BackendProcess] Dispose(): Kill() threw after {sw.Elapsed.TotalSeconds:F1}s (process may have already exited): {ex}");
+            }
+            // Stop the async redirected-output reads explicitly before Dispose() -- if a
+            // surviving grandchild is holding the pipe open, this at least gives the BCL a
+            // clean "we're done listening" signal instead of relying on EOF alone. Harmless
+            // (and expected to throw/no-op) if reading was never active or already stopped.
+            try { process.CancelOutputRead(); } catch { /* not reading, or already stopped */ }
+            try { process.CancelErrorRead(); } catch { /* not reading, or already stopped */ }
+            process.Dispose();
+        });
+        if (!cleanupTask.Wait(TimeSpan.FromSeconds(5)))
         {
-            OutputLine?.Invoke($"[BackendProcess] Dispose(): Kill() threw after {sw.Elapsed.TotalSeconds:F1}s (process may have already exited): {ex}");
+            OutputLine?.Invoke(
+                $"[BackendProcess] Dispose(): background cleanup did not finish within 5.0s -- abandoning it " +
+                "and returning anyway (the Process object leaks; that's a much smaller problem than blocking " +
+                "the caller forever, which is what happened live before this fix)."
+            );
+            return;
         }
-        _process.Dispose();
-        _process = null;
         OutputLine?.Invoke($"[BackendProcess] Dispose() done, total elapsed {sw.Elapsed.TotalSeconds:F1}s");
     }
 }

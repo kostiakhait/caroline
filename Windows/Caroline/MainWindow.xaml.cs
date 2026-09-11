@@ -175,7 +175,16 @@ public partial class MainWindow : Window
         Logger.Log($"MainWindow.OnLoaded: starting backend (call #{_onLoadedCallCount} -- WPF's Loaded event " +
             "firing more than once would explain a stray/duplicate health watchdog; logging this to confirm or rule it out)");
         _backend.OutputLine += line => Logger.Log($"[backend] {line}");
-        _backend.Crashed += () => Dispatcher.Invoke(() =>
+        // Bug fix (2026-09-11), per a real live incident: this used to be a BLOCKING
+        // Dispatcher.Invoke. Crashed fires from Process.Exited's own callback machinery, and
+        // synchronously waiting for the UI thread to run RestartBackend -> BackendProcess.Dispose()
+        // -> Process.Dispose() on that SAME Process object, while its Exited callback is still
+        // "in flight", deadlocks on Process's internal wait-handle unregistration -- confirmed
+        // live: froze the entire window for 40+ minutes. BeginInvoke lets Process.Exited's own
+        // callback return immediately; RestartBackend then runs later, genuinely outside that
+        // callback's call stack, so this specific reentrancy can't happen anymore. (See also
+        // BackendProcess.Dispose()'s own 5s timeout bound, added as a backstop alongside this.)
+        _backend.Crashed += () => Dispatcher.BeginInvoke(() =>
         {
             try { RestartBackend("crashed"); }
             catch (Exception ex) { Logger.Log($"MainWindow: RestartBackend threw while handling Crashed: {ex}"); }
@@ -208,7 +217,13 @@ public partial class MainWindow : Window
             Logger.Log($"MainWindow: Frozen event received (reason: {reason}) -- dispatching to UI thread");
             try
             {
-                Dispatcher.Invoke(() =>
+                // BeginInvoke (2026-09-11), not Invoke -- see the Crashed handler's own comment
+                // above for the deadlock this class of bug can cause. Frozen fires from
+                // BackendHealthWatchdog's own thread rather than Process.Exited, so the specific
+                // reentrancy there doesn't apply here, but there's no reason for this thread to
+                // block on RestartBackend either, and consistency matters more than a provably
+                // narrower fix.
+                Dispatcher.BeginInvoke(() =>
                 {
                     Logger.Log($"MainWindow: external health check says the backend is unresponsive: {reason}");
                     try
