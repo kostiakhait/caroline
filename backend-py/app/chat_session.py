@@ -79,7 +79,7 @@ from app.durability import (
     save_tab_continuity_archive,
     save_tab_session_id,
 )
-from app.history import _extract_entries_from_jsonl, read_archived_entries
+from app.history import _extract_entries_from_jsonl, _HISTORY_STAMP_PATTERN, read_archived_entries
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -135,6 +135,14 @@ SILENT_USER_WAIT_NUDGE_MS = 90_000
 # actual cosmetic-comment mechanism this drives.
 PROGRESS_NARRATION_INTERVAL_MS = 60_000
 
+# How many recent user-visible dialogue lines (_read_recent_dialogue_lines)
+# feed language detection and progress narration. Bug fix (2026-09-10, per
+# explicit instruction): was 5 for language detection specifically -- too
+# small a window meant a couple of stray non-conversational lines could
+# dominate the whole sample. Both consumers now share one number so they
+# can't drift apart again either.
+RECENT_DIALOGUE_WINDOW = 12
+
 # How many consecutive "authentication_failed" system/api_retry messages on
 # one connection before forcing a clean restart (re-resolves the mode and
 # rebuilds Options.env) instead of retrying the same doomed request forever.
@@ -171,7 +179,8 @@ BALANCE_EXHAUSTED_MESSAGE = (
 
 # --- detect_recent_language's synthetic-text filter (ported verbatim from
 # server.ts's already-fixed, 2026-09-09 version) ----------------------------
-_HISTORY_STAMP_PATTERN = re.compile(r"^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )[^\]]*\]\s*", re.IGNORECASE)
+# _HISTORY_STAMP_PATTERN itself now lives in history.py (2026-09-10, see its
+# own comment there) -- imported below alongside the other history helpers.
 # Best-effort, not exhaustive -- new synthetic wrapper shapes keep turning
 # up. Confirmed live (2026-09-09): STARTUP_GREETING_NUDGE_TEMPLATE/
 # CONTINUE_OR_SILENT_NUDGE_TEMPLATE's own injected instruction text (always
@@ -204,11 +213,54 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     re.compile(r"^\[The user just stopped what you were doing", re.IGNORECASE),
     re.compile(r"^No response requested\.?$", re.IGNORECASE),
     re.compile(r"^<"),  # XML/HTML-ish wrapped system content
+    # Added 2026-09-10 specifically as a bridge for entries already on disk
+    # from before _SYNTHETIC_TURN_MARKER existed (_on_reminder_due's own
+    # wrapper, main.py's app-closing backup nudge) -- the structural marker
+    # covers these going forward without needing a list entry per nudge;
+    # this pair stays only so TODAY's already-written history (which the
+    # marker can't retroactively tag) doesn't keep leaking into the sample
+    # until it ages out of the window on its own.
+    re.compile(r"^⏰ Reminder due"),  # "⏰ Reminder due" (_on_reminder_due)
+    re.compile(r"^The app is closing right now\.", re.IGNORECASE),
 ]
+
+
+# Bug fix (2026-09-10): the patterns below are a blocklist of specific known
+# nudge wordings -- confirmed live tonight this keeps missing new synthetic
+# text as new nudges get added (most recently: the hourly vault-backup
+# reminder's own note text, never added to this list at all) and silently
+# re-poisons language detection each time. Structural fix instead of one
+# more pattern: submit() tags EVERY turn it knows isn't from a real user
+# (is_real_user=False -- inject_proactive() and the few direct internal
+# submit() call sites) with this one fixed, permanent marker, at the single
+# choke point that already knows the answer -- so any FUTURE proactive
+# nudge is automatically covered, with nothing for its author to remember
+# to add here (the blocklist patterns stay too, as a belt-and-suspenders
+# fallback for OLD transcript entries already on disk from before this
+# fix, written without the marker). U+2063 (invisible separator) means
+# this never visibly renders as odd text in the rare case it ever leaked
+# somewhere unfiltered.
+_SYNTHETIC_TURN_MARKER = "⁣[[caroline-internal-turn]]⁣"
 
 
 def _is_synthetic_history_text(raw_text: str) -> bool:
     text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
+    # Bug fix (2026-09-10): confirmed live -- a text block that is ENTIRELY
+    # the "[Sent: ...]" timestamp stamp (no real content after it, e.g. the
+    # stamp _push_message always prepends as its own separate content
+    # block) stripped down to "" here, and "" matches none of the patterns
+    # below -- so this function said "not synthetic" for a block that was
+    # nothing BUT a machine-generated timestamp. Every submitted turn
+    # (real or proactive) produces one of these, and they were silently
+    # counted as real conversational content by every caller of this
+    # function (refresh_language_in_background's sampling, most visibly --
+    # confirmed live it dominated the "last 5" sample with pure-English
+    # weekday/month/timezone text and kept mis-detecting an all-Russian
+    # conversation as English).
+    if not text:
+        return True
+    if text.startswith(_SYNTHETIC_TURN_MARKER):
+        return True
     return any(p.match(text) for p in _SYNTHETIC_HISTORY_TEXT_PATTERNS)
 
 
@@ -320,30 +372,57 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"type": "text", "text": f"[Attached file saved to {saved_path} -- read it if relevant to the request.]"}]
 
 
-def _read_recent_history_texts(session_id: str | None, limit: int = 50) -> list[str]:
-    if not session_id:
-        return []
-    path = claude_project_dir(WORKSPACE_DIR) / f"{session_id}.jsonl"
-    try:
-        lines = [l for l in path.read_text(encoding="utf-8").split("\n") if l]
-    except Exception:
-        return []
-    texts: list[str] = []
-    for line in lines[-limit:]:
+def _usable_dialogue_lines(entries: list[dict[str, Any]]) -> list[str]:
+    """Turns _extract_entries_from_jsonl's raw entries into clean
+    "Speaker: text" lines -- real, user-visible conversation only. Drops
+    anything synthetic/service (_is_synthetic_history_text, which now
+    covers both the old wording-blocklist and the new structural
+    _SYNTHETIC_TURN_MARKER tag) and bare bracketed placeholder lines (a
+    lone "[<timestamp>]" with nothing else, a compaction stub)."""
+    out: list[str] = []
+    for entry in entries:
+        raw_text = str(entry.get("text") or "")
+        clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
+        if not clean_text or _is_synthetic_history_text(raw_text):
+            continue
+        if clean_text.startswith("[") and clean_text.endswith("]") and "\n" not in clean_text:
+            continue
+        speaker = "User" if entry.get("role") == "user" else "Caroline"
+        out.append(f"{speaker}: {clean_text}")
+    return out
+
+
+def _read_recent_dialogue_lines(session_id: str | None, tab_id: str, workspace_dir: str, limit: int) -> list[str]:
+    """Bug fix (2026-09-10): the real, single source of "what the user
+    actually saw" -- replaces two independently-maintained readers
+    (refresh_language_in_background's own hand-rolled block walker, and
+    _gather_recent_dialogue_for_narration's private _usable_lines) that had
+    already drifted apart (the narration one had already learned the
+    NO_UPDATE/synthetic-text lessons; language detection hadn't, and
+    confirmed live that gap let internal noise -- bare "[Sent: ...]"
+    timestamp stamps, an hourly reminder's own English wording -- dominate
+    a too-small 5-message sample and silently kept mis-detecting an
+    entirely-Russian conversation as English). Widened to a real, much
+    larger window (2026-09-10, per explicit instruction) since narrow
+    sampling was itself part of the problem. Falls back to this tab's own
+    continuity-archive file (the pre-compaction transcript the PreCompact
+    hook saved, per-tab, never shared) when the live session file alone is
+    too thin, e.g. right after a native auto-compaction."""
+    lines: list[str] = []
+    if session_id:
+        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
         try:
-            entry = json.loads(line)
-        except Exception:
-            continue
-        if entry.get("type") not in ("user", "assistant"):
-            continue
-        content = (entry.get("message") or {}).get("content")
-        if isinstance(content, str):
-            texts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-                    texts.append(block["text"])
-    return texts
+            lines = _usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)))
+        except Exception as exc:
+            log_event("engine", "recent_dialogue_read_failed", tab_id=tab_id, error=str(exc))
+    if len(lines) < limit:
+        archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
+        if archive_path:
+            try:
+                lines = _usable_dialogue_lines(read_archived_entries(archive_path)) + lines
+            except Exception as exc:
+                log_event("engine", "recent_dialogue_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
+    return lines[-limit:]
 
 
 def current_language_name(tab_id: str) -> str:
@@ -361,29 +440,25 @@ def current_language_name(tab_id: str) -> str:
 
 
 def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
-    """Fire-and-forget: gathers the last 5 non-synthetic history entries and
-    asks resolve_user_language (Camerlengo's ai:resolve, NOT
-    ai:detectLanguage) what language the user is actually writing in. Never
-    awaited by any caller and carries no timeout of its own beyond
-    resolve_user_language's own leak-prevention ceiling -- whatever it
-    manages to persist simply becomes visible on the NEXT query()
-    construction via language_hint_instruction/current_language_name, for
-    THIS SAME tab only."""
+    """Fire-and-forget: gathers the last RECENT_DIALOGUE_WINDOW real,
+    user-visible dialogue lines (_read_recent_dialogue_lines -- shared with
+    _gather_recent_dialogue_for_narration, see its own docstring for why
+    this used to be a separate, drifting reader) and asks
+    resolve_user_language (Camerlengo's ai:resolve, NOT ai:detectLanguage)
+    what language the user is actually writing in. Never awaited by any
+    caller and carries no timeout of its own beyond resolve_user_language's
+    own leak-prevention ceiling -- whatever it manages to persist simply
+    becomes visible on the NEXT query() construction via
+    language_hint_instruction/current_language_name, for THIS SAME tab
+    only."""
     from app.plugins.voice_api import resolve_user_language
 
     async def _run() -> None:
         try:
-            texts = _read_recent_history_texts(session_id, 50)
-            recent_texts: list[str] = []
-            for text in reversed(texts):
-                stripped = text.strip()
-                if stripped and not _is_synthetic_history_text(stripped):
-                    recent_texts.insert(0, stripped)
-                if len(recent_texts) >= 5:
-                    break
-            if not recent_texts:
+            lines = _read_recent_dialogue_lines(session_id, tab_id, WORKSPACE_DIR, RECENT_DIALOGUE_WINDOW)
+            if not lines:
                 return
-            name = await resolve_user_language("\n---\n".join(recent_texts))
+            name = await resolve_user_language("\n".join(lines))
             if name:
                 log_event("engine", "language_resolved", tab_id=tab_id, language=name)
                 _save_persisted_language(tab_id, name)
@@ -579,7 +654,15 @@ class ChatSession:
             self.last_visible_output_at = time.monotonic()
             self.last_real_user_question = text
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
-        self._push_message(text, attachments, is_voice)
+        # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
+        # last_real_user_question/the saved pending-turn file above -- those
+        # all need to stay the real, clean text for their own consumers,
+        # e.g. main.py's crash-resume path or a restart replay) so a reader
+        # of the saved transcript can tell a proactive/synthetic turn from
+        # a real one structurally, without guessing from its wording -- see
+        # _SYNTHETIC_TURN_MARKER's own docstring.
+        wire_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
+        self._push_message(wire_text, attachments, is_voice)
 
     def inject_proactive(self, text: str, silent: bool = False) -> bool:
         if self.ended:
@@ -853,7 +936,7 @@ class ChatSession:
         except asyncio.CancelledError:
             pass
 
-    def _gather_recent_dialogue_for_narration(self, limit: int = 8) -> str:
+    def _gather_recent_dialogue_for_narration(self, limit: int = RECENT_DIALOGUE_WINDOW) -> str:
         """Per explicit correction (2026-09-10): the first version of
         _check_progress_narration fed generate_progress_comment only the
         single original question plus a list of currently-running tool
@@ -863,48 +946,12 @@ class ChatSession:
         operation...") instead of anything that actually engaged with the
         conversation, and stayed generic turn after turn since none of its
         inputs ever changed mid-turn. Rebuilt to hand the model the REAL
-        recent back-and-forth instead. Deliberately does NOT reuse
-        history.read_recent_history() (keyed only by workspace_dir, picks
-        whichever .jsonl in the shared project dir was modified most
-        recently) -- with multiple tabs sharing one workspace dir, that
-        could silently pull another tab's transcript. Stays scoped to
-        THIS tab's own resumed session id throughout, same as
-        refresh_language_in_background/_read_recent_history_texts.
-        When the live session file alone is thin (right after a native
-        auto-compaction, whose isCompactSummary replaces older turns), it
-        falls back to this tab's own continuity-archive file (the
-        pre-compaction transcript the PreCompact hook saved, per-tab,
-        never shared)."""
-        def _usable_lines(entries: list[dict[str, Any]]) -> list[str]:
-            out: list[str] = []
-            for entry in entries:
-                raw_text = str(entry.get("text") or "")
-                clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
-                if not clean_text or _is_synthetic_history_text(raw_text):
-                    continue
-                # A clean_text that is one lone bracketed expression is a
-                # placeholder/marker (a bare "[<timestamp>]" line, a
-                # compaction stub), never real conversational content.
-                if clean_text.startswith("[") and clean_text.endswith("]") and "\n" not in clean_text:
-                    continue
-                speaker = "User" if entry.get("role") == "user" else "Caroline"
-                out.append(f"{speaker}: {clean_text}")
-            return out
-
-        lines: list[str] = []
-        if self.last_saved_session_id:
-            path = claude_project_dir(self.workspace_dir) / f"{self.last_saved_session_id}.jsonl"
-            try:
-                lines = _usable_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)))
-            except Exception as exc:
-                log_event("engine", "progress_narration_history_read_failed", tab_id=self.tab_id, error=str(exc))
-        if len(lines) < limit:
-            archive_path = load_tab_continuity_archive(self.workspace_dir, self.tab_id)
-            if archive_path:
-                try:
-                    lines = _usable_lines(read_archived_entries(archive_path)) + lines
-                except Exception as exc:
-                    log_event("engine", "progress_narration_archive_read_failed", tab_id=self.tab_id, path=archive_path, error=str(exc))
+        recent back-and-forth instead, via _read_recent_dialogue_lines --
+        shared with refresh_language_in_background (see that module-level
+        function's own docstring for why this used to be two separately-
+        drifting readers, and why the window widened from 8/5 to
+        RECENT_DIALOGUE_WINDOW)."""
+        lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, limit)
 
         # Bug fix (2026-09-10): confirmed live -- the disk-persisted
         # transcript doesn't yet contain a real user message that's merely
