@@ -1,6 +1,7 @@
 package com.partnerssolutions.caroline.companion
 
 import android.app.Application
+import com.partnerssolutions.caroline.companion.data.remote.CredentialsStore
 import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
@@ -15,6 +16,7 @@ class CompanionApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         Logger.init(this)
+        CredentialsStore.init(this)
         Logger.i("CompanionApplication started")
     }
 }

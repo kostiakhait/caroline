@@ -6,7 +6,6 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
-import com.partnerssolutions.caroline.companion.data.remote.SessionHolder
 import kotlinx.coroutines.launch
 
 class LoginViewModel(private val repository: CamerlengoRepository = CamerlengoRepository()) : ViewModel() {
@@ -26,8 +25,7 @@ class LoginViewModel(private val repository: CamerlengoRepository = CamerlengoRe
         error = null
         viewModelScope.launch {
             try {
-                val session = repository.login(email.trim(), password)
-                SessionHolder.set(session)
+                repository.login(email.trim(), password)
                 onSuccess()
             } catch (exc: Exception) {
                 error = exc.message ?: "Login failed."

@@ -29,7 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.partnerssolutions.caroline.companion.data.remote.SessionHolder
+import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.ui.chat.ChatScreen
 import com.partnerssolutions.caroline.companion.util.Logger
 
@@ -69,7 +69,7 @@ fun CompanionTabsScreen(onLogout: () -> Unit, viewModel: TabsViewModel = viewMod
                             onClick = {
                                 menuOpen = false
                                 Logger.i("user logged out")
-                                SessionHolder.clear()
+                                CamerlengoRepository().logout()
                                 onLogout()
                             },
                         )
