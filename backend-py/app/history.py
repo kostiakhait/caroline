@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from app.durability import claude_project_dir
 from app.logging_setup import log_event
 
 _ATTACHMENT_NOTE_PREFIXES = [
@@ -191,6 +192,23 @@ def _extract_entries_from_jsonl(raw: str, source_label: str) -> list[dict[str, A
 def read_recent_history(workspace_dir: str, limit: int = 200) -> list[dict[str, Any]]:
     file = _latest_session_file(workspace_dir)
     if not file:
+        return []
+    entries = _extract_entries_from_jsonl(file.read_text(encoding="utf-8"), str(file))
+    return entries[-limit:]
+
+
+def read_recent_history_for_session(workspace_dir: str, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    """Bug fix (2026-09-10): read_recent_history() above reads whichever
+    session .jsonl was modified most recently across the WHOLE workspace,
+    with no regard for which tab that belongs to -- fine for the single-tab
+    get_history recovery path, but wrong for the Android companion app's
+    per-tab history sync (companion_api.py's _sync_history), which was
+    confirmed live to mislabel one tab's conversation as another's this
+    way. This reads the EXACT session file for the tab whose session_id
+    the caller already resolved (durability.py's load_tab_session_id) --
+    no "most recent" guessing."""
+    file = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+    if not file.exists():
         return []
     entries = _extract_entries_from_jsonl(file.read_text(encoding="utf-8"), str(file))
     return entries[-limit:]

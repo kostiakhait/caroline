@@ -21,8 +21,8 @@ from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, auth_status as cli_auth_status, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
-from app.durability import dehydrated_dir, peek_pending_turn
-from app.history import read_archived_entries, read_recent_history
+from app.durability import dehydrated_dir, load_tab_session_id, peek_pending_turn
+from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.persona import get_persona, get_persona_edit_state, get_persona_gender, reset_profile, save_custom_persona, save_profile_override, set_profile_key
@@ -123,10 +123,24 @@ def _inject_companion_message(tab_id: str, text: str) -> bool:
     )
 
 
-def _companion_history_snapshot() -> list[dict[str, Any]]:
-    """Callback for the same loop: the recent visible transcript to mirror
-    to the phone so it can render the tab without its own history logic."""
-    return read_recent_history(WORKSPACE_DIR)
+def _active_tab_ids() -> list[str]:
+    """Callback for the same loop: every tab with a live session right
+    now, so history sync (and the inbox drain) covers all of them, not
+    just the primary one."""
+    return list(sessions.keys())
+
+
+def _companion_history_snapshot(tab_id: str) -> list[dict[str, Any]]:
+    """Callback for the same loop: THIS tab's own recent visible
+    transcript to mirror to the phone. Bug fix (2026-09-10): confirmed
+    live -- this used to ignore tab_id and call read_recent_history()
+    (whichever session file was most recently modified anywhere in the
+    workspace), which could mislabel one tab's conversation as another's.
+    Now resolves this exact tab's own session id first."""
+    session_id = load_tab_session_id(WORKSPACE_DIR, tab_id)
+    if not session_id:
+        return []
+    return read_recent_history_for_session(WORKSPACE_DIR, session_id)
 
 
 @app.on_event("startup")
@@ -144,7 +158,7 @@ async def _start_ratatosk_background_loops() -> None:
     # Android companion app: drain phone-originated messages from
     # tabs/<tabId>/inbox into live sessions, and mirror recent history back
     # out to tabs/<tabId>/history. No-op while not logged into SW.
-    start_companion_inbox_loop(WORKSPACE_DIR, _inject_companion_message, _companion_history_snapshot)
+    start_companion_inbox_loop(WORKSPACE_DIR, _active_tab_ids, _inject_companion_message, _companion_history_snapshot)
     # Resume any companion operation (SMS send, sms/contacts lookup) that
     # was still in flight when the backend last went down -- see
     # companion_api.py's own module docstring for the never-gives-up

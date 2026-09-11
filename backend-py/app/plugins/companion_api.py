@@ -94,9 +94,6 @@ def _phase2_backoff_delays():
 # and push any new outgoing history.
 INBOX_LOOP_INTERVAL_S = 10.0
 
-# Duplicated from chat_session.py / main.py (both already define it locally,
-# same value) -- there's no shared constants module to import it from.
-PRIMARY_TAB_ID = "1"
 
 ReportProgress = Callable[[Any], None] | None
 
@@ -383,7 +380,8 @@ async def _resume_one(workspace_dir: str, op_id: str, entry: dict[str, Any], inj
 # --- engine-level tab wiring (started from main.py, next to the scheduler
 #     due-check loop -- see companion_plugin.py's docstring) -------------------
 
-HistorySnapshot = Callable[[], list[dict[str, Any]]]
+HistorySnapshot = Callable[[str], list[dict[str, Any]]]
+GetActiveTabIds = Callable[[], list[str]]
 
 
 def _history_cursor_path(workspace_dir: str) -> Path:
@@ -412,23 +410,31 @@ def _save_history_cursor(workspace_dir: str, cursors: dict[str, int]) -> None:
         log_event("plugin:companion", "save_history_cursor_failed", error=str(exc))
 
 
-async def _sync_history(workspace_dir: str, history_snapshot: HistorySnapshot) -> None:
+async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds, history_snapshot: HistorySnapshot) -> None:
     """Pushes only the entries the phone hasn't received yet, one per key
-    under tabs/<tabId>/history/<index> (not one overwritten blob). Primary
-    tab only for v1 (history_snapshot only knows how to read the single
-    most-recently-active session file)."""
+    under tabs/<tabId>/history/<index> (not one overwritten blob) -- for
+    EVERY currently-open tab, not just the primary one. Bug fix
+    (2026-09-10): confirmed live -- the previous "primary tab only, whatever
+    session file was most recently modified" approach could sync a
+    DIFFERENT tab's conversation under tabs/1/history, mislabeling it.
+    history_snapshot(tab_id) now reads that exact tab's own session file
+    (history.read_recent_history_for_session), never a guess."""
     try:
-        entries = history_snapshot()
         cursors = _load_history_cursor(workspace_dir)
-        already_sent = cursors.get(PRIMARY_TAB_ID, 0)
-        new_entries = entries[already_sent:]
-        if not new_entries:
-            return
-        for i, entry in enumerate(new_entries, start=already_sent):
-            await set_mine(f"tabs/{PRIMARY_TAB_ID}/history/{i}", entry)
-        cursors[PRIMARY_TAB_ID] = len(entries)
-        _save_history_cursor(workspace_dir, cursors)
-        log_event("plugin:companion", "history_synced", tab_id=PRIMARY_TAB_ID, new_entries=len(new_entries), total=len(entries))
+        changed = False
+        for tab_id in get_active_tab_ids():
+            entries = history_snapshot(tab_id)
+            already_sent = cursors.get(tab_id, 0)
+            new_entries = entries[already_sent:]
+            if not new_entries:
+                continue
+            for i, entry in enumerate(new_entries, start=already_sent):
+                await set_mine(f"tabs/{tab_id}/history/{i}", entry)
+            cursors[tab_id] = len(entries)
+            changed = True
+            log_event("plugin:companion", "history_synced", tab_id=tab_id, new_entries=len(new_entries), total=len(entries))
+        if changed:
+            _save_history_cursor(workspace_dir, cursors)
     except Exception as exc:  # noqa: BLE001 -- best effort, never break the loop
         log_event("plugin:companion", "history_sync_failed", error=str(exc))
 
@@ -458,15 +464,17 @@ async def _drain_inbox(inject_to_tab: InjectToTab) -> None:
                 log_event("plugin:companion", "inbox_message_injected", tab_id=tab_id, msg_id=msg_id)
 
 
-async def _inbox_loop_tick(workspace_dir: str, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot) -> None:
+async def _inbox_loop_tick(
+    workspace_dir: str, get_active_tab_ids: GetActiveTabIds, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
+) -> None:
     if not is_logged_in():
         return  # not paired to any SW account yet -- nothing to sync
-    await _sync_history(workspace_dir, history_snapshot)
+    await _sync_history(workspace_dir, get_active_tab_ids, history_snapshot)
     await _drain_inbox(inject_to_tab)
 
 
 def start_companion_inbox_loop(
-    workspace_dir: str, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
+    workspace_dir: str, get_active_tab_ids: GetActiveTabIds, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
     interval_s: float = INBOX_LOOP_INTERVAL_S,
 ) -> "asyncio.Task[None]":
     """Started once from main.py's startup hook (needs a running loop),
@@ -478,7 +486,7 @@ def start_companion_inbox_loop(
         while True:
             await asyncio.sleep(interval_s)
             try:
-                await _inbox_loop_tick(workspace_dir, inject_to_tab, history_snapshot)
+                await _inbox_loop_tick(workspace_dir, get_active_tab_ids, inject_to_tab, history_snapshot)
             except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
                 log_event("plugin:companion", "inbox_loop_tick_failed", error=str(exc))
 
