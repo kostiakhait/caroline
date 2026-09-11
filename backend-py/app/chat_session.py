@@ -527,9 +527,12 @@ class ChatSession:
         self.queue: list[dict[str, Any]] = []
         self._queue_event = asyncio.Event()
         self.turn_is_voice = False
-        self.silent_turn = True
         self.classifier_refusal_retry_count = 0
-        self.turn_pending = False
+        # Backing field for the turn_pending property (defined below,
+        # outside __init__) -- set directly here, not via self.turn_pending
+        # = False, so construction doesn't trigger a premature status
+        # publish before start() has even run.
+        self._turn_pending = False
         self.pending_user_text: str | None = None
         self.pending_attachments: list[Any] = []
 
@@ -697,11 +700,70 @@ class ChatSession:
         except Exception as exc:
             log_event("engine", "safe_disconnect_failed", tab_id=self.tab_id, error=str(exc))
 
+    # ------------------------------------------------------------- status --
+    # Per explicit instruction (2026-09-11): "четыре режима: готов, работаю,
+    # не готов но сам восстановлюсь, ошибка которую сам восстановить не
+    # смогу" -- replaces the previous tangle of caroline_status/
+    # system_notice/turnQueue-length-driven client-side busy inference that
+    # kept producing new corner cases all night (a lamp that wouldn't
+    # blink, one that wouldn't turn yellow, a busy state that never got
+    # re-armed after a retry...). ONE authoritative value, computed here,
+    # published to the client in ONE message type -- chat.js no longer
+    # infers anything from turnQueue length or message-type bookkeeping,
+    # it just renders whatever this says.
+
+    @property
+    def turn_pending(self) -> bool:
+        return self._turn_pending
+
+    @turn_pending.setter
+    def turn_pending(self, value: bool) -> None:
+        if value == self._turn_pending:
+            return
+        log_event("engine", "turn_pending_changed", tab_id=self.tab_id, prev=self._turn_pending, new=value)
+        self._turn_pending = value
+        # Every one of the ~9 places in this file that flips turn_pending
+        # now republishes status automatically -- no call site has to
+        # remember to do it itself (that "remember to do it everywhere"
+        # pattern is exactly what produced tonight's whole run of bugs).
+        asyncio.create_task(self._publish_status())
+
+    def _compute_public_status(self) -> tuple[str, str]:
+        kind = self.conn_state.get("kind")
+        reason = self.conn_state.get("reason") or ""
+        if kind == "billing_blocked":
+            return "error", reason
+        if kind in ("restarting", "restart_backoff", "limited"):
+            return "recovering", reason
+        if self.turn_pending:
+            return "working", ""
+        return "ready", ""
+
+    async def _publish_status(self) -> None:
+        state, reason = self._compute_public_status()
+        # Per standing instruction ("логи повсеместно"): every status the
+        # client is told about is logged here, in ONE place, regardless of
+        # which of the several call sites (turn_pending's own setter,
+        # _apply_conn_state, the initial connect in main.py) triggered it --
+        # matches the same "log at the one choke point, not at every
+        # caller" shape as task_supervisor.py.
+        log_event("engine", "status_published", tab_id=self.tab_id, state=state, reason=reason)
+        await self.send({"type": "status", "state": state, "reason": reason})
+
     # --------------------------------------------------------------- submit --
 
-    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, silent: bool = False, is_voice: bool = False) -> None:
+    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False) -> None:
+        # Per standing instruction ("ВЕЗДЕ логируем и ВСЁ"): this is the
+        # single choke point EVERY turn goes through -- real user messages,
+        # every proactive/internal nudge (inject_proactive already logs
+        # its own text_len separately, but not is_real_user/is_voice), and
+        # every replay -- confirmed live tonight this had NO logging of
+        # its own at all, unlike inject_proactive.
         attachments = attachments or []
-        self.silent_turn = self.silent_turn and silent
+        log_event(
+            "engine", "submit", tab_id=self.tab_id, is_real_user=is_real_user, is_voice=is_voice,
+            text_len=len(text), attachment_count=len(attachments),
+        )
         self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
         self.pending_attachments = attachments
@@ -725,12 +787,24 @@ class ChatSession:
         wire_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         self._push_message(wire_text, attachments, is_voice)
 
-    def inject_proactive(self, text: str, silent: bool = False) -> bool:
+    def inject_proactive(self, text: str, is_voice: bool = False) -> bool:
+        """Bug fix (2026-09-11), per explicit instruction: no more
+        silent/silent_turn parameter -- whether a proactive reply is worth
+        showing is now decided ENTIRELY by the model's own reply content
+        (the existing [[NO_UPDATE]] sentinel, see no_update_sentinel_instruction),
+        never by a caller-side flag here. silent_turn used to be a
+        whole-session AND-latch that (a) couldn't be un-set once a real
+        conversation had made it False (confirmed live: an hourly
+        "silent" reminder could still leak into the chat this way) and
+        (b) got its own state corrupted by an unrelated bug (a rejected
+        turn's own trailing ResultMessage wrongly flipping it back to
+        True mid-conversation, silently swallowing a whole later real
+        reply). Removed entirely rather than patched again."""
         if self.ended:
             return False
-        log_event("engine", "proactive_inject", tab_id=self.tab_id, silent=silent, text_len=len(text))
+        log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
-        self.submit(text, [], False, silent)
+        self.submit(text, [], False, is_voice)
         return True
 
     def stop(self) -> None:
@@ -781,27 +855,18 @@ class ChatSession:
     # ---------------------------------------------------------- conn state --
 
     async def _apply_conn_state(self, kind: str, reason: str | None = None) -> None:
+        # Bug fix (2026-09-11), per explicit instruction: used to send one
+        # of TWO different wire message types (caroline_status/
+        # system_notice) depending on kind, each carrying its own ad-hoc
+        # status text/cls -- chat.js then had to reconstruct "is this
+        # actually working, waiting, or broken" from THAT, PLUS turnQueue
+        # length, PLUS wsConnected, independently. Collapsed to a single
+        # _publish_status() call -- see _compute_public_status for the
+        # kind -> READY/WORKING/RECOVERING/ERROR mapping.
         prev_kind = self.conn_state.get("kind")
         self.conn_state = {"kind": kind, "reason": reason}
         log_event("engine", "conn_state", tab_id=self.tab_id, prev=prev_kind, new=kind, reason=reason)
-        if kind == "connected":
-            await self.send({"type": "caroline_status", "status": "connected"})
-        elif kind in ("restarting", "restart_backoff"):
-            await self.send({"type": "caroline_status", "status": kind, "reason": reason})
-        elif kind == "limited":
-            # Bug fix (2026-09-10): this used to reuse cls "restarting" --
-            # same value the routine internal-churn caroline_status path
-            # produces, which chat.js deliberately keeps the lamp green
-            # for (a hang/dehydration restart the socket survives, self-
-            # resolves in seconds). "limited" is categorically different:
-            # a real block (rate limit / usage-window cap) where no turn
-            # CAN complete until it clears, possibly hours away. Its own
-            # distinct cls lets chat.js tell the two apart and show yellow
-            # ("work is impossible right now, but waiting on it") instead
-            # of green ("everything's fine").
-            await self.send({"type": "system_notice", "text": reason or "", "cls": "limited"})
-        elif kind == "billing_blocked":
-            await self.send({"type": "system_notice", "text": reason or ""})
+        await self._publish_status()
 
     def _set_conn_state(self, kind: str, reason: str | None = None, arm_ignore_next_result: bool = False) -> None:
         if arm_ignore_next_result:
@@ -836,10 +901,19 @@ class ChatSession:
             if self.ended:
                 return
             log_event("engine", "api_retry_firing", tab_id=self.tab_id, reason=reason)
-            self.submit(
-                "[Internal: automatic recheck after an API/subscription limit blocked a previous turn -- continue "
-                "from wherever you left off.]",
-                [], False, True, is_voice,
+            # Bug fix (2026-09-11): confirmed live -- this used to call
+            # submit() directly, bypassing inject_proactive() (the only
+            # thing that sends proactive_turn_queued, which re-arms
+            # chat.js's busy lamp/heartbeat) -- so from the moment a
+            # rate-limit hit to whenever the retry's own first assistant
+            # message happened to trigger chat.js's lazy fallback, there
+            # was no "working" indication at all. Also reuses
+            # CONTINUE_OR_SILENT_NUDGE_TEMPLATE now (language-aware,
+            # [[NO_UPDATE]]-aware) instead of bespoke text with neither.
+            self.inject_proactive(
+                "[Internal: automatic recheck after an API/subscription limit blocked a previous turn.] "
+                f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
+                is_voice,
             )
 
         loop = asyncio.get_event_loop()
@@ -1088,7 +1162,10 @@ class ChatSession:
         # to pending_user_text (set for every pending turn, real or
         # proactive), so the emptiness check below on the actual gathered
         # dialogue is the real, general guard now -- not this field.
-        if self.ended or not self.turn_pending or self.silent_turn:
+        # (silent_turn removed 2026-09-11 -- whether the eventual reply
+        # itself gets shown is now a per-message [[NO_UPDATE]] decision,
+        # unrelated to whether this cosmetic aside narration comment fires.)
+        if self.ended or not self.turn_pending:
             return
         now = time.monotonic()
         if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
@@ -1143,7 +1220,7 @@ class ChatSession:
             "you're already working on something (a tool call, research, a multi-step task), just continue -- "
             "don't restart from scratch. If you actually finished and simply didn't reply, or lost track, answer "
             f"them now, directly, in {current_language_name(self.tab_id)}. Don't mention this note itself.]",
-            [], False, True, False,
+            [], False, False,
         )
 
     def _check_idle_task_drift(self) -> None:
@@ -1168,7 +1245,7 @@ class ChatSession:
         self.last_idle_check_at = now
         lang = current_language_name(self.tab_id)
         log_event("engine", "idle_task_drift_check", tab_id=self.tab_id)
-        self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang), False)
+        self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang))
 
     async def _check_hang(self) -> None:
         effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
@@ -1309,11 +1386,11 @@ class ChatSession:
             lang = current_language_name(self.tab_id)
             if self.pending_user_text is not None:
                 log_event("engine", "handle_failure_real_message_arrived_before_nudge", tab_id=self.tab_id)
-                self.inject_proactive(watchdog_note, True)
+                self.inject_proactive(watchdog_note)
             else:
                 log_event("engine", "handle_failure_continue_or_silent_nudge", tab_id=self.tab_id, lang=lang)
                 refresh_language_in_background(self.last_saved_session_id, self.tab_id)
-                self.inject_proactive(f"{watchdog_note}\n\n{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang)}", False)
+                self.inject_proactive(f"{watchdog_note}\n\n{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang)}")
         log_event("engine", "handle_failure_done", tab_id=self.tab_id)
 
     # -------------------------------------------------------------- status --
@@ -1580,17 +1657,33 @@ class ChatSession:
                         save_tab_session_id(self.workspace_dir, self.tab_id, sid)
 
                     if isinstance(message, ResultMessage):
-                        # Bug fix (2026-09-10): confirmed live -- this
-                        # ResultMessage can be the CLI's graceful response
-                        # to _check_hang's own interrupt()/disconnect() on a
-                        # turn it just force-terminated, structurally
-                        # identical to one for a turn that finished for
-                        # real. Preserve turn_pending/pending_user_text in
-                        # that case so _handle_failure's replay (which fires
-                        # right after, once the stream actually ends) still
-                        # has the real original text to work with -- see
-                        # hang_interrupt_result_pending's own comment.
-                        if not self.hang_interrupt_result_pending:
+                        # Bug fix (2026-09-11): confirmed live -- a
+                        # RateLimitEvent(rejected) sets
+                        # ignore_next_result_recovery=True specifically so
+                        # the trailing ResultMessage the SDK still sends
+                        # for that same rejected turn doesn't get mistaken
+                        # for a real completion -- but that flag only ever
+                        # protected conn_state/the retry timer (below),
+                        # never turn_pending/pending_user_text/silent_turn.
+                        # Confirmed live: the rejected turn's own
+                        # ResultMessage arrived ~2s after the rejection,
+                        # cleared turn_pending/pending_user_text and set
+                        # silent_turn=True -- so when the retry then fired
+                        # 90s later and genuinely completed a real,
+                        # substantive reply (present in the session
+                        # transcript), that reply was silently swallowed
+                        # for the reply's ENTIRE duration: the retry's own
+                        # submit() call passes silent=True, and
+                        # (True and True) stays True forever after, since
+                        # nothing else was left to flip it back. Same bug
+                        # class, same fix shape as hang_interrupt_result_pending
+                        # (built for a hang-interrupt, a different
+                        # trigger) -- captured together here, once, before
+                        # ignore_next_result_recovery gets consumed a few
+                        # lines down, so every place a ResultMessage
+                        # touches turn state uses the SAME verdict.
+                        result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery
+                        if not result_is_fake:
                             self.turn_pending = False
                             self.pending_user_text = None
                             self.pending_attachments = []
@@ -1624,17 +1717,26 @@ class ChatSession:
                                 self._set_conn_state("connected")
 
                     wire = message_to_wire(message)
-                    # Bug fix (2026-09-10): an interrupted turn's own
-                    # ResultMessage carries whatever partial/empty result
-                    # the CLI had at the moment of interrupt -- never
-                    # something to show as if it were Caroline's real
-                    # answer. Suppressing the send (not just the
+                    # Bug fix (2026-09-10/11): an interrupted or rejected
+                    # turn's own ResultMessage carries whatever partial/
+                    # empty/error result the CLI had at that moment --
+                    # never something to show as if it were Caroline's
+                    # real answer. Suppressing the send (not just the
                     # turn_pending clear above) also keeps chat.js's
                     # turnQueue placeholder for the ORIGINAL real submit
                     # open until the REPLAY's own genuine ResultMessage
                     # resolves it for real, instead of being wrongly
-                    # resolved early by this one.
-                    if not self.silent_turn and wire is not None and not (isinstance(message, ResultMessage) and self.hang_interrupt_result_pending):
+                    # resolved early by this one. (silent_turn itself
+                    # removed 2026-09-11, per explicit instruction -- it
+                    # was a whole-session AND-latch that couldn't be
+                    # un-set once a real conversation had made it False,
+                    # and its own state got corrupted by exactly this kind
+                    # of fake-ResultMessage bug. Whether a REAL message
+                    # gets shown is now a per-message [[NO_UPDATE]]
+                    # decision the model itself makes -- this check here
+                    # is now purely about not sending a KNOWN-meaningless
+                    # fake result.)
+                    if wire is not None and not (isinstance(message, ResultMessage) and result_is_fake):
                         wire = _strip_no_update_from_wire(wire)
                         if wire is not None:
                             # Bug fix (2026-09-10): confirmed live -- voice-reply
@@ -1656,26 +1758,21 @@ class ChatSession:
                                     self.last_visible_output_at = time.monotonic()
 
                     if isinstance(message, ResultMessage):
-                        if self.hang_interrupt_result_pending:
+                        if result_is_fake:
                             # Consumed here (not earlier) -- this is the
                             # last of the three places this ResultMessage
-                            # touches hang_interrupt_result_pending-gated
-                            # state, so this is where it's safe to clear.
+                            # touches result_is_fake-gated state. Leave
+                            # turn_is_voice untouched too (not reset to
+                            # False here) -- preserved for whichever REAL
+                            # ResultMessage eventually completes this same
+                            # logical turn.
                             self.hang_interrupt_result_pending = False
-                            log_event("engine", "hang_interrupt_result_preserved", tab_id=self.tab_id)
+                            log_event("engine", "fake_result_message_preserved", tab_id=self.tab_id)
                         else:
                             # One long-lived client now -- the turn is done,
                             # but the stream stays open for the next queued
                             # turn (_input_stream yields it). No per-turn
-                            # restart. Skipped above when this ResultMessage
-                            # was for a hang-interrupted turn -- silent_turn
-                            # must stay whatever it already was (almost
-                            # always False, from the real submit() that
-                            # started the turn this interrupt cut off) so
-                            # the REPLAY's own genuine reply, moments later,
-                            # actually reaches the user instead of being
-                            # silently swallowed.
-                            self.silent_turn = True
+                            # restart.
                             self.turn_is_voice = False
 
                     if isinstance(message, SystemMessage) and message.subtype == "init":
@@ -1710,10 +1807,16 @@ class ChatSession:
 
                 if self.user_stop_requested:
                     self.user_stop_requested = False
+                    # Bug fix (2026-09-11): no more explicit "stopped"
+                    # wire message -- setting turn_pending below (via the
+                    # property setter) already auto-publishes the correct
+                    # status (READY, since nothing else is pending yet at
+                    # this exact instant), and the imminent resubmit()
+                    # right after auto-publishes WORKING again. Two states
+                    # correctly represented, no special-cased message type.
                     self.turn_pending = False
                     self.pending_user_text = None
                     self.pending_attachments = []
-                    await self.send({"type": "caroline_status", "status": "stopped"})
                     self.submit(
                         "[The user just stopped what you were doing. Whatever action was in progress may be "
                         "incomplete or partially applied -- don't assume it finished. Wait for their next "
@@ -1733,7 +1836,7 @@ class ChatSession:
                     self.pending_attachments = []
                     clear_pending_turn(self.workspace_dir, self.tab_id)
                     if replay_text is not None:
-                        self.submit(replay_text, replay_attachments, True, False, self.turn_is_voice)
+                        self.submit(replay_text, replay_attachments, True, self.turn_is_voice)
                     continue
 
                 if self.restart_for_unrecoverable_session:
@@ -1755,7 +1858,7 @@ class ChatSession:
                         # its own system prompt. Just kick off a background
                         # refresh for the next reset/turn.
                         refresh_language_in_background(self.last_saved_session_id, self.tab_id)
-                        self.submit(replay_text, replay_attachments, True, False, self.turn_is_voice)
+                        self.submit(replay_text, replay_attachments, True, self.turn_is_voice)
                     continue
 
                 balance_source = detect_balance_exhaustion(str(exc))

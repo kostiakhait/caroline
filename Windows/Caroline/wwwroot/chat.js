@@ -3,7 +3,7 @@
   // sent to the backend right after connect (see "client_diag" below) and
   // logged server-side, purely so a stale-cache suspicion can be confirmed
   // or ruled out from caroline.log alone, with zero UI interaction needed.
-  const CHAT_JS_VERSION = "2026-09-11-markdown-url-emphasis-fix";
+  const CHAT_JS_VERSION = "2026-09-11-status-model-redesign";
   const port = new URLSearchParams(location.search).get("port") || "8765";
   // Which tab this WebView2 instance belongs to (see MainWindow's tab strip,
   // each tab navigates to chat.html?tab=<id>) -- threaded into the WS URL so
@@ -159,8 +159,20 @@
   // whatever connection status text was showing before it, same idea as a
   // toast notification.
   let lastConnText = "connecting…";
-  let lastConnCls = null;
   let statusBarRevertTimer = null;
+
+  // Backend-authoritative status (2026-09-11), per explicit instruction:
+  // "четыре режима: готов, работаю, не готов но сам восстановлюсь, ошибка
+  // которую сам восстановить не смогу" -- ONE value the backend computes
+  // (see chat_session.py's _compute_public_status) and publishes as
+  // {type:"status", state, reason}, replacing the old caroline_status/
+  // system_notice/turnQueue-length-driven busy inference that kept
+  // producing new corner cases (a lamp that wouldn't blink, one that
+  // wouldn't turn yellow, a busy state that never got re-armed after a
+  // retry...). chat.js no longer infers backend state on its own -- see
+  // applyCarolineStatus below, the only place these two are written.
+  let carolineStatus = "ready"; // "ready" | "working" | "recovering" | "error"
+  let carolineStatusReason = "";
 
   function setStatusBarText(text, transientMs) {
     statusBarText.textContent = text;
@@ -176,61 +188,51 @@
     }
   }
 
-  // Lamp 1 (backend/connection): red = genuinely blocked (billing/limit --
-  // sending a message would just queue forever with no resolution), yellow =
-  // the WebSocket itself is down (nothing can be sent at all right now),
-  // green = connected, green-blinking = a turn is actively running.
-  //
-  // Bug fix (2026-09-09): this used to go yellow for cls "restarting" too
-  // (an internal backend session cycling -- dehydration, a routine restart,
-  // even a multi-minute restart_backoff loop) -- but per inputEl's own gating
-  // just below, the input field stays enabled the WHOLE time the WebSocket
-  // itself is open, since submit() just queues onto a durable queue that the
-  // backend drains once its internal retry succeeds. Confirmed live: the
-  // system genuinely WAS ready to accept and eventually answer a message
-  // during a restart_backoff stretch, but the lamp said otherwise. Now keyed
-  // on wsConnected (this page's own actual socket state) instead of the
-  // backend's internal churn -- "not ready to respond" means the socket
-  // itself is down, not that the backend is busy reconnecting a session.
+  // Lamp 1 (backend/connection): red = carolineStatus "error" (genuinely
+  // blocked -- billing/balance, needs the user to act), yellow = either the
+  // WebSocket itself is down, or carolineStatus is "recovering" (backend
+  // knows it's broken and is fixing itself -- dehydration restart, a
+  // rate/session-window limit, hang recovery...), green = "ready",
+  // green-blinking = "working". Straight switch on the one backend-reported
+  // value plus the client's own transport state -- no other client-side
+  // inference.
   function updateBackendLamp() {
     let color;
-    if (lastConnCls === "error") color = "red";
-    // Bug fix (2026-09-10): "limited" (a real rate-limit/usage-window
-    // block -- backend's own conn_state "limited", distinct from the
-    // "restarting" cls a routine internal restart uses) used to be
-    // indistinguishable from routine churn and stayed green here. A turn
-    // genuinely CANNOT complete while this is active -- possibly for
-    // hours -- so it gets its own yellow, same meaning as "socket down":
-    // work is impossible right now, but this resolves on its own.
-    else if (lastConnCls === "limited") color = "yellow";
-    else if (!wsConnected) color = "yellow";
-    else color = turnBusy ? "green-blink" : "green";
+    if (!wsConnected) color = "yellow";
+    else if (carolineStatus === "error") color = "red";
+    else if (carolineStatus === "recovering") color = "yellow";
+    else if (carolineStatus === "working") color = "green-blink";
+    else color = "green";
     lampBackend.className = "lamp lamp-" + color;
   }
 
   // Tracks the actual WebSocket connection only -- NOT the same thing as
-  // lastConnCls, which also carries "error" for in-app notices (a depleted
-  // API/subscription balance, a repeated-failure banner) that have nothing to
-  // do with whether this page can reach the backend. Confirmed live
-  // (2026-09-03): hitting the monthly Claude subscription limit sent a
-  // system_notice with cls "error", which setStatus used to treat exactly
-  // like a dead socket and disabled the input field over it -- even though
-  // the WS was fine and the user could see and read the notice just fine.
+  // carolineStatus, which also goes "error" for in-app notices (a depleted
+  // API/subscription balance) that have nothing to do with whether this page
+  // can reach the backend. Confirmed live (2026-09-03): hitting the monthly
+  // Claude subscription limit used to disable the input field right along
+  // with a dead-socket state -- even though the WS was fine and the user
+  // could see and read the notice just fine.
   let wsConnected = false;
 
-  function setStatus(text, cls) {
-    // Per explicit instruction (2026-09-06): confirmed live that the lamp can
-    // end up showing "restarting" (yellow) while the backend's own connState
-    // for this tab is already "connected" -- a genuine desync whose cause
-    // wasn't pinned down. Every call here (from whichever source -- ws
-    // caroline_status/system_notice, or the native update_status message)
-    // is now visible in this WebView2's own devtools console, so a future
-    // occurrence can be traced client-side too, not just from the backend.
-    console.log(`[caroline] setStatus text=${JSON.stringify(text)} cls=${cls || "(none)"} (was lastConnCls=${lastConnCls})`);
-    lastConnText = text;
-    lastConnCls = cls || null;
-    setStatusBarText(text);
+  function baselineStatusText() {
+    if (!wsConnected) return "reconnecting…";
+    if (carolineStatus === "error") return carolineStatusReason || "Something needs your attention.";
+    if (carolineStatus === "recovering") return carolineStatusReason || "Recovering…";
+    return "connected";
+  }
+
+  // The one place that pushes carolineStatus/wsConnected out to every piece
+  // of UI that depends on them (lamp, status-bar baseline text, Stop button,
+  // input/mic enabled state). Called after either one changes.
+  function refreshConnectionUi() {
+    lastConnText = baselineStatusText();
+    // Don't stomp the live tool-heartbeat line ("Working… (Ns)") -- it
+    // repaints itself every 5s regardless, and stopHeartbeat() already
+    // reverts to whatever lastConnText holds once a turn actually ends.
+    if (!heartbeatTimer) setStatusBarText(lastConnText);
     updateBackendLamp();
+    updateStopBtnVisibility();
     // Per explicit correction (2026-09-03): only the input field (and voice
     // input -- sending a transcribed message has the exact same "nowhere to
     // send it yet" problem while not connected, confirmed live as a gap the
@@ -239,12 +241,42 @@
     // usable the whole time. A previous version blocked the ENTIRE main
     // window instead; that was wrong and has been removed (see App.xaml.cs).
     //
-    // "not connected" here means the WS itself, not lastConnCls -- an SDK/
-    // billing/limit problem (also surfaced via cls "error") is a reason to
-    // show a red lamp, not a reason to stop the user from typing (see this
-    // function's own wsConnected comment above).
+    // "not connected" here means the WS itself, not carolineStatus -- an
+    // SDK/billing/limit problem (also surfaced via carolineStatus "error")
+    // is a reason to show a red lamp, not a reason to stop the user typing.
     inputEl.disabled = !wsConnected;
     micBtn.disabled = !wsConnected;
+  }
+
+  // The ONLY place carolineStatus/carolineStatusReason get written --
+  // called from the backend's own {type:"status"} message. Per explicit
+  // instruction (2026-09-11): the lamp/heartbeat/Stop button now render
+  // exactly what the backend says, nothing inferred client-side.
+  function applyCarolineStatus(state, reason) {
+    console.log(`[caroline] status state=${state} reason=${JSON.stringify(reason)} (was ${carolineStatus})`);
+    const wasWorking = carolineStatus === "working";
+    if (state === "recovering" && carolineStatus !== "recovering" && turnQueue.length > 0) {
+      // Bug fix carried over from the old caroline_status "restarting"
+      // handler (2026-09-10): an internal session restart mid-turn
+      // (dehydration, a rate/session-window limit, hang recovery...) means
+      // whatever partial assistantText the still-open turnQueue head
+      // already accumulated belongs to a query() that's being thrown away
+      // and replayed -- collapse to one fresh placeholder so the eventual
+      // real reply's TTS text doesn't get the old partial text glued onto
+      // the front of it.
+      turnQueue = [{ isVoice: false, assistantText: "" }];
+    } else if (state === "error") {
+      // Genuinely blocked (e.g. depleted balance) -- nothing still running
+      // will ever produce a "result" until the user acts, unlike
+      // "recovering" which resolves on its own. Same as the old
+      // system_notice handler's turnQueue = [].
+      turnQueue = [];
+    }
+    carolineStatus = state;
+    carolineStatusReason = reason || "";
+    refreshConnectionUi();
+    if (state === "working" && !wasWorking) startHeartbeat();
+    else if (state !== "working" && wasWorking) stopHeartbeat();
   }
 
   // Lamp 2 (Ratatosk channel -- every group Caroline's own account is a
@@ -1085,8 +1117,14 @@
   function recoverFromStuckTurn() {
     console.error(`chat.js: no turn activity for >${STUCK_TURN_THRESHOLD_MS}ms while busy -- self-healing stuck UI state`);
     turnQueue = [];
-    setBusy(false);
+    // Force back to ready locally, distrusting whatever the backend last
+    // reported -- the whole point of this self-heal is that no further
+    // signal (a "status" message included) is expected to arrive for this
+    // stuck turn any time soon.
+    carolineStatus = "ready";
+    carolineStatusReason = "";
     stopHeartbeat();
+    refreshConnectionUi();
     addBanner("Не дождались ответа от Кэролайн вовремя — поле ввода разблокировано. Начатое действие могло не завершиться.");
   }
 
@@ -1115,15 +1153,13 @@
     setToolStatus("");
   }
 
-  // Tracked separately from voiceSession so updateStopBtnVisibility() can
-  // OR the two together -- stopBtn needs to show for either "a turn is
-  // running" or "voice input is live", not just the first one (see
-  // toggleVoiceRecording/stopVoiceSession for where voice recording toggles
-  // this too).
-  let turnBusy = false;
-
+  // Shows for either "a turn is running" (carolineStatus, see
+  // applyCarolineStatus) or "voice input is live" (voiceSession, see
+  // toggleVoiceRecording/stopVoiceSession) -- OR'd together, not just the
+  // first one.
   function updateStopBtnVisibility() {
-    const show = turnBusy || !!voiceSession;
+    const busy = carolineStatus === "working" || carolineStatus === "recovering";
+    const show = busy || !!voiceSession;
     stopBtn.style.display = show ? "" : "none";
     // Sending stays enabled regardless while just a turn is busy -- the
     // backend queues a follow-up and runs it right after, so there's no
@@ -1132,18 +1168,16 @@
     stopBtn.title = voiceSession ? "Cancel voice input" : "Stop";
   }
 
-  function setBusy(busy) {
-    turnBusy = busy;
-    updateStopBtnVisibility();
-    updateBackendLamp();
-  }
-
   function connect() {
     ws = new WebSocket(`ws://127.0.0.1:${port}/?tab=${encodeURIComponent(tabId)}`);
 
     ws.addEventListener("open", () => {
       wsConnected = true;
-      setStatus("connected", "connected");
+      // carolineStatus itself is left as whatever it last was -- main.py
+      // sends a fresh {type:"status"} the moment this connection is
+      // registered (see its own initial-connect _publish_status() call),
+      // which will correct it within one round trip if stale.
+      refreshConnectionUi();
       {
         // Diagnostic-only, same reasoning as CHAT_JS_VERSION above -- proves
         // or disproves from caroline.log alone whether a given attachment
@@ -1174,20 +1208,22 @@
     });
     ws.addEventListener("close", () => {
       wsConnected = false;
-      setStatus("reconnecting…", "restarting");
       // Whatever was in flight lost its connection to the backend that was
-      // running it -- no "result" (or "stopped") is coming for it anymore.
-      // Without this, the Stop button and busy state could get stuck
-      // showing "something is running" indefinitely after a connection drop
-      // that had nothing to do with the user's own turnQueue bookkeeping.
+      // running it -- no "result" is coming for it anymore, and no further
+      // "status" message will arrive until this reconnects. Without this,
+      // the Stop button and busy state could get stuck showing "something
+      // is running" indefinitely after a connection drop that had nothing
+      // to do with the user's own turnQueue bookkeeping.
       turnQueue = [];
-      setBusy(false);
+      carolineStatus = "ready";
+      carolineStatusReason = "";
       stopHeartbeat();
+      refreshConnectionUi();
       setTimeout(connect, 1500);
     });
     ws.addEventListener("error", () => {
       wsConnected = false;
-      setStatus("connection error", "error");
+      refreshConnectionUi();
     });
     ws.addEventListener("message", (ev) => {
       let evt;
@@ -1250,105 +1286,19 @@
       // queued turn happens to be at the front (confirmed live 2026-09-03: a memory-
       // backup reminder landing between a voice message and its reply ate the voice
       // turn's queue slot, so isVoice got lost and its TTS never fired).
+      //
+      // Busy lamp/heartbeat no longer handled here (2026-09-11): submit()
+      // always flips turn_pending True right alongside sending this event,
+      // so the backend's own "status" message (applyCarolineStatus) is
+      // already on its way over the same connection.
       turnQueue.push({ isVoice: false, assistantText: "" });
-      // Bug fix (2026-09-10): confirmed live -- this used to only push the
-      // placeholder and rely on the "assistant" handler's own fallback
-      // (turnQueue.length === 0 -> setBusy(true)/startHeartbeat()) to pick up
-      // the busy state once real activity showed up. But the placeholder just
-      // pushed above makes that fallback's own condition false from the start,
-      // so it NEVER fires for a proactively-injected turn -- the lamp stayed
-      // static (no blink) and the heartbeat/progress-narration timer never
-      // started for the whole turn, even a long-running one (e.g. resuming
-      // unfinished work after a crash). Both calls are no-ops if already
-      // busy/running, so this is safe to call unconditionally here too.
-      setBusy(true);
-      startHeartbeat();
       return;
     }
 
-    if (evt.type === "system_notice") {
-      // Not part of a real SDK turn -- see server.ts's OutEvent doc comment for
-      // system_notice. Per explicit instruction: service/system messages like
-      // this must NEVER show as a chat bubble -- status bar only. cls defaults
-      // to "error" (red lamp, for a depleted balance -- something the user can
-      // actually fix) when the backend omits it; a usage/session-window limit
-      // sends "restarting" instead (yellow, same as a plain restart) since it
-      // resets on its own and there's nothing to fix. Also unsticks the UI the
-      // same way a "restarting" caroline_status would, since no "result" is
-      // ever coming for whatever turn was in flight when this fired.
-      setStatus(evt.text, evt.cls || "error");
-      turnQueue = [];
-      setBusy(false);
-      stopHeartbeat();
-      return;
-    }
-
-    if (evt.type === "caroline_status") {
-      if (evt.status === "connected") setStatus("connected", "connected");
-      else if (evt.status === "restarting" || evt.status === "restart_backoff") {
-        // Per explicit instruction (2026-09-09): this backend-internal
-        // session churn (a real hang recovering, an hourly compaction cycle,
-        // even a multi-minute restart_backoff loop) arrives over a
-        // WebSocket that never actually dropped -- the input field stays
-        // enabled the whole time (see inputEl's own gating in setStatus),
-        // since submit() just queues onto a durable queue the backend drains
-        // once its internal retry succeeds. Confirmed live: the system WAS
-        // genuinely ready to accept and eventually answer a message the
-        // whole time, but showing "recovering session…" here claimed
-        // otherwise. Only actually change the displayed status if the socket
-        // itself is down (ws.onclose's own "reconnecting…" already covers
-        // that case) -- otherwise leave the status bar/lamp exactly as they
-        // already read ("connected"/green), and let the reply's own eventual
-        // arrival be the only visible signal, same as any ordinary turn that
-        // just happens to take a while.
-        //
-        // Bug fix (2026-09-09): setBusy(false)/stopHeartbeat() used to run
-        // here UNCONDITIONALLY, contradicting the very reasoning just above
-        // -- every internal restart (and these can be frequent: dehydration,
-        // a transient "tool use concurrency" self-heal, etc.) blinked the
-        // lamp off and hid the Stop button for a beat, even though the
-        // backend silently replays the in-flight turn into the fresh
-        // session and a real reply is still genuinely coming. turnQueue
-        // still has to be cleared (the OLD entries can never match a
-        // "result" from the NEW session), but busy/heartbeat now only stop
-        // when the socket itself is actually down -- otherwise the
-        // "turnQueue.length === 0" fallback a few lines below (an assistant
-        // message arriving with no queue entry) picks it right back up,
-        // and since setBusy(true)/startHeartbeat() are both no-ops when
-        // already busy/running, the lamp just keeps blinking through the
-        // whole restart with no visible gap.
-        if (!wsConnected) {
-          setStatus("recovering session…", "restarting");
-          setBusy(false);
-          stopHeartbeat();
-        }
-        // Bug fix (2026-09-10): confirmed live -- emptying turnQueue to []
-        // outright (instead of collapsing it) left the lamp correctly
-        // blinking through the restart itself, but then died the moment
-        // ANY "result" next arrived (even a stray one for the OLD,
-        // now-abandoned turn): the "result" handler does
-        // turnQueue.shift()/setBusy(turnQueue.length > 0), and an empty
-        // queue makes that setBusy(false) -- even though the backend is
-        // about to silently replay the user's actual pending turn into the
-        // fresh session and a real reply is still coming. The backend only
-        // ever replays ONE pending turn (see handleFailure's own
-        // pendingUserText), so if there was anything queued, collapse it to
-        // exactly one placeholder instead of wiping it -- that placeholder
-        // absorbs the stray/old "result" cleanly and keeps the lamp
-        // blinking straight through to the replayed turn's own real one.
-        turnQueue = turnQueue.length > 0 ? [{ isVoice: false, assistantText: "" }] : [];
-      } else if (evt.status === "stopped") {
-        turnQueue.shift(); // the interrupted turn won't get a "result" of its own
-        // The backend immediately injects a synthetic message telling Caroline
-        // she was stopped, which runs as its own turn ahead of anything the
-        // user queued -- a placeholder here keeps turnQueue aligned with the
-        // backend's actual turn count so the *next real* turn's result isn't
-        // misattributed to it.
-        turnQueue.unshift({ isVoice: false, assistantText: "" });
-        setBusy(true);
-        stopHeartbeat();
-        startHeartbeat();
-      }
+    if (evt.type === "status") {
+      // The one authoritative signal for ready/working/recovering/error --
+      // see applyCarolineStatus and chat_session.py's _compute_public_status.
+      applyCarolineStatus(evt.state, evt.reason || "");
       return;
     }
 
@@ -1360,14 +1310,13 @@
       if (turnQueue.length === 0) {
         // Activity for a turn this page never called send() for -- it was
         // already running on the backend before this page (re)connected
-        // (app restart, or a reconnect after a dropped connection), so
-        // neither setBusy(true) nor startHeartbeat() ever ran for it.
-        // Without this, the heartbeat clock reads elapsed time from a null
-        // start (Date.now() - null -- a huge bogus second count) and Stop
-        // never appears, since only setBusy(true) shows it.
+        // (app restart, or a reconnect after a dropped connection). Only the
+        // turnQueue placeholder is needed here now (2026-09-11) -- the lamp/
+        // heartbeat/Stop button are driven purely by the backend's own
+        // "status" message (applyCarolineStatus), already published the
+        // moment this turn's own submit()/inject_proactive() ran, whether or
+        // not this page was even connected yet to receive it.
         turnQueue.push({ isVoice: false, assistantText: "" });
-        setBusy(true);
-        startHeartbeat();
       }
       const turn = turnQueue[0]; // oldest still-unresolved turn -- see turnQueue's doc comment
       const blocks = msg.message.content || [];
@@ -1410,10 +1359,14 @@
         }
       }
     } else if (msg.type === "result") {
+      // turnQueue.shift() only handles TTS/assistantText bookkeeping now
+      // (2026-09-11) -- lamp/heartbeat/Stop button no longer key off
+      // turnQueue length at all, purely off the backend's own "status"
+      // message (applyCarolineStatus). A back-to-back queued turn may
+      // briefly show ready/working here where the old code kept the
+      // heartbeat running uninterrupted -- an accurate reflection of a real
+      // (if momentary) gap, not a bug to paper over.
       const turn = turnQueue.shift();
-      setBusy(turnQueue.length > 0);
-      if (turnQueue.length === 0) stopHeartbeat();
-      else { heartbeatToolName = null; updateHeartbeatText(); } // another queued turn is about to start
       if (msg.subtype === "error") {
         addBanner("Something went wrong processing that message.");
       } else if (evt.isVoice && turn && turn.assistantText) {
@@ -1856,13 +1809,28 @@
     pendingAttachments = [];
     renderPendingAttachments();
     autoGrow();
-    setBusy(true);
-    startHeartbeat();
+    // No eager local setBusy/startHeartbeat here (2026-09-11) -- the
+    // backend's submit() flips turn_pending True in the same handler that
+    // receives this "user_message", so a "status":"working" message is
+    // already on its way back over this same (localhost) connection.
   }
 
   function stopCurrentTurn() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ type: "interrupt" }));
+    // The interrupted turn never gets a "result" of its own; the backend
+    // immediately submits a new synthetic turn telling Caroline she was
+    // stopped, which WILL get a real result soon (see chat_session.py's
+    // stop()). Collapse turnQueue right here instead of waiting on a wire
+    // signal -- there is no more caroline_status "stopped" message
+    // (2026-09-11 status redesign) -- otherwise the synthetic turn's own
+    // assistantText would append onto whatever partial text the interrupted
+    // turn already streamed, corrupting TTS playback for a voice turn. The
+    // lamp/heartbeat need no special handling here: the backend's own
+    // turn_pending flips (false, then true again for the synthetic turn)
+    // publish their own "status" messages that drive both automatically.
+    turnQueue.shift();
+    turnQueue.unshift({ isVoice: false, assistantText: "" });
   }
 
   // --- Voice input: record until silence (or manual stop), then send ---
@@ -2106,8 +2074,11 @@
         // explicit instruction (2026-09-06): this used to be completely
         // invisible for the whole multi-minute download; now shown here plus
         // a one-time tray popup (see MainWindow.BroadcastUpdateStatus).
-        // Yellow, not red -- this isn't an error, just in progress.
-        setStatus(data.text, "restarting");
+        // Status-bar text only (2026-09-11) -- doesn't touch the lamp, which
+        // is now purely the backend's own ready/working/recovering/error
+        // state (see applyCarolineStatus); this is a distinct, native-only
+        // notice layered on top.
+        setStatusBarText(data.text);
       } else if (data && data.type === "visual_speech_done") {
         // VisualModeWindow finished playing (or failed to render/play) and has
         // already closed itself -- advance playOneSpeech's queue the same way

@@ -58,7 +58,9 @@ RATATOSK_TAB_ID = "ratatosk"
 BACKUP_NUDGE = (
     "Time for your periodic memory backup: if Notes is available, save your current persona/reminders/anything "
     "worth keeping into the \"Caroline:Vault\" folder now (see your system instructions). If Notes isn't "
-    "available, do nothing."
+    "available, do nothing. Either way, this is routine background maintenance -- reply with exactly "
+    "[[NO_UPDATE]] afterward, not a normal reply, unless something actually went wrong that the user needs to "
+    "know about."
 )
 ensure_recurring_backup(BACKUP_NUDGE)
 
@@ -96,14 +98,23 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     primary = primary_session()
     if reminder.get("priority") == "background" and primary is not None and primary.has_live_dialog():
         return False
-    is_backup_nudge = reminder.get("kind") == "vault-backup-hourly"
     if primary is None:
         return False
+    # Bug fix (2026-09-11), per explicit instruction: used to pass
+    # is_backup_nudge as inject_proactive()'s old "silent" flag -- a
+    # whole-session switch that (a) couldn't actually force quiet once a
+    # real conversation had already made the session "not silent" (an
+    # AND-latch only ever moves toward "not silent", never back) and (b)
+    # had nothing to do with THIS specific reply's own content. Whether
+    # this reply is worth showing is now the model's own per-reply call,
+    # via the existing [[NO_UPDATE]] sentinel -- for the recurring backup
+    # reminder specifically, that guidance now lives directly in
+    # BACKUP_NUDGE's own text (the note this reminder carries), so it
+    # doesn't need special-casing here.
     delivered = primary.inject_proactive(
         f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n"
         "Nobody prompted you for this -- it's a self-scheduled follow-up. Act on it now and tell "
-        "the user proactively, don't wait for them to say anything first.",
-        is_backup_nudge,
+        "the user proactively, don't wait for them to say anything first."
     )
     if delivered:
         log_event("engine", "reminder_delivered", reminder_id=reminder.get("id"))
@@ -119,7 +130,7 @@ def _inject_companion_message(tab_id: str, text: str) -> bool:
     if session is None:
         return False
     return session.inject_proactive(
-        f"[The user sent this from their phone via the Caroline companion app]: {text}", False
+        f"[The user sent this from their phone via the Caroline companion app]: {text}"
     )
 
 
@@ -291,7 +302,7 @@ def _inject_from_ratatosk_owner(text: str) -> None:
 
     async def _do() -> None:
         session = await get_or_create_ratatosk_session()
-        session.inject_proactive(text, False)
+        session.inject_proactive(text)
 
     asyncio.create_task(_do())
 
@@ -435,7 +446,10 @@ async def handle_control_request(
         take_login_request(request_id)  # just clears the tracking entry
         if cancelled:
             if session is not None:
-                session.inject_proactive("[The user closed the SquirrelWisdom login form without logging in.]", True)
+                session.inject_proactive(
+                    "[The user closed the SquirrelWisdom login form without logging in. If this doesn't need any "
+                    "reaction from you right now, reply with exactly [[NO_UPDATE]].]"
+                )
             return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
         email, password = parsed.get("email"), parsed.get("password")
         if not email or not password:
@@ -447,8 +461,8 @@ async def handle_control_request(
                 kind = "registration" if is_register else "login"
                 session.inject_proactive(
                     f"[SquirrelWisdom {kind} succeeded for {email}. Notes and other SquirrelWisdom-backed tools "
-                    "will work from now on -- no need to log in again.]",
-                    True,
+                    "will work from now on -- no need to log in again. If this doesn't need any reaction from you "
+                    "right now, reply with exactly [[NO_UPDATE]].]"
                 )
         else:
             # Reopen the same form with the error shown, bypassing the model
@@ -610,7 +624,7 @@ async def handle_control_request(
         log_event("engine", "shutdown_sync")
         p = primary_session()
         if p is not None:
-            p.inject_proactive("The app is closing right now. " + BACKUP_NUDGE + " Do it immediately, as briefly as possible.", True)
+            p.inject_proactive("The app is closing right now. " + BACKUP_NUDGE + " Do it immediately, as briefly as possible.")
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "get_history":
         entries = read_recent_history(WORKSPACE_DIR)
@@ -720,7 +734,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     sessions[tab_id] = session
     await session.start()
 
-    await websocket.send_json({"type": "caroline_status", "status": "connected"})
+    # Bug fix (2026-09-11): send the SAME status message (READY/WORKING/
+    # RECOVERING/ERROR) the client will keep getting from here on, via the
+    # session's own single source of truth for that shape, instead of a
+    # separate hand-rolled "caroline_status: connected" the client had to
+    # reconcile against everything else.
+    await session._publish_status()
 
     # Bug fix (2026-09-10): confirmed live -- this was never ported from
     # server.ts at all (flagged as a known gap in the migration plan and
@@ -750,7 +769,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         recent_session_id = load_tab_session_id(WORKSPACE_DIR, PRIMARY_TAB_ID)
         lang = current_language_name(PRIMARY_TAB_ID)
         log_event("engine", "startup_greeting", lang=lang)
-        session.inject_proactive(STARTUP_GREETING_NUDGE_TEMPLATE.format(language=lang), False)
+        session.inject_proactive(STARTUP_GREETING_NUDGE_TEMPLATE.format(language=lang))
         refresh_language_in_background(recent_session_id, PRIMARY_TAB_ID)
 
     # Survives a FULL app restart (not just this backend's own in-process
@@ -790,7 +809,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             msg_type = data.get("type")
             log_event("ws", "message_received", tab_id=tab_id, msg_type=msg_type)
             if msg_type == "user_message":
-                session.submit(data.get("text", ""), data.get("attachments") or [], True, False, bool(data.get("voice")))
+                session.submit(data.get("text", ""), data.get("attachments") or [], True, bool(data.get("voice")))
             elif msg_type == "interrupt":
                 session.stop()
             elif msg_type == "control_request":
