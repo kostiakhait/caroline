@@ -52,6 +52,7 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolUseBlock,
 )
 
 from app import win_subprocess_patch
@@ -142,6 +143,19 @@ PROGRESS_NARRATION_INTERVAL_MS = 60_000
 # dominate the whole sample. Both consumers now share one number so they
 # can't drift apart again either.
 RECENT_DIALOGUE_WINDOW = 12
+
+# Per explicit instruction (2026-09-10): a regular, unconditional safety net
+# independent of our own turn_pending bookkeeping -- confirmed live that
+# bookkeeping itself can be wrong (see hang_interrupt_result_pending's own
+# comment), silently dropping a real task with nothing visible to the user.
+# Rather than trust our own state to always be right, periodically just ASK
+# the model directly whether it has active/unfinished work it hasn't
+# reported back on -- only while we believe nothing is pending (turn_pending
+# False); if a turn genuinely IS pending, hang-detection/progress-narration
+# already own that. Own choice, not a specified value -- frequent enough to
+# catch drift within a few minutes, not so frequent it spams a real query()
+# call on every genuinely idle tab.
+IDLE_TASK_CHECK_INTERVAL_MS = 180_000
 
 # How many consecutive "authentication_failed" system/api_retry messages on
 # one connection before forcing a clean restart (re-resolves the mode and
@@ -524,6 +538,34 @@ class ChatSession:
         self.has_seen_init = False
         self.hang_interrupted_at: float | None = None
         self.hang_count = 0
+        # Bug fix (2026-09-10): confirmed live -- interrupt() (called by
+        # _check_hang on a genuine hang) is a soft ask to the CLI, not a
+        # hard kill -- the CLI still sends a final ResultMessage for the
+        # turn it just aborted, structurally identical to one for a turn
+        # that finished normally. Treating it as real completion wiped
+        # turn_pending/pending_user_text AND reset silent_turn=True before
+        # _handle_failure's own replay (which fires right after, once the
+        # stream then actually ends) ever got a chance to run -- confirmed
+        # live: the watchdog correctly caught a genuinely slow tool call,
+        # interrupted it, and the replay then genuinely succeeded (a real
+        # GitLab repo really did get created a few tool calls later), but
+        # the success reply never reached the user at all, silently
+        # swallowed by silent_turn still being True from the misclassified
+        # ResultMessage. Set right before calling interrupt(); the very
+        # next ResultMessage this flag is armed for skips the normal
+        # turn-pending-clear/silent_turn-reset entirely (same shape as
+        # ignore_next_result_recovery, a different trigger).
+        self.hang_interrupt_result_pending = False
+        # What tool call (if any) was actually in flight when a hang got
+        # detected -- captured so _handle_failure's replay nudge can tell
+        # the model specifically what got force-interrupted (per explicit
+        # instruction, 2026-09-10) instead of a generic "something failed"
+        # note, so it can try a different approach instead of blindly
+        # repeating the same slow/stuck call.
+        self.last_tool_use_name: str | None = None
+        self.last_tool_use_started_at: float | None = None
+        self.hang_interrupted_tool_name: str | None = None
+        self.hang_interrupted_tool_elapsed_s: float | None = None
 
         # silent user-wait nudge (see SILENT_USER_WAIT_NUDGE_MS) -- tracks
         # only REAL user-typed messages (submit()'s is_real_user=True),
@@ -538,6 +580,15 @@ class ChatSession:
         # that question was, so a comment (if generated) can tie back to it.
         self.last_visible_output_at: float | None = None
         self.last_real_user_question: str | None = None
+
+        # periodic idle-task-drift check (see IDLE_TASK_CHECK_INTERVAL_MS)
+        # -- per explicit instruction (2026-09-10): our own turn_pending
+        # bookkeeping can itself be wrong (see hang_interrupt_result_pending
+        # above), so rather than trust it exclusively, periodically just
+        # ASK the model directly whether it has unfinished work it hasn't
+        # reported back on -- initialized to "now" so a freshly (re)started
+        # session doesn't fire this on its very first idle tick.
+        self.last_idle_check_at: float | None = time.monotonic()
 
         # restart budget
         self.restart_timestamps: list[float] = []
@@ -933,6 +984,7 @@ class ChatSession:
                 await self._check_hang()
                 self._check_user_wait_nudge()
                 await self._check_progress_narration()
+                self._check_idle_task_drift()
         except asyncio.CancelledError:
             pass
 
@@ -1066,6 +1118,30 @@ class ChatSession:
             [], False, True, False,
         )
 
+    def _check_idle_task_drift(self) -> None:
+        """Per explicit instruction (2026-09-10): a regular, unconditional
+        safety net independent of our own turn_pending bookkeeping --
+        confirmed live that bookkeeping itself can be wrong (a
+        hang-interrupt's own trailing ResultMessage silently clearing
+        turn_pending/pending_user_text before the original task could be
+        replayed -- see hang_interrupt_result_pending). Rather than trust
+        our own state to always be right, periodically just ASK the model
+        directly whether it has active/unfinished work it hasn't actually
+        reported back on -- the model's own session context is the real
+        source of truth here, not our flags. Only fires while we believe
+        nothing is pending (turn_pending False); if a turn genuinely IS
+        pending, hang-detection/progress-narration already own that."""
+        if self.ended or self.turn_pending:
+            self.last_idle_check_at = time.monotonic()
+            return
+        now = time.monotonic()
+        if self.last_idle_check_at is not None and now - self.last_idle_check_at < IDLE_TASK_CHECK_INTERVAL_MS / 1000:
+            return
+        self.last_idle_check_at = now
+        lang = current_language_name(self.tab_id)
+        log_event("engine", "idle_task_drift_check", tab_id=self.tab_id)
+        self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang), False)
+
     async def _check_hang(self) -> None:
         effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
         elapsed = time.monotonic() - self.last_activity
@@ -1083,16 +1159,46 @@ class ChatSession:
 
         if self.hang_interrupted_at is None:
             self.hang_count += 1
+            # Bug fix (2026-09-10): capture what was actually running,
+            # before interrupting it, so _handle_failure's replay nudge can
+            # tell the model specifically what got force-terminated (per
+            # explicit instruction) rather than a generic note -- lets it
+            # try something else instead of blindly repeating the same
+            # slow/stuck call. Only meaningful if a tool call started more
+            # recently than this hang's own elapsed window (otherwise it's
+            # a stale name from an earlier, already-finished call).
+            if self.last_tool_use_started_at is not None and time.monotonic() - self.last_tool_use_started_at <= elapsed + 1:
+                self.hang_interrupted_tool_name = self.last_tool_use_name
+                self.hang_interrupted_tool_elapsed_s = time.monotonic() - self.last_tool_use_started_at
+            else:
+                self.hang_interrupted_tool_name = None
+                self.hang_interrupted_tool_elapsed_s = None
             if self.hang_count >= 2:
                 log_event("engine", "hang_repeat_force_close", tab_id=self.tab_id, hang_count=self.hang_count)
+                self.hang_interrupt_result_pending = True
                 try:
                     if self.client:
                         await self.client.disconnect()
                 except Exception as exc:
                     log_event("engine", "hang_force_close_failed", tab_id=self.tab_id, error=str(exc))
                 return
-            log_event("engine", "hang_detected_soft_interrupt", tab_id=self.tab_id)
+            log_event(
+                "engine", "hang_detected_soft_interrupt", tab_id=self.tab_id,
+                tool_name=self.hang_interrupted_tool_name, tool_elapsed_s=self.hang_interrupted_tool_elapsed_s,
+            )
             self.hang_interrupted_at = time.monotonic()
+            # Bug fix (2026-09-10): confirmed live -- interrupt() is a soft
+            # ask, not a hard kill; the CLI still sends a final ResultMessage
+            # for the turn it just aborted. Without this flag, that
+            # ResultMessage was treated exactly like a real completion --
+            # wiping turn_pending/pending_user_text AND resetting
+            # silent_turn=True -- so even when _handle_failure's replay
+            # genuinely succeeded a few seconds later, its real answer was
+            # silently swallowed (silent_turn never got reset back to
+            # False, since the replay goes through _push_message directly,
+            # not submit()). See the ResultMessage handler below for the
+            # other half of this fix.
+            self.hang_interrupt_result_pending = True
             try:
                 if self.client:
                     await self.client.interrupt()
@@ -1140,9 +1246,27 @@ class ChatSession:
             )
             await asyncio.sleep(RESTART_BACKOFF_MS / 1000)
         self._set_conn_state("restarting", str(exc))
+        # Per explicit instruction (2026-09-10): don't raise the hang
+        # timeout itself (a genuinely slow-but-alive tool call, e.g. a
+        # recursive grep/filesystem scan over a large repo under Windows,
+        # can legitimately exceed it -- confirmed live, HANG_TIMEOUT_MS
+        # stays as-is) -- instead, when it DOES fire, tell the model
+        # exactly what got force-terminated so it can try a different
+        # approach on retry instead of blindly repeating the same
+        # slow/stuck call.
+        tool_note = ""
+        if self.hang_interrupted_tool_name:
+            tool_note = (
+                f" The tool call in progress ('{self.hang_interrupted_tool_name}') had not finished after "
+                f"{round(self.hang_interrupted_tool_elapsed_s or 0)}s and was force-terminated -- if this is still "
+                "relevant, try a different approach instead of just repeating that same call, since whatever made "
+                "it slow or stuck likely hasn't changed."
+            )
+        self.hang_interrupted_tool_name = None
+        self.hang_interrupted_tool_elapsed_s = None
         watchdog_note = (
-            f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}): "
-            f"{exc}. This is Caroline's own infrastructure self-healing, already handled -- for your own "
+            f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}):"
+            f"{tool_note} {exc}. This is Caroline's own infrastructure self-healing, already handled -- for your own "
             "situational awareness only. Do not mention this or sound any alarm about it to the user unless they "
             "specifically ask what happened just now.]"
         )
@@ -1284,6 +1408,21 @@ class ChatSession:
                     self.last_activity = time.monotonic()
                     message: Any = raw_message
 
+                    # Bug fix (2026-09-10): tracks whatever tool call is
+                    # currently in flight so, if a hang fires while one is
+                    # running, _check_hang/_handle_failure can tell the
+                    # model specifically what got force-interrupted (per
+                    # explicit instruction) instead of a generic "something
+                    # failed" note. Never explicitly cleared on completion --
+                    # if the tool finished, a NEW message would have arrived
+                    # and reset last_activity anyway, so a hang could only
+                    # ever fire while this really is the one still running.
+                    if isinstance(message, AssistantMessage):
+                        tool_use_block = next((b for b in message.content if isinstance(b, ToolUseBlock)), None)
+                        if tool_use_block:
+                            self.last_tool_use_name = tool_use_block.name
+                            self.last_tool_use_started_at = time.monotonic()
+
                     # --- classifier refusal ---
                     if isinstance(message, AssistantMessage):
                         refusal_text = next(
@@ -1413,10 +1552,21 @@ class ChatSession:
                         save_tab_session_id(self.workspace_dir, self.tab_id, sid)
 
                     if isinstance(message, ResultMessage):
-                        self.turn_pending = False
-                        self.pending_user_text = None
-                        self.pending_attachments = []
-                        clear_pending_turn(self.workspace_dir, self.tab_id)
+                        # Bug fix (2026-09-10): confirmed live -- this
+                        # ResultMessage can be the CLI's graceful response
+                        # to _check_hang's own interrupt()/disconnect() on a
+                        # turn it just force-terminated, structurally
+                        # identical to one for a turn that finished for
+                        # real. Preserve turn_pending/pending_user_text in
+                        # that case so _handle_failure's replay (which fires
+                        # right after, once the stream actually ends) still
+                        # has the real original text to work with -- see
+                        # hang_interrupt_result_pending's own comment.
+                        if not self.hang_interrupt_result_pending:
+                            self.turn_pending = False
+                            self.pending_user_text = None
+                            self.pending_attachments = []
+                            clear_pending_turn(self.workspace_dir, self.tab_id)
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
                         self.consecutive_auth_retry_failures = 0
@@ -1446,7 +1596,17 @@ class ChatSession:
                                 self._set_conn_state("connected")
 
                     wire = message_to_wire(message)
-                    if not self.silent_turn and wire is not None:
+                    # Bug fix (2026-09-10): an interrupted turn's own
+                    # ResultMessage carries whatever partial/empty result
+                    # the CLI had at the moment of interrupt -- never
+                    # something to show as if it were Caroline's real
+                    # answer. Suppressing the send (not just the
+                    # turn_pending clear above) also keeps chat.js's
+                    # turnQueue placeholder for the ORIGINAL real submit
+                    # open until the REPLAY's own genuine ResultMessage
+                    # resolves it for real, instead of being wrongly
+                    # resolved early by this one.
+                    if not self.silent_turn and wire is not None and not (isinstance(message, ResultMessage) and self.hang_interrupt_result_pending):
                         wire = _strip_no_update_from_wire(wire)
                         if wire is not None:
                             # Bug fix (2026-09-10): confirmed live -- voice-reply
@@ -1468,11 +1628,27 @@ class ChatSession:
                                     self.last_visible_output_at = time.monotonic()
 
                     if isinstance(message, ResultMessage):
-                        # One long-lived client now -- the turn is done, but
-                        # the stream stays open for the next queued turn
-                        # (_input_stream yields it). No per-turn restart.
-                        self.silent_turn = True
-                        self.turn_is_voice = False
+                        if self.hang_interrupt_result_pending:
+                            # Consumed here (not earlier) -- this is the
+                            # last of the three places this ResultMessage
+                            # touches hang_interrupt_result_pending-gated
+                            # state, so this is where it's safe to clear.
+                            self.hang_interrupt_result_pending = False
+                            log_event("engine", "hang_interrupt_result_preserved", tab_id=self.tab_id)
+                        else:
+                            # One long-lived client now -- the turn is done,
+                            # but the stream stays open for the next queued
+                            # turn (_input_stream yields it). No per-turn
+                            # restart. Skipped above when this ResultMessage
+                            # was for a hang-interrupted turn -- silent_turn
+                            # must stay whatever it already was (almost
+                            # always False, from the real submit() that
+                            # started the turn this interrupt cut off) so
+                            # the REPLAY's own genuine reply, moments later,
+                            # actually reaches the user instead of being
+                            # silently swallowed.
+                            self.silent_turn = True
+                            self.turn_is_voice = False
 
                     if isinstance(message, SystemMessage) and message.subtype == "init":
                         self.has_seen_init = True
