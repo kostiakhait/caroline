@@ -328,6 +328,29 @@ def no_unauthorized_secret_changes_instruction() -> str:
     )
 
 
+def prefer_embedded_browser_instruction() -> str:
+    """Bug fix (2026-09-11), per explicit instruction: this priority was
+    already stated once, in open_app_browser's own tool description
+    (appbrowser_plugin.py -- present since this backend's very first
+    commit, 2026-09-09) -- confirmed live that a single sentence in one
+    tool's own description isn't a strong enough signal on its own:
+    Caroline kept reaching for the standalone caroline-browser
+    (Playwright, a completely separate real browser window) for ordinary
+    tasks anyway. Promoted to ALWAYS_ON so it's guaranteed visible BEFORE
+    any tool gets chosen, not just discoverable after the model has
+    already leaned toward caroline-browser and never looked at
+    open_app_browser's own text."""
+    return (
+        "For ordinary web/app browsing (WhatsApp Web, Telegram Web, Facebook, Slack, general sites), prefer your "
+        "OWN embedded browser (open_app_browser and the other app_browser_* tools) over the standalone "
+        "caroline-browser tools -- the embedded one lives inside the app itself, the user can see it, and it's "
+        "the default for a reason. Only reach for caroline-browser when there's a real, specific reason the "
+        "embedded browser can't do the job (e.g. it genuinely lacks a capability you need, or the embedded one "
+        "has already failed at this specific task) -- not out of habit or because a caroline-browser session "
+        "already happens to be open."
+    )
+
+
 # Unconditionally appended to EVERY turn's system prompt (see
 # chat_session.py) -- deliberately small; everything tool-specific lives
 # in that tool's own plugin instead (see this module's docstring).
@@ -347,6 +370,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     no_alarming_internal_recovery_instruction,
     vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
+    prefer_embedded_browser_instruction,
 )
 
 

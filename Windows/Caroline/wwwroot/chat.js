@@ -3,7 +3,7 @@
   // sent to the backend right after connect (see "client_diag" below) and
   // logged server-side, purely so a stale-cache suspicion can be confirmed
   // or ruled out from caroline.log alone, with zero UI interaction needed.
-  const CHAT_JS_VERSION = "2026-09-10-limited-lamp-yellow";
+  const CHAT_JS_VERSION = "2026-09-11-markdown-url-emphasis-fix";
   const port = new URLSearchParams(location.search).get("port") || "8765";
   // Which tab this WebView2 instance belongs to (see MainWindow's tab strip,
   // each tab navigates to chat.html?tab=<id>) -- threaded into the WS URL so
@@ -471,7 +471,17 @@
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
       (_, label, url) => stash(`<a href="${url}" target="_blank" rel="noopener">${label}</a>`));
     // Bare URLs not already wrapped in an <a> tag from the rule above.
-    html = html.replace(/(^|[^"'>])(https?:\/\/[^\s<]+)/g,
+    // Bug fix (2026-09-11): confirmed live -- "*"/"_" weren't excluded, so
+    // a bare URL wrapped in **bold** or _italic_ (no [text](url) syntax,
+    // just raw asterisks around a raw URL) had its CLOSING marker(s)
+    // greedily swallowed into the URL match itself (protected from every
+    // later rule once stashed) -- the opening marker was then left as a
+    // literal, unpaired "**"/"_" on screen with nothing left to match it
+    // against, right next to an otherwise-correctly-rendered link.
+    // Excluding both from the URL body lets them terminate the match
+    // normally, so the bold/italic rules below still see a real matched
+    // pair (the placeholder token itself is markdown-special-character-free).
+    html = html.replace(/(^|[^"'>])(https?:\/\/[^\s<*_]+)/g,
       (_, pre, url) => pre + stash(`<a href="${url}" target="_blank" rel="noopener">${url}</a>`));
 
     html = html.replace(/^###\s+(.+)$/gm, "<h4>$1</h4>");
