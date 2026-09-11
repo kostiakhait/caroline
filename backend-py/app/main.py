@@ -87,6 +87,11 @@ _ratatosk_turn_got_reply = False
 _has_greeted = False
 _has_sent_visual_mode_config = False
 _resumed_unfinished_turn_for_tab: set[str] = set()
+# Same "once per process, not per reconnect" shape as the set above -- see
+# ChatSession.needs_startup_compaction/_check_forced_compaction
+# (chat_session.py) for why forced compaction exists and what this flag
+# actually triggers once set.
+_forced_startup_compaction_for_tab: set[str] = set()
 
 
 def _on_reminder_due(reminder: dict[str, Any]) -> bool:
@@ -802,6 +807,19 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "first where that makes sense (e.g. was an email already sent, a file already written). Reply in "
                 f"{resume_lang}.]",
             )
+
+    # Forced compaction's "at Caroline's startup" trigger (2026-09-11): once
+    # per tab per PROCESS lifetime, not per reconnect -- ChatSession itself
+    # gets recreated on every WS (re)connection, so this flag has to live at
+    # module scope, same reasoning as _resumed_unfinished_turn_for_tab just
+    # above. Just sets the flag here; _check_forced_compaction
+    # (chat_session.py's own watchdog tick) does the actual triggering once
+    # the session is genuinely connected -- see that method's own doc
+    # comment for why native auto-compaction can't be trusted to do this on
+    # its own.
+    if tab_id not in _forced_startup_compaction_for_tab:
+        _forced_startup_compaction_for_tab.add(tab_id)
+        session.needs_startup_compaction = True
 
     try:
         while True:

@@ -158,6 +158,31 @@ RECENT_DIALOGUE_WINDOW = 12
 # call on every genuinely idle tab.
 IDLE_TASK_CHECK_INTERVAL_MS = 180_000
 
+# Forced compaction (2026-09-11), per explicit instruction, after confirming
+# live that native auto-compaction -- correctly wired (see
+# _ensure_settings_file/_pre_compact_hook) -- has never actually fired even
+# once in real use (0 pre_compact_archived events across the whole log,
+# while one resumed tab's on-disk transcript grew to 24MB+). Most likely
+# cause: the CLI's own "how much context has accumulated" tracking doesn't
+# survive this engine's own frequent restarts (rate-limit retries, hang
+# recovery, app relaunches), even though the on-disk RESUMED transcript
+# keeps growing across every one of them -- so it may never see a long
+# enough uninterrupted stretch to cross its own threshold. Rather than trust
+# it to eventually notice, force it: once per process start (see
+# needs_startup_compaction, set by main.py per tab), every hour, and
+# whenever the on-disk session file has grown past this many bytes since
+# the last forced compaction -- by sending the same "/compact" a human
+# would type (live-confirmed this works through THIS engine's own
+# connect()+generator wiring, content-as-block-list included, not just the
+# SDK's query(str) convenience path).
+FORCED_COMPACTION_HOURLY_MS = 3_600_000
+FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD = 100_000
+# Minimum gap between two forced compactions on the same tab, regardless of
+# which trigger fires -- keeps the three triggers from stacking (e.g. the
+# hourly clock and the growth threshold both crossing within the same
+# watchdog tick) into back-to-back /compact calls.
+FORCED_COMPACTION_MIN_INTERVAL_MS = 300_000
+
 # How many consecutive "authentication_failed" system/api_retry messages on
 # one connection before forcing a clean restart (re-resolves the mode and
 # rebuilds Options.env) instead of retrying the same doomed request forever.
@@ -534,7 +559,24 @@ class ChatSession:
         # publish before start() has even run.
         self._turn_pending = False
         self.pending_user_text: str | None = None
+        self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
+
+        # Forced compaction (see FORCED_COMPACTION_HOURLY_MS's own comment).
+        # needs_startup_compaction is set True by main.py, once per tab_id
+        # per PROCESS lifetime (a module-level set there, mirroring how the
+        # startup greeting/pending-turn-crash-recovery already track "once
+        # per process, not per reconnect") -- this ChatSession instance
+        # itself gets recreated on every WS reconnect, so instance state
+        # alone can't carry that scope.
+        self.needs_startup_compaction: bool = False
+        self.last_forced_compaction_at: float | None = None
+        self.size_at_last_forced_compaction: int | None = None
+        # Same "this ResultMessage/whatever precedes it isn't real, don't
+        # show it or let it touch turn state" shape as
+        # hang_interrupt_result_pending/ignore_next_result_recovery -- see
+        # result_is_fake's own computation in the message loop.
+        self.forced_compaction_result_pending: bool = False
 
         # activity / hang tracking
         self.last_activity = time.monotonic()
@@ -766,6 +808,15 @@ class ChatSession:
         )
         self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
+        # Bug fix (2026-09-11), per explicit instruction: _gather_recent_
+        # dialogue_for_narration's own pending_user_text fallback used to
+        # label THIS unconditionally as if the user had just said it --
+        # confirmed live: an internal retry nudge ("[Internal: automatic
+        # recheck... Reply in English.") got fed to the narrator as literal
+        # user speech, producing both nonsense commentary and an English
+        # reply for an otherwise-Russian conversation. Tracked alongside
+        # pending_user_text so that fallback can tell the difference.
+        self.pending_is_real_user = is_real_user
         self.pending_attachments = attachments
         self.turn_pending = True
         self.last_activity = time.monotonic()
@@ -1012,16 +1063,18 @@ class ChatSession:
             asyncio.create_task(self._safe_disconnect(self.client))
 
     async def _pre_compact_hook(self, hook_input: Any, tool_use_id: Any, context: Any) -> dict[str, Any]:
-        """Fires just before Claude's own auto-compaction summarises older
-        turns. Copies the current transcript to workspace/dehydrated/ and
-        points the continuity pointer at it, so if the summary ever drops
-        something the user asks about, Caroline has a real file to Read
-        (main.py's expand_dehydrated_ref serves it back). Best-effort;
-        never blocks or fails compaction."""
+        """Fires just before Claude's own compaction summarises older turns
+        -- either its own native auto-compaction, or our forced "/compact"
+        (see FORCED_COMPACTION_HOURLY_MS; trigger is "manual" for that one,
+        live-confirmed). Copies the current transcript to
+        workspace/dehydrated/ and points the continuity pointer at it, so
+        if the summary ever drops something the user asks about, Caroline
+        has a real file to Read (main.py's expand_dehydrated_ref serves it
+        back). Best-effort; never blocks or fails compaction."""
         try:
             trigger = hook_input.get("trigger") if isinstance(hook_input, dict) else None
             transcript_path = hook_input.get("transcript_path") if isinstance(hook_input, dict) else None
-            if trigger != "auto" or not transcript_path or not Path(transcript_path).exists():
+            if trigger not in ("auto", "manual") or not transcript_path or not Path(transcript_path).exists():
                 return {}
             import shutil
             directory = dehydrated_dir(self.workspace_dir)
@@ -1029,7 +1082,7 @@ class ChatSession:
             archive_path = str(directory / f"{uuid_mod.uuid4()}.txt")
             shutil.copyfile(transcript_path, archive_path)
             save_tab_continuity_archive(self.workspace_dir, self.tab_id, archive_path)
-            log_event("engine", "pre_compact_archived", tab_id=self.tab_id, archive_path=archive_path)
+            log_event("engine", "pre_compact_archived", tab_id=self.tab_id, archive_path=archive_path, trigger=trigger)
         except Exception as exc:
             log_event("engine", "pre_compact_hook_failed", tab_id=self.tab_id, error=str(exc))
         return {}
@@ -1075,7 +1128,7 @@ class ChatSession:
                 # 20+ minutes until the downstream symptoms (no narrator
                 # comments, a lamp that never blinks) got reported. A
                 # single bad tick must never cost this tab everything these
-                # four checks are responsible for -- log it and keep
+                # five checks are responsible for -- log it and keep
                 # ticking. supervise() (start(), task_supervisor.py) is the
                 # outer safety net if this task ever dies anyway.
                 try:
@@ -1083,6 +1136,7 @@ class ChatSession:
                     self._check_user_wait_nudge()
                     await self._check_progress_narration()
                     self._check_idle_task_drift()
+                    self._check_forced_compaction()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 -- must log, never let this tick die silently
@@ -1117,17 +1171,30 @@ class ChatSession:
         # most recent real question is represented as the LAST line,
         # appending it if the disk read didn't already surface it.
         # Also (2026-09-10): last_real_user_question is only ever set by a
-        # REAL submit() (is_real_user=True), so a proactively-injected turn
-        # (inject_proactive() always passes is_real_user=False -- startup
-        # greeting, reminders, ratatosk nudges, crash-resume) left this None
-        # on a fresh process with no real user turn yet this lifetime, so
-        # narration had nothing to anchor on and never fired even for a
-        # long-running proactive turn. pending_user_text is set
-        # unconditionally by submit() for EVERY turn, real or proactive, for
-        # exactly as long as one is pending -- falls back to it so this
-        # works for any in-flight turn, not just ones a real user directly
-        # started.
-        question = (self.last_real_user_question or self.pending_user_text or "").strip()
+        # REAL submit() (is_real_user=True). pending_user_text used to be
+        # used as a blanket fallback for ANY pending turn, real or
+        # proactive, so a long-running proactive task still had something
+        # to narrate about before anything hit the real transcript on disk.
+        #
+        # Bug fix (2026-09-11), per explicit instruction: confirmed live --
+        # that blanket fallback also caught purely-internal synthetic
+        # nudges (the API-retry recheck: "[Internal: automatic recheck
+        # after an API/subscription limit blocked a previous turn.]
+        # Continue any unfinished work... Reply in English."), labeled them
+        # "User: ..." same as real speech, and fed that straight into the
+        # narrator -- which then both reacted to internal bookkeeping as if
+        # it were conversation AND picked up the nudge's own hardcoded
+        # English wording, breaking language for an otherwise-Russian
+        # conversation. Only trust pending_user_text here when it's a REAL
+        # user's own words (pending_is_real_user, set alongside it in
+        # submit()) -- a genuinely informative proactive task (companion
+        # message, startup greeting) loses this one fallback line for the
+        # brief window before anything real lands on disk, but
+        # _read_recent_dialogue_lines (the real, general source) picks it
+        # up the moment it does; that's a far smaller gap than actively
+        # narrating on internal nudge text for the whole length of a
+        # rate-limit wait.
+        question = (self.last_real_user_question or (self.pending_user_text if self.pending_is_real_user else None) or "").strip()
         if question and (not lines or question not in lines[-1]):
             lines.append(f"User: {question}")
 
@@ -1165,7 +1232,17 @@ class ChatSession:
         # (silent_turn removed 2026-09-11 -- whether the eventual reply
         # itself gets shown is now a per-message [[NO_UPDATE]] decision,
         # unrelated to whether this cosmetic aside narration comment fires.)
-        if self.ended or not self.turn_pending:
+        #
+        # Bug fix (2026-09-11), per explicit instruction: confirmed live --
+        # turn_pending alone stays True for the ENTIRE duration of a rate-
+        # limit-wait cycle (the turn is legitimately still "owed" a reply,
+        # by design, so the retry can resume it later), even though nothing
+        # is actually happening except quietly waiting for the limit to
+        # reset. This kept firing narration every minute throughout that
+        # wait, reacting to nothing real. Only narrate while actually
+        # connected -- recovering/limited/restarting/billing_blocked all
+        # mean there's genuinely nothing to narrate about right now.
+        if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
             return
         now = time.monotonic()
         if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
@@ -1246,6 +1323,78 @@ class ChatSession:
         lang = current_language_name(self.tab_id)
         log_event("engine", "idle_task_drift_check", tab_id=self.tab_id)
         self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang))
+
+    def _current_session_file_size(self) -> int | None:
+        """Bytes on disk for this tab's currently-resumed session transcript,
+        or None if there's nothing resolvable yet (no session id, or the
+        file genuinely isn't there). Used by _check_forced_compaction's
+        growth trigger -- see FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD."""
+        if not self.last_saved_session_id:
+            return None
+        try:
+            path = claude_project_dir(self.workspace_dir) / f"{self.last_saved_session_id}.jsonl"
+            return path.stat().st_size
+        except OSError:
+            return None
+
+    def _push_internal_command(self, text: str) -> None:
+        """Queues a raw CLI command (e.g. "/compact") the same way a human
+        typing it would send it -- bypasses submit()/_push_message entirely
+        (no "[Sent: ...]" timestamp line, no attachments, no turn_pending/
+        pending_user_text bookkeeping) since this isn't a conversational
+        turn at all. Live-confirmed this exact shape (content as a
+        single-block list, no extra text) is recognized as a slash command
+        through THIS engine's own connect()+generator wiring, not just the
+        SDK's separate query(str) convenience path."""
+        self.queue.append({
+            "message": {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}, "parent_tool_use_id": None},
+            "is_voice": False,
+        })
+        self._queue_event.set()
+
+    def _check_forced_compaction(self) -> None:
+        """See FORCED_COMPACTION_HOURLY_MS's own comment for why this
+        exists at all (native auto-compaction confirmed never firing on its
+        own). Three triggers, checked in priority order: a pending startup
+        compaction (main.py sets needs_startup_compaction once per tab per
+        process), the hourly clock, or on-disk growth past
+        FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD since the last forced
+        compaction. Never runs while a real turn is in flight or the
+        connection isn't fully settled -- this is maintenance, not
+        something to inject into or race with actual work."""
+        if self.ended or self.turn_pending or self.forced_compaction_result_pending:
+            return
+        if self.conn_state.get("kind") != "connected":
+            return
+        if not self.last_saved_session_id:
+            return
+        now = time.monotonic()
+        if self.last_forced_compaction_at is not None and now - self.last_forced_compaction_at < FORCED_COMPACTION_MIN_INTERVAL_MS / 1000:
+            return
+
+        reason: str | None = None
+        if self.needs_startup_compaction:
+            reason = "startup"
+        elif self.last_forced_compaction_at is None or now - self.last_forced_compaction_at >= FORCED_COMPACTION_HOURLY_MS / 1000:
+            reason = "hourly"
+        else:
+            size = self._current_session_file_size()
+            baseline = self.size_at_last_forced_compaction or 0
+            if size is not None and size - baseline >= FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD:
+                reason = "growth"
+
+        if reason is None:
+            return
+
+        self.needs_startup_compaction = False
+        self.last_forced_compaction_at = now
+        self.size_at_last_forced_compaction = self._current_session_file_size() or 0
+        self.forced_compaction_result_pending = True
+        log_event(
+            "engine", "forced_compaction_triggered", tab_id=self.tab_id, reason=reason,
+            session_size_bytes=self.size_at_last_forced_compaction,
+        )
+        self._push_internal_command("/compact")
 
     async def _check_hang(self) -> None:
         effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
@@ -1612,6 +1761,20 @@ class ChatSession:
                             self._handle_rate_limit_rejected("in-stream", info_dict)
                         continue
 
+                    # --- system/status (compacting progress), only logged while
+                    # WE triggered it -- see FORCED_COMPACTION_HOURLY_MS. Not a
+                    # `continue` -- the wire-send suppression a few lines down
+                    # (result_is_fake/forced_compaction_result_pending) already
+                    # covers not showing this to the client; this is purely a
+                    # side-effect log line, everything else about this message
+                    # still flows through the loop normally.
+                    if isinstance(message, SystemMessage) and message.subtype == "status" and self.forced_compaction_result_pending:
+                        log_event(
+                            "engine", "forced_compaction_status", tab_id=self.tab_id,
+                            status=message.data.get("status"), compact_result=message.data.get("compact_result"),
+                            compact_error=message.data.get("compact_error"),
+                        )
+
                     # --- system/api_retry ---
                     if isinstance(message, SystemMessage) and message.subtype == "api_retry":
                         self.last_api_retry_error = message.data.get("error")
@@ -1682,7 +1845,18 @@ class ChatSession:
                         # ignore_next_result_recovery gets consumed a few
                         # lines down, so every place a ResultMessage
                         # touches turn state uses the SAME verdict.
-                        result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery
+                        #
+                        # forced_compaction_result_pending (2026-09-11) joins
+                        # the same verdict for the same reason: our own
+                        # "/compact" produces its own ResultMessage that must
+                        # not be shown, and must not clear turn_pending/
+                        # pending_user_text -- especially since turn_pending
+                        # was already False the whole time this ran (forced
+                        # compaction only fires while idle), so touching it
+                        # here would risk clobbering pending_user_text/
+                        # pending_attachments for something ELSE that got
+                        # queued in the meantime.
+                        result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending
                         if not result_is_fake:
                             self.turn_pending = False
                             self.pending_user_text = None
@@ -1735,8 +1909,19 @@ class ChatSession:
                     # gets shown is now a per-message [[NO_UPDATE]]
                     # decision the model itself makes -- this check here
                     # is now purely about not sending a KNOWN-meaningless
-                    # fake result.)
-                    if wire is not None and not (isinstance(message, ResultMessage) and result_is_fake):
+                    # fake result.
+                    #
+                    # forced_compaction_result_pending (2026-09-11) needs its
+                    # OWN, broader term here rather than folding into
+                    # result_is_fake's usual ResultMessage-only check: a
+                    # real "/compact" round trip also produces real
+                    # AssistantMessage/SystemMessage traffic BEFORE its
+                    # ResultMessage (live-confirmed: an assistant reply like
+                    # "Not enough messages to compact.", plus a "compacting"
+                    # status message) that would otherwise show up as a
+                    # bogus chat bubble -- suppress the whole stretch, not
+                    # just the terminal ResultMessage.)
+                    if wire is not None and not self.forced_compaction_result_pending and not (isinstance(message, ResultMessage) and result_is_fake):
                         wire = _strip_no_update_from_wire(wire)
                         if wire is not None:
                             # Bug fix (2026-09-10): confirmed live -- voice-reply
@@ -1767,7 +1952,11 @@ class ChatSession:
                             # ResultMessage eventually completes this same
                             # logical turn.
                             self.hang_interrupt_result_pending = False
-                            log_event("engine", "fake_result_message_preserved", tab_id=self.tab_id)
+                            if self.forced_compaction_result_pending:
+                                self.forced_compaction_result_pending = False
+                                log_event("engine", "forced_compaction_done", tab_id=self.tab_id, subtype=message.subtype)
+                            else:
+                                log_event("engine", "fake_result_message_preserved", tab_id=self.tab_id)
                         else:
                             # One long-lived client now -- the turn is done,
                             # but the stream stays open for the next queued
