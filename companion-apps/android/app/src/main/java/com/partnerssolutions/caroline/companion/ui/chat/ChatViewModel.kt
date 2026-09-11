@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.partnerssolutions.caroline.companion.data.model.ChatMessage
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.util.Logger
+import com.partnerssolutions.caroline.companion.util.TextFiltering
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -65,10 +66,18 @@ class ChatViewModel(
                 .mapNotNull { (key, value) ->
                     val index = (key as? String)?.toIntOrNull() ?: return@mapNotNull null
                     val entry = value as? Map<*, *> ?: return@mapNotNull null
+                    val rawText = entry["text"] as? String ?: ""
+                    // Client-side only, per explicit instruction (2026-09-11)
+                    // -- the backend hands over the SAME raw text its own
+                    // model-facing session sees (a "[Sent: ...]" stamp, and
+                    // occasionally a whole synthetic/internal turn); this
+                    // app decides what a human should actually see, same as
+                    // the desktop's own chat.js does for its live rendering.
+                    if (TextFiltering.isSyntheticText(rawText)) return@mapNotNull null
                     ChatMessage(
                         index = index,
                         role = entry["role"] as? String ?: "user",
-                        text = entry["text"] as? String ?: "",
+                        text = TextFiltering.stripStamp(rawText),
                         ts = (entry["ts"] as? Double)?.toLong() ?: 0L,
                     )
                 }

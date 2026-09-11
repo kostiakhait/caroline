@@ -183,8 +183,26 @@ private fun MessageBubble(message: ChatMessage) {
                 )
             }
         }
+        if (message.ts > 0) {
+            Text(
+                formatBubbleTimestamp(message.ts),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                modifier = Modifier.padding(top = 2.dp, start = 4.dp, end = 4.dp),
+            )
+        }
     }
 }
+
+// Same idea as the desktop's own chat.js formatTimestamp() (2-digit
+// hour:minute, locale AM/PM) -- read there, not touched; ported by hand
+// since there's no shared code between the Kotlin and JS sides.
+private val BUBBLE_TIME_FORMATTER = java.time.format.DateTimeFormatter.ofPattern("h:mm a")
+
+private fun formatBubbleTimestamp(epochMs: Long): String =
+    java.time.Instant.ofEpochMilli(epochMs)
+        .atZone(java.time.ZoneId.systemDefault())
+        .format(BUBBLE_TIME_FORMATTER)
 
 /**
  * Minimal briefly-visible scrollbar for a LazyColumn -- Compose has no
