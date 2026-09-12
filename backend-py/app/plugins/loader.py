@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server, tool as sdk_tool
+from claude_agent_sdk import _build_input_schema as _sdk_build_input_schema
 
 from app.logging_setup import log_event
 from app.operations import ToolHandler, build_operations_mcp_server, dispatch
@@ -126,6 +127,30 @@ def wrap_tool(plugin_name: str, plugin_tool: PluginTool) -> SdkMcpTool[Any]:
         return _envelope_to_mcp_response(envelope)
 
     return dispatching_handler
+
+
+def to_openai_tool_def(plugin_tool: PluginTool) -> dict[str, Any]:
+    """The OpenAI/Camerlengo function-calling shape for the SAME PluginTool
+    wrap_tool() above already wraps for the SDK/MCP path -- per explicit
+    instruction (2026-09-12): tool schemas are NOT translated from one
+    format to the other, both are supported natively from the one
+    PluginTool.input_schema a plugin author already wrote. Reuses the SDK's
+    own _build_input_schema() (claude_agent_sdk/__init__.py) -- the exact
+    same function the SDK path uses internally to normalize input_schema
+    (a plain JSON-schema dict, a TypedDict, or a simple {name: type}
+    mapping) into real JSON Schema -- so both paths see byte-identical
+    parameter schemas from one source of truth, never a hand-rolled second
+    implementation that could quietly drift from the SDK's own. Confirmed
+    live: _build_input_schema only ever reads tool_def.input_schema, so it
+    works directly on a PluginTool, no adapter object needed."""
+    return {
+        "type": "function",
+        "function": {
+            "name": plugin_tool.name,
+            "description": plugin_tool.description,
+            "parameters": _sdk_build_input_schema(plugin_tool),
+        },
+    }
 
 
 def discover_plugins() -> list[Plugin]:

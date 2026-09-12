@@ -44,7 +44,7 @@ installed -- relevant for the installer:
 - `Windows/Caroline/` -- WPF shell (C#): tray icon, global hotkey, WebView2
   hosting the chat UI, Settings screen. Spawns/kills the backend sidecar.
 - `backend/` -- Node/TypeScript sidecar. Exposes a loopback WebSocket
-  (`ws://127.0.0.1:8765` by default) that the chat UI talks to. Wraps the
+  (`ws://127.0.0.1:48765` by default) that the chat UI talks to. Wraps the
   Claude Agent SDK's streaming `query()`, with a watchdog that auto-restarts
   a hung or crashed session (replaying the unanswered message) so the app
   never needs a manual restart.

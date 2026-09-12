@@ -18,7 +18,10 @@ namespace Caroline.Native;
 /// </summary>
 public sealed class BackendProcess : IDisposable
 {
-    public const int Port = 8765;
+    // Moved off 8765 (2026-09-13, per explicit instruction) to 48765 -- a
+    // dedicated, unlikely-to-collide port, rather than the low/common 8765
+    // several other unrelated apps also default to.
+    public const int Port = 48765;
 
     private readonly string _backendDir;
     private Process? _process;
@@ -85,6 +88,16 @@ public sealed class BackendProcess : IDisposable
         // edge-tts server subprocess, matching the original's own convention rather than
         // hardcoding sys.executable there.
         psi.Environment["CAROLINE_PYTHON_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "python.exe");
+
+        // Per explicit instruction (2026-09-13): Port above is the ONE place
+        // the port number is defined -- every other C# call site already
+        // reads BackendProcess.Port rather than a literal (see App.xaml.cs/
+        // MainWindow.xaml.cs). The Python side previously had to duplicate
+        // the same literal by hand as its own os.environ default (main.py's
+        // PORT) with nothing keeping the two in sync -- passing it explicitly
+        // here closes that gap; main.py's own literal now only matters as a
+        // fallback for someone running backend-py directly, outside this launcher.
+        psi.Environment["CAROLINE_PORT"] = Port.ToString();
 
         OutputLine?.Invoke($"[BackendProcess] calling Process.Start() (elapsed so far: {sw.Elapsed.TotalSeconds:F1}s)...");
         try

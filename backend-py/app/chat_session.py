@@ -92,7 +92,9 @@ from app.failure_classification import (
     extract_classifier_refusal_category,
 )
 from app.logging_setup import log_event
+from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
+from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction
@@ -571,6 +573,30 @@ class ChatSession:
         self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
 
+        # Small-model primary path (2026-09-12, see small_model_engine.py's
+        # own module docstring) -- an alternative to the SDK path above for
+        # simple, tool-using turns, tried first via
+        # submit_or_try_small_model() when eligible. small_model_active is
+        # the ONLY thing that distinguishes "a turn is running" here from a
+        # normal SDK turn (both set turn_pending True) -- every other piece
+        # of code that branches on which engine is live checks this flag.
+        self.small_model_active: bool = False
+        # The live, in-memory exchange for the turn CURRENTLY running
+        # through the small model -- set by run_small_model_turn's own
+        # on_live_dialogue_update callback. Nothing this path does ever
+        # touches the on-disk Claude Code .jsonl transcript (it never talks
+        # to the CLI at all), so _gather_recent_dialogue_for_narration must
+        # prefer this over its usual disk read while a small-model turn is
+        # active, or the narrator would see nothing happening.
+        self.small_model_live_dialogue: list[str] | None = None
+        # New user_message text that arrived WHILE a small-model turn was
+        # already running -- per explicit instruction, this is live context
+        # fed into the SAME turn (via get_new_user_comments, polled once per
+        # resolve_agentic() iteration), never a fresh submit() and never an
+        # implicit cancellation of the turn in progress.
+        self.small_model_pending_comments: list[str] = []
+        self._small_model_task: asyncio.Task[None] | None = None
+
         # Forced compaction (see FORCED_COMPACTION_HOURLY_MS's own comment).
         # needs_startup_compaction is set True by main.py, once per tab_id
         # per PROCESS lifetime (a module-level set there, mirroring how the
@@ -870,6 +896,147 @@ class ChatSession:
         wire_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         self._push_message(wire_text, attachments, is_voice)
 
+    def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False) -> None:
+        """The real entry point for a REAL user_message (main.py's WS
+        "user_message" handler and POST /api/message both call this now,
+        never submit() directly) -- per explicit design (2026-09-12): try
+        answering through the small/cheap Camerlengo model FIRST when
+        eligible, falling through to the existing, completely untouched
+        Claude Agent SDK path (self.submit()) otherwise, including on the
+        small model's own escalation (self-reported sentinel or the
+        mechanical repeated-tool-call guard, see small_model_engine.py).
+
+        Eligible means: no attachments (the small model never sees vision/
+        document content here -- not a hard technical limit, just out of
+        scope for this first cut), no turn already in flight, and
+        SquirrelWisdom access is available -- login_api.is_logged_in(), the
+        SAME check sw_gate.py's own require_sw_or_prompt already uses at
+        every other SW-gated call site, reused rather than re-derived.
+
+        If a small-model turn is ALREADY running, a new message here is
+        live context for THAT turn, not a fresh submit -- see the
+        small_model_pending_comments docstring above."""
+        attachments = attachments or []
+        if self.small_model_active:
+            log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text))
+            self.small_model_pending_comments.append(text)
+            return
+
+        if attachments or self.turn_pending or not is_logged_in():
+            self.submit(text, attachments, True, is_voice)
+            return
+
+        log_event("engine", "small_model_turn_attempting", tab_id=self.tab_id, text_len=len(text))
+        # Mirrors submit()'s own is_real_user=True bookkeeping exactly (see
+        # its comments for why each field exists) -- this turn is just as
+        # real a user turn as one that goes through the SDK, so every
+        # consumer of this state (narration, the silent-wait nudge, crash
+        # recovery) must see it the same way.
+        self.classifier_refusal_retry_count = 0
+        self.pending_user_text = text
+        self.pending_is_real_user = True
+        self.pending_attachments = []
+        self.turn_pending = True
+        self.last_activity = time.monotonic()
+        self.last_user_activity = time.monotonic()
+        self.last_real_user_turn_at = time.monotonic()
+        self.real_user_turn_answered = False
+        self.silence_nudge_sent_for_turn = False
+        self.last_visible_output_at = time.monotonic()
+        self.last_real_user_question = text
+        refresh_language_in_background(self.last_saved_session_id, self.tab_id)
+        save_pending_turn(self.workspace_dir, self.tab_id, text, [])
+
+        self.small_model_active = True
+        self.small_model_live_dialogue = None
+        self._small_model_task = asyncio.create_task(self._run_small_model_turn(text, is_voice))
+
+    def _end_small_model_turn(self) -> None:
+        self.small_model_active = False
+        self.small_model_live_dialogue = None
+        self.small_model_pending_comments = []
+        self._small_model_task = None
+
+    async def _run_small_model_turn(self, text: str, is_voice: bool) -> None:
+        persona = get_persona(self.workspace_dir)
+        recent_dialogue_lines = _read_recent_dialogue_lines(
+            self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW,
+        )
+        language = current_language_name(self.tab_id)
+
+        def on_live_dialogue_update(lines: list[str]) -> None:
+            self.small_model_live_dialogue = lines
+
+        def get_new_user_comments() -> list[str] | None:
+            if not self.small_model_pending_comments:
+                return None
+            comments = self.small_model_pending_comments
+            self.small_model_pending_comments = []
+            return comments
+
+        try:
+            result = await run_small_model_turn(
+                tab_id=self.tab_id, persona=persona, user_text=text,
+                recent_dialogue_lines=recent_dialogue_lines, language=language,
+                send=self.send, on_live_dialogue_update=on_live_dialogue_update,
+                get_new_user_comments=get_new_user_comments,
+            )
+        except asyncio.CancelledError:
+            # Stop button -- see stop()'s own small_model_active branch.
+            log_event("engine", "small_model_turn_cancelled", tab_id=self.tab_id)
+            clear_pending_turn(self.workspace_dir, self.tab_id)
+            self.turn_pending = False
+            self._end_small_model_turn()
+            raise
+        except Exception as exc:  # noqa: BLE001 -- this path must never wedge the session
+            log_event("engine", "small_model_turn_unexpected_error", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
+            result = {"status": "escalate", "reason": f"unexpected error: {exc}"}
+
+        if result["status"] == "answered":
+            await self._finish_small_model_turn_answered(result["text"], is_voice)
+        else:
+            log_event("engine", "small_model_escalating_to_sdk", tab_id=self.tab_id, reason=result.get("reason"))
+            self._end_small_model_turn()
+            # Falls through to the real, untouched SDK path with the
+            # original text -- nothing was ever shown to the user yet, so
+            # this is indistinguishable to them from a normal first submit.
+            self.submit(text, [], True, is_voice)
+
+    async def _finish_small_model_turn_answered(self, text: str, is_voice: bool) -> None:
+        """Synthesizes the same {assistant} + {result} wire pair a normal
+        SDK turn's completion sends (see wire.py's message_to_wire), so
+        chat.js needs no changes at all to render a small-model answer --
+        it can't tell the difference from a real SDK turn's own reply."""
+        log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
+        assistant_wire = {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "model": "small-model",
+                "stop_reason": "end_turn",
+            },
+            "session_id": self.last_saved_session_id,
+            "parent_tool_use_id": None,
+        }
+        await self.send({"type": "sdk_message", "message": assistant_wire})
+        result_wire = {
+            "type": "result",
+            "subtype": "success",
+            "duration_ms": 0,
+            "is_error": False,
+            "num_turns": 1,
+            "session_id": self.last_saved_session_id,
+            "total_cost_usd": 0.0,
+            "result": text,
+        }
+        await self.send({"type": "sdk_message", "message": result_wire, "isVoice": is_voice})
+        self.real_user_turn_answered = True
+        self.last_visible_output_at = time.monotonic()
+        clear_pending_turn(self.workspace_dir, self.tab_id)
+        self.turn_pending = False
+        self._end_small_model_turn()
+
     def inject_proactive(self, text: str, is_voice: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
@@ -895,7 +1062,14 @@ class ChatSession:
             return
         log_event("engine", "user_stop", tab_id=self.tab_id)
         self.user_stop_requested = True
-        if self.client:
+        if self.small_model_active:
+            # No SDK client/query() is involved in this path at all -- the
+            # only thing to stop is the background task running
+            # resolve_agentic() (in a worker thread) and, via REGISTRY
+            # below, any tool call it already dispatched.
+            if self._small_model_task is not None:
+                self._small_model_task.cancel()
+        elif self.client:
             asyncio.create_task(self._safe_interrupt())
         # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
         # only stops the model's own generation stream. A tool call that
@@ -1236,7 +1410,18 @@ class ChatSession:
         shared with refresh_language_in_background (see that module-level
         function's own docstring for why this used to be two separately-
         drifting readers, and why the window widened from 8/5 to
-        RECENT_DIALOGUE_WINDOW)."""
+        RECENT_DIALOGUE_WINDOW).
+
+        Per explicit instruction (2026-09-12): the narrator must work in
+        BOTH engines. A small-model turn (small_model_engine.py) never
+        talks to the CLI at all, so nothing it does ever reaches the
+        on-disk transcript _read_recent_dialogue_lines reads below --
+        while one is active, prefer its own live in-memory exchange
+        instead (small_model_live_dialogue, kept current by
+        on_live_dialogue_update as the turn progresses)."""
+        if self.small_model_active and self.small_model_live_dialogue:
+            return "\n".join(self.small_model_live_dialogue[-limit:])
+
         lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, limit)
 
         # Bug fix (2026-09-10): confirmed live -- the disk-persisted

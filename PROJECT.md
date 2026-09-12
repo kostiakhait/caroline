@@ -14,7 +14,7 @@ describes what's actually implemented, not the roadmap.
   WebView2-hosted chat UI (`wwwroot/chat.html`/`chat.js`), a Settings panel, and several
   secondary windows (`DocumentViewerWindow`, `AppBrowserWindow`, `VisualModeWindow`,
   `SplashWindow`). Spawns and supervises the backend sidecar process (`BackendProcess.cs`).
-- **`backend/`** — Node/TypeScript sidecar. Hosts a loopback WebSocket (`ws://127.0.0.1:8765`)
+- **`backend/`** — Node/TypeScript sidecar. Hosts a loopback WebSocket (`ws://127.0.0.1:48765`)
   the chat UI talks to, and wraps the Claude Agent SDK's streaming `query()` per chat tab.
 - **`backend/mcp-servers/`** — the default MCP tool roster, built from this repo's
   `backend/mcp-servers-src/*` sources by `scripts/bundle-mcp-servers.mjs` (esbuild-bundled into

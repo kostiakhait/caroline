@@ -42,7 +42,7 @@ from app.subscription_mode import create_topup_checkout_url, get_own_anthropic_a
 from app.visual_mode import is_visual_mode_enabled, resolve_visual_model, set_visual_mode_enabled
 from app.workspace_dir import WORKSPACE_DIR
 
-PORT = int(os.environ.get("CAROLINE_PORT", "8765"))
+PORT = int(os.environ.get("CAROLINE_PORT", "48765"))
 PRIMARY_TAB_ID = "1"
 # Headless Ratatosk owner-DM channel (see app/ratatosk_channel.py) -- a tab
 # with no WebView2/WS connection at all, created lazily (only once there's
@@ -223,7 +223,7 @@ async def post_message(body: MessageBody, tab: str = PRIMARY_TAB_ID) -> JSONResp
             {"ok": False, "error": f'No active session for tab "{tab}" -- open that tab in the Caroline window at least once first.'},
             status_code=503,
         )
-    session.submit(body.text, body.attachments)
+    session.submit_or_try_small_model(body.text, body.attachments)
     return JSONResponse({"ok": True}, status_code=202)
 
 
@@ -850,7 +850,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             msg_type = data.get("type")
             log_event("ws", "message_received", tab_id=tab_id, msg_type=msg_type)
             if msg_type == "user_message":
-                session.submit(data.get("text", ""), data.get("attachments") or [], True, bool(data.get("voice")))
+                session.submit_or_try_small_model(data.get("text", ""), data.get("attachments") or [], bool(data.get("voice")))
             elif msg_type == "interrupt":
                 session.stop()
             elif msg_type == "control_request":

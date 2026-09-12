@@ -67,7 +67,7 @@ const workspaceDir = await ensureWorkspace();
 const BACKUP_NUDGE = "Time for your periodic memory backup: if Notes is available, save your current persona/reminders/anything worth keeping into the \"Caroline:Vault\" folder now (see your system instructions). If Notes isn't available, do nothing.";
 ensureRecurringBackup(workspaceDir, BACKUP_NUDGE);
 
-const PORT = Number(process.env.CAROLINE_PORT ?? 8765);
+const PORT = Number(process.env.CAROLINE_PORT ?? 48765);
 
 // How long we'll wait, with a turn in flight and no new SDK message at all,
 // before deciding the session (and whatever MCP server it's waiting on) has

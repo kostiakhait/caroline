@@ -111,7 +111,7 @@ Don't just trust "Deploy complete" / exit code 0. After installing:
 - Check `%LOCALAPPDATA%\Temp\CarolineInstaller.log` for a clean run ending in
   `RunAsync completed normally`, with no `ExtractWithRetryAsync` retries.
 - Check `%LOCALAPPDATA%\Caroline\caroline.log`'s tail for
-  `[backend] [caroline] backend listening on ws://127.0.0.1:8765` shortly
+  `[backend] [caroline] backend listening on ws://127.0.0.1:48765` shortly
   after `=== Caroline starting ===` -- if instead you see a Node stack trace
   (`ERR_MODULE_NOT_FOUND`, `SyntaxError`, etc.) right after
   `[BackendProcess] Process.Start() returned`, the backend crashed on launch
