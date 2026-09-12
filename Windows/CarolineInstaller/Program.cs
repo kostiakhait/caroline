@@ -58,6 +58,13 @@ internal static class Program
             catch (Exception ex)
             {
                 Logger.Log($"RunAsync failed: {ex}");
+                // Per explicit instruction (2026-09-12): every failure shows
+                // a CODE, not just a bare message -- see InstallerException's
+                // own doc comment for why. Anything that reaches here without
+                // already being one (a bug in a step nobody wrapped, or a
+                // framework-level failure before any step started) still
+                // gets a code rather than showing a bare, code-less message.
+                var coded = ex as InstallerException ?? new InstallerException(ErrorCodes.Unexpected, ex.Message, ex);
                 // Without an owner, this can render BEHIND the progress
                 // window -- confirmed live: that window is Topmost="True",
                 // and an ownerless MessageBox doesn't automatically stack
@@ -65,7 +72,7 @@ internal static class Program
                 // invisible, hidden under the still-showing progress banner.
                 // app.MainWindow is null in --silent-update mode (no window
                 // ever shown there), which is fine -- nothing to hide behind.
-                MessageBox.Show(app.MainWindow, $"Setup failed: {ex.Message}\n\nDetails: {Logger.LogPathForDisplay}", "Caroline Setup",
+                MessageBox.Show(app.MainWindow, $"Setup failed: {coded.Formatted}\n\nDetails: {Logger.LogPathForDisplay}", "Caroline Setup",
                     MessageBoxButton.OK, MessageBoxImage.Error);
                 exitCode = 1;
             }
@@ -130,8 +137,11 @@ internal static class Program
         // "CarolineInstaller" still running at this point is genuinely stale/orphaned,
         // not a legitimate concurrent run that just hasn't reached the mutex yet.
         window.SetStatus("Removing previous installation…");
-        await Task.Run(Autostart.StopOtherInstallerInstances, ct);
-        await Task.Run(Autostart.RemovePreInstallerCopies, ct);
+        await WithStepAsync(ErrorCodes.CleanupPreviousInstall, "Removing previous installation", async () =>
+        {
+            await Task.Run(Autostart.StopOtherInstallerInstances, ct);
+            await Task.Run(Autostart.RemovePreInstallerCopies, ct);
+        });
 
         AppPaths.EnsureRootExists();
 
@@ -140,10 +150,10 @@ internal static class Program
         // so order between Node/Python doesn't matter beyond that.
         if (!NodeInstaller.IsInstalled())
         {
-            await NodeInstaller.InstallAsync(downloader,
+            await WithStepAsync(ErrorCodes.NodeInstall, "Installing Node.js", () => NodeInstaller.InstallAsync(downloader,
                 s => window.SetStatus(s),
                 p => window.SetDownloadProgress("Downloading Node.js…", p),
-                ct);
+                ct));
         }
         else
         {
@@ -155,17 +165,17 @@ internal static class Program
         // existing install that already has the Python runtime but predates a newly
         // added package still gets that package installed here instead of the whole
         // step being skipped just because python.exe already exists.
-        await PythonInstaller.InstallAsync(downloader,
+        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.InstallAsync(downloader,
             s => window.SetStatus(s),
             p => window.SetDownloadProgress("Downloading Python…", p),
-            ct);
+            ct));
 
         if (!GitBashInstaller.IsInstalled())
         {
-            await GitBashInstaller.InstallAsync(downloader,
+            await WithStepAsync(ErrorCodes.GitBashInstall, "Installing Git Bash", () => GitBashInstaller.InstallAsync(downloader,
                 s => window.SetStatus(s),
                 p => window.SetDownloadProgress("Downloading Git Bash…", p),
-                ct);
+                ct));
         }
         else
         {
@@ -174,24 +184,34 @@ internal static class Program
 
         if (!FfmpegInstaller.IsInstalled())
         {
-            await FfmpegInstaller.InstallAsync(downloader,
+            await WithStepAsync(ErrorCodes.FfmpegInstall, "Installing ffmpeg", () => FfmpegInstaller.InstallAsync(downloader,
                 s => window.SetStatus(s),
                 p => window.SetDownloadProgress("Downloading ffmpeg…", p),
-                ct);
+                ct));
         }
         else
         {
             Logger.Log("ffmpeg already present, skipping");
         }
 
+        // Caroline's own window is a WebView2 host -- without the Runtime present,
+        // the app fails to show a window (or crashes) on first launch, AFTER this
+        // installer would otherwise have already reported success. See
+        // WebView2Installer's own doc comment.
+        await WithStepAsync(ErrorCodes.WebView2Install, "Installing the WebView2 Runtime",
+            () => WebView2Installer.InstallAsync(downloader, s => window.SetStatus(s), ct));
+
         // Step 2: the Caroline app itself.
         window.SetStatus("Checking for the latest version…");
-        var info = await DownloadsInfo.FetchAsync(http, ct);
-        if (!info.Available)
+        var info = await WithStepAsync(ErrorCodes.VersionCheck, "Checking for the latest version", async () =>
         {
-            throw new InvalidOperationException(
-                "Caroline isn't currently available for download. Please try again later.");
-        }
+            var result = await DownloadsInfo.FetchAsync(http, ct);
+            if (!result.Available)
+            {
+                throw new InvalidOperationException("Caroline isn't currently available for download. Please try again later.");
+            }
+            return result;
+        });
         window.SetVersionInfo(info.Version);
         Logger.Log($"Target version: {info.Version}, sha256={info.Sha256Hex}");
 
@@ -209,44 +229,117 @@ internal static class Program
         else
         {
             window.SetStatus("Downloading Caroline…");
-            await downloader.DownloadAsync(DownloadsInfo.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
-                progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct);
+            await WithStepAsync(ErrorCodes.Download, "Downloading Caroline", () => downloader.DownloadAsync(
+                DownloadsInfo.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
+                progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct));
 
             Logger.Log("Stopping any running instance before extraction");
             await Autostart.StopRunningClientAsync();
-            await ExtractWithRetryAsync(window, info.Sha256Hex, ct);
+            await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, info.Sha256Hex, ct));
         }
 
         // Step 3: Chromium, now that the app's own copy of playwright-core exists on disk.
         window.SetStatus("Setting up browser automation…");
-        await PlaywrightInstaller.InstallAsync(s => window.SetStatus(s), ct);
+        await WithStepAsync(ErrorCodes.PlaywrightInstall, "Setting up browser automation",
+            () => PlaywrightInstaller.InstallAsync(s => window.SetStatus(s), ct));
 
         // Step 4: Visual Mode's talking-head models -- tens of GB, idempotent (see
         // ModelsInstaller's own doc comment), best-effort (a model that isn't deployed
         // yet is skipped, not a fatal error -- see ModelsInfo.FetchAsync's 404 handling).
-        await ModelsInstaller.InstallAsync(downloader, http,
+        await WithStepAsync(ErrorCodes.ModelsInstall, "Downloading talking-head models", () => ModelsInstaller.InstallAsync(downloader, http,
             s => window.SetStatus(s),
             p => window.SetDownloadProgress("Downloading talking-head models…", p),
-            ct);
+            ct));
 
         window.SetStatus("Creating shortcut…");
-        await Task.Run(ShortcutManager.CreateDesktopShortcut, ct);
+        await WithStepAsync(ErrorCodes.ShortcutOrAutostart, "Creating the desktop shortcut", () => Task.Run(ShortcutManager.CreateDesktopShortcut, ct));
 
         window.SetStatus("Registering autostart…");
-        await Task.Run(Autostart.Register, ct);
+        await WithStepAsync(ErrorCodes.ShortcutOrAutostart, "Registering autostart", () => Task.Run(Autostart.Register, ct));
 
         window.SetStatus("Starting Caroline…");
-        Logger.Log($"Launching {AppPaths.ClientExe}");
-        Process.Start(new ProcessStartInfo(AppPaths.ClientExe)
+        var launched = await WithStepAsync(ErrorCodes.Launch, "Starting Caroline", () =>
         {
-            WorkingDirectory = AppPaths.AppDir,
-            UseShellExecute = true,
+            Logger.Log($"Launching {AppPaths.ClientExe}");
+            var proc = Process.Start(new ProcessStartInfo(AppPaths.ClientExe)
+            {
+                WorkingDirectory = AppPaths.AppDir,
+                UseShellExecute = true,
+            });
+            if (proc is null)
+            {
+                throw new InvalidOperationException($"Process.Start returned null for {AppPaths.ClientExe}.");
+            }
+            return Task.FromResult(proc);
         });
+
+        // Per explicit instruction (2026-09-12): confirm the app actually stayed up,
+        // rather than unconditionally reporting success the instant it was merely
+        // requested to start -- confirmed as a real, currently-unmonitored gap: a
+        // missing WebView2 Runtime, a corrupted extraction, or an AV false-positive
+        // quarantining a just-extracted DLL could all make Caroline.exe exit
+        // immediately, and this installer would have no way to know unless it
+        // actually checks. UseShellExecute=true above (needed so a per-user, non-
+        // elevated launch behaves like a normal user double-click) means `launched`
+        // isn't necessarily the real Caroline.exe process handle on every Windows
+        // version -- Exited/HasExited can throw or lie in that case, so this check
+        // is best-effort, not a hard guarantee, and swallows its own errors rather
+        // than turning "couldn't verify" into a false failure report.
+        try
+        {
+            await Task.Delay(2500, CancellationToken.None);
+            if (launched.HasExited && launched.ExitCode != 0)
+            {
+                throw new InstallerException(ErrorCodes.LaunchCrashed,
+                    $"Caroline started but exited immediately (exit code {launched.ExitCode}). It may be blocked by "
+                    + "antivirus, missing a dependency, or the install may be corrupted -- try running Setup again.");
+            }
+        }
+        catch (InstallerException) { throw; }
+        catch (Exception ex)
+        {
+            Logger.Log($"Post-launch liveness check inconclusive (ignored, not treated as failure): {ex.Message}");
+        }
 
         // Brief pause so the user sees "Starting Caroline…" rather than the window vanishing
         // the instant the child process is merely requested to start.
         await Task.Delay(800, CancellationToken.None);
         window.Close();
+    }
+
+    /// <summary>
+    /// Runs one setup step, tagging any exception it throws with `code` --
+    /// see InstallerException's own doc comment. An exception that's
+    /// ALREADY an InstallerException (thrown deliberately by the step
+    /// itself, e.g. WebView2Installer's own "bootstrapper exit code"
+    /// check) passes through unchanged rather than getting double-wrapped.
+    /// </summary>
+    private static async Task WithStepAsync(string code, string stepDescription, Func<Task> step)
+    {
+        try
+        {
+            await step();
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (InstallerException) { throw; }
+        catch (Exception ex)
+        {
+            throw new InstallerException(code, $"{stepDescription}: {ex.Message}", ex);
+        }
+    }
+
+    private static async Task<T> WithStepAsync<T>(string code, string stepDescription, Func<Task<T>> step)
+    {
+        try
+        {
+            return await step();
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (InstallerException) { throw; }
+        catch (Exception ex)
+        {
+            throw new InstallerException(code, $"{stepDescription}: {ex.Message}", ex);
+        }
     }
 
     /// <summary>
