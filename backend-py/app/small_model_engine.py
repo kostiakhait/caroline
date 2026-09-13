@@ -96,6 +96,7 @@ from app.policies import (
     prefer_embedded_browser_instruction,
     proactive_context_recovery_instruction,
     self_sufficiency_instruction,
+    system_temp_dir_instruction,
     task_completion_memory_instruction,
     timestamp_awareness_instruction,
     vault_security_instruction,
@@ -124,6 +125,7 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     prefer_embedded_browser_instruction,
     learn_from_mistakes_instruction,
     self_sufficiency_instruction,
+    system_temp_dir_instruction,
 )
 
 # Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__

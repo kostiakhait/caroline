@@ -2359,7 +2359,38 @@ class ChatSession:
                                 if not self.real_user_turn_answered:
                                     self.real_user_turn_answered = True
                                 if wire.get("type") == "assistant":
-                                    self.last_visible_output_at = time.monotonic()
+                                    # Bug fix (2026-09-13), confirmed live from the
+                                    # real session transcript (tab 1, "Основной
+                                    # диалог", 2026-09-13 ~14:04-14:08 UTC): dozens
+                                    # of consecutive assistant wire messages during
+                                    # a long multi-mailbox tool-calling stretch were
+                                    # tool_use-ONLY (no text block) -- chat.js's own
+                                    # hasToolUse check (mirrored server-side in
+                                    # history.py's _extract_entries_from_jsonl)
+                                    # suppresses exactly these as pre-tool narration
+                                    # the user never sees. This line used to bump
+                                    # last_visible_output_at on EVERY one of them
+                                    # regardless, repeatedly re-arming
+                                    # _check_progress_narration()'s 60s cooldown
+                                    # without the user ever actually seeing anything
+                                    # new -- the confirmed cause of a 5+ minute
+                                    # narrator silence with real work still running.
+                                    # Only a message carrying an actual visible text
+                                    # block should count as "the user just saw
+                                    # something new".
+                                    content_blocks = wire.get("message", {}).get("content") or []
+                                    has_visible_text = any(
+                                        isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                                        for b in content_blocks
+                                    )
+                                    has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content_blocks)
+                                    log_event(
+                                        "engine", "assistant_wire_sent", tab_id=self.tab_id,
+                                        has_visible_text=has_visible_text, has_tool_use=has_tool_use,
+                                        last_visible_output_updated=has_visible_text,
+                                    )
+                                    if has_visible_text:
+                                        self.last_visible_output_at = time.monotonic()
 
                     if isinstance(message, ResultMessage):
                         if result_is_fake:

@@ -1137,15 +1137,34 @@
   // are a client-only, last-resort safety net for exactly that: independent of WHY a
   // notification got lost, if nothing has moved for this long while still marked busy, just
   // recover locally instead of staying stuck indefinitely.
+  //
+  // Bug fix (2026-09-13), confirmed live: a single slow tool call (no
+  // hard bound on the backend's own IMAP connect, separately fixed) with
+  // no OTHER assistant-type wire traffic in between meant no
+  // touchTurnActivity() call for the whole stretch -- this fired and
+  // silently killed the "working" lamp/blink and showed the "gave up
+  // waiting" banner while the backend was still genuinely, correctly
+  // working the whole time. 180s was too aggressive given real multi-
+  // minute tool calls are routine in this system; raised well past that.
+  // This is still only a last-resort net for a GENUINELY lost
+  // notification (WS message dropped, backend process actually died
+  // silently) -- the backend's own hang-detection (chat_session.py's
+  // _check_hang) is the primary, better-informed mechanism and normally
+  // recovers or reports first.
   let lastTurnActivityAt = null;
-  const STUCK_TURN_THRESHOLD_MS = 180_000;
+  const STUCK_TURN_THRESHOLD_MS = 600_000;
 
   function touchTurnActivity() {
     lastTurnActivityAt = Date.now();
   }
 
   function recoverFromStuckTurn() {
-    console.error(`chat.js: no turn activity for >${STUCK_TURN_THRESHOLD_MS}ms while busy -- self-healing stuck UI state`);
+    // Bug fix (2026-09-13): this used to be a bare console.error(), which
+    // (unlike clog()) never reaches caroline.log -- this exact event was
+    // the one most worth seeing on the backend side (it means the CLIENT
+    // overrode a status the backend never actually changed), and was
+    // invisible every time it fired.
+    clog(`no turn activity for >${STUCK_TURN_THRESHOLD_MS}ms while busy -- self-healing stuck UI state`);
     turnQueue = [];
     // Force back to ready locally, distrusting whatever the backend last
     // reported -- the whole point of this self-heal is that no further
