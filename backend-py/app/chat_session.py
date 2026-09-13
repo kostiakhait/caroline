@@ -1129,11 +1129,16 @@ class ChatSession:
         clear_pending_turn(self.workspace_dir, self.tab_id)
         self.turn_pending = False
         self._end_small_model_turn()
-        # Every small-model turn is a real user turn by construction (see
-        # submit_or_try_small_model's own docstring -- an internal/proactive
-        # nudge always goes through self.submit() to the full SDK, never
-        # here), so no is_real_user gate needed before this sanity check.
-        self._fire_post_turn_completion_check()
+        # Per explicit instruction (2026-09-13): "Работа малой модели в
+        # отсутствие эскалации не должна требовать Claude SDK вообще" --
+        # this used to call self._fire_post_turn_completion_check() here,
+        # which unconditionally goes through self.submit() to the full SDK.
+        # That's wrong for a small-model-answered turn specifically: the
+        # ONLY things allowed to reach the SDK are the two existing
+        # escalation paths (the model's own sentinel, the mechanical
+        # repeated-call guard) -- never a routine completion sanity check.
+        # That check now lives entirely inside run_small_model_turn() itself
+        # (small_model_engine.py), using Camerlengo/OpenRouter models only.
 
     def inject_proactive(self, text: str, is_voice: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
