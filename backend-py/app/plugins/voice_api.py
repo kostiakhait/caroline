@@ -7,6 +7,7 @@ app_browser_plugin.py's app_browser_describe.
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Any
 
@@ -133,6 +134,11 @@ _NARRATION_GARBAGE_PATTERNS = [
     re.compile(r"\bavailable catalog\b", re.IGNORECASE),
     re.compile(r"\berrcode\b", re.IGNORECASE),
     re.compile(r"^\s*[{\[]"),  # raw JSON/array leaking through
+    # Bug fix (2026-09-13), confirmed live: a declarative "there's nothing
+    # to say" meta-statement, distinct from the first-person refusals above
+    # -- just as much a non-answer, still slipped through unfiltered.
+    re.compile(r"\bno (?:specific )?(?:remark|response|sentence|instructions?)\b.{0,40}\b(?:found|derived|generated|drafted|identified|could be)\b", re.IGNORECASE),
+    re.compile(r"\bcould not be (?:drafted|generated|derived|produced)\b", re.IGNORECASE),
 ]
 _NARRATION_MAX_CHARS = 400
 # Han / Hiragana / Katakana / Hangul. Progress narration for this product
@@ -147,6 +153,92 @@ def _looks_like_narration_garbage(text: str, language: str = "") -> bool:
     if _CJK_RE.search(text) and not re.search(r"chin|japan|korea|mandarin|中文", language, re.IGNORECASE):
         return True
     return any(p.search(text) for p in _NARRATION_GARBAGE_PATTERNS)
+
+
+def _normalized_overlap(text: str, other: str) -> bool:
+    """Whitespace-collapsed, case-folded containment check either
+    direction -- a near-verbatim echo, not requiring an exact match
+    (paraphrases that drop/add a clause on either side still count)."""
+    norm_text = re.sub(r"\s+", " ", text).strip().lower()
+    norm_other = re.sub(r"\s+", " ", other).strip().lower()
+    if len(norm_text) < 15 or len(norm_other) < 15:
+        return False
+    return norm_text in norm_other or norm_other in norm_text
+
+
+def _is_echo_of_dialogue(text: str, recent_dialogue: str) -> bool:
+    """A genuine narration REACTS to the conversation -- it doesn't quote it
+    back. Confirmed live (2026-09-13): even with the <narration>-tag
+    contract in place, the SMALL model sometimes just repeats the user's
+    own last line, or Caroline's own last line, near-verbatim instead of
+    producing a new reactive remark -- the mechanical garbage filter above
+    has no way to catch this (the text itself is perfectly well-formed)."""
+    return any(_normalized_overlap(text, line.split(":", 1)[-1]) for line in recent_dialogue.splitlines())
+
+
+# The prompt's own bad/good/tag-format example sentences (built into the
+# prompt string below via these same constants) -- kept as named constants
+# specifically so this check can never drift out of sync with what the
+# prompt actually says. Bug fix (2026-09-13), confirmed live: giving the
+# model ANY concrete example sentence to illustrate the <narration> tag
+# format risks it being copied back verbatim (confirmed live twice: once
+# with a bare "your one sentence goes here" placeholder, once with the
+# real GOOD-example sentence reused for a completely unrelated
+# conversation about mailboxes) when the model is unsure/lazy rather than
+# genuinely reacting to the actual dialogue -- catch that the same way as
+# a dialogue echo, not by trying to word the example so carefully it can
+# never be copied (that arms race isn't worth it for a cosmetic feature).
+_NARRATION_EXAMPLE_BAD = "I'll create a GitLab repo and send you the link."
+_NARRATION_EXAMPLE_GOOD = "Setting up a fresh repo for this is usually the fiddly part."
+_NARRATION_EXAMPLE_TAG = "Movers always lowball the box count, every single time."
+
+
+def _is_echo_of_prompt_example(text: str) -> bool:
+    return any(
+        _normalized_overlap(text, example)
+        for example in (_NARRATION_EXAMPLE_BAD, _NARRATION_EXAMPLE_GOOD, _NARRATION_EXAMPLE_TAG)
+    )
+
+
+# Bug fix (2026-09-13, confirmed live via caroline.log): a bare "reply with
+# ONLY X, no preamble" instruction buried at the end of a long paragraph of
+# caveats wasn't a strong enough contract for the cheap SMALL model --
+# confirmed live it regularly echoed back a paraphrase of its OWN
+# instructions ("(If there are no \"User:\" lines above, the default
+# response is in Russian.)"), or wrapped the real sentence in JSON
+# (`{"assistant": "...", "note": "..."}`) or backticks/a "Result:" prefix.
+# The old garbage filter only caught JSON that started at position 0
+# (`^\s*[{\[]`) -- anything wrapped in backticks, a leading word, or valid-
+# but-differently-shaped JSON sailed straight through to the user as a real
+# chat bubble. generate_progress_comment() now asks for the answer inside
+# an explicit <narration> tag (a stronger, more parseable contract for a
+# small model than prose alone) and this function extracts ONLY that tag's
+# content -- falling back to unwrapping a plain {"result": "..."}-shaped
+# JSON object (for a response that ignored the tag instruction but still
+# came back structured), and finally to the raw text as-is for a model
+# that just answered in plain prose. Never guesses past a JSON shape it
+# doesn't recognize -- returns "" rather than passing raw JSON through.
+_NARRATION_TAG_RE = re.compile(r"<narration>(.*?)</narration>", re.IGNORECASE | re.DOTALL)
+_NARRATION_JSON_TEXT_KEYS = ("narration", "result", "text", "message", "assistant", "response", "comment", "answer")
+
+
+def _extract_narration_text(raw: str) -> str:
+    tag_match = _NARRATION_TAG_RE.search(raw)
+    if tag_match:
+        return tag_match.group(1).strip()
+    stripped = raw.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return ""
+        if isinstance(parsed, dict):
+            for key in _NARRATION_JSON_TEXT_KEYS:
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+    return stripped
 
 
 async def generate_progress_comment(recent_dialogue: str, language: str, session: str | None = None) -> str | None:
@@ -193,22 +285,26 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
         "how long anything is taking. Instead, react like someone genuinely engaged with the actual topic "
         "would: add a real, specific thought connected to what's being discussed -- a relevant detail, a "
         "follow-up angle, a small observation -- not a generic placeholder that could fit any conversation.\n\n"
-        "Bug fix (2026-09-10), read carefully -- confirmed live this remark once said \"I'll create a GitLab "
-        "repo and send you the link\" while the real, actual work happening at that exact moment was something "
-        "else entirely (an unrelated code search), and the user took it as a real promise that then never got "
-        "fulfilled. You are NOT the real assistant and have no idea what she is actually doing right now -- "
-        "NEVER commit to a new action on her behalf (no \"I'll do X\", \"I will send/create/check Y\", no new "
-        "promises or plans of any kind, however small). Only react to what's ALREADY in the conversation below "
-        "-- an observation, a reaction, a connection to something already said -- never something forward-"
-        "looking that could turn out to be false.\n\n"
+        "You have no idea what the real assistant is actually doing right now, so NEVER commit to a new "
+        "action on her behalf -- no \"I'll do X\", \"I will send/create/check Y\", no new promises or plans "
+        "of any kind, however small. Only react to what's ALREADY in the conversation below -- an "
+        "observation, a reaction, a connection to something already said -- never something forward-looking "
+        "that could turn out to be false.\n"
+        f"  Bad (a new promise): \"{_NARRATION_EXAMPLE_BAD}\"\n"
+        f"  Good (same situation, no promise): \"{_NARRATION_EXAMPLE_GOOD}\"\n\n"
         f"Here is the real recent conversation between her and the user (oldest first):\n---\n{recent_dialogue}\n---\n\n"
-        "Write ONE short, natural sentence (two at most), in first person, speaking directly to the user. "
         "Reply in whatever language the USER's OWN lines (marked \"User:\") above are written in -- ignore "
         "what language Caroline's own lines happen to use, even if they dominate the text (e.g. she may be "
         "quoting or analyzing English-language technical/legal material mid-conversation while the user "
         "themselves is writing in a different language entirely -- go by the user's words, not the topic's). "
-        f"Only if there are no \"User:\" lines at all above, default to {language}. Reply with ONLY that "
-        "sentence, nothing else -- no quotes, no preamble."
+        f"Only if there are no \"User:\" lines at all above, default to {language}.\n\n"
+        "Output format, follow exactly -- a program parses this, not a person: write your one sentence (two "
+        "at most) inside a <narration> tag, with NOTHING else anywhere in your reply -- no JSON, no markdown, "
+        "no code fences, no quotes around it, no explanation, and never repeat or paraphrase these "
+        "instructions themselves. There is always SOMETHING to react to below -- even a single prior line "
+        "is enough; never reply that you can't produce one.\n"
+        "Example, for an unrelated hypothetical conversation about a house move -- copy the TAG, not the "
+        f"words: <narration>{_NARRATION_EXAMPLE_TAG}</narration>"
     )
     # Bug fix (2026-09-11), per explicit instruction: reverted to "SMALL"
     # (the openai/gpt5-nano bypass above is no longer needed -- see this
@@ -224,11 +320,18 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
         log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))
         return None
-    text = data["result"].strip()
+    text = _extract_narration_text(data["result"])
     if not text:
+        log_event("plugin:voice", "generate_progress_comment_unextractable", raw=data["result"][:300])
         return None
     if _looks_like_narration_garbage(text, language):
         log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300])
+        return None
+    if _is_echo_of_dialogue(text, recent_dialogue):
+        log_event("plugin:voice", "generate_progress_comment_rejected_echo", text=text[:300])
+        return None
+    if _is_echo_of_prompt_example(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_example_echo", text=text[:300])
         return None
     log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=text)
     return text
