@@ -1156,11 +1156,16 @@ class ChatSession:
         clear_pending_turn(self.workspace_dir, self.tab_id)
         self.turn_pending = False
         self._end_small_model_turn()
-        # Every small-model turn is a real user turn by construction (see
-        # submit_or_try_small_model's own docstring -- an internal/proactive
-        # nudge always goes through self.submit() to the full SDK, never
-        # here), so no is_real_user gate needed before this sanity check.
-        self._fire_post_turn_completion_check()
+        # Per explicit instruction (2026-09-13): "Работа малой модели в
+        # отсутствие эскалации не должна требовать Claude SDK вообще" --
+        # this used to call self._fire_post_turn_completion_check() here,
+        # which unconditionally goes through self.submit() to the full SDK.
+        # That's wrong for a small-model-answered turn specifically: the
+        # ONLY things allowed to reach the SDK are the two existing
+        # escalation paths (the model's own sentinel, the mechanical
+        # repeated-call guard) -- never a routine completion sanity check.
+        # That check now lives entirely inside run_small_model_turn() itself
+        # (small_model_engine.py), using Camerlengo/OpenRouter models only.
 
     def inject_proactive(self, text: str, is_voice: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
@@ -2428,7 +2433,38 @@ class ChatSession:
                                 if not self.real_user_turn_answered:
                                     self.real_user_turn_answered = True
                                 if wire.get("type") == "assistant":
-                                    self.last_visible_output_at = time.monotonic()
+                                    # Bug fix (2026-09-13), confirmed live from the
+                                    # real session transcript (tab 1, "Основной
+                                    # диалог", 2026-09-13 ~14:04-14:08 UTC): dozens
+                                    # of consecutive assistant wire messages during
+                                    # a long multi-mailbox tool-calling stretch were
+                                    # tool_use-ONLY (no text block) -- chat.js's own
+                                    # hasToolUse check (mirrored server-side in
+                                    # history.py's _extract_entries_from_jsonl)
+                                    # suppresses exactly these as pre-tool narration
+                                    # the user never sees. This line used to bump
+                                    # last_visible_output_at on EVERY one of them
+                                    # regardless, repeatedly re-arming
+                                    # _check_progress_narration()'s 60s cooldown
+                                    # without the user ever actually seeing anything
+                                    # new -- the confirmed cause of a 5+ minute
+                                    # narrator silence with real work still running.
+                                    # Only a message carrying an actual visible text
+                                    # block should count as "the user just saw
+                                    # something new".
+                                    content_blocks = wire.get("message", {}).get("content") or []
+                                    has_visible_text = any(
+                                        isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                                        for b in content_blocks
+                                    )
+                                    has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content_blocks)
+                                    log_event(
+                                        "engine", "assistant_wire_sent", tab_id=self.tab_id,
+                                        has_visible_text=has_visible_text, has_tool_use=has_tool_use,
+                                        last_visible_output_updated=has_visible_text,
+                                    )
+                                    if has_visible_text:
+                                        self.last_visible_output_at = time.monotonic()
 
                     if isinstance(message, ResultMessage):
                         if result_is_fake:

@@ -202,12 +202,16 @@ def no_internal_mechanics_to_user_instruction() -> str:
     return (
         "Never expose your own internal machinery to the user in conversation. That means: no file paths, "
         "no session/turn/context internals, no mention of dehydration, compaction, archives, dumps, resets, "
-        "restarts, stub notes, continuity files, your workspace layout, your tools' names, your skills/lessons "
-        "files, or 'standing instructions/lessons' you're following. Do the work behind the scenes -- read "
-        "whatever files you need, recover whatever context you need -- and then just talk to the user about "
-        "the actual subject, the way a capable person would. If you had to go dig something up, don't narrate "
-        "the digging; just present what you found. The one exception is if the user explicitly asks how you "
-        "work internally -- then answer plainly. Otherwise your own construction is simply not a topic."
+        "restarts, retries, or any other internal operation, stub notes, continuity files, your workspace "
+        "layout, your tools' names, your skills/lessons files, or 'standing instructions/lessons' you're "
+        "following. Do the work behind the scenes -- read whatever files you need, recover whatever context "
+        "you need -- and then just talk to the user about the actual subject, the way a capable person would. "
+        "If you had to go dig something up, don't narrate the digging; just present what you found. You are "
+        "fully aware of your own internal restarts/recoveries/other operations and may freely use that "
+        "awareness for your own reasoning (e.g. realizing you were mid-task when one happened, so you can "
+        "resume cleanly) -- using the information internally is fine, reporting it to the user is not. The "
+        "one exception is if the user explicitly asks how you work internally -- then answer plainly. "
+        "Otherwise your own construction is simply not a topic."
     )
 
 
@@ -345,6 +349,23 @@ def self_sufficiency_instruction() -> str:
     )
 
 
+def system_temp_dir_instruction() -> str:
+    """Per explicit instruction (2026-09-13): Caroline's own scratch/helper
+    files and directories must all live under the system temp directory,
+    never scattered elsewhere (the workspace root, a project checkout, the
+    user's own folders) where they'd accumulate unnoticed and never get
+    cleaned up by the OS's own temp-cleanup conventions."""
+    return (
+        "For any temporary or helper file/directory you create yourself (a scratch script, an intermediate "
+        "output, a throwaway working copy) -- ALWAYS use the system temp directory (Windows: the real path "
+        "behind %TEMP%/%TMP%, not a literal string with those names in it) and NEVER create temporary or "
+        "helper files/directories anywhere else -- not the workspace root, not a project folder, not the "
+        "user's own directories. Never invent your own separate 'temp' or 'scratch' folder elsewhere either -- "
+        "the system temp directory is the one place for this, so it's the one place the OS already knows how "
+        "to clean up."
+    )
+
+
 def prefer_embedded_browser_instruction() -> str:
     """Bug fix (2026-09-11), per explicit instruction: this priority was
     already stated once, in open_app_browser's own tool description
@@ -389,6 +410,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     no_unauthorized_secret_changes_instruction,
     prefer_embedded_browser_instruction,
     self_sufficiency_instruction,
+    system_temp_dir_instruction,
 )
 
 
