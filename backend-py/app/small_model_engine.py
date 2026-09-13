@@ -1,47 +1,35 @@
-"""Primary path for simple, tool-using tasks (2026-09-12, redesigned
-2026-09-13), per explicit design discussion: when SquirrelWisdom access is
-available, try answering a real user turn through a small/cheap model
-BEFORE falling back to the full Claude Agent SDK session -- same persona,
-same tools (the SAME PluginTool objects every plugin already declares, via
+"""Primary path for simple, tool-using tasks (2026-09-12), per explicit
+design discussion: try answering a real user turn through a small/cheap
+model (Camerlengo's own resolve_agentic(), via reforce's AI.py) BEFORE
+falling back to the full Claude Agent SDK session -- same persona, same
+tools (the SAME PluginTool objects every plugin already declares, via
 app/plugins/loader.py's to_openai_tool_def(); see that function's own doc
 comment for why this is native dual-format support, not a translation
 layer), just a cheaper engine for anything simple enough not to need
 Claude's own reasoning.
 
-Redesign (2026-09-13, per explicit instruction -- "нужно эту часть вообще
-переделать; подписка должна браться со squirrelwisdom.com, а не ключи"):
-the ORIGINAL version of this module vendored Camerlengo's own AI.py (plus
-its Config.py/Cache.py/etc. dependency closure) into Caroline's install so
-it could run resolve_agentic() locally. That was scrapped entirely after
-discovering, while wiring up packaging, that Config.py's own hardcoded
-defaults AND AI.py itself contain real Partners Solutions production
-secrets (admin/email passwords, a Google Maps key, and -- worse -- two live
-OpenAI/OpenRouter API keys used as fallback defaults) that would have
-shipped in cleartext inside a PUBLIC installer. There is no safe way to
-vendor that file as-is.
+Runs LOCALLY (2026-09-12, corrected back from a same-day redesign that had
+routed every model-call STEP through a new squirrelwisdom.com v2 command,
+ai:resolveAgenticStep -- per explicit instruction: "нужно эту часть вообще
+переделать; подписка должна браться со squirrelwisdom.com, а не ключи"
+meant the model-provider KEY should come from SW instead of being
+hardcoded/vendored in cleartext, NOT that the dialogue itself should be
+proxied through SW turn by turn. Camerlengo's own resolve_agentic() loop
+(tool-calling, iteration, escalation judgment) runs entirely in this
+process, exactly like every other in-process caller of that function --
+the ONE thing that comes from SquirrelWisdom is the OpenRouter API key
+itself, fetched once per process (model_key_provisioning.py), Fernet-
+encrypted in transit with a key derived from the caller's own session so
+it's never sent or stored in cleartext, and never written to disk. SW
+login gates whether the small model is available at all (no login -> no
+key -> straight to the full SDK), same as every other SW-gated feature in
+this codebase (see sw_gate.py) -- but the actual conversation content
+never crosses the network to SW.
 
-The model call now happens SERVER-SIDE instead: a new v2 command,
-ai:resolveAgenticStep (reforce's API/Api2AICommands.py, backed by AI.py's
-new resolve_agentic_step() method), takes one turn of messages+tool defs,
-makes exactly one model call, and returns either a final answer or the
-tool_calls to run. Caroline sends the user's OWN SquirrelWisdom v2 session
-(login_api.get_v2_session()) with every call, so the model call is
-authenticated and billed against THEIR wallet/subscription -- exactly the
-"подписка со squirrelwisdom.com" the user asked for -- and Caroline's
-install never holds or ships any model-provider credential of any kind.
-Tool EXECUTION still happens entirely locally (those tools -- OS
-automation, the user's own email/notes/etc. -- only exist on their
-machine); only the "ask the model what to do next" step crosses the
-network. This also drops the sync/thread-bridging small_model_engine.py
-needed before (resolve_agentic() was a blocking, synchronous call that had
-to run via asyncio.to_thread with its executor_fn bridging back to the main
-loop via run_coroutine_threadsafe) -- httpx is already async, so the whole
-loop below is now plain async/await, no thread crossing at all.
-
-Escalation to the full SDK happens in exactly two ways, per the original
-design discussion (still unchanged) -- deliberately NOT based on timing,
-iteration count, or dispatch()'s own "running" status (that's just normal
-tool execution, not a complexity signal):
+Escalation to the full SDK happens in exactly two ways, per explicit
+instruction -- deliberately NOT based on timing, iteration count, or
+dispatch()'s own "running" status (that's just normal tool execution, not
+a complexity signal):
   1. The model's OWN judgment, expressed as a content-level sentinel
      (ESCALATION_SENTINEL) in its final reply -- covers "this task is
      harder than it looked" AND "the user has already had to correct me
@@ -51,33 +39,91 @@ tool execution, not a complexity signal):
   2. A mechanical safety check in the executor: the SAME (tool_name, args)
      pair called too many times in a row is a broken/looping execution,
      not a complexity judgment -- raises NeedsEscalation immediately,
-     which aborts the loop below rather than letting the model "retry"
-     into the exact same loop.
-MAX_ITERATIONS is deliberately set to a value that should never fire first
-in real use -- a pure runaway-loop backstop, not a task-complexity budget;
-the two escalation mechanisms above are what actually decide when to hand
-off, not a step count.
+     which aborts resolve_agentic()'s loop rather than letting the model
+     "retry" into the exact same loop.
+max_iterations is deliberately set to a value that should never fire
+first in real use (see MAX_ITERATIONS's own comment) -- it exists in
+resolve_agentic() purely as a runaway-loop backstop for callers who don't
+have a better signal, not as a task-complexity budget; this caller has a
+better signal (the two above) and doesn't want to rely on it.
+
+Packaging (not yet resolved): reaches Camerlengo's AI.py via
+_resolve_camerlengo_dir() below -- NO hardcoded absolute path anywhere. A
+dev checkout resolves it via a sibling `reforce` repo checkout (this dev
+machine's own layout: REPO/caroline and REPO/reforce side by side), or
+CAROLINE_CAMERLENGO_PATH for a non-standard layout. Vendoring a copy into
+real installs at packaging time (as originally planned) is a SEPARATE,
+not-yet-resolved follow-up: AI.py's own hardcoded-secret defaults are now
+fixed (Config.OPENAI_KEY/Config.OPENROUTER_KEY, never a literal -- see
+that file's own history), but Config.py itself still holds real Partners
+Solutions production secrets (admin/email passwords, a Google Maps key,
+etc.) unrelated to this feature -- vendoring it as-is into a public
+installer is not safe, and this module deliberately does not attempt
+that yet. If neither the sibling checkout nor CAROLINE_CAMERLENGO_PATH
+resolves (or the import itself fails for any reason), camerlengo_ai stays
+None and run_small_model_turn() escalates immediately, every time -- this
+path degrades to "always escalate to the SDK" rather than ever crashing
+backend startup over a missing/broken dependency, per this module's own
+"never a hard dependency" guarantee.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from app import session_context
-from app.login_api import get_v2_session
 from app.logging_setup import log_event
+from app.model_key_provisioning import get_model_provider_key
 from app.operations import dispatch
 from app.persona import Persona
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
-from app.plugins.sw_api import CAROLINE_SW_KEY, SwApiError, call_v2
+
+# Mirrors local_tts_launcher.py's/skills_seed.py's own shipped-vs-dev-tree
+# resolution pattern exactly: a shipped copy under backend-py/ itself first
+# (not yet populated by the Makefile -- see module docstring's "Packaging"
+# note), then a dev-tree sibling-repo checkout as a fallback for a repo
+# checkout that hasn't been packaged yet.
+_SHIPPED_CAMERLENGO_DIR = Path(__file__).resolve().parent.parent / "camerlengo"
+_DEV_TREE_CAMERLENGO_DIR = Path(__file__).resolve().parents[3] / "reforce"
+
+
+def _resolve_camerlengo_dir() -> Path | None:
+    override = os.environ.get("CAROLINE_CAMERLENGO_PATH")
+    if override and (Path(override) / "AI.py").is_file():
+        return Path(override)
+    if (_SHIPPED_CAMERLENGO_DIR / "AI.py").is_file():
+        return _SHIPPED_CAMERLENGO_DIR
+    if (_DEV_TREE_CAMERLENGO_DIR / "AI.py").is_file():
+        return _DEV_TREE_CAMERLENGO_DIR
+    return None
+
+
+camerlengo_ai: Any = None
+_camerlengo_dir = _resolve_camerlengo_dir()
+if _camerlengo_dir is None:
+    log_event("engine", "small_model_engine_camerlengo_not_found",
+              shipped=str(_SHIPPED_CAMERLENGO_DIR), dev_tree=str(_DEV_TREE_CAMERLENGO_DIR))
+else:
+    if str(_camerlengo_dir) not in sys.path:
+        sys.path.insert(0, str(_camerlengo_dir))
+    try:
+        import AI as camerlengo_ai  # type: ignore[no-redef]  # noqa: E402
+    except Exception as exc:  # noqa: BLE001 -- see module docstring: never a hard dependency
+        log_event("engine", "small_model_engine_camerlengo_import_failed", path=str(_camerlengo_dir), error=str(exc))
+        camerlengo_ai = None
 
 ESCALATION_SENTINEL = "[[NEED_ESCALATION]]"
 
-# Per explicit instruction (2026-09-12): NOT a task-complexity budget -- a
-# pure runaway-loop backstop for a caller that has a better signal (the two
-# escalation mechanisms above) and doesn't want to rely on a step count.
+# Per explicit instruction (2026-09-12): NOT a task-complexity budget --
+# resolve_agentic()'s own doc comment documents this same thing. Set high
+# enough that real use should NEVER hit it; the two escalation mechanisms
+# above are what actually decide when to hand off, not a step count.
 MAX_ITERATIONS = 200
 
 # How many times the SAME (tool_name, json-args) pair may repeat before the
@@ -87,10 +133,11 @@ REPEATED_CALL_LIMIT = 3
 
 
 class NeedsEscalation(Exception):
-    """Raised by the executor to abort the loop immediately -- caught by
-    run_small_model_turn() and turned into an {"status": "escalate", ...}
-    result. Never let a repeated-call loop just keep retrying into the same
-    stuck pattern -- it has to actually stop."""
+    """Raised by the executor_fn to abort resolve_agentic()'s loop
+    immediately -- caught by run_small_model_turn() and turned into an
+    {"status": "escalate", ...} result. Never let resolve_agentic() itself
+    see this as a normal tool error (which the model might just retry into
+    the same loop) -- it has to actually stop the loop."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -162,18 +209,24 @@ def build_tool_registry() -> ToolRegistry:
     return ToolRegistry(tool_defs=tool_defs, lookup=lookup)
 
 
-def _make_executor(
+def _make_executor_fn(
     registry: ToolRegistry, tab_id: str | None, send: session_context.SendFn | None,
-) -> Callable[[str, dict[str, Any]], Any]:
-    """Plain async tool executor -- no thread bridging needed at all now
-    that the model call itself is a network round-trip (see module
-    docstring): this runs directly on the same event loop as everything
-    else in ChatSession, calling the REAL dispatch() (app/operations.py,
-    the same uniform start/status/stop + auto-logging contract the SDK
-    path's wrap_tool() already uses for every tool call)."""
+    main_loop: asyncio.AbstractEventLoop,
+) -> Callable[[str, dict[str, Any]], str]:
+    """Bridges resolve_agentic()'s synchronous, worker-thread-side
+    executor_fn(name, args) -> str callback into Caroline's own async
+    plugin dispatch -- runs the REAL dispatch() (app/operations.py, the
+    same uniform start/status/stop + auto-logging contract the SDK path's
+    wrap_tool() already uses for every tool call) on the MAIN event loop
+    via run_coroutine_threadsafe, blocking only this call's own worker
+    thread (never the main loop) until it resolves. tab_id/send are
+    captured explicitly and re-set via session_context inside the
+    dispatched coroutine's own context -- contextvars set inside a
+    coroutine only affect that coroutine's own (isolated, discarded-after)
+    context, so there's deliberately no reset/cleanup dance needed here."""
     seen_calls: dict[tuple[str, str], int] = {}
 
-    async def executor(name: str, args: dict[str, Any]) -> str:
+    def executor_fn(name: str, args: dict[str, Any]) -> str:
         args = args or {}
         call_key = (name, json.dumps(args, sort_keys=True, default=str))
         seen_calls[call_key] = seen_calls.get(call_key, 0) + 1
@@ -189,40 +242,28 @@ def _make_executor(
             return f"ERROR: unknown tool '{name}'"
         plugin_name, plugin_tool = entry
 
-        if tab_id is not None:
+        async def _run() -> dict[str, Any]:
             session_context.set_tab_id(tab_id)
-        if send is not None:
-            session_context.set_send(send)
-        envelope = await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args)
+            if send is not None:
+                session_context.set_send(send)
+            return await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args)
+
+        envelope = asyncio.run_coroutine_threadsafe(_run(), main_loop).result()
         log_event("engine", "small_model_tool_result", tab_id=tab_id, tool=name, status=envelope.get("status"))
         if envelope.get("status") == "error":
             return f"ERROR: {envelope.get('error')}"
         if envelope.get("status") == "running":
             # Genuinely normal (a slow tool call, e.g. a network-bound
-            # plugin) -- NOT a signal of anything wrong. There is no
-            # polling concept here; the best honest answer right now is
-            # "still working". Expected to be rare given FAST_PATH_TIMEOUT_S.
+            # plugin) -- NOT a signal of anything wrong. resolve_agentic()
+            # has no polling concept of its own, so the best honest answer
+            # right now is "still working"; the model can decide whether
+            # to wait (call a cheap tool to pass a beat) or conclude. This
+            # is expected to be rare given FAST_PATH_TIMEOUT_S.
             return f"Operation {envelope.get('operation_id')} is still running."
         result = envelope.get("result")
         return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
 
-    return executor
-
-
-async def _resolve_agentic_step(messages: list[dict[str, Any]], tool_defs: list[dict[str, Any]], model: str) -> dict[str, Any]:
-    """One network round-trip to reforce's ai:resolveAgenticStep -- see that
-    command's own docstring (API/Api2AICommands.py) and AI.resolve_agentic_step's
-    (AI.py) for the exact shared request/response shape. Authenticated with
-    the user's OWN v2 session (billed/gated against their real SquirrelWisdom
-    wallet, per explicit instruction) alongside CAROLINE_SW_KEY (identifies
-    this as legitimate Caroline traffic, same as every other ai:* call this
-    backend already makes -- see voice_api.py)."""
-    session = await get_v2_session()
-    envelope = await call_v2(
-        "ai:resolveAgenticStep", key=CAROLINE_SW_KEY, session=session,
-        messages=messages, tools=tool_defs, model=model,
-    )
-    return envelope
+    return executor_fn
 
 
 async def run_small_model_turn(
@@ -249,12 +290,22 @@ async def run_small_model_turn(
     conversation to the progress narrator instead of the stale on-disk SDK
     transcript, which this path never writes to at all.
 
-    get_new_user_comments(), if given, is polled once per loop iteration
-    below -- returns any new real user messages that arrived since the
-    last check, so a long-running turn stays responsive to what the user
-    says WHILE it's still working, without cancelling and restarting.
+    get_new_user_comments(), if given, is polled once per resolve_agentic()
+    iteration (see that function's own get_new_messages parameter) --
+    returns any new real user messages that arrived since the last check,
+    so a long-running turn stays responsive to what the user says WHILE
+    it's still working, without cancelling and restarting.
     """
     log_event("engine", "small_model_turn_started", tab_id=tab_id, text_len=len(user_text))
+    if camerlengo_ai is None:
+        log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
+        return {"status": "escalate", "reason": "small-model engine (Camerlengo AI.py) not available on this install"}
+
+    api_key = await get_model_provider_key()
+    if not api_key:
+        log_event("engine", "small_model_no_key_available", tab_id=tab_id)
+        return {"status": "escalate", "reason": "no model-provider key available (not logged into SquirrelWisdom, or the fetch failed)"}
+
     registry = build_tool_registry()
     system = _persona_system_message(persona) + "\n\n" + _engine_instructions(language)
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
@@ -264,64 +315,60 @@ async def run_small_model_turn(
         messages.append({"role": "assistant" if is_caroline else "user", "content": content})
     messages.append({"role": "user", "content": user_text})
 
-    executor = _make_executor(registry, tab_id, send)
+    main_loop = asyncio.get_running_loop()
+    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop)
 
     live_dialogue = [f"User: {user_text}"]
     if on_live_dialogue_update:
         on_live_dialogue_update(list(live_dialogue))
 
-    log_event("engine", "small_model_resolved", tab_id=tab_id, tool_count=len(registry.tool_defs))
+    def on_progress(evt: dict[str, Any]) -> None:
+        log_event(
+            "engine", "small_model_progress", tab_id=tab_id, event_type=evt.get("type"),
+            tool=evt.get("name"), iteration=evt.get("iteration"),
+        )
+        if evt.get("type") == "done" and on_live_dialogue_update:
+            live_dialogue.append(f"Caroline: {evt.get('text', '')}")
+            on_live_dialogue_update(list(live_dialogue))
+
+    def get_new_messages() -> list[dict[str, Any]] | None:
+        if not get_new_user_comments:
+            return None
+        comments = get_new_user_comments()
+        if not comments:
+            return None
+        out = []
+        for c in comments:
+            log_event("engine", "small_model_live_comment_injected", tab_id=tab_id, text_len=len(c))
+            live_dialogue.append(f"User: {c}")
+            out.append({"role": "user", "content": c})
+        if on_live_dialogue_update:
+            on_live_dialogue_update(list(live_dialogue))
+        return out
+
+    # Explicit adapter with the freshly-fetched key -- never rely on
+    # camerlengo_ai.AI()'s own default (Config.OPENROUTER_KEY, server-only)
+    # from this process; Caroline always passes its own, per-session key.
+    adapter = camerlengo_ai.OpenRouterAdapter(api_key=api_key)
+    ai = camerlengo_ai.AI(adapter=adapter)
+    model = camerlengo_ai.resolveModelCategory("SMALL")
+    log_event("engine", "small_model_resolved", tab_id=tab_id, model=model, tool_count=len(registry.tool_defs))
 
     try:
-        for iteration in range(MAX_ITERATIONS):
-            if get_new_user_comments:
-                comments = get_new_user_comments()
-                if comments:
-                    for c in comments:
-                        log_event("engine", "small_model_live_comment_injected", tab_id=tab_id, text_len=len(c))
-                        messages.append({"role": "user", "content": c})
-                        live_dialogue.append(f"User: {c}")
-                    if on_live_dialogue_update:
-                        on_live_dialogue_update(list(live_dialogue))
-
-            step = await _resolve_agentic_step(messages, registry.tool_defs, "SMALL")
-
-            if step.get("type") != "tool_calls":
-                final_text = (step.get("text") or "").strip()
-                log_event("engine", "small_model_progress", tab_id=tab_id, event_type="done", iteration=iteration)
-                if on_live_dialogue_update:
-                    live_dialogue.append(f"Caroline: {final_text}")
-                    on_live_dialogue_update(list(live_dialogue))
-                if ESCALATION_SENTINEL in final_text:
-                    log_event("engine", "small_model_escalation_self_reported", tab_id=tab_id)
-                    return {"status": "escalate", "reason": "model reported NEED_ESCALATION"}
-                log_event("engine", "small_model_turn_answered", tab_id=tab_id, text_len=len(final_text))
-                return {"status": "answered", "text": final_text}
-
-            messages.append(step["assistant_message"])
-            for call in step["calls"]:
-                name = call["name"]
-                try:
-                    args = json.loads(call["arguments"] or "{}")
-                except Exception:
-                    args = {}
-                result = str(await executor(name, args))
-                if len(result) > 8000:
-                    result = result[:8000] + "\n[...truncated]"
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-                log_event(
-                    "engine", "small_model_progress", tab_id=tab_id, event_type="tool_call",
-                    tool=name, iteration=iteration,
-                )
-
-        log_event("engine", "small_model_turn_max_iterations", tab_id=tab_id)
-        return {"status": "escalate", "reason": "reached maximum iterations without completing"}
+        final_text = await asyncio.to_thread(
+            ai.resolve_agentic, messages, registry.tool_defs, executor_fn,
+            model, MAX_ITERATIONS, on_progress, get_new_messages,
+        )
     except NeedsEscalation as exc:
         log_event("engine", "small_model_escalation_mechanical", tab_id=tab_id, reason=exc.reason)
         return {"status": "escalate", "reason": exc.reason}
-    except SwApiError as exc:
-        log_event("engine", "small_model_turn_failed", tab_id=tab_id, error=str(exc), error_type="SwApiError")
-        return {"status": "escalate", "reason": f"SquirrelWisdom API error: {exc}"}
     except Exception as exc:  # noqa: BLE001 -- this path must never be a hard dependency
         log_event("engine", "small_model_turn_failed", tab_id=tab_id, error=str(exc), error_type=type(exc).__name__)
         return {"status": "escalate", "reason": f"internal error: {exc}"}
+
+    if ESCALATION_SENTINEL in final_text:
+        log_event("engine", "small_model_escalation_self_reported", tab_id=tab_id)
+        return {"status": "escalate", "reason": "model reported NEED_ESCALATION"}
+
+    log_event("engine", "small_model_turn_answered", tab_id=tab_id, text_len=len(final_text))
+    return {"status": "answered", "text": final_text}

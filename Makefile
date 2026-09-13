@@ -28,6 +28,14 @@ SHELL := C:/Program Files/Git/bin/bash.exe
 SCRIPT_DIR := $(CURDIR)
 BACKEND_DIR := $(SCRIPT_DIR)/backend
 BACKEND_PY_DIR := $(SCRIPT_DIR)/backend-py
+
+# Any local clone of the `reforce` repo that has the `caroline` branch reachable
+# (as a local branch or via a remote, e.g. origin/caroline) -- pulled via `git show
+# caroline:<path>`, not a plain file copy, so this works regardless of what that
+# clone's OWN working tree currently has checked out. Override on the command line
+# (`make build CAMERLENGO_REPO=...`) for a non-default sibling layout.
+CAMERLENGO_REPO ?= $(SCRIPT_DIR)/../reforce
+CAMERLENGO_VENDOR_STUBS := $(BACKEND_PY_DIR)/camerlengo-vendor-stubs
 CAROLINE_DIR := $(SCRIPT_DIR)/Windows/Caroline
 INSTALLER_DIR := $(SCRIPT_DIR)/Windows/CarolineInstaller
 XCFA_DIR := $(SCRIPT_DIR)/vendor/XcfaRenderer
@@ -110,6 +118,18 @@ $(OUT)/Caroline.exe: $(CAROLINE_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.sta
 	mkdir -p "$(OUT)/backend-py/python-scripts"
 	cp "$(BACKEND_DIR)/python-scripts/local_tts_server.py" "$(OUT)/backend-py/python-scripts/local_tts_server.py"
 	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
+	@echo "--- camerlengo (small-model primary path, see small_model_engine.py's own doc comment) ---"
+	@if git -C "$(CAMERLENGO_REPO)" cat-file -e caroline:AI.py 2>/dev/null; then \
+		mkdir -p "$(OUT)/backend-py/camerlengo"; \
+		for f in AI.py Cache.py EmailBasics.py Logger.py JSONStorage.py; do \
+			git -C "$(CAMERLENGO_REPO)" show caroline:$$f > "$(OUT)/backend-py/camerlengo/$$f"; \
+		done; \
+		cp "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT)/backend-py/camerlengo/Config.py"; \
+		echo "vendored from $(CAMERLENGO_REPO)@caroline"; \
+	else \
+		echo "WARNING: $(CAMERLENGO_REPO) has no reachable 'caroline' branch -- skipping camerlengo vendoring."; \
+		echo "         small_model_engine.py degrades to always-escalate on this build (never a hard dependency)."; \
+	fi
 	@echo "Build complete: $(OUT)/Caroline.exe"
 
 build: $(OUT)/Caroline.exe
