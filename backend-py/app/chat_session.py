@@ -661,6 +661,31 @@ class ChatSession:
         self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
 
+        # Per explicit instruction (2026-09-13), after a real incident: a
+        # PROACTIVE turn (a scheduled mailbox check, here) can complete
+        # with genuinely EMPTY visible content -- confirmed live via the
+        # raw session transcript, a real final assistant message with
+        # stop_reason="end_turn" and real spent output tokens, but its
+        # content array held only an empty thinking block, no text at all
+        # (not even a [[NO_UPDATE]] sentinel -- that's a real text block,
+        # just client-suppressed, and would count as "visible" here).
+        # _fire_post_turn_completion_check() previously only ever fired for
+        # REAL user turns (see its own docstring for why proactive turns
+        # were excluded -- most proactive completions are LEGITIMATELY
+        # silent via NO_UPDATE, and re-nudging every single one would be
+        # wasteful). turn_saw_any_visible_text closes exactly the gap
+        # between "legitimately silent" and "silently lost real content":
+        # reset per-turn in submit(), set True the moment any assistant
+        # wire message carries real text (NO_UPDATE included) -- see the
+        # wire-send site's own comment.
+        self.turn_saw_any_visible_text: bool = False
+        # One-shot guard so the completion-check's OWN reply (itself a
+        # proactive turn, submitted via inject_proactive) can't chain into
+        # firing this same check again if IT also happens to come back
+        # empty -- fires at most once per originating turn, never an
+        # infinite loop of self-nudges.
+        self._awaiting_post_turn_check_reply: bool = False
+
         # Small-model primary path (2026-09-12, see small_model_engine.py's
         # own module docstring) -- an alternative to the SDK path above for
         # simple, tool-using turns, tried first via
@@ -933,6 +958,10 @@ class ChatSession:
         )
         self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
+        # Reset for THIS turn -- see this flag's own __init__ comment for
+        # why it exists (post-turn-completion sanity check for proactive
+        # turns that silently produce no content at all).
+        self.turn_saw_any_visible_text = False
         # Bug fix (2026-09-11), per explicit instruction: _gather_recent_
         # dialogue_for_narration's own pending_user_text fallback used to
         # label THIS unconditionally as if the user had just said it --
@@ -1671,20 +1700,28 @@ class ChatSession:
         )
 
     def _fire_post_turn_completion_check(self) -> None:
-        """Sanity check run right after a REAL user turn finishes -- per
-        explicit correction (2026-09-13), replacing a periodic timer-based
-        version (every IDLE_TASK_CHECK_INTERVAL_MS regardless of whether
-        anything had happened) that the user rejected as needless expense.
-        Called from the turn_pending property setter's True->False edge,
-        gated there on self.pending_is_real_user so this fires exactly once
-        per real turn -- never for this check's own reply (submitted via
-        inject_proactive with is_real_user=False, so it can't re-trigger
-        itself), never for forced_compaction's own "/compact" (that bypasses
-        turn_pending entirely, see _push_internal_command), and never twice
-        for a turn that started on the small-model path and escalated (that
-        hand-off keeps turn_pending continuously True across the switch, see
+        """Sanity check run right after a turn finishes -- per explicit
+        correction (2026-09-13), replacing a periodic timer-based version
+        (every IDLE_TASK_CHECK_INTERVAL_MS regardless of whether anything
+        had happened) that the user rejected as needless expense. Called
+        from the turn_pending property setter's True->False edge:
+        unconditionally for a REAL user turn, or for a PROACTIVE turn that
+        produced genuinely no visible content at all (see
+        turn_saw_any_visible_text's own comment for that second case, added
+        2026-09-13 after a real incident -- a scheduled mailbox check did
+        real work but its final answer never reached the wire). Never for
+        forced_compaction's own "/compact" (that bypasses turn_pending
+        entirely, see _push_internal_command), and never twice for a turn
+        that started on the small-model path and escalated (that hand-off
+        keeps turn_pending continuously True across the switch, see
         submit_or_try_small_model's own docstring, so only the FINAL
         completion trips this edge).
+
+        Sets _awaiting_post_turn_check_reply so THIS check's own reply
+        (submitted via inject_proactive, always is_real_user=False) can't
+        chain into firing the proactive-empty branch above again on itself
+        -- fires at most once per originating turn, never an infinite loop
+        of self-nudges even if the reply is ALSO empty.
 
         Still asks the model directly rather than trusting our own
         bookkeeping (confirmed live that bookkeeping alone can be wrong --
@@ -1694,6 +1731,7 @@ class ChatSession:
             return
         lang = current_language_name(self.tab_id)
         log_event("engine", "post_turn_completion_check", tab_id=self.tab_id)
+        self._awaiting_post_turn_check_reply = True
         self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang))
 
     def _current_session_file_size(self) -> int | None:
@@ -2290,6 +2328,12 @@ class ChatSession:
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending
                         if not result_is_fake:
                             was_real_user_turn = self.pending_is_real_user
+                            # Captured (and consumed) BEFORE the checks below can
+                            # re-arm it for the NEXT turn -- see this flag's own
+                            # __init__ comment for why it must never let its own
+                            # nudge's reply re-trigger itself.
+                            was_awaiting_post_turn_check_reply = self._awaiting_post_turn_check_reply
+                            self._awaiting_post_turn_check_reply = False
                             self.turn_pending = False
                             self.pending_user_text = None
                             self.pending_attachments = []
@@ -2303,6 +2347,24 @@ class ChatSession:
                             # check's own doc comment for why this replaced a
                             # periodic timer instead.
                             if was_real_user_turn:
+                                self._fire_post_turn_completion_check()
+                            elif not was_awaiting_post_turn_check_reply and not self.turn_saw_any_visible_text:
+                                # Per explicit instruction (2026-09-13), after a
+                                # real incident: a PROACTIVE turn (a scheduled
+                                # mailbox check) completed with genuinely EMPTY
+                                # visible content -- real work done, real output
+                                # tokens spent, but no text (not even
+                                # [[NO_UPDATE]]) ever reached the wire. Most
+                                # proactive completions are legitimately silent
+                                # via a real NO_UPDATE text block (which DOES
+                                # count as "visible" here, see turn_saw_any_
+                                # visible_text's own comment) -- this only fires
+                                # for the genuinely-empty case, and the
+                                # was_awaiting_post_turn_check_reply guard means
+                                # it can fire at most once per originating turn,
+                                # never chain into itself if its own reply is
+                                # ALSO empty.
+                                log_event("engine", "post_turn_completion_check_proactive_empty", tab_id=self.tab_id)
                                 self._fire_post_turn_completion_check()
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
@@ -2431,6 +2493,7 @@ class ChatSession:
                                     )
                                     if has_visible_text:
                                         self.last_visible_output_at = time.monotonic()
+                                        self.turn_saw_any_visible_text = True
 
                     if isinstance(message, ResultMessage):
                         if result_is_fake:
