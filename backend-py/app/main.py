@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, current_language_name, refresh_language_in_background
@@ -196,6 +197,30 @@ async def _start_ratatosk_background_loops() -> None:
 
 def primary_session() -> ChatSession | None:
     return sessions.get(PRIMARY_TAB_ID)
+
+
+@app.get("/api/local-file")
+async def get_local_file(path: str) -> Any:
+    """Per explicit instruction (2026-09-13): the chat page's own inline
+    Markdown image rendering (chat.js's renderMarkdown) used to only work
+    for Caroline's own shipped assets/ photos -- any OTHER local image
+    (something she found, generated, or was handed) rendered as broken/
+    literal Markdown text instead of actually showing, with no feedback to
+    the model that it hadn't worked. Confirmed live as a real, recurring
+    failure, not an acceptable limitation. This endpoint is what makes it
+    actually work: chat.js now rewrites ANY local image path in Markdown
+    into a request here, and this just reads and returns the file's raw
+    bytes with a guessed content-type -- no path restriction, per explicit
+    instruction ("любой абсолютный путь на диске"). Loopback-only (see
+    uvicorn.run's own host="127.0.0.1" below) -- this process already
+    reads/writes anything on this machine's disk via its own tool
+    implementations; this endpoint doesn't grant new access, only a new
+    transport for content this process could already reach directly."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return JSONResponse({"ok": False, "error": f'No such file: "{path}"'}, status_code=404)
+    mime, _ = mimetypes.guess_type(str(file_path))
+    return Response(content=file_path.read_bytes(), media_type=mime or "application/octet-stream")
 
 
 @app.get("/api/status")

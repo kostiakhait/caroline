@@ -3,8 +3,8 @@
   // sent to the backend right after connect (see "client_diag" below) and
   // logged server-side, purely so a stale-cache suspicion can be confirmed
   // or ruled out from caroline.log alone, with zero UI interaction needed.
-  const CHAT_JS_VERSION = "2026-09-11-status-model-redesign";
-  const port = new URLSearchParams(location.search).get("port") || "8765";
+  const CHAT_JS_VERSION = "2026-09-13-local-image-serving";
+  const port = new URLSearchParams(location.search).get("port") || "48765";
   // Which tab this WebView2 instance belongs to (see MainWindow's tab strip,
   // each tab navigates to chat.html?tab=<id>) -- threaded into the WS URL so
   // the backend routes this connection to the right per-tab ChatSession
@@ -518,11 +518,28 @@
     html = html.replace(/```([\s\S]*?)```/g, (_, code) => stash(`<pre><code>${code}</code></pre>`));
     html = html.replace(/`([^`]+)`/g, (_, code) => stash(`<code>${code}</code>`));
 
-    // Only local paths under assets/ -- deliberately not remote URLs, so the
-    // model can show her own shipped photos but can't embed arbitrary
-    // external images into the chat.
-    html = html.replace(/!\[([^\]]*)\]\((assets\/[^\s)"']+)\)/g,
-      (_, alt, src) => stash(`<img class="chat-photo" alt="${alt}" title="${alt}" src="${src}" />`));
+    // Bug fix (2026-09-13), per explicit instruction ("не намеренное
+    // ограничение, а лютейший баг"): used to match ONLY assets/-prefixed
+    // paths (Caroline's own shipped reference photos), so any OTHER local
+    // image she found/generated/was handed rendered as broken, literal
+    // Markdown text instead of actually showing -- confirmed live,
+    // repeatedly, as a real failure with no feedback to the model that it
+    // hadn't worked. Now matches ANY local path: assets/ still resolves
+    // directly (relative to this page's own origin, unchanged), anything
+    // else is rewritten to a request against the backend's own new
+    // /api/local-file endpoint (main.py), which just reads and returns
+    // the file's raw bytes -- no path restriction, per explicit
+    // instruction ("любой абсолютный путь на диске"). Deliberately still
+    // not a remote http(s) URL -- that's a different, unrelated risk
+    // (loading arbitrary external images) this change isn't about.
+    html = html.replace(/!\[([^\]]*)\]\(([^\s)"']+)\)/g, (_, alt, rawSrc) => {
+      let src = rawSrc;
+      if (!src.startsWith("assets/")) {
+        const localPath = src.startsWith("file:///") ? decodeURIComponent(src.slice(8)) : src;
+        src = `http://127.0.0.1:${port}/api/local-file?path=${encodeURIComponent(localPath)}`;
+      }
+      return stash(`<img class="chat-photo" alt="${alt}" title="${alt}" src="${src}" />`);
+    });
 
     // A local document link -- clicking it asks the backend to open it in
     // the OS default app (see the "open_file" control op) rather than
