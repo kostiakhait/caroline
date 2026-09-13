@@ -89,9 +89,14 @@ _has_sent_visual_mode_config = False
 _resumed_unfinished_turn_for_tab: set[str] = set()
 # Same "once per process, not per reconnect" shape as the set above -- see
 # ChatSession.needs_startup_compaction/_check_forced_compaction
-# (chat_session.py) for why forced compaction exists and what this flag
-# actually triggers once set.
-_forced_startup_compaction_for_tab: set[str] = set()
+# (chat_session.py). Mark completion only after the command's result (or
+# after confirming this tab has no session to compact), so a WebSocket
+# reconnect during startup cannot lose the pending intent.
+_completed_startup_compaction_for_tab: set[str] = set()
+# A CLI /compact error is retried after the maintenance interval. Keep that
+# deadline across WebSocket recreation; an otherwise healthy reconnect must
+# not turn a repeated error into a five-second watchdog retry loop.
+_startup_compaction_retry_not_before_for_tab: dict[str, float] = {}
 # Bug fix (2026-09-11), confirmed live: refresh_language_in_background used
 # to only ever run for PRIMARY_TAB_ID (tied to the startup greeting) or as a
 # side effect of a tab's OWN unrecoverable-session-reset recovery path --
@@ -747,7 +752,24 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # <id>.json), not from in-memory state surviving on some stale object.
     # The previous connection's session (if any) is disposed on its own
     # "close" below.
-    session = ChatSession(tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=websocket.send_json)
+    def mark_startup_compaction_finished(finished_tab_id: str) -> None:
+        if sessions.get(finished_tab_id) is session:
+            _completed_startup_compaction_for_tab.add(finished_tab_id)
+            _startup_compaction_retry_not_before_for_tab.pop(finished_tab_id, None)
+
+    def mark_startup_compaction_retry_scheduled(failed_tab_id: str, retry_not_before: float) -> None:
+        if sessions.get(failed_tab_id) is session:
+            _startup_compaction_retry_not_before_for_tab[failed_tab_id] = retry_not_before
+
+    session = ChatSession(
+        tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=websocket.send_json,
+        on_startup_compaction_finished=mark_startup_compaction_finished,
+        on_startup_compaction_retry_scheduled=mark_startup_compaction_retry_scheduled,
+        startup_compaction_retry_not_before=_startup_compaction_retry_not_before_for_tab.get(tab_id),
+    )
+    # Set the intent before registration: /api/status may be polled as soon
+    # as sessions[tab_id] becomes visible, before the watchdog's first tick.
+    session.needs_startup_compaction = tab_id not in _completed_startup_compaction_for_tab
     sessions[tab_id] = session
     await session.start()
 
@@ -820,19 +842,6 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "first where that makes sense (e.g. was an email already sent, a file already written). Reply in "
                 f"{resume_lang}.]",
             )
-
-    # Forced compaction's "at Caroline's startup" trigger (2026-09-11): once
-    # per tab per PROCESS lifetime, not per reconnect -- ChatSession itself
-    # gets recreated on every WS (re)connection, so this flag has to live at
-    # module scope, same reasoning as _resumed_unfinished_turn_for_tab just
-    # above. Just sets the flag here; _check_forced_compaction
-    # (chat_session.py's own watchdog tick) does the actual triggering once
-    # the session is genuinely connected -- see that method's own doc
-    # comment for why native auto-compaction can't be trusted to do this on
-    # its own.
-    if tab_id not in _forced_startup_compaction_for_tab:
-        _forced_startup_compaction_for_tab.add(tab_id)
-        session.needs_startup_compaction = True
 
     # Language refresh at startup, per tab -- see _language_refreshed_for_tab's
     # own comment above for the bug this closes (a non-primary tab could go
