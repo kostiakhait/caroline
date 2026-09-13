@@ -67,14 +67,7 @@ internal static class PythonInstaller
          // CDP endpoint (AppBrowserWindow's own WebView2 instance) via
          // connect_over_cdp(), never launches a local browser itself. The
          // pip package alone ships the driver that requires.
-         "playwright",
-         // small_model_engine.py's primary path (2026-09-12): "requests" is
-         // Camerlengo's AI.py's own HTTP dependency (its OpenRouterAdapter),
-         // "openai" is only needed for its type hints/optional client usage
-         // -- both ad-hoc pip-installed on the dev machine while building
-         // that path; listed here so a real (non-dev-machine) install
-         // actually has them too.
-         "requests", "openai"];
+         "playwright"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 
