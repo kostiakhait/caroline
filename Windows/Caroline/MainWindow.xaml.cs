@@ -22,6 +22,7 @@ namespace Caroline;
 public partial class MainWindow : Window
 {
     private readonly AppSettings _settings;
+    internal IReadOnlyList<string> StartupTabIds { get; }
     private readonly SettingsService _settingsService;
     private readonly BackendProcess _backend = new();
     private readonly TrayIconManager _tray;
@@ -41,6 +42,8 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _settings = settings;
+        StartupTabIds = (_settings.OpenTabIds is { Count: > 0 } ? _settings.OpenTabIds : new List<string> { "1" })
+            .Distinct().Take(MaxTabs).ToArray();
         _settingsService = settingsService;
         // For the /test_visual_mode debug endpoint (AppBrowserHost.cs) -- lets a plain
         // curl trigger VisualModeWindow's init in total isolation from the chat/TTS
@@ -453,9 +456,7 @@ public partial class MainWindow : Window
 
     private async Task InitTabsAsync()
     {
-        var idsToOpen = (_settings.OpenTabIds is { Count: > 0 } ? _settings.OpenTabIds : new List<string> { "1" })
-            .Distinct().Take(MaxTabs).ToList();
-        foreach (var id in idsToOpen)
+        foreach (var id in StartupTabIds)
         {
             await AddTabAsync(id, selectAfter: false);
         }

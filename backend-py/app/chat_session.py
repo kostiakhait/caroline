@@ -637,7 +637,12 @@ def _ensure_settings_file(workspace_dir: str) -> str:
 
 
 class ChatSession:
-    def __init__(self, tab_id: str, workspace_dir: str, send: SendFn) -> None:
+    def __init__(
+        self, tab_id: str, workspace_dir: str, send: SendFn,
+        on_startup_compaction_finished: Callable[[str], None] | None = None,
+        on_startup_compaction_retry_scheduled: Callable[[str, float], None] | None = None,
+        startup_compaction_retry_not_before: float | None = None,
+    ) -> None:
         self.tab_id = tab_id
         self.workspace_dir = workspace_dir
         self.send = send
@@ -648,6 +653,14 @@ class ChatSession:
 
         # queue / turn plumbing
         self.queue: list[dict[str, Any]] = []
+        self._real_turn_generation = 0
+        self._one_shot_consumed_generation = -1
+        # The CLI can merge queued user inputs into one model turn, so there
+        # is no reliable one-Result-per-input mapping. These latches suppress
+        # cap rearming until the next terminal result, even when a newer real
+        # user message is queued during an older follow-up or response.
+        self._one_shot_followup_waiting_for_result = False
+        self._one_shot_ignore_cap_until_result = False
         self._queue_event = asyncio.Event()
         self.turn_is_voice = False
         self.classifier_refusal_retry_count = 0
@@ -699,6 +712,11 @@ class ChatSession:
         # hang_interrupt_result_pending/ignore_next_result_recovery -- see
         # result_is_fake's own computation in the message loop.
         self.forced_compaction_result_pending: bool = False
+        self.forced_compaction_reason: str | None = None
+        self._forced_compaction_previous_clock: tuple[float | None, int | None] | None = None
+        self._forced_compaction_retry_not_before = startup_compaction_retry_not_before
+        self.on_startup_compaction_finished = on_startup_compaction_finished
+        self.on_startup_compaction_retry_scheduled = on_startup_compaction_retry_scheduled
 
         # activity / hang tracking
         self.last_activity = time.monotonic()
@@ -811,6 +829,7 @@ class ChatSession:
     def dispose(self) -> None:
         log_event("engine", "dispose", tab_id=self.tab_id)
         self.ended = True
+        self._abandon_forced_compaction()
         if self._watchdog_task:
             self._watchdog_task.cancel()
         self._clear_api_retry_timer()
@@ -1007,6 +1026,14 @@ class ChatSession:
             log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text))
             self.small_model_pending_comments.append(text)
             return
+
+        # Only this external entrypoint starts a new logical user turn.
+        # Recovery's submit(..., True) replays the same turn and must not
+        # grant another one-shot usage-cap check.
+        if self.turn_pending:
+            self._one_shot_ignore_cap_until_result = True
+        self._real_turn_generation += 1
+        self._clear_one_shot_followup_timer()
 
         if not SMALL_MODEL_ENABLED or attachments or self.turn_pending or not is_logged_in():
             self.submit(text, attachments, True, is_voice)
@@ -1292,9 +1319,14 @@ class ChatSession:
         (a genuine [[NO_UPDATE]], a real answer, or nothing at all) --
         unlike api_retry_timer, which reschedules itself every time it
         fires until something clears it."""
+        generation = self._real_turn_generation
+        if generation <= self._one_shot_consumed_generation:
+            log_event("engine", "one_shot_followup_already_consumed", tab_id=self.tab_id, reason=reason)
+            return
         if self.one_shot_followup_timer:
             log_event("engine", "one_shot_followup_already_pending", tab_id=self.tab_id, reason=reason)
             return
+        self._one_shot_consumed_generation = generation
         log_event(
             "engine", "one_shot_followup_scheduled", tab_id=self.tab_id, reason=reason,
             delay_ms=ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS,
@@ -1305,6 +1337,7 @@ class ChatSession:
             if self.ended:
                 return
             log_event("engine", "one_shot_followup_firing", tab_id=self.tab_id, reason=reason)
+            self._one_shot_followup_waiting_for_result = True
             self.inject_proactive(
                 f"[Internal: one-time follow-up check -- your previous turn concluded by reporting a usage cap.] "
                 f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
@@ -1715,8 +1748,35 @@ class ChatSession:
         self.queue.append({
             "message": {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}, "parent_tool_use_id": None},
             "is_voice": False,
+            "internal_command": text,
         })
         self._queue_event.set()
+
+    def _abandon_forced_compaction(self) -> None:
+        """A torn-down SDK stream cannot deliver this command's result.
+
+        Only a tagged, still-queued maintenance command is removed. User
+        messages and already-sent commands stay untouched; startup work is
+        retried by the next connection after any pending user turn finishes.
+        """
+        if not self.forced_compaction_result_pending:
+            return
+        self.queue = [item for item in self.queue if item.get("internal_command") != "/compact"]
+        if self._forced_compaction_previous_clock is not None:
+            self.last_forced_compaction_at, self.size_at_last_forced_compaction = (
+                self._forced_compaction_previous_clock
+            )
+            self._forced_compaction_previous_clock = None
+        if self.forced_compaction_reason == "startup":
+            self.needs_startup_compaction = True
+        self.forced_compaction_result_pending = False
+        self.forced_compaction_reason = None
+        log_event("engine", "forced_compaction_abandoned", tab_id=self.tab_id)
+
+    def _complete_startup_compaction(self) -> None:
+        self.needs_startup_compaction = False
+        if self.on_startup_compaction_finished:
+            self.on_startup_compaction_finished(self.tab_id)
 
     def _check_forced_compaction(self) -> None:
         """See FORCED_COMPACTION_HOURLY_MS's own comment for why this
@@ -1735,6 +1795,8 @@ class ChatSession:
         if not self.last_saved_session_id:
             return
         now = time.monotonic()
+        if self._forced_compaction_retry_not_before is not None and now < self._forced_compaction_retry_not_before:
+            return
         if self.last_forced_compaction_at is not None and now - self.last_forced_compaction_at < FORCED_COMPACTION_MIN_INTERVAL_MS / 1000:
             return
 
@@ -1752,10 +1814,13 @@ class ChatSession:
         if reason is None:
             return
 
+        self._forced_compaction_previous_clock = (self.last_forced_compaction_at, self.size_at_last_forced_compaction)
+        self._forced_compaction_retry_not_before = None
         self.needs_startup_compaction = False
         self.last_forced_compaction_at = now
         self.size_at_last_forced_compaction = self._current_session_file_size() or 0
         self.forced_compaction_result_pending = True
+        self.forced_compaction_reason = reason
         log_event(
             "engine", "forced_compaction_triggered", tab_id=self.tab_id, reason=reason,
             session_size_bytes=self.size_at_last_forced_compaction,
@@ -1848,6 +1913,9 @@ class ChatSession:
 
     async def _handle_failure(self, exc: BaseException) -> None:
         log_event("engine", "handle_failure_entered", tab_id=self.tab_id, hang_count=self.hang_count, turn_pending=self.turn_pending, error=str(exc))
+        self._abandon_forced_compaction()
+        self._one_shot_followup_waiting_for_result = False
+        self._one_shot_ignore_cap_until_result = False
         # Any pending per-server reconnect retries belong to the client
         # instance that's being torn down -- _schedule_mcp_reconnect's own
         # self.client-identity check would catch this anyway, but clearing
@@ -1927,7 +1995,7 @@ class ChatSession:
             # why _check_forced_compaction's own "startup" trigger otherwise
             # raced the splash-dismiss/SyncTabListToBackend timing and
             # produced a window with a missing tab list.
-            "forcedCompactionPending": self.forced_compaction_result_pending,
+            "forcedCompactionPending": self.needs_startup_compaction or self.forced_compaction_result_pending,
         }
 
     # ------------------------------------------------------------- run loop --
@@ -1987,6 +2055,11 @@ class ChatSession:
                 resume_session_id = self._resolve_resume_session_id()
                 if resume_session_id:
                     self.last_saved_session_id = resume_session_id
+                elif self.needs_startup_compaction:
+                    # No transcript exists yet, so there is nothing to
+                    # compact on this launch. Still wait for SDK init before
+                    # the splash may dismiss (the UI checks hasSeenInit).
+                    self._complete_startup_compaction()
 
                 mcp_servers = build_mcp_servers()
                 self._system_prompt_language = current_language_name(self.tab_id)
@@ -2151,7 +2224,8 @@ class ChatSession:
                             # apply here; see _schedule_one_shot_followup_check's own
                             # doc comment for the distinction.
                             self._set_conn_state("limited", limit_text)
-                            self._schedule_one_shot_followup_check("cc_cli_limit_message", self.turn_is_voice)
+                            if not (self._one_shot_followup_waiting_for_result or self._one_shot_ignore_cap_until_result):
+                                self._schedule_one_shot_followup_check("cc_cli_limit_message", self.turn_is_voice)
                             continue
 
                     # --- structured rate-limit event ---
@@ -2367,8 +2441,31 @@ class ChatSession:
                             # logical turn.
                             self.hang_interrupt_result_pending = False
                             if self.forced_compaction_result_pending:
-                                self.forced_compaction_result_pending = False
-                                log_event("engine", "forced_compaction_done", tab_id=self.tab_id, subtype=message.subtype)
+                                if getattr(message, "is_error", False):
+                                    was_startup = self.forced_compaction_reason == "startup"
+                                    self._abandon_forced_compaction()
+                                    # An explicit CLI error is likely to
+                                    # recur on the next watchdog tick. Keep
+                                    # startup intent, but bound retries to
+                                    # the normal maintenance gap. Transport
+                                    # teardown uses _abandon without this
+                                    # delay so a transient disconnect can
+                                    # recover promptly.
+                                    self._forced_compaction_retry_not_before = (
+                                        time.monotonic() + FORCED_COMPACTION_MIN_INTERVAL_MS / 1000
+                                    )
+                                    if was_startup and self.on_startup_compaction_retry_scheduled:
+                                        self.on_startup_compaction_retry_scheduled(
+                                            self.tab_id, self._forced_compaction_retry_not_before,
+                                        )
+                                    log_event("engine", "forced_compaction_failed", tab_id=self.tab_id, subtype=message.subtype)
+                                else:
+                                    self.forced_compaction_result_pending = False
+                                    if self.forced_compaction_reason == "startup":
+                                        self._complete_startup_compaction()
+                                    self.forced_compaction_reason = None
+                                    self._forced_compaction_previous_clock = None
+                                    log_event("engine", "forced_compaction_done", tab_id=self.tab_id, subtype=message.subtype)
                             else:
                                 log_event("engine", "fake_result_message_preserved", tab_id=self.tab_id)
                         else:
@@ -2377,6 +2474,9 @@ class ChatSession:
                             # turn (_input_stream yields it). No per-turn
                             # restart.
                             self.turn_is_voice = False
+                        if not result_is_fake:
+                            self._one_shot_followup_waiting_for_result = False
+                            self._one_shot_ignore_cap_until_result = False
 
                     if isinstance(message, SystemMessage) and message.subtype == "init":
                         self.has_seen_init = True
@@ -2407,6 +2507,13 @@ class ChatSession:
             except Exception as exc:  # noqa: BLE001 -- must classify, not swallow
                 if self.ended:
                     return
+
+                # A ResultMessage for /compact cannot arrive from a dead
+                # connection. Clear its suppression latch before any branch
+                # below replays a real turn onto the replacement stream.
+                self._abandon_forced_compaction()
+                self._one_shot_followup_waiting_for_result = False
+                self._one_shot_ignore_cap_until_result = False
 
                 if self.user_stop_requested:
                     self.user_stop_requested = False

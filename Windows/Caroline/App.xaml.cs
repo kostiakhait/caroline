@@ -1,5 +1,5 @@
+using System.Collections.Generic;
 using System.Net.Http;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -123,7 +123,7 @@ public partial class App : System.Windows.Application
         splash.Closed += (_, _) => dismissedEarly.TrySetResult();
         splash.Show();
 
-        await WaitForSplashDismissAsync(dismissedEarly.Task);
+        await WaitForSplashDismissAsync(dismissedEarly.Task, _mainWindow.StartupTabIds);
         if (splash.IsLoaded) splash.Close();
         _mainWindow.Opacity = 1;
 
@@ -153,8 +153,8 @@ public partial class App : System.Windows.Application
     /// Keeps the splash up (and, per OnStartup's Opacity=0/1 dance, the main
     /// window invisible) until the backend actually answers GET /api/status
     /// (started by MainWindow.OnLoaded, already running by the time this is
-    /// called) AND no tab in that response's own tabs[] array reports
-    /// forcedCompactionPending -- see ChatSession.status()'s own doc comment
+    /// called) and every tab expected for this launch has initialized and
+    /// completed its startup compaction -- see ChatSession.status()
     /// (backend-py/app/chat_session.py) for the startup forced-compaction
     /// this is specifically waiting out. Per explicit instruction
     /// (2026-09-13): confirmed live that dismissing on /api/status alone
@@ -167,7 +167,7 @@ public partial class App : System.Windows.Application
     /// watchdog/restart logic takes over after this either way). An early
     /// click (dismissedEarly) wins over both.
     /// </summary>
-    private static async Task WaitForSplashDismissAsync(Task dismissedEarly)
+    private static async Task WaitForSplashDismissAsync(Task dismissedEarly, IReadOnlyList<string> expectedTabIds)
     {
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
         var deadline = DateTime.UtcNow + SplashMaxWait;
@@ -189,25 +189,12 @@ public partial class App : System.Windows.Application
                 else
                 {
                     var body = await resp.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(body);
-                    var compacting = false;
-                    if (doc.RootElement.TryGetProperty("tabs", out var tabs) && tabs.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var t in tabs.EnumerateArray())
-                        {
-                            if (t.TryGetProperty("forcedCompactionPending", out var p) && p.ValueKind == JsonValueKind.True)
-                            {
-                                compacting = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (compacting && !loggedCompactionWait)
+                    healthy = SplashReadiness.IsReady(body, expectedTabIds);
+                    if (!healthy && !loggedCompactionWait)
                     {
                         loggedCompactionWait = true;
-                        Logger.Log("App.WaitForSplashDismissAsync: holding splash -- a tab is still running its startup forced compaction");
+                        Logger.Log("App.WaitForSplashDismissAsync: holding splash -- waiting for restored tabs to initialize and finish startup compaction");
                     }
-                    healthy = !compacting;
                 }
             }
             catch
