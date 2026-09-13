@@ -85,6 +85,7 @@ from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
     NOT_LOGGED_IN_PATTERN,
+    OVERSIZED_MESSAGE_PATTERN,
     PROMPT_TOO_LONG_PATTERN,
     SESSION_NOT_FOUND_PATTERN,
     TOOL_CONCURRENCY_ERROR_PATTERN,
@@ -1851,7 +1852,7 @@ class ChatSession:
 
     # ------------------------------------------------------------- failure --
 
-    async def _handle_failure(self, exc: BaseException) -> None:
+    async def _handle_failure(self, exc: BaseException, extra_note: str | None = None) -> None:
         log_event("engine", "handle_failure_entered", tab_id=self.tab_id, hang_count=self.hang_count, turn_pending=self.turn_pending, error=str(exc))
         # Any pending per-server reconnect retries belong to the client
         # instance that's being torn down -- _schedule_mcp_reconnect's own
@@ -1891,9 +1892,9 @@ class ChatSession:
         self.hang_interrupted_tool_elapsed_s = None
         watchdog_note = (
             f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}):"
-            f"{tool_note} {exc}. This is Caroline's own infrastructure self-healing, already handled -- for your own "
-            "situational awareness only. Do not mention this or sound any alarm about it to the user unless they "
-            "specifically ask what happened just now.]"
+            f"{tool_note} {exc}.{(' ' + extra_note) if extra_note else ''} This is Caroline's own infrastructure "
+            "self-healing, already handled -- for your own situational awareness only. Do not mention this or "
+            "sound any alarm about it to the user unless they specifically ask what happened just now.]"
         )
         if self.pending_user_text is not None:
             log_event("engine", "handle_failure_replay_pending", tab_id=self.tab_id, text_len=len(self.pending_user_text))
@@ -2023,6 +2024,28 @@ class ChatSession:
                     # fixes.
                     "settings": _ensure_settings_file(self.workspace_dir),
                     "hooks": {"PreCompact": [HookMatcher(hooks=[self._pre_compact_hook])]},
+                    # Bug fix (2026-09-13), confirmed live (tab 2, "Flying
+                    # Squirrel", twice -- 2026-09-11 and again 2026-09-13):
+                    # the SDK's own subprocess transport frames the CLI's
+                    # NDJSON stdout one line at a time and hard-fails
+                    # (SDKJSONDecodeError, "JSON message exceeded maximum
+                    # buffer size") past its default 1MB-per-line limit -- a
+                    # single large tool result (base64 image content, here)
+                    # is enough to cross it. That failure is NOT recoverable
+                    # by this class's own restart/replay machinery once it
+                    # happens: the oversized line is already persisted in
+                    # the resumed session's own transcript, so the very next
+                    # `resume` reads it right back off disk and dies again
+                    # immediately -- confirmed live as a real, indefinite
+                    # "query() stream ended unexpectedly" retry loop (over
+                    # an hour, every ~5min, restart budget never even
+                    # tripped because each cycle "succeeded" at restarting
+                    # only to fail the same way seconds later). Raised well
+                    # past any plausible single-message size this app
+                    # produces (a handful of embedded images, at most) --
+                    # None keeps inheriting the SDK's own default forever if
+                    # this line is ever removed, so pin an explicit value.
+                    "max_buffer_size": 50 * 1024 * 1024,
                 }
                 if anthropic_env:
                     options_kwargs["env"] = anthropic_env
@@ -2351,9 +2374,26 @@ class ChatSession:
                             # isVoice: this.turnIsVoice } specifically on the
                             # "result" message -- ported that shape here; every
                             # other message type is sent exactly as before.
-                            envelope: dict[str, Any] = {"type": "sdk_message", "message": wire}
-                            if wire.get("type") == "result":
-                                envelope["isVoice"] = self.turn_is_voice
+                            #
+                            # Bug fix (2026-09-13), confirmed live from a real
+                            # incident: a voice-originated turn that ran long
+                            # (several minutes of tool calls) DID produce a real,
+                            # visible mid-turn text reply (shown as a chat bubble)
+                            # -- but the SDK's own transport then hit an unrelated
+                            # failure ("JSON message exceeded maximum buffer size")
+                            # before ever reaching a clean ResultMessage, so
+                            # isVoice (previously attached ONLY to "result")
+                            # never reached the client at all -- nothing was ever
+                            # spoken/animated, even though the user had already
+                            # SEEN a real reply. Voice/Visual-Mode playback must
+                            # not depend on the turn eventually reaching a clean
+                            # result -- attach isVoice to EVERY sdk_message now
+                            # (self.turn_is_voice is stable for the whole logical
+                            # turn, including across a crash-triggered replay --
+                            # see its own "leave untouched"/"preserved" comments
+                            # below), so chat.js can speak/animate each visible
+                            # reply as it actually arrives.
+                            envelope: dict[str, Any] = {"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice}
                             await self.send(envelope)
                             if wire.get("type") in ("assistant", "result"):
                                 if not self.real_user_turn_answered:
@@ -2525,6 +2565,42 @@ class ChatSession:
                     self.turn_pending = False
                     clear_pending_turn(self.workspace_dir, self.tab_id)
                     self._handle_rate_limit_rejected("silent-stream-death", self.last_rate_limit_info)
+                    continue
+
+                # Per explicit instruction (2026-09-13): raising
+                # max_buffer_size (options_kwargs, above) is a ceiling, not
+                # a fix -- confirmed live that blindly replaying the exact
+                # same request after this failure just repeats the exact
+                # same expensive approach (reading several full-resolution
+                # images via the native Read tool back-to-back) and can
+                # cross even a much higher ceiling. A dedicated note is
+                # needed so the model actually changes approach, not just
+                # retries -- generic _handle_failure's own {exc} text alone
+                # gives it nothing to act on differently. No manual
+                # transcript surgery to "delete" the oversized result (the
+                # CLI already wrote it to the resumed session's own
+                # transcript before this failure fired; editing that file
+                # out from under a resuming CLI is not safe) -- the EXISTING
+                # forced-compaction-on-growth check (_check_forced_
+                # compaction, 100KB threshold) already dehydrates it out to
+                # a file + pointer automatically within one watchdog tick
+                # of the replayed turn actually completing, which is
+                # exactly the "write to a file and point at it" shape this
+                # was missing -- it just needs THIS retry to succeed rather
+                # than loop forever repeating the same failure.
+                if OVERSIZED_MESSAGE_PATTERN.search(str(exc)):
+                    log_event("engine", "oversized_tool_result_failure", tab_id=self.tab_id, error=str(exc))
+                    await self._handle_failure(
+                        exc,
+                        extra_note=(
+                            "The failure was a single tool result too large to process (most likely reading "
+                            "several full-resolution images in a row with the Read tool). Don't repeat that same "
+                            "approach: process images one at a time rather than in a burst, and prefer whatever "
+                            "cheaper/lower-resolution option is available (a thumbnail, a smaller crop, a text "
+                            "description of the image) over reading multiple large full-resolution files back to "
+                            "back."
+                        ),
+                    )
                     continue
 
                 await self._handle_failure(exc)

@@ -82,3 +82,17 @@ SESSION_NOT_FOUND_PATTERN = re.compile(r"No conversation found with session ID",
 # prefix. No recovery action -- suppressed entirely; the account's real
 # login state is fine.
 NOT_LOGGED_IN_PATTERN = re.compile(r"Not logged in", re.IGNORECASE)
+
+# --- oversized single tool result --------------------------------------------
+# claude_agent_sdk's own subprocess transport frames the CLI's NDJSON
+# stdout one line at a time and raises SDKJSONDecodeError past its own
+# max_buffer_size (ClaudeAgentOptions.max_buffer_size, raised well past the
+# SDK's 1MB default -- see chat_session.py's own options_kwargs comment) --
+# confirmed live (2026-09-11, again 2026-09-13) as a single large tool
+# result (the native Read tool on a full-resolution image, read several in
+# a row) crossing it. Distinct from every other pattern here: raising the
+# buffer limit prevents the crash, but replaying the SAME request with the
+# SAME approach risks hitting it again on a big enough result even past a
+# raised limit -- the recovery note for this one specifically has to steer
+# the model toward a cheaper approach, not just retry.
+OVERSIZED_MESSAGE_PATTERN = re.compile(r"exceeded maximum buffer size", re.IGNORECASE)

@@ -294,7 +294,7 @@
       // and replayed -- collapse to one fresh placeholder so the eventual
       // real reply's TTS text doesn't get the old partial text glued onto
       // the front of it.
-      turnQueue = [{ isVoice: false, assistantText: "" }];
+      turnQueue = [{ isVoice: false, assistantText: "", spoken: false }];
     } else if (state === "error") {
       // Genuinely blocked (e.g. depleted balance) -- nothing still running
       // will ever produce a "result" until the user acts, unlike
@@ -1340,7 +1340,7 @@
       // always flips turn_pending True right alongside sending this event,
       // so the backend's own "status" message (applyCarolineStatus) is
       // already on its way over the same connection.
-      turnQueue.push({ isVoice: false, assistantText: "" });
+      turnQueue.push({ isVoice: false, assistantText: "", spoken: false });
       return;
     }
 
@@ -1365,7 +1365,7 @@
         // "status" message (applyCarolineStatus), already published the
         // moment this turn's own submit()/inject_proactive() ran, whether or
         // not this page was even connected yet to receive it.
-        turnQueue.push({ isVoice: false, assistantText: "" });
+        turnQueue.push({ isVoice: false, assistantText: "", spoken: false });
       }
       const turn = turnQueue[0]; // oldest still-unresolved turn -- see turnQueue's doc comment
       const blocks = msg.message.content || [];
@@ -1394,6 +1394,20 @@
           if (hasToolUse) continue;
           addBubble("assistant", block.text);
           if (turn) turn.assistantText += (turn.assistantText ? "\n\n" : "") + block.text;
+          // Bug fix (2026-09-13), confirmed live: a voice-originated turn that
+          // crashed (SDK transport error) partway through, AFTER already
+          // showing a real visible reply like this one, never spoke/animated
+          // it -- playback used to wait for the turn's own terminal "result",
+          // which in that incident never arrived. Voice/Visual-Mode playback
+          // must not depend on the turn eventually finishing cleanly: speak
+          // each visible reply the moment it actually reaches the user, not
+          // in one batch at the end. evt.isVoice is now attached to EVERY
+          // sdk_message (backend chat_session.py), not just "result" -- same
+          // authoritative, crash/restart-stable source as before.
+          if (evt.isVoice) {
+            speak(block.text);
+            if (turn) turn.spoken = true;
+          }
         } else if (block.type === "tool_use") {
           // Confirmed live: a long turn chaining many tool calls (browsing,
           // clicking, checking folders...) showed "Bash... (12660s)" -- 3.5h
@@ -1418,14 +1432,22 @@
       const turn = turnQueue.shift();
       if (msg.subtype === "error") {
         addBanner("Something went wrong processing that message.");
-      } else if (evt.isVoice && turn && turn.assistantText) {
-        // isVoice comes from the backend's own result event (see server.ts's
-        // OutEvent doc comment), NOT from turnQueue -- turnQueue is still used
-        // for assistantText accumulation/busy-state, but a proactive (backend-
-        // only) turn landing between this turn's submit and its result can
-        // desync turnQueue's isVoice specifically (confirmed live 2026-09-03:
-        // this is why voice replies silently stopped being spoken). The
-        // backend's own turnIsVoice is authoritative and immune to that.
+      } else if (evt.isVoice && turn && turn.assistantText && !turn.spoken) {
+        // Per explicit instruction (2026-09-13): every visible reply during
+        // a voice turn is now spoken/animated AS IT ARRIVES (see the
+        // "assistant" branch above), not batched into one speak() here --
+        // that's what actually fixed the "crashed mid-turn, never spoke a
+        // word despite showing a real reply" bug. This is now only a
+        // fallback for the (should-be-impossible, but cheap to guard)
+        // case where assistantText has content but nothing was spoken for
+        // it yet -- isVoice comes from the backend's own result event (see
+        // server.ts's OutEvent doc comment), NOT from turnQueue -- turnQueue
+        // is still used for assistantText accumulation/busy-state, but a
+        // proactive (backend-only) turn landing between this turn's submit
+        // and its result can desync turnQueue's isVoice specifically
+        // (confirmed live 2026-09-03: this is why voice replies silently
+        // stopped being spoken). The backend's own turnIsVoice is
+        // authoritative and immune to that.
         speak(turn.assistantText);
       }
     }
@@ -1851,7 +1873,7 @@
     // No busy-gate: the backend queues this behind whatever's currently
     // running and processes it next, so there's no reason to make the user
     // wait for the previous turn just to queue up the next one.
-    turnQueue.push({ isVoice: !!voiceOrigin, assistantText: "" });
+    turnQueue.push({ isVoice: !!voiceOrigin, assistantText: "", spoken: false });
     addBubble("user", text, pendingAttachments);
     ws.send(JSON.stringify({ type: "user_message", text, attachments: pendingAttachments, voice: !!voiceOrigin }));
     inputEl.value = "";
@@ -1879,7 +1901,7 @@
     // turn_pending flips (false, then true again for the synthetic turn)
     // publish their own "status" messages that drive both automatically.
     turnQueue.shift();
-    turnQueue.unshift({ isVoice: false, assistantText: "" });
+    turnQueue.unshift({ isVoice: false, assistantText: "", spoken: false });
   }
 
   // --- Voice input: record until silence (or manual stop), then send ---
