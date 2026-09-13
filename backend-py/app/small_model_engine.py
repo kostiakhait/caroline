@@ -351,7 +351,7 @@ async def run_small_model_turn(
     # from this process; Caroline always passes its own, per-session key.
     adapter = camerlengo_ai.OpenRouterAdapter(api_key=api_key)
     ai = camerlengo_ai.AI(adapter=adapter)
-    model = camerlengo_ai.resolveModelCategory("SMALL")
+    model = camerlengo_ai.resolveModelCategory("LARGE")
     log_event("engine", "small_model_resolved", tab_id=tab_id, model=model, tool_count=len(registry.tool_defs))
 
     try:

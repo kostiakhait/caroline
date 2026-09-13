@@ -14,6 +14,17 @@ public sealed class EndToEndRenderTests : IDisposable
 {
     private static readonly string[] CandidateModels =
     {
+        // Bug fix (2026-09-12): confirmed live -- none of these ever existed on
+        // this machine (a stale path from a different checkout layout), so this
+        // test has been silently skipping instead of actually exercising the
+        // pipeline. The real models CarolineInstaller provisions live as a
+        // sibling of the app's own install dir -- see BackendProcess.cs's
+        // CAROLINE_MODELS_DIR comment for why (tens of GB each, must survive
+        // every app-zip update). Kept the old paths too, harmless if unused.
+        @"C:\Users\khait\AppData\Local\Caroline\art\models\CarolineA.xcfa",
+        @"C:\Users\khait\AppData\Local\Caroline\art\models\CarolineB.xcfa",
+        @"C:\Users\khait\AppData\Local\Caroline\art\models\PeterA.xcfa",
+        @"C:\Users\khait\AppData\Local\Caroline\art\models\PeterB.xcfa",
         @"d:\REPO\silmarillion\Caroline\art\models\CarolineA.xcfa",
         @"d:\REPO\silmarillion\Caroline\art\models\CarolineB.xcfa",
         @"d:\REPO\silmarillion\Caroline\art\models\PeterA.xcfa",

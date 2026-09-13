@@ -476,6 +476,72 @@ def _read_recent_dialogue_lines(session_id: str | None, tab_id: str, workspace_d
     return lines[-limit:]
 
 
+def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session_id: str | None, user_text: str, assistant_text: str) -> None:
+    """Bug fix (2026-09-12), per explicit instruction: the small-model
+    primary path (small_model_engine.py) never talks to the Claude Code CLI
+    at all, so its own Q&A never reached the ONE place
+    _read_recent_dialogue_lines (above) actually reads from -- the on-disk
+    session .jsonl. Confirmed live: a tab that answered via the small model
+    once, then got asked about "our dialogue" again, could only see
+    whatever the last real SDK turn had written, not its own most recent
+    reply. Both engines answer the SAME conversation and get used
+    interchangeably turn by turn, so both must write to the SAME durable
+    history, not two that silently diverge.
+
+    Appends a real user+assistant entry pair in the exact shape Claude
+    Code's own CLI writes (type/uuid/parentUuid/timestamp/sessionId/
+    message), chained onto whatever the last entry in the file already
+    was -- so a LATER full-SDK turn that resumes this same session_id sees
+    an unbroken, valid history, and _read_recent_dialogue_lines picks this
+    up immediately via the exact same parser (_extract_entries_from_jsonl)
+    a real CLI-written entry would produce.
+
+    No-op (logged, not raised) if this tab has never run a single SDK turn
+    yet -- session_id is None, so there is no session FILE to append onto
+    (inventing one here risks a format Claude Code itself might not accept
+    on a future resume -- Claude Code's own CLI, not Caroline, owns minting
+    a new session id and creating that file in the first place). Once any
+    real SDK turn has run once for this tab, every small-model turn after
+    that appends correctly from then on."""
+    if not session_id:
+        log_event("engine", "small_model_turn_not_persisted_no_session", tab_id=tab_id)
+        return
+    path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+    if not path.exists():
+        log_event("engine", "small_model_turn_not_persisted_no_session_file", tab_id=tab_id, path=str(path))
+        return
+    try:
+        last_uuid: str | None = None
+        existing = path.read_text(encoding="utf-8")
+        for line in reversed(existing.rstrip("\n").split("\n")):
+            if not line.strip():
+                continue
+            try:
+                last_uuid = json.loads(line).get("uuid")
+            except Exception:
+                last_uuid = None
+            break
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        user_uuid = str(uuid_mod.uuid4())
+        assistant_uuid = str(uuid_mod.uuid4())
+        user_entry = {
+            "type": "user", "uuid": user_uuid, "parentUuid": last_uuid,
+            "timestamp": now_iso, "sessionId": session_id,
+            "message": {"role": "user", "content": user_text},
+        }
+        assistant_entry = {
+            "type": "assistant", "uuid": assistant_uuid, "parentUuid": user_uuid,
+            "timestamp": now_iso, "sessionId": session_id,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": assistant_text}]},
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(user_entry, ensure_ascii=False) + "\n")
+            f.write(json.dumps(assistant_entry, ensure_ascii=False) + "\n")
+        log_event("engine", "small_model_turn_persisted", tab_id=tab_id, session_id=session_id)
+    except Exception as exc:
+        log_event("engine", "small_model_turn_persist_failed", tab_id=tab_id, error=str(exc))
+
+
 def current_language_name(tab_id: str) -> str:
     """Redesign (2026-09-09, see the resolve-based-language-detection plan):
     synchronous, instant, no network call -- just whatever was last
@@ -998,7 +1064,7 @@ class ChatSession:
             result = {"status": "escalate", "reason": f"unexpected error: {exc}"}
 
         if result["status"] == "answered":
-            await self._finish_small_model_turn_answered(result["text"], is_voice)
+            await self._finish_small_model_turn_answered(text, result["text"], is_voice)
         else:
             log_event("engine", "small_model_escalating_to_sdk", tab_id=self.tab_id, reason=result.get("reason"))
             self._end_small_model_turn()
@@ -1007,12 +1073,19 @@ class ChatSession:
             # this is indistinguishable to them from a normal first submit.
             self.submit(text, [], True, is_voice)
 
-    async def _finish_small_model_turn_answered(self, text: str, is_voice: bool) -> None:
+    async def _finish_small_model_turn_answered(self, question_text: str, text: str, is_voice: bool) -> None:
         """Synthesizes the same {assistant} + {result} wire pair a normal
         SDK turn's completion sends (see wire.py's message_to_wire), so
         chat.js needs no changes at all to render a small-model answer --
-        it can't tell the difference from a real SDK turn's own reply."""
+        it can't tell the difference from a real SDK turn's own reply.
+
+        Also persists this exchange onto the tab's own SDK session .jsonl
+        (see _append_small_model_turn_to_session's own docstring) -- both
+        engines answer the same conversation and get used interchangeably
+        turn by turn, so both must leave the SAME durable history behind,
+        not two that silently diverge."""
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
+        _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
         assistant_wire = {
             "type": "assistant",
             "message": {
