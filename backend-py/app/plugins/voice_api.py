@@ -113,6 +113,75 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name or None
 
 
+async def translate_text(text: str, language: str, session: str | None = None) -> str | None:
+    """Per explicit instruction (2026-09-13): the target language for a
+    generated piece of text (progress narration, today) must come from
+    Caroline's own DEDICATED, already-continuously-refreshed language
+    detector (chat_session.py's current_language_name/
+    refresh_language_in_background), never from asking the SAME
+    creative-generation call to also correctly infer language from
+    context -- confirmed live that the small model kept defaulting to
+    English regardless of a "reply in whatever language the user's lines
+    are written in" instruction, once the surrounding dialogue had enough
+    English technical/tool-ish content mixed in to confuse it. Run
+    UNCONDITIONALLY on the final text as a forced correction pass, not
+    conditionally based on a guess about whether it's "already right".
+
+    Confirmed live, twice: (1) CAROLINE_SW_KEY's ACL rejects the dedicated
+    ai:translate command outright ("Key scope/resource ACL does not
+    permit this call") -- same restriction resolve_user_language() above
+    already works around by going through the general-purpose ai:resolve
+    instead of the more specific ai:detectLanguage; same fix here. (2)
+    Once routed through ai:resolve, the SAME small-model failure modes as
+    generate_progress_comment() showed up here too (a JSON-wrapped refusal
+    -- "already in English... no translation can be generated" -- for a
+    perfectly ordinary translation request) -- same <tag> contract +
+    extraction + garbage/refusal filter as narration, not a bespoke
+    lighter check. Text already in the target language should come back
+    close to unchanged. Returns None on any failure OR on a garbage/
+    refusal-shaped response -- callers must fall back to the original
+    text, never block on this."""
+    prompt = (
+        f"Translate the following text into {language}. If the text is already in that language, respond with "
+        "it unchanged (or only lightly cleaned up) -- do not refuse or explain, translation into the SAME "
+        "language it's already in is a normal, valid case, not an error.\n\n"
+        f"Text to translate:\n---\n{text}\n---\n\n"
+        "Output format, follow exactly -- a program parses this, not a person: write ONLY the translated text "
+        "inside a <translation> tag, nothing else anywhere in your reply -- no JSON, no markdown, no code "
+        "fences, no quotes around it, no explanation.\n"
+        "Example, for an unrelated hypothetical translation into French -- copy the TAG, not the words: "
+        "<translation>Il pleut à Paris aujourd'hui.</translation>"
+    )
+    # Bug fix (2026-09-13), confirmed live: model="SMALL" (openai/gpt-5-nano)
+    # just echoed the source text back unchanged instead of translating it,
+    # every time -- too weak for this specific task even with a clear tag
+    # contract and a correct explicit prompt. Leaving `model` unset (the
+    # account's own default/ALTERNATE tier) instead reliably produced a
+    # real, correct translation on the same exact input. This call exists
+    # specifically to GUARANTEE correctness (see this function's own
+    # docstring) -- worth the extra cost over SMALL, unlike the narration
+    # draft itself above, which stays SMALL on purpose.
+    body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body)
+    except Exception as exc:
+        log_event("plugin:voice", "translate_text_request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
+        log_event("plugin:voice", "translate_text_bad_response", status=data.get(".status"), reason=data.get(".reason"))
+        return None
+    translated = _extract_tagged_text(data["result"], "translation")
+    if not translated:
+        log_event("plugin:voice", "translate_text_unextractable", raw=data["result"][:300])
+        return None
+    if _looks_like_narration_garbage(translated, language):
+        log_event("plugin:voice", "translate_text_rejected_garbage", text=translated[:300])
+        return None
+    return translated
+
+
 # Guards against the failure modes seen live rather than trusting any
 # non-empty .result blindly (screenshots, tab 2):
 #  - the SMALL model REFUSING the task ("I'm sorry, I can't help with
@@ -218,12 +287,21 @@ def _is_echo_of_prompt_example(text: str) -> bool:
 # came back structured), and finally to the raw text as-is for a model
 # that just answered in plain prose. Never guesses past a JSON shape it
 # doesn't recognize -- returns "" rather than passing raw JSON through.
-_NARRATION_TAG_RE = re.compile(r"<narration>(.*?)</narration>", re.IGNORECASE | re.DOTALL)
-_NARRATION_JSON_TEXT_KEYS = ("narration", "result", "text", "message", "assistant", "response", "comment", "answer")
+_JSON_TEXT_KEYS = ("narration", "translation", "translated_text", "result", "text", "message", "assistant", "response", "comment", "answer")
 
 
-def _extract_narration_text(raw: str) -> str:
-    tag_match = _NARRATION_TAG_RE.search(raw)
+def _extract_tagged_text(raw: str, tag: str) -> str:
+    """Generalized (2026-09-13) from what was narration-only: the SAME
+    unreliable-small-model failure modes (JSON-wrapping, backtick/"Result:"
+    prefixes, echoing its own instructions) confirmed live for
+    translate_text() too, not just generate_progress_comment() -- one
+    shared extractor, parameterized by which XML-ish tag the prompt asked
+    for. Falls back to unwrapping a plain {"result": "..."}-shaped JSON
+    object (a response that ignored the tag instruction but still came
+    back structured), and finally to the raw text as-is for a model that
+    just answered in plain prose. Never guesses past a JSON shape it
+    doesn't recognize -- returns "" rather than passing raw JSON through."""
+    tag_match = re.search(rf"<{tag}>(.*?)</{tag}>", raw, re.IGNORECASE | re.DOTALL)
     if tag_match:
         return tag_match.group(1).strip()
     stripped = raw.strip()
@@ -233,7 +311,7 @@ def _extract_narration_text(raw: str) -> str:
         except Exception:
             return ""
         if isinstance(parsed, dict):
-            for key in _NARRATION_JSON_TEXT_KEYS:
+            for key in _JSON_TEXT_KEYS:
                 value = parsed.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
@@ -293,11 +371,9 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
         f"  Bad (a new promise): \"{_NARRATION_EXAMPLE_BAD}\"\n"
         f"  Good (same situation, no promise): \"{_NARRATION_EXAMPLE_GOOD}\"\n\n"
         f"Here is the real recent conversation between her and the user (oldest first):\n---\n{recent_dialogue}\n---\n\n"
-        "Reply in whatever language the USER's OWN lines (marked \"User:\") above are written in -- ignore "
-        "what language Caroline's own lines happen to use, even if they dominate the text (e.g. she may be "
-        "quoting or analyzing English-language technical/legal material mid-conversation while the user "
-        "themselves is writing in a different language entirely -- go by the user's words, not the topic's). "
-        f"Only if there are no \"User:\" lines at all above, default to {language}.\n\n"
+        "Write in whichever language feels most natural to draft this in -- don't spend effort trying to "
+        "match the user's own language yourself, a dedicated separate step translates your draft into "
+        "exactly the right language afterward regardless of what you write it in here.\n\n"
         "Output format, follow exactly -- a program parses this, not a person: write your one sentence (two "
         "at most) inside a <narration> tag, with NOTHING else anywhere in your reply -- no JSON, no markdown, "
         "no code fences, no quotes around it, no explanation, and never repeat or paraphrase these "
@@ -320,7 +396,7 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
         log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))
         return None
-    text = _extract_narration_text(data["result"])
+    text = _extract_tagged_text(data["result"], "narration")
     if not text:
         log_event("plugin:voice", "generate_progress_comment_unextractable", raw=data["result"][:300])
         return None
@@ -333,8 +409,22 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     if _is_echo_of_prompt_example(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_example_echo", text=text[:300])
         return None
-    log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=text)
-    return text
+    # Per explicit instruction (2026-09-13): force the final text through
+    # Camerlengo's own dedicated ai:translate command, targeting `language`
+    # -- the authoritative, separately/continuously detected value (see
+    # chat_session.py's current_language_name), not something this creative
+    # generation call was ever asked to correctly infer on its own anymore
+    # (see the prompt's own comment above). Unconditional, not "only if it
+    # looks wrong" -- confirmed live this small model doesn't reliably self-
+    # report a language mismatch, so a forced pass is the only guarantee.
+    # Falls back to the untranslated text on any failure -- a narration
+    # comment in the wrong language is still better than none at all.
+    translated = await translate_text(text, language, session=session)
+    final_text = translated or text
+    if translated is None:
+        log_event("plugin:voice", "generate_progress_comment_translate_failed_using_original", text=text[:300])
+    log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=final_text)
+    return final_text
 
 
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
