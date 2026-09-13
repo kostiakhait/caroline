@@ -534,7 +534,17 @@
     // (loading arbitrary external images) this change isn't about.
     html = html.replace(/!\[([^\]]*)\]\(([^\s)"']+)\)/g, (_, alt, rawSrc) => {
       let src = rawSrc;
-      if (!src.startsWith("assets/")) {
+      // Bug fix (2026-09-13), confirmed live: the model referenced a real
+      // Downloads-folder file as "assets/../../../../Downloads/foo.png" --
+      // literally starting with "assets/" (so this check used to treat it
+      // as a safe, direct shipped-photo reference and left it untouched),
+      // but a "../"-riddled path is never a genuine assets/ reference; it
+      // resolved to nothing anywhere (confirmed zero /api/local-file
+      // requests logged for it) and rendered as a silently broken image.
+      // Any ".." in the path means it's NOT a clean assets/ reference,
+      // whatever it starts with -- always route those through the local-
+      // file endpoint instead, same as any other real local path.
+      if (!src.startsWith("assets/") || src.includes("..")) {
         const localPath = src.startsWith("file:///") ? decodeURIComponent(src.slice(8)) : src;
         src = `http://127.0.0.1:${port}/api/local-file?path=${encodeURIComponent(localPath)}`;
       }

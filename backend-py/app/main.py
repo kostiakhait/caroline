@@ -199,6 +199,27 @@ def primary_session() -> ChatSession | None:
     return sessions.get(PRIMARY_TAB_ID)
 
 
+def _recover_mangled_local_path(path: str) -> Path | None:
+    """Best-effort recovery for a path the model garbled while trying to
+    fake an assets/ reference (see chat.js's own doc comment on this exact
+    live incident: "assets/../../../../Downloads/fig3_coaxial.png") -- a
+    string like that never resolves as a literal relative OR absolute
+    path from any base, but the real file (confirmed live) was sitting
+    exactly where the trailing segment says: the user's own Downloads
+    folder. If a well-known Windows user folder name appears anywhere in
+    the string, retry using everything from that folder name onward,
+    resolved against the current user's home directory."""
+    normalized = path.replace("\\", "/")
+    for folder in ("Downloads", "Desktop", "Documents", "Pictures"):
+        idx = normalized.find(f"{folder}/")
+        if idx == -1:
+            continue
+        candidate = Path.home() / normalized[idx:]
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 @app.get("/api/local-file")
 async def get_local_file(path: str) -> Any:
     """Per explicit instruction (2026-09-13): the chat page's own inline
@@ -218,7 +239,10 @@ async def get_local_file(path: str) -> Any:
     transport for content this process could already reach directly."""
     file_path = Path(path)
     if not file_path.is_file():
-        return JSONResponse({"ok": False, "error": f'No such file: "{path}"'}, status_code=404)
+        recovered = _recover_mangled_local_path(path)
+        if recovered is None:
+            return JSONResponse({"ok": False, "error": f'No such file: "{path}"'}, status_code=404)
+        file_path = recovered
     mime, _ = mimetypes.guess_type(str(file_path))
     return Response(content=file_path.read_bytes(), media_type=mime or "application/octet-stream")
 
