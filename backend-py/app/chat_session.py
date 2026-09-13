@@ -814,7 +814,7 @@ class ChatSession:
     def _compute_public_status(self) -> tuple[str, str]:
         kind = self.conn_state.get("kind")
         reason = self.conn_state.get("reason") or ""
-        if kind == "billing_blocked":
+        if kind in ("billing_blocked", "not_logged_in"):
             return "error", reason
         if kind in ("restarting", "restart_backoff", "limited"):
             return "recovering", reason
@@ -831,7 +831,12 @@ class ChatSession:
         # matches the same "log at the one choke point, not at every
         # caller" shape as task_supervisor.py.
         log_event("engine", "status_published", tab_id=self.tab_id, state=state, reason=reason)
-        await self.send({"type": "status", "state": state, "reason": reason})
+        # "kind" is additive (chat.js's lamp logic only ever reads "state"/
+        # "reason", unaffected) -- lets chat.js tell "not_logged_in" apart
+        # from "billing_blocked" even though both publish as state="error",
+        # so it can raise a one-time native dialog only for the former (see
+        # chat.js's applyCarolineStatus).
+        await self.send({"type": "status", "state": state, "reason": reason, "kind": self.conn_state.get("kind")})
 
     # --------------------------------------------------------------- submit --
 
@@ -2002,6 +2007,22 @@ class ChatSession:
                         not_logged_in = next((t for t in text_blocks if NOT_LOGGED_IN_PATTERN.search(t)), None)
                         if not_logged_in:
                             log_event("engine", "not_logged_in_suppressed", tab_id=self.tab_id)
+                            # Bug fix (2026-09-12): unlike its two siblings just above
+                            # (prompt_too_long, tool_concurrency), this branch used to just
+                            # log and swallow the turn -- carolineStatus was left at
+                            # whatever it was before (usually "ready"), so the lamp stayed
+                            # green and the user got zero feedback that nothing will ever
+                            # come back until they sign in. Genuinely distinct from
+                            # billing_blocked/limited (a logged-in user out of quota, which
+                            # DOES self-heal via _schedule_api_retry) -- this is "no chat
+                            # source configured at all" (see subscription_mode.resolve_mode),
+                            # which no amount of retrying fixes, so it maps to the same
+                            # "error" public state as billing_blocked, not "recovering".
+                            self._set_conn_state(
+                                "not_logged_in",
+                                "You don't have an active Claude Code login or a SquirrelWisdom account "
+                                "signed in -- please sign in to one of them to continue.",
+                            )
                             continue
 
                     # --- CC CLI usage-cap message ---

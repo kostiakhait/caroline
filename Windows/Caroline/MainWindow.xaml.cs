@@ -933,6 +933,15 @@ public partial class MainWindow : Window
         Splash.Visibility = Visibility.Visible;
     }
 
+    // Tracks whether the currently-visible Splash overlay was raised for the
+    // "not logged in" case specifically, as opposed to a genuinely dead-end
+    // failure (no Node.js, WebView2 missing, backend gave up) -- those never
+    // clear on their own, but this one does the moment the user signs in
+    // (confirmed live 2026-09-12: no app restart needed), so it's the only
+    // ShowError case that gets dismissed programmatically rather than only
+    // by the user closing/restarting the app.
+    private bool _splashShownForNoChatSource;
+
     private void OnWebMessageReceived(WebView2 webView, CoreWebView2WebMessageReceivedEventArgs args)
     {
         try
@@ -959,6 +968,36 @@ public partial class MainWindow : Window
             if (type == "open_login")
             {
                 OnOpenLogin(webView, root);
+                return;
+            }
+
+            if (type == "no_chat_source_error")
+            {
+                // Bug fix (2026-09-12): the "not logged in" case previously had zero
+                // user-facing feedback at all -- the lamp turning red is easy to miss.
+                // This is the one status the backend reports that will NEVER self-heal
+                // without the user acting (unlike billing_blocked/limited, which retry
+                // on their own), so it gets a real blocking notice, not just the lamp.
+                var reason = root.TryGetProperty("reason", out var r) ? r.GetString() : null;
+                Logger.Log($"MainWindow: no_chat_source_error reason={reason ?? "null"}");
+                _splashShownForNoChatSource = true;
+                ShowError(reason ?? "You don't have an active Claude Code login or a SquirrelWisdom account signed in -- please sign in to one of them to continue.");
+                return;
+            }
+
+            if (type == "no_chat_source_resolved")
+            {
+                // See _splashShownForNoChatSource's own doc comment -- only clears
+                // the overlay if THIS is why it's up, never a genuinely dead-end
+                // ShowError (missing Node.js/WebView2, backend gave up) that happened
+                // to also be showing; those never send this message in the first
+                // place since chat.js can't even be running while they're active.
+                Logger.Log("MainWindow: no_chat_source_resolved");
+                if (_splashShownForNoChatSource)
+                {
+                    _splashShownForNoChatSource = false;
+                    Splash.Visibility = Visibility.Collapsed;
+                }
                 return;
             }
 

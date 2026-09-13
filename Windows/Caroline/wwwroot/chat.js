@@ -252,9 +252,39 @@
   // called from the backend's own {type:"status"} message. Per explicit
   // instruction (2026-09-11): the lamp/heartbeat/Stop button now render
   // exactly what the backend says, nothing inferred client-side.
-  function applyCarolineStatus(state, reason) {
-    console.log(`[caroline] status state=${state} reason=${JSON.stringify(reason)} (was ${carolineStatus})`);
+  // True while this tab has raised the native "no chat source at all"
+  // dialog (see below) and it hasn't been resolved yet -- without this,
+  // every subsequent turn that also comes back "not logged in" (nothing
+  // auto-retries this kind, unlike billing_blocked/limited) would pop the
+  // dialog again on every turn.
+  let noChatSourceDialogShown = false;
+
+  function applyCarolineStatus(state, reason, kind) {
+    console.log(`[caroline] status state=${state} reason=${JSON.stringify(reason)} kind=${kind} (was ${carolineStatus})`);
     const wasWorking = carolineStatus === "working";
+    if (kind === "not_logged_in" && !noChatSourceDialogShown) {
+      // Bug fix (2026-09-12): this used to be silent -- state="error" alone
+      // turns the lamp red and updates the status-bar text, but a user who
+      // isn't looking at the lamp right then would see nothing at all. This
+      // is the one case that will NEVER self-heal without the user acting
+      // (billing_blocked/limited both do, via the backend's own
+      // _schedule_api_retry), so it gets a real modal, once per tab session.
+      noChatSourceDialogShown = true;
+      if (window.chrome?.webview) {
+        window.chrome.webview.postMessage({ type: "no_chat_source_error", reason });
+      }
+    } else if (kind !== "not_logged_in" && noChatSourceDialogShown) {
+      // Confirmed live (2026-09-12): signing in via Settings resolves this
+      // WITHOUT an app restart -- the very next turn just works, since
+      // resolve_mode() re-checks `claude auth status`/the pasted key fresh
+      // every time. Tell the native side to drop its blocking overlay too,
+      // or the user would be stuck staring at a stale error screen despite
+      // being fully unblocked underneath it.
+      noChatSourceDialogShown = false;
+      if (window.chrome?.webview) {
+        window.chrome.webview.postMessage({ type: "no_chat_source_resolved" });
+      }
+    }
     if (state === "recovering" && carolineStatus !== "recovering" && turnQueue.length > 0) {
       // Bug fix carried over from the old caroline_status "restarting"
       // handler (2026-09-10): an internal session restart mid-turn
@@ -1298,7 +1328,7 @@
     if (evt.type === "status") {
       // The one authoritative signal for ready/working/recovering/error --
       // see applyCarolineStatus and chat_session.py's _compute_public_status.
-      applyCarolineStatus(evt.state, evt.reason || "");
+      applyCarolineStatus(evt.state, evt.reason || "", evt.kind);
       return;
     }
 
