@@ -73,16 +73,66 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from app import session_context
+from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
-from app.operations import dispatch
+from app.operations import REGISTRY as OPERATIONS_REGISTRY
+from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
+from app.policies import (
+    continuity_pointer_instruction,
+    learn_from_mistakes_instruction,
+    no_alarming_internal_recovery_instruction,
+    no_full_filesystem_search_instruction,
+    no_internal_mechanics_to_user_instruction,
+    no_remote_filesystem_scans_instruction,
+    no_unauthorized_secret_changes_instruction,
+    prefer_embedded_browser_instruction,
+    proactive_context_recovery_instruction,
+    self_sufficiency_instruction,
+    task_completion_memory_instruction,
+    timestamp_awareness_instruction,
+    vault_security_instruction,
+)
+
+# Per explicit instruction (2026-09-13), after a real capability audit
+# ("проверь, что маленькая модель имеет ВСЁ, что имеет полный путь"): every
+# ALWAYS_ON_INSTRUCTIONS entry (policies.py) that doesn't assume a Claude-
+# Code-CLI-native affordance this engine structurally lacks (Bash's own
+# run_in_background/BashOutput, the Task subagent tool, TodoWrite, or the
+# multi-bubble live narration the SDK path's own streaming turn produces).
+# Deliberately NOT a curated subset for any other reason -- this list is
+# ALWAYS_ON_INSTRUCTIONS minus exactly the entries that reference a tool
+# this engine doesn't have, so a future addition to that list is included
+# here automatically unless it hits the same structural limit.
+_SHARED_ALWAYS_ON_INSTRUCTIONS = (
+    no_full_filesystem_search_instruction,
+    no_remote_filesystem_scans_instruction,
+    timestamp_awareness_instruction,
+    no_alarming_internal_recovery_instruction,
+    no_internal_mechanics_to_user_instruction,
+    proactive_context_recovery_instruction,
+    task_completion_memory_instruction,
+    vault_security_instruction,
+    no_unauthorized_secret_changes_instruction,
+    prefer_embedded_browser_instruction,
+    learn_from_mistakes_instruction,
+    self_sufficiency_instruction,
+)
+
+# Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__
+# notes_login"] on the full SDK path's ClaudeAgentOptions -- notes_login is
+# an interactive device-code flow meant to be driven by squirrelwisdom-login
+# (a Skill on the SDK path), not called directly by the model; kept
+# consistent here rather than silently giving this engine MORE access to a
+# plugin than the full path allows itself.
+_DISALLOWED_TOOL_NAMES = {"notes_login"}
 
 # Mirrors local_tts_launcher.py's/skills_seed.py's own shipped-vs-dev-tree
 # resolution pattern exactly: a shipped copy under backend-py/ itself first
@@ -173,40 +223,182 @@ def _persona_system_message(persona: Persona) -> str:
     )
 
 
+def _shared_policy_text(workspace_dir: str, tab_id: str) -> str:
+    """The subset of policies.py's ALWAYS_ON_INSTRUCTIONS that applies here
+    unchanged (see _SHARED_ALWAYS_ON_INSTRUCTIONS's own doc comment), plus
+    continuity_pointer_instruction -- the SAME text the full SDK path
+    appends to its system prompt (chat_session.py's system_prompt_parts),
+    so a fact/rule the user only ever stated once doesn't quietly stop
+    applying depending on which engine happens to answer a given turn."""
+    parts = [fn() for fn in _SHARED_ALWAYS_ON_INSTRUCTIONS]
+    archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
+    parts.append(continuity_pointer_instruction(archive_path))
+    if archive_path:
+        # Per explicit instruction (2026-09-13): confirmed live -- the
+        # "recent dialogue" window you're given below is short (only the
+        # last few exchanges) and can end up ENTIRELY made of internal
+        # housekeeping (proactive nudges and their own replies) right after
+        # a compaction, leaving you with what looks like a blank slate even
+        # though this is a long-running, ongoing conversation. That is
+        # never a reason to ask the user what's going on or to re-explain
+        # something they already told you -- the complete prior transcript
+        # is saved on disk; go read it yourself with read_file before you
+        # ask the user anything or say you lack context. Do this
+        # immediately and silently -- never tell the user you had to go
+        # look something up.
+        parts.append(
+            "If the dialogue shown to you below looks thin, empty, or doesn't match what the user's message "
+            "clearly presupposes you already know, that's because it was trimmed for space, not because "
+            f"nothing happened -- the full conversation so far is saved at: {archive_path}\nRead that file "
+            "yourself before asking the user to repeat or clarify anything. Never tell the user you had to go "
+            "read a file to recall this."
+        )
+    return "\n\n".join(p for p in parts if p)
+
+
 def _engine_instructions(language: str) -> str:
     return (
         "You are being asked to help with something that looked simple enough to answer directly -- possibly "
-        "using one or more of the tools available to you. Do so.\n\n"
+        "using one or more of the tools available to you (including generic file read/write and running shell "
+        "commands or Python scripts -- you have real tools for all of that, not just the specific plugins like "
+        "email/notes/screenshots). Do so.\n\n"
+        "If a tool call comes back with status \"running\" instead of a real result, that is not the end of the "
+        "story -- call check_operation_status with its operation_id to find out what actually happened before "
+        "you reply. Calling a tool is not the same thing as the task being done: before you tell the user "
+        "something is finished, make sure you have actually seen the real result and it matches what they asked "
+        "for -- never write a placeholder, a stub, or a summary of what you intend to fill in, and never say "
+        "you're about to do something without actually doing it in this same turn. If a tool's own short "
+        "description isn't enough to be sure how to use it correctly, call get_tool_instructions for it first.\n\n"
         f"Reply in {language} unless the user's own message is written in a different language -- then match "
         "theirs instead.\n\n"
         "If you judge that you are NOT coping with this task -- too many tool-call failures, the task turning "
-        "out to be more complex than it looked once you got into it, or the conversation history below shows "
-        "the user already had to correct you or repeat themselves more than once -- stop and reply with "
-        f"EXACTLY {ESCALATION_SENTINEL} and nothing else, no explanation. This hands the conversation off to a "
-        "more capable assistant -- it is not a failure on your part, it's the right call the moment a task "
-        "turns out to be bigger than it looked. Only do this as a genuine judgment call, not a first resort -- "
-        "most things you'll be asked fall well within what you can handle directly."
+        "out to be more complex than it looked once you got into it, the conversation history below shows the "
+        "user already had to correct you or repeat themselves more than once, OR you conclude there is no tool "
+        "available to you that can accomplish some necessary step -- stop and reply with EXACTLY "
+        f"{ESCALATION_SENTINEL} and nothing else, no explanation. In that last case specifically: never tell the "
+        "user you're unable to do something and leave it at that -- a more capable assistant that picks up right "
+        "after you may well have a way to do it, so hand off instead of declining on their behalf. This hands "
+        "the conversation off to a more capable assistant -- it is not a failure on your part, it's the right "
+        "call the moment a task turns out to be bigger than it looked. Only do this as a genuine judgment call, "
+        "not a first resort -- most things you'll be asked fall well within what you can handle directly."
     )
+
+
+
+# OpenAI/Camerlengo-format tool_defs for the three generic operation-control
+# tools (app/operations.py's build_operations_mcp_server(), same descriptions
+# copied verbatim) -- these don't come from a plugin, so to_openai_tool_def()
+# doesn't apply; hand-written once here instead. Handled specially in
+# _make_executor_fn() below (never go through registry.lookup/dispatch()),
+# since they operate ON operations.py's own process-wide REGISTRY rather than
+# starting a new plugin operation themselves.
+_OPERATIONS_TOOL_DEFS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_operation_status",
+            "description": (
+                "Checks the status of a previously started long-running tool operation (one whose start "
+                "returned status=\"running\" instead of \"done\"). Returns the current status "
+                "(running/done/error/cancelled), any partial/intermediate data reported so far, and the final "
+                "result once done."
+            ),
+            "parameters": {"type": "object", "properties": {"operation_id": {"type": "string"}}, "required": ["operation_id"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_operation",
+            "description": "Cancels a previously started long-running tool operation by its operation_id.",
+            "parameters": {"type": "object", "properties": {"operation_id": {"type": "string"}}, "required": ["operation_id"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tool_instructions",
+            "description": (
+                "Fetches the detailed usage guidance for a specific tool by name (not every tool has any -- "
+                "most are self-explanatory from their own short description alone). Call this when you're about "
+                "to use a tool whose behavior/conventions/gotchas you're not fully sure of, or when a tool's own "
+                "short description hints there's more nuance. Cheap to call, no side effects."
+            ),
+            "parameters": {"type": "object", "properties": {"tool_name": {"type": "string"}}, "required": ["tool_name"]},
+        },
+    },
+]
+
+_OPERATIONS_TOOL_NAMES = {t["function"]["name"] for t in _OPERATIONS_TOOL_DEFS}
 
 
 @dataclass
 class ToolRegistry:
     tool_defs: list[dict[str, Any]]
     lookup: dict[str, tuple[str, PluginTool]]
+    # tool_name -> that tool's plugin's usage_instructions, for the
+    # get_tool_instructions tool -- see loader.py's Plugin.usage_instructions
+    # own doc comment for why this is fetched on demand rather than injected
+    # into the system prompt outright.
+    tool_instructions: dict[str, str] = field(default_factory=dict)
 
 
 def build_tool_registry() -> ToolRegistry:
     """Every tool every plugin exposes, in OpenAI/Camerlengo format -- per
     explicit instruction, tools are fully shared between this path and the
     SDK path, not a curated subset; see to_openai_tool_def()'s own doc
-    comment for why this needs no plugin-file changes at all."""
-    tool_defs: list[dict[str, Any]] = []
+    comment for why this needs no plugin-file changes at all. Also carries
+    the same generic check_operation_status/stop_operation/
+    get_tool_instructions trio the full SDK path gets via
+    build_operations_mcp_server() (2026-09-13 capability audit) -- without
+    these, a tool call that crosses dispatch()'s FAST_PATH_TIMEOUT_S and
+    comes back status="running" was a dead end for this engine: no way to
+    ever learn the real result, so it had to guess or just claim success.
+    Confirmed live as the actual cause of a placeholder note being left
+    behind while the model told the user it was "preparing" the real one."""
+    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS)
     lookup: dict[str, tuple[str, PluginTool]] = {}
+    tool_instructions: dict[str, str] = {}
     for plugin in discover_plugins():
         for t in plugin.tools:
+            if t.name in _DISALLOWED_TOOL_NAMES:
+                continue
             tool_defs.append(to_openai_tool_def(t))
             lookup[t.name] = (plugin.name, t)
-    return ToolRegistry(tool_defs=tool_defs, lookup=lookup)
+            if plugin.usage_instructions:
+                tool_instructions[t.name] = plugin.usage_instructions
+    return ToolRegistry(tool_defs=tool_defs, lookup=lookup, tool_instructions=tool_instructions)
+
+
+async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRegistry) -> str:
+    """Implements check_operation_status/stop_operation/get_tool_instructions
+    directly against operations.py's own process-wide OPERATIONS_REGISTRY --
+    NOT via dispatch() (these tools inspect/control an operation dispatch()
+    already created, they don't start a new one of their own). Run on the
+    main event loop (see _make_executor_fn's run_coroutine_threadsafe call)
+    since Operation.task is a live asyncio.Task; .cancel() and reading task
+    state should only ever happen on the loop that owns it."""
+    if name == "check_operation_status":
+        op = OPERATIONS_REGISTRY.get(args["operation_id"])
+        if op is None:
+            return "Unknown or already-completed operation_id."
+        body = _operation_to_dict(op)
+        if op.status in ("done", "error", "cancelled"):
+            OPERATIONS_REGISTRY.forget(op.id)
+        return str(body)
+    if name == "stop_operation":
+        op = OPERATIONS_REGISTRY.get(args["operation_id"])
+        if op is None or op.task is None:
+            return "Unknown or already-completed operation_id."
+        op.task.cancel()
+        return f"Cancelled {args['operation_id']}."
+    if name == "get_tool_instructions":
+        tool_name = args["tool_name"]
+        text = registry.tool_instructions.get(tool_name)
+        if text is None:
+            return f'No detailed usage instructions for "{tool_name}" -- its own short description is all there is.'
+        return text
+    return f"ERROR: unknown operations tool '{name}'"
 
 
 def _make_executor_fn(
@@ -235,6 +427,11 @@ def _make_executor_fn(
         if count > REPEATED_CALL_LIMIT:
             log_event("engine", "small_model_repeated_call_detected", tab_id=tab_id, tool=name, args=args, count=count)
             raise NeedsEscalation(f"tool '{name}' called with identical arguments {count} times in a row -- likely a stuck loop")
+
+        if name in _OPERATIONS_TOOL_NAMES:
+            return asyncio.run_coroutine_threadsafe(
+                _run_operations_tool(name, args, registry), main_loop,
+            ).result()
 
         entry = registry.lookup.get(name)
         if entry is None:
@@ -268,6 +465,7 @@ def _make_executor_fn(
 
 async def run_small_model_turn(
     tab_id: str,
+    workspace_dir: str,
     persona: Persona,
     user_text: str,
     recent_dialogue_lines: list[str],
@@ -307,13 +505,23 @@ async def run_small_model_turn(
         return {"status": "escalate", "reason": "no model-provider key available (not logged into SquirrelWisdom, or the fetch failed)"}
 
     registry = build_tool_registry()
-    system = _persona_system_message(persona) + "\n\n" + _engine_instructions(language)
+    system = "\n\n".join([
+        _persona_system_message(persona),
+        _engine_instructions(language),
+        _shared_policy_text(workspace_dir, tab_id),
+    ])
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for line in recent_dialogue_lines:
         is_caroline = line.startswith("Caroline:")
         content = line.split(":", 1)[-1].strip()
         messages.append({"role": "assistant" if is_caroline else "user", "content": content})
-    messages.append({"role": "user", "content": user_text})
+    # Deferred import: chat_session imports this module at load time, so a
+    # top-level import here would be circular -- see this module's own
+    # module-level comments for other examples of this pattern.
+    from app.chat_session import _format_timestamp_for_model
+    from datetime import datetime, timezone
+    sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}]"
+    messages.append({"role": "user", "content": f"{sent_line}\n{user_text}"})
 
     main_loop = asyncio.get_running_loop()
     executor_fn = _make_executor_fn(registry, tab_id, send, main_loop)

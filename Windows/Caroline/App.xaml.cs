@@ -1,4 +1,5 @@
 using System.Net.Http;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -82,18 +83,35 @@ public partial class App : System.Windows.Application
         // first shown, and both the global hotkey (registered in
         // OnSourceInitialized) and the backend/WebView2 startup (in Loaded)
         // depend on that HWND existing -- staying hidden at launch meant
-        // neither the hotkey nor the backend ever started. The splash
-        // (owned by this window, see below) covers it visually until backend
-        // readiness is confirmed below. Tray/hotkey hide it from here on,
-        // same as DictateWin's floating panel.
+        // neither the hotkey nor the backend ever started. Opacity=0 (not
+        // Visibility=Hidden) keeps that HWND/Loaded pipeline running exactly
+        // as before while keeping the window itself invisible to the user
+        // during this window -- see the Opacity=1 restore below for why.
         _mainWindow.Show();
-        // Per explicit correction (2026-09-03): the main window must stay fully
-        // usable while the backend connects -- the tab strip, menu, everything.
-        // Only the chat input field itself should be disabled during that window
-        // (see chat.js's connection-status handling), NOT the whole UI. A previous
-        // version of this code disabled the entire window here and justified it in
-        // this comment as something the user had asked for -- they hadn't; that was
-        // fabricated. Do not reintroduce whole-window blocking.
+        _mainWindow.Opacity = 0;
+        // Per explicit instruction (2026-09-13): while the splash is up, the
+        // dialog window must not be visible at all -- confirmed live as a
+        // real bug (2026-09-13): a startup forced-compaction on a large tab
+        // session made SyncTabListToBackend keep timing out, so the tab
+        // strip never populated and the user saw a half-loaded, effectively
+        // broken-looking window (only the default tab, blank content) the
+        // whole time the splash was supposedly "covering" it. The splash
+        // was never actually opaque/full-window (see SplashWindow's own doc
+        // comment) -- it's a small floating banner over an already-visible
+        // main window, which is fine ONLY once that window's content is
+        // real. This supersedes the 2026-09-03 correction below for
+        // specifically the loading window; that correction's actual point
+        // (don't disable a window the user can already see and use) still
+        // holds once Opacity is restored to 1 further down.
+        //
+        // Per that 2026-09-03 correction: once visible, the main window must
+        // stay fully usable while the backend connects -- the tab strip,
+        // menu, everything. Only the chat input field itself should be
+        // disabled during that window (see chat.js's connection-status
+        // handling), NOT the whole UI. A previous version of this code
+        // disabled the entire window here and justified it in this comment
+        // as something the user had asked for -- they hadn't; that was
+        // fabricated. Do not reintroduce whole-window blocking once shown.
 
         // Floating transparent splash (cycling photos + "Connecting...", no chrome
         // -- see SplashWindow) is purely a cosmetic loading indicator now, not a
@@ -107,6 +125,7 @@ public partial class App : System.Windows.Application
 
         await WaitForSplashDismissAsync(dismissedEarly.Task);
         if (splash.IsLoaded) splash.Close();
+        _mainWindow.Opacity = 1;
 
         _mainWindow.Activate();
         // Activate() alone can silently no-op here: Windows' foreground-lock
@@ -131,20 +150,29 @@ public partial class App : System.Windows.Application
     }
 
     /// <summary>
-    /// Keeps the splash up until the backend actually answers GET
-    /// /api/status (started by MainWindow.OnLoaded, already running by the
-    /// time this is called) -- honors SplashMinDuration as a floor (so a
-    /// warm start still gets a brief, deliberate branding beat instead of
-    /// flashing by instantly) and SplashMaxWait as a ceiling (so a
-    /// genuinely broken backend doesn't leave the user staring at a splash
-    /// forever -- MainWindow's own health watchdog/restart logic takes over
-    /// after this either way). An early click (dismissedEarly) wins over both.
+    /// Keeps the splash up (and, per OnStartup's Opacity=0/1 dance, the main
+    /// window invisible) until the backend actually answers GET /api/status
+    /// (started by MainWindow.OnLoaded, already running by the time this is
+    /// called) AND no tab in that response's own tabs[] array reports
+    /// forcedCompactionPending -- see ChatSession.status()'s own doc comment
+    /// (backend-py/app/chat_session.py) for the startup forced-compaction
+    /// this is specifically waiting out. Per explicit instruction
+    /// (2026-09-13): confirmed live that dismissing on /api/status alone
+    /// let the user see a broken-looking, half-populated tab strip while a
+    /// large tab's session was still being compacted in the background.
+    /// Honors SplashMinDuration as a floor (so a warm start still gets a
+    /// brief, deliberate branding beat instead of flashing by instantly) and
+    /// SplashMaxWait as a ceiling (so a genuinely broken backend doesn't
+    /// leave the user staring at a splash forever -- MainWindow's own health
+    /// watchdog/restart logic takes over after this either way). An early
+    /// click (dismissedEarly) wins over both.
     /// </summary>
     private static async Task WaitForSplashDismissAsync(Task dismissedEarly)
     {
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
         var deadline = DateTime.UtcNow + SplashMaxWait;
         var minDeadline = DateTime.UtcNow + SplashMinDuration;
+        var loggedCompactionWait = false;
 
         while (DateTime.UtcNow < deadline)
         {
@@ -154,7 +182,33 @@ public partial class App : System.Windows.Application
             try
             {
                 using var resp = await http.GetAsync($"http://127.0.0.1:{BackendProcess.Port}/api/status");
-                healthy = resp.IsSuccessStatusCode;
+                if (!resp.IsSuccessStatusCode)
+                {
+                    healthy = false;
+                }
+                else
+                {
+                    var body = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(body);
+                    var compacting = false;
+                    if (doc.RootElement.TryGetProperty("tabs", out var tabs) && tabs.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var t in tabs.EnumerateArray())
+                        {
+                            if (t.TryGetProperty("forcedCompactionPending", out var p) && p.ValueKind == JsonValueKind.True)
+                            {
+                                compacting = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (compacting && !loggedCompactionWait)
+                    {
+                        loggedCompactionWait = true;
+                        Logger.Log("App.WaitForSplashDismissAsync: holding splash -- a tab is still running its startup forced compaction");
+                    }
+                    healthy = !compacting;
+                }
             }
             catch
             {

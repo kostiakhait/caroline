@@ -148,6 +148,18 @@ SILENT_USER_WAIT_NUDGE_MS = 90_000
 # actual cosmetic-comment mechanism this drives.
 PROGRESS_NARRATION_INTERVAL_MS = 60_000
 
+# Per explicit instruction (2026-09-13): disabled, NOT removed, pending a
+# discussion of what's actually wrong with it -- confirmed live (tab 1,
+# "Основной диалог") repeatedly writing out a plan ("сделаю так: ...") with
+# zero or incomplete tool calls, and once mid-diagnosis a real question mark
+# over whether email_list_folders/email_list_messages calls it started ever
+# actually finish (reforce's own IMAP connection code has no socket timeout,
+# separately being investigated). While this is False, submit_or_try_small_
+# model() falls straight through to the full SDK path (self.submit()) for
+# every real user turn, same as before this whole feature existed -- flip
+# back to True to re-enable once the underlying issue is understood/fixed.
+SMALL_MODEL_ENABLED = False
+
 # How many recent user-visible dialogue lines (_read_recent_dialogue_lines)
 # feed language detection and progress narration. Bug fix (2026-09-10, per
 # explicit instruction): was 5 for language detection specifically -- too
@@ -160,14 +172,15 @@ RECENT_DIALOGUE_WINDOW = 12
 # independent of our own turn_pending bookkeeping -- confirmed live that
 # bookkeeping itself can be wrong (see hang_interrupt_result_pending's own
 # comment), silently dropping a real task with nothing visible to the user.
-# Rather than trust our own state to always be right, periodically just ASK
-# the model directly whether it has active/unfinished work it hasn't
-# reported back on -- only while we believe nothing is pending (turn_pending
-# False); if a turn genuinely IS pending, hang-detection/progress-narration
-# already own that. Own choice, not a specified value -- frequent enough to
-# catch drift within a few minutes, not so frequent it spams a real query()
-# call on every genuinely idle tab.
-IDLE_TASK_CHECK_INTERVAL_MS = 180_000
+#
+# Redesigned (2026-09-13), per explicit correction: this used to be a
+# periodic timer (every IDLE_TASK_CHECK_INTERVAL_MS, independent of whether
+# anything had actually happened) -- the user rejected that outright as
+# needlessly expensive ("каждые три минуты вызывать модель просто так - это
+# слишком дорого"). What was actually asked for is a check tied to the end
+# of a real turn, not a clock -- see _fire_post_turn_completion_check(),
+# called directly from the turn_pending setter's True->False edge, not from
+# the watchdog loop at all anymore.
 
 # Forced compaction (2026-09-11), per explicit instruction, after confirming
 # live that native auto-compaction -- correctly wired (see
@@ -201,8 +214,16 @@ FORCED_COMPACTION_MIN_INTERVAL_MS = 300_000
 AUTH_RETRY_ESCALATION_THRESHOLD = 3
 
 CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
-    "Continue any unfinished work, if there is any. If not, do nothing and reply with exactly [[NO_UPDATE]], with "
-    "no explanation. Reply in {language}."
+    "Check whether you actually finished what you were doing -- having called a tool is not the same thing as "
+    "the work being done; a tool call only counts once you've checked its real result and confirmed it matches "
+    "what was actually asked for, not just that the call was made. In particular: if your last reply described "
+    "a plan (\"I'll do X, then Y\", \"let me go through them\", anything framed as about to happen) without you "
+    "actually carrying every step of it out to the end in that same reply, the task is NOT done and the work is "
+    "NOT finished, no matter how complete or confident that reply sounded -- continue it now, for real, using "
+    "your tools, rather than repeating or restating the plan. If anything else is unfinished, unverified, or "
+    "was left as a placeholder/stub rather than the real thing, continue that too. If everything genuinely is "
+    "finished and verified, do nothing and reply with exactly [[NO_UPDATE]], with no explanation. Reply in "
+    "{language}."
 )
 
 # Fires once per backend-process lifetime, the moment the primary tab's
@@ -728,15 +749,6 @@ class ChatSession:
         self.last_visible_output_at: float | None = None
         self.last_real_user_question: str | None = None
 
-        # periodic idle-task-drift check (see IDLE_TASK_CHECK_INTERVAL_MS)
-        # -- per explicit instruction (2026-09-10): our own turn_pending
-        # bookkeeping can itself be wrong (see hang_interrupt_result_pending
-        # above), so rather than trust it exclusively, periodically just
-        # ASK the model directly whether it has unfinished work it hasn't
-        # reported back on -- initialized to "now" so a freshly (re)started
-        # session doesn't fire this on its very first idle tick.
-        self.last_idle_check_at: float | None = time.monotonic()
-
         # restart budget
         self.restart_timestamps: list[float] = []
 
@@ -976,6 +988,9 @@ class ChatSession:
         Claude Agent SDK path (self.submit()) otherwise, including on the
         small model's own escalation (self-reported sentinel or the
         mechanical repeated-tool-call guard, see small_model_engine.py).
+        Currently disabled process-wide by SMALL_MODEL_ENABLED (see its own
+        comment) -- every real turn falls through to self.submit() below
+        regardless of the other eligibility checks while that's False.
 
         Eligible means: no attachments (the small model never sees vision/
         document content here -- not a hard technical limit, just out of
@@ -993,7 +1008,7 @@ class ChatSession:
             self.small_model_pending_comments.append(text)
             return
 
-        if attachments or self.turn_pending or not is_logged_in():
+        if not SMALL_MODEL_ENABLED or attachments or self.turn_pending or not is_logged_in():
             self.submit(text, attachments, True, is_voice)
             return
 
@@ -1047,7 +1062,7 @@ class ChatSession:
 
         try:
             result = await run_small_model_turn(
-                tab_id=self.tab_id, persona=persona, user_text=text,
+                tab_id=self.tab_id, workspace_dir=self.workspace_dir, persona=persona, user_text=text,
                 recent_dialogue_lines=recent_dialogue_lines, language=language,
                 send=self.send, on_live_dialogue_update=on_live_dialogue_update,
                 get_new_user_comments=get_new_user_comments,
@@ -1114,6 +1129,11 @@ class ChatSession:
         clear_pending_turn(self.workspace_dir, self.tab_id)
         self.turn_pending = False
         self._end_small_model_turn()
+        # Every small-model turn is a real user turn by construction (see
+        # submit_or_try_small_model's own docstring -- an internal/proactive
+        # nudge always goes through self.submit() to the full SDK, never
+        # here), so no is_real_user gate needed before this sanity check.
+        self._fire_post_turn_completion_check()
 
     def inject_proactive(self, text: str, is_voice: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
@@ -1458,14 +1478,17 @@ class ChatSession:
                 # 20+ minutes until the downstream symptoms (no narrator
                 # comments, a lamp that never blinks) got reported. A
                 # single bad tick must never cost this tab everything these
-                # five checks are responsible for -- log it and keep
+                # four checks are responsible for -- log it and keep
                 # ticking. supervise() (start(), task_supervisor.py) is the
-                # outer safety net if this task ever dies anyway.
+                # outer safety net if this task ever dies anyway. (The old
+                # fifth check here, idle-task-drift, is gone -- see
+                # _fire_post_turn_completion_check()'s own doc comment for
+                # why it's now event-driven, off the turn_pending setter,
+                # not a periodic tick.)
                 try:
                     await self._check_hang()
                     self._check_user_wait_nudge()
                     await self._check_progress_narration()
-                    self._check_idle_task_drift()
                     self._check_forced_compaction()
                 except asyncio.CancelledError:
                     raise
@@ -1641,28 +1664,30 @@ class ChatSession:
             [], False, False,
         )
 
-    def _check_idle_task_drift(self) -> None:
-        """Per explicit instruction (2026-09-10): a regular, unconditional
-        safety net independent of our own turn_pending bookkeeping --
-        confirmed live that bookkeeping itself can be wrong (a
-        hang-interrupt's own trailing ResultMessage silently clearing
-        turn_pending/pending_user_text before the original task could be
-        replayed -- see hang_interrupt_result_pending). Rather than trust
-        our own state to always be right, periodically just ASK the model
-        directly whether it has active/unfinished work it hasn't actually
-        reported back on -- the model's own session context is the real
-        source of truth here, not our flags. Only fires while we believe
-        nothing is pending (turn_pending False); if a turn genuinely IS
-        pending, hang-detection/progress-narration already own that."""
-        if self.ended or self.turn_pending:
-            self.last_idle_check_at = time.monotonic()
+    def _fire_post_turn_completion_check(self) -> None:
+        """Sanity check run right after a REAL user turn finishes -- per
+        explicit correction (2026-09-13), replacing a periodic timer-based
+        version (every IDLE_TASK_CHECK_INTERVAL_MS regardless of whether
+        anything had happened) that the user rejected as needless expense.
+        Called from the turn_pending property setter's True->False edge,
+        gated there on self.pending_is_real_user so this fires exactly once
+        per real turn -- never for this check's own reply (submitted via
+        inject_proactive with is_real_user=False, so it can't re-trigger
+        itself), never for forced_compaction's own "/compact" (that bypasses
+        turn_pending entirely, see _push_internal_command), and never twice
+        for a turn that started on the small-model path and escalated (that
+        hand-off keeps turn_pending continuously True across the switch, see
+        submit_or_try_small_model's own docstring, so only the FINAL
+        completion trips this edge).
+
+        Still asks the model directly rather than trusting our own
+        bookkeeping (confirmed live that bookkeeping alone can be wrong --
+        see hang_interrupt_result_pending's own comment) -- just event-
+        driven now instead of polling on a clock."""
+        if self.ended:
             return
-        now = time.monotonic()
-        if self.last_idle_check_at is not None and now - self.last_idle_check_at < IDLE_TASK_CHECK_INTERVAL_MS / 1000:
-            return
-        self.last_idle_check_at = now
         lang = current_language_name(self.tab_id)
-        log_event("engine", "idle_task_drift_check", tab_id=self.tab_id)
+        log_event("engine", "post_turn_completion_check", tab_id=self.tab_id)
         self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang))
 
     def _current_session_file_size(self) -> int | None:
@@ -1895,6 +1920,14 @@ class ChatSession:
             "lastUserActivityMs": round((time.monotonic() - self.last_user_activity) * 1000),
             "hangCount": self.hang_count,
             "connState": self.conn_state,
+            # Per explicit instruction (2026-09-13): App.xaml.cs's startup
+            # splash must not dismiss (and the main window must not even be
+            # shown) while any tab's forced startup compaction is still
+            # running -- see WaitForSplashDismissAsync's own doc comment for
+            # why _check_forced_compaction's own "startup" trigger otherwise
+            # raced the splash-dismiss/SyncTabListToBackend timing and
+            # produced a window with a missing tab list.
+            "forcedCompactionPending": self.forced_compaction_result_pending,
         }
 
     # ------------------------------------------------------------- run loop --
@@ -2228,10 +2261,21 @@ class ChatSession:
                         # queued in the meantime.
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending
                         if not result_is_fake:
+                            was_real_user_turn = self.pending_is_real_user
                             self.turn_pending = False
                             self.pending_user_text = None
                             self.pending_attachments = []
                             clear_pending_turn(self.workspace_dir, self.tab_id)
+                            # Per explicit correction (2026-09-13): a real
+                            # turn's genuine completion (not this fake/
+                            # compaction/hang-recovery ResultMessage, and not
+                            # an internal nudge answering itself) is exactly
+                            # the moment to sanity-check whether the work is
+                            # actually done -- see _fire_post_turn_completion_
+                            # check's own doc comment for why this replaced a
+                            # periodic timer instead.
+                            if was_real_user_turn:
+                                self._fire_post_turn_completion_check()
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
                         self.consecutive_auth_retry_failures = 0

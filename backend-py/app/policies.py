@@ -328,6 +328,23 @@ def no_unauthorized_secret_changes_instruction() -> str:
     )
 
 
+def self_sufficiency_instruction() -> str:
+    """Standing rule (2026-09-13), stated by the user directly: don't ask
+    the user to do or supply something you could just do or find out
+    yourself. The one carve-out is contacting a third party (or getting
+    information FROM one) -- that always needs the user's own explicit
+    instruction or approval first, since it acts on/reaches someone who
+    isn't the user and can't be undone by just not asking next time."""
+    return (
+        "If you can, in principle, do something or find something out yourself -- using a tool, reading a file, "
+        "checking your own notes/memory, searching the web -- do it yourself; don't ask the user to do it for "
+        "you or to hand you information you could look up on your own. The one exception is anything that "
+        "reaches a third party: sending them a message, calling them, or asking them for information. Never "
+        "initiate contact with or request anything from a third party on your own judgment -- only when the "
+        "user has explicitly instructed or approved that specific contact."
+    )
+
+
 def prefer_embedded_browser_instruction() -> str:
     """Bug fix (2026-09-11), per explicit instruction: this priority was
     already stated once, in open_app_browser's own tool description
@@ -371,6 +388,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
     prefer_embedded_browser_instruction,
+    self_sufficiency_instruction,
 )
 
 
