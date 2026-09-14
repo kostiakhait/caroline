@@ -152,6 +152,15 @@
           <button id="swLoginBtn">Log in / Register with SquirrelWisdom</button>
           <button id="swTopUpBtn" class="secondary">Top up</button>
         </div>
+
+        <div id="chatModeField" class="settings-field" style="display:none">
+          <label>This tab answers via</label>
+          <select id="chatModeSelect">
+            <option value="claude">Claude (your Anthropic subscription)</option>
+            <option value="sw">SquirrelWisdom (cheaper, metered)</option>
+          </select>
+        </div>
+        <p id="chatModeHint" class="settings-hint" style="display:none">Requires both a Claude subscription and a paid SquirrelWisdom balance -- available once both are set up above.</p>
       </section>
 
       <section class="settings-section">

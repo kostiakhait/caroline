@@ -185,6 +185,42 @@ def clear_tab_continuity_archive(workspace_dir: str, tab_id: str) -> None:
         log_event("engine", "clear_tab_continuity_archive_failed", tab_id=tab_id, error=str(exc))
 
 
+# --- per-tab chat mode (claude vs sw), user-facing Settings toggle ---------
+# Per explicit instruction (2026-09-14): each tab independently picks which
+# backend answers its real turns -- "claude" (the full Claude Agent SDK,
+# submit()) or "sw" (the small-model/Camerlengo path billed through the
+# SquirrelWisdom PIA wallet, run_small_model_turn()). Defaults to "claude"
+# for every tab; see subscription_mode.py's chat_mode_eligible() for the
+# gating (both a Claude subscription AND a paid SW balance) that decides
+# whether "sw" can be SET at all -- this module only persists whatever was
+# already validated, same file-per-tab shape as tab-session-<id>.json etc.
+
+def _chat_mode_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"chat-mode-{_sanitize_tab_id(tab_id)}.json"
+
+
+def load_chat_mode(workspace_dir: str, tab_id: str) -> str:
+    path = _chat_mode_path(workspace_dir, tab_id)
+    if not path.exists():
+        return "claude"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        mode = data.get("mode")
+        return mode if mode in ("claude", "sw") else "claude"
+    except Exception as exc:
+        log_event("engine", "load_chat_mode_failed", tab_id=tab_id, error=str(exc))
+        return "claude"
+
+
+def save_chat_mode(workspace_dir: str, tab_id: str, mode: str) -> None:
+    try:
+        path = _chat_mode_path(workspace_dir, tab_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"mode": mode}, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "save_chat_mode_failed", tab_id=tab_id, error=str(exc))
+
+
 def find_most_recent_claude_session_id(workspace_dir: str) -> str | None:
     """One-time migration for users upgrading from pre-multi-tab Caroline:
     reads Claude Code's own session transcript directory for this

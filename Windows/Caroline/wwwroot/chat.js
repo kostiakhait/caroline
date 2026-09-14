@@ -86,6 +86,9 @@
     swUpsellHint.style.display = show ? "" : "none";
   }
   const swTopUpBtn = document.getElementById("swTopUpBtn");
+  const chatModeField = document.getElementById("chatModeField");
+  const chatModeSelect = document.getElementById("chatModeSelect");
+  const chatModeHint = document.getElementById("chatModeHint");
 
   const ratatoskStatusText = document.getElementById("ratatoskStatusText");
   const ratatoskRegisterBtn = document.getElementById("ratatoskRegisterBtn");
@@ -1515,9 +1518,11 @@
       authLoginOutput.textContent += evt.ok ? "\n[done]\n" : "\n[failed]\n";
       sendControl("auth_status");
       sendControl("mode_get");
+      sendControl("chat_mode_get");
     } else if (evt.op === "auth_logout") {
       sendControl("auth_status");
       sendControl("mode_get");
+      sendControl("chat_mode_get");
     } else if (evt.op === "mode_get") {
       try {
         const m = JSON.parse(evt.stdout || "{}");
@@ -1550,6 +1555,19 @@
         lastSwLoggedIn = null;
       }
       renderSwUpsellHint();
+    } else if (evt.op === "chat_mode_get") {
+      try {
+        const m = JSON.parse(evt.stdout || "{}");
+        chatModeField.style.display = m.eligible ? "" : "none";
+        chatModeHint.style.display = m.eligible ? "none" : "";
+        if (m.eligible) chatModeSelect.value = m.mode === "sw" ? "sw" : "claude";
+      } catch {
+        chatModeField.style.display = "none";
+        chatModeHint.style.display = "";
+      }
+    } else if (evt.op === "chat_mode_set") {
+      if (!evt.ok) addBanner(`Could not change chat mode: ${evt.stderr || "unknown error"}`);
+      sendControl("chat_mode_get");
     } else if (evt.op === "ratatosk_status_get") {
       try {
         const s = JSON.parse(evt.stdout || "{}");
@@ -1581,6 +1599,7 @@
       ownAnthropicKeyInput.value = "";
       sendControl("own_anthropic_key_get");
       sendControl("mode_get");
+      sendControl("chat_mode_get");
     } else if (evt.op === "sms_account_get") {
       try {
         const s = JSON.parse(evt.stdout || "{}");
@@ -1605,6 +1624,7 @@
     } else if (evt.op === "login_submit") {
       sendControl("mode_get");
       sendControl("sw_status");
+      sendControl("chat_mode_get");
     } else if (evt.op === "open_login_from_settings") {
       // Nothing to do here -- the actual login form opens via the
       // server-initiated "open_login" event this triggers (see chat.js's
@@ -1712,6 +1732,7 @@
     sendControl("visual_mode_get");
     sendControl("mode_get");
     sendControl("sw_status");
+    sendControl("chat_mode_get");
     sendControl("own_anthropic_key_get");
     sendControl("ratatosk_status_get");
     sendControl("sms_account_get");
@@ -1744,6 +1765,9 @@
   });
   swTopUpBtn.addEventListener("click", () => {
     sendControl("open_payment_from_settings");
+  });
+  chatModeSelect.addEventListener("change", () => {
+    sendControl("chat_mode_set", { mode: chatModeSelect.value });
   });
 
   personaSaveBtn.addEventListener("click", () => {
@@ -2166,6 +2190,7 @@
         // confirms completion server-side; closing this window just means
         // "done browsing the checkout", so refresh the displayed balance.
         sendControl("sw_status");
+        sendControl("chat_mode_get");
       } else if (data && data.type === "update_status") {
         // The WPF shell's own self-updater downloading a new build -- purely
         // native, has nothing to do with any backend/query() turn. Per

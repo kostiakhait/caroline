@@ -73,6 +73,8 @@ import asyncio
 import json
 import os
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -215,15 +217,25 @@ def _is_silent_infra_failure(text: str) -> str | None:
     return None
 
 
-# Per explicit instruction (2026-09-13): resolve_agentic() itself has no
-# wall-clock ceiling of its own (MAX_ITERATIONS is a call-count backstop,
-# not a time one, and a stuck/slow API call plus enough iterations could in
-# principle run far longer than any real user turn should stay pending with
-# no external safety net -- the full SDK path has its own hang-detection
-# watchdog for exactly this, this path had nothing). Generous on purpose:
-# legitimate multi-step work (several mailboxes, each a few seconds) can
-# genuinely take a couple of minutes; this is a backstop, not a target.
-TURN_TIMEOUT_S = 300
+# Per explicit instruction (2026-09-13), corrected same-day after a real
+# live test: resolve_agentic() itself has no wall-clock ceiling of its own
+# (MAX_ITERATIONS is a call-count backstop, not a time one). This used to
+# be a single "give up after 300s total" cutoff -- confirmed live as WRONG:
+# a real 8-mailbox check made genuine, continuous progress (declare_plan,
+# one notes_get after another gathering credentials) the whole time, each
+# gap between tool calls well under a minute, and still got killed at the
+# 300s mark despite never actually stalling -- the exact same "check
+# ELAPSED, not ACTIVITY" mistake already fixed once for the full SDK path's
+# own hang detection (_check_hang uses last_activity, not total turn
+# duration). Replaced with the same shape: STALL_TIMEOUT_S is measured from
+# the last real progress event (a tool call or the model finishing), not
+# from the turn's start -- a task making steady progress can run
+# indefinitely; only a genuine stretch of silence trips this.
+STALL_TIMEOUT_S = 120
+# Absolute backstop on top of the stall detector, in case something keeps
+# "progressing" (a call every stall-interval) without ever actually
+# finishing -- deliberately generous, a safety net not a target.
+ABSOLUTE_TURN_TIMEOUT_S = 1800
 
 # OpenRouter's own unified reasoning-tokens parameter (forwarded through
 # resolve_agentic()/OpenRouterAdapter._resolve() -- see their own doc
@@ -260,6 +272,55 @@ class NeedsEscalation(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class _TurnStalled(Exception):
+    """Raised by _resolve_agentic_with_watchdog() when it gives up WAITING
+    on a resolve_agentic() call -- never means the underlying worker thread
+    actually stopped (see _TurnTracker.cancelled's own doc comment: threads
+    can't be preempted, only asked nicely via that flag, which the caller
+    already set before raising this)."""
+
+    def __init__(self, elapsed_s: float, kind: str) -> None:
+        super().__init__(f"{kind} timeout after {elapsed_s:.0f}s")
+        self.elapsed_s = elapsed_s
+        self.kind = kind  # "stall" (no progress for STALL_TIMEOUT_S) or "absolute" (ABSOLUTE_TURN_TIMEOUT_S ceiling)
+
+
+async def _resolve_agentic_with_watchdog(ai: Any, tracker: _TurnTracker, **resolve_kwargs: Any) -> str:
+    """Runs ai.resolve_agentic(**resolve_kwargs) in a worker thread (it's a
+    synchronous, uncancellable call from a third-party module) while
+    polling tracker.last_progress_at instead of just awaiting a flat
+    deadline -- per explicit correction (2026-09-14), confirmed live that a
+    flat "give up after N seconds total" cutoff killed a turn that was
+    making real, continuous (if slow) progress the whole time. Only a
+    genuine STALL (no tool call/completion for STALL_TIMEOUT_S) or the far
+    more generous ABSOLUTE_TURN_TIMEOUT_S backstop gives up. Giving up here
+    only stops WAITING -- see _TurnTracker.cancelled for how the abandoned
+    thread itself is kept from doing further real-world damage (email
+    sends, logins, ...) once nobody is listening for its result anymore."""
+    tracker.touch_progress()
+    started = time.monotonic()
+    task: asyncio.Task[str] = asyncio.create_task(asyncio.to_thread(ai.resolve_agentic, **resolve_kwargs))
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=5.0)
+            if task in done:
+                return task.result()
+            now = time.monotonic()
+            stalled_for = now - tracker.last_progress_at
+            if stalled_for > STALL_TIMEOUT_S:
+                tracker.cancelled.set()
+                raise _TurnStalled(stalled_for, "stall")
+            if now - started > ABSOLUTE_TURN_TIMEOUT_S:
+                tracker.cancelled.set()
+                raise _TurnStalled(now - started, "absolute")
+    finally:
+        # Best-effort only -- can't actually stop the underlying OS thread
+        # (see this function's own doc comment), just avoids an "a Task was
+        # destroyed but it is pending" warning if we're giving up on it.
+        if not task.done():
+            task.cancel()
 
 
 def _persona_system_message(persona: Persona) -> str:
@@ -474,6 +535,30 @@ class _TurnTracker:
     # async tool call was started, checked once, then abandoned while the
     # model told the user a plausible-sounding story about it.
     pending_operation_ids: set[str] = field(default_factory=set)
+    # Per explicit correction (2026-09-14), after a real live test: WHEN
+    # this turn last made real progress (a tool call actually starting, or
+    # the model finishing) -- touched from both the worker thread
+    # (executor_fn, at the top of every call) and the main-loop side
+    # (on_progress) since resolve_agentic() runs in a separate OS thread.
+    # Read by the watchdog in run_small_model_turn() to detect a genuine
+    # STALL (no activity for STALL_TIMEOUT_S), replacing an earlier flat
+    # "give up after N seconds total" cutoff that killed a turn making
+    # real, if slow, continuous progress.
+    last_progress_at: float = field(default_factory=time.monotonic)
+    # Set once the watchdog gives up waiting on this turn -- checked at the
+    # top of executor_fn so a resolve_agentic() thread that's already been
+    # abandoned (its result no longer awaited by anyone) stops short of
+    # actually dispatching further real tool calls (email sends, IMAP
+    # logins with real passwords, ...) instead of racing on to completion
+    # or failure on its own, unsupervised, after the fact -- confirmed live
+    # as a real gap: an abandoned thread kept making real (doomed, since
+    # its own bridge back to the main loop was already gone) email calls
+    # with real credentials for minutes after this turn had already been
+    # reported as escalated.
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+    def touch_progress(self) -> None:
+        self.last_progress_at = time.monotonic()
 
     def needs_verification(self) -> bool:
         if self.pending_operation_ids:
@@ -596,6 +681,16 @@ def _make_executor_fn(
 
     def executor_fn(name: str, args: dict[str, Any]) -> str:
         args = args or {}
+        if tracker.cancelled.is_set():
+            # This turn's own watchdog already gave up waiting on us (a
+            # genuine stall, see STALL_TIMEOUT_S) and reported that to our
+            # caller -- nobody is listening for this call's real result
+            # anymore. Refuse instantly rather than actually dispatching
+            # (a real email send, an IMAP login with a real password,
+            # etc.) unsupervised after the fact; see _TurnTracker.cancelled
+            # own doc comment for the incident this fixes.
+            return "ERROR: this turn was already abandoned (stalled/timed out) -- stop, do not attempt further tool calls."
+        tracker.touch_progress()
         call_key = (name, json.dumps(args, sort_keys=True, default=str))
         seen_calls[call_key] = seen_calls.get(call_key, 0) + 1
         count = seen_calls[call_key]
@@ -750,6 +845,7 @@ async def run_small_model_turn(
         on_live_dialogue_update(list(live_dialogue))
 
     def on_progress(evt: dict[str, Any]) -> None:
+        tracker.touch_progress()
         log_event(
             "engine", "small_model_progress", tab_id=tab_id, event_type=evt.get("type"),
             tool=evt.get("name"), iteration=evt.get("iteration"),
@@ -782,19 +878,16 @@ async def run_small_model_turn(
     log_event("engine", "small_model_resolved", tab_id=tab_id, model=model, tool_count=len(registry.tool_defs))
 
     try:
-        final_text = await asyncio.wait_for(
-            asyncio.to_thread(
-                ai.resolve_agentic,
-                messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
-                model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
-                get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                reasoning=REASONING_EFFORT,
-            ),
-            timeout=TURN_TIMEOUT_S,
+        final_text = await _resolve_agentic_with_watchdog(
+            ai, tracker,
+            messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
+            model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+            get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
+            reasoning=REASONING_EFFORT,
         )
-    except asyncio.TimeoutError:
-        log_event("engine", "small_model_turn_timed_out", tab_id=tab_id, timeout_s=TURN_TIMEOUT_S)
-        return {"status": "escalate", "reason": f"no result after {TURN_TIMEOUT_S}s -- treating as a hang"}
+    except _TurnStalled as exc:
+        log_event("engine", "small_model_turn_stalled", tab_id=tab_id, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
+        return {"status": "escalate", "reason": f"no progress for {exc.elapsed_s:.0f}s ({exc.kind}) -- treating as a hang"}
     except NeedsEscalation as exc:
         log_event("engine", "small_model_escalation_mechanical", tab_id=tab_id, reason=exc.reason)
         return {"status": "escalate", "reason": exc.reason}
@@ -837,19 +930,16 @@ async def run_small_model_turn(
         verification_messages.append({"role": "assistant", "content": final_text})
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, final_text)})
         try:
-            verified_text = await asyncio.wait_for(
-                asyncio.to_thread(
-                    ai.resolve_agentic,
-                    messages=verification_messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
-                    model=verification_model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
-                    get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                    reasoning=REASONING_EFFORT,
-                ),
-                timeout=TURN_TIMEOUT_S,
+            verified_text = await _resolve_agentic_with_watchdog(
+                ai, tracker,
+                messages=verification_messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
+                model=verification_model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
+                reasoning=REASONING_EFFORT,
             )
-        except asyncio.TimeoutError:
-            log_event("engine", "small_model_verification_timed_out", tab_id=tab_id, timeout_s=TURN_TIMEOUT_S)
-            return {"status": "escalate", "reason": f"verification pass had no result after {TURN_TIMEOUT_S}s"}
+        except _TurnStalled as exc:
+            log_event("engine", "small_model_verification_stalled", tab_id=tab_id, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
+            return {"status": "escalate", "reason": f"verification pass had no progress for {exc.elapsed_s:.0f}s ({exc.kind})"}
         except NeedsEscalation as exc:
             log_event("engine", "small_model_verification_escalation_mechanical", tab_id=tab_id, reason=exc.reason)
             return {"status": "escalate", "reason": exc.reason}

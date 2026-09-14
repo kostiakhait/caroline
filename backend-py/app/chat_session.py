@@ -74,6 +74,7 @@ from app.durability import (
     clear_tab_session_id,
     dehydrated_dir,
     find_most_recent_claude_session_id,
+    load_chat_mode,
     load_tab_continuity_archive,
     load_tab_session_id,
     save_pending_turn,
@@ -165,17 +166,24 @@ SILENT_USER_WAIT_NUDGE_MS = 90_000
 # actual cosmetic-comment mechanism this drives.
 PROGRESS_NARRATION_INTERVAL_MS = 60_000
 
-# Per explicit instruction (2026-09-13): disabled, NOT removed, pending a
-# discussion of what's actually wrong with it -- confirmed live (tab 1,
-# "Основной диалог") repeatedly writing out a plan ("сделаю так: ...") with
-# zero or incomplete tool calls, and once mid-diagnosis a real question mark
-# over whether email_list_folders/email_list_messages calls it started ever
-# actually finish (reforce's own IMAP connection code has no socket timeout,
-# separately being investigated). While this is False, submit_or_try_small_
-# model() falls straight through to the full SDK path (self.submit()) for
-# every real user turn, same as before this whole feature existed -- flip
-# back to True to re-enable once the underlying issue is understood/fixed.
-SMALL_MODEL_ENABLED = False
+# Per explicit instruction (2026-09-13/2026-09-14): was a process-wide kill
+# switch (SMALL_MODEL_ENABLED, always False) while the small-model path's
+# reliability was still being diagnosed -- gpt-5.1 repeatedly writing out a
+# plan with zero/incomplete tool calls, a flat wall-clock turn timeout
+# killing turns that were making genuine slow progress, an orphaned worker
+# thread still dispatching real tool calls (real IMAP logins) after its
+# caller had already given up on it. All three fixed and confirmed live (a
+# real 6-mailbox check completed cleanly in ~560s with the stall-based
+# watchdog, no premature cutoff, no orphaned work) -- see small_model_engine.
+# py's own STALL_TIMEOUT_S/ABSOLUTE_TURN_TIMEOUT_S/_TurnStalled comments.
+# Superseded by a real, per-tab, user-facing Settings toggle instead of one
+# global flag: each tab independently persists "claude" (default) or "sw"
+# via durability.py's load_chat_mode/save_chat_mode, and "sw" can only be
+# SET (main.py's chat_mode_set control op) when subscription_mode.py's
+# chat_mode_eligible() holds -- both a real Claude subscription AND a PAID
+# SquirrelWisdom balance. Nothing changes for anyone who never opens that
+# toggle: every tab still starts on "claude", identical to this flag's old
+# permanent False.
 
 # How many recent user-visible dialogue lines (_read_recent_dialogue_lines)
 # feed progress narration, which genuinely needs real back-and-forth
@@ -1136,16 +1144,20 @@ class ChatSession:
         Claude Agent SDK path (self.submit()) otherwise, including on the
         small model's own escalation (self-reported sentinel or the
         mechanical repeated-tool-call guard, see small_model_engine.py).
-        Currently disabled process-wide by SMALL_MODEL_ENABLED (see its own
-        comment) -- every real turn falls through to self.submit() below
-        regardless of the other eligibility checks while that's False.
+        Gated per-tab now (2026-09-14) by this tab's own persisted chat
+        mode (durability.py's load_chat_mode, Settings-controlled -- see
+        chat_mode_eligible's own docstring for why "sw" can only be set
+        when both subscriptions are active) -- every real turn falls
+        through to self.submit() below unless this tab is specifically set
+        to "sw".
 
-        Eligible means: no attachments (the small model never sees vision/
-        document content here -- not a hard technical limit, just out of
-        scope for this first cut), no turn already in flight, and
-        SquirrelWisdom access is available -- login_api.is_logged_in(), the
-        SAME check sw_gate.py's own require_sw_or_prompt already uses at
-        every other SW-gated call site, reused rather than re-derived.
+        Eligible means: this tab's chat mode is "sw", no attachments (the
+        small model never sees vision/document content here -- not a hard
+        technical limit, just out of scope for this first cut), no turn
+        already in flight, and SquirrelWisdom access is available --
+        login_api.is_logged_in(), the SAME check sw_gate.py's own
+        require_sw_or_prompt already uses at every other SW-gated call
+        site, reused rather than re-derived.
 
         If a small-model turn is ALREADY running, a new message here is
         live context for THAT turn, not a fresh submit -- see the
@@ -1156,7 +1168,7 @@ class ChatSession:
             self.small_model_pending_comments.append(text)
             return
 
-        if not SMALL_MODEL_ENABLED or attachments or self.turn_pending or not is_logged_in():
+        if load_chat_mode(self.workspace_dir, self.tab_id) != "sw" or attachments or self.turn_pending or not is_logged_in():
             self.submit(text, attachments, True, is_voice)
             return
 

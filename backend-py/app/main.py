@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, auth_status as cli_auth_status, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
-from app.durability import dehydrated_dir, load_tab_session_id, peek_pending_turn
+from app.durability import dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_turn, save_chat_mode
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
@@ -39,7 +39,7 @@ from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.sms_account import get_sms_account_status, remove_sms_account, set_sms_account
-from app.subscription_mode import create_topup_checkout_url, get_own_anthropic_api_key, get_sw_status, resolve_mode, set_own_anthropic_api_key
+from app.subscription_mode import chat_mode_eligible, create_topup_checkout_url, get_own_anthropic_api_key, get_sw_status, resolve_mode, set_own_anthropic_api_key
 from app.visual_mode import is_visual_mode_enabled, resolve_visual_model, set_visual_mode_enabled
 from app.window_registry import unregister_window
 from app.workspace_dir import WORKSPACE_DIR
@@ -589,6 +589,26 @@ async def handle_control_request(
     if op == "sw_logout":
         log_event("engine", "sw_logout")
         clear_credentials()
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "chat_mode_get":
+        tab_id = session.tab_id if session is not None else PRIMARY_TAB_ID
+        current_mode = load_chat_mode(WORKSPACE_DIR, tab_id)
+        eligible = await chat_mode_eligible(WORKSPACE_DIR, tab_id)
+        stdout = json.dumps({"mode": current_mode, "eligible": eligible})
+        return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}
+    if op == "chat_mode_set":
+        tab_id = session.tab_id if session is not None else PRIMARY_TAB_ID
+        requested_mode = parsed.get("mode")
+        if requested_mode not in ("claude", "sw"):
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "mode must be 'claude' or 'sw'", "requestId": request_id}
+        if requested_mode == "sw" and not await chat_mode_eligible(WORKSPACE_DIR, tab_id):
+            return {
+                "type": "control_response", "op": op, "ok": False,
+                "stderr": "Both a Claude subscription and a paid SquirrelWisdom balance are required to switch this tab to sw.",
+                "requestId": request_id,
+            }
+        save_chat_mode(WORKSPACE_DIR, tab_id, requested_mode)
+        log_event("engine", "chat_mode_set", tab_id=tab_id, mode=requested_mode)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "own_anthropic_key_get":
         key = get_own_anthropic_api_key(WORKSPACE_DIR)
