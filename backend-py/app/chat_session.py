@@ -162,12 +162,21 @@ PROGRESS_NARRATION_INTERVAL_MS = 60_000
 SMALL_MODEL_ENABLED = False
 
 # How many recent user-visible dialogue lines (_read_recent_dialogue_lines)
-# feed language detection and progress narration. Bug fix (2026-09-10, per
-# explicit instruction): was 5 for language detection specifically -- too
-# small a window meant a couple of stray non-conversational lines could
-# dominate the whole sample. Both consumers now share one number so they
-# can't drift apart again either.
+# feed progress narration, which genuinely needs real back-and-forth
+# (both speakers) to have something to react to.
 RECENT_DIALOGUE_WINDOW = 12
+
+# Bug fix (2026-09-14), per explicit instruction: language detection needs
+# the user's own last N messages specifically -- "независимо от остального"
+# -- not a fixed-size window of mixed dialogue lines the way narration
+# above uses. A mixed window can dilute down to zero real user lines when a
+# stretch of history is heavy on Caroline's own turns or synthetic/service
+# text (confirmed live, 2026-09-14: after filtering out the CLI's own
+# auto-compaction continuation preamble, one tab's last 80 mixed lines held
+# ZERO real user messages). _read_recent_user_lines (below) scans back as
+# far as it needs to in order to find this many real user lines, rather
+# than being capped by an unrelated total-line budget.
+LANGUAGE_DETECTION_USER_LINE_COUNT = 5
 
 # Per explicit instruction (2026-09-10): a regular, unconditional safety net
 # independent of our own turn_pending bookkeeping -- confirmed live that
@@ -295,6 +304,20 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     # until it ages out of the window on its own.
     re.compile(r"^⏰ Reminder due"),  # "⏰ Reminder due" (_on_reminder_due)
     re.compile(r"^The app is closing right now\.", re.IGNORECASE),
+    # Bug fix (2026-09-14), confirmed live: this one isn't one of Caroline's
+    # OWN injected nudges at all (so _SYNTHETIC_TURN_MARKER never tags it --
+    # that tagging only happens at submit()'s own is_real_user=False path,
+    # which this never goes through), it's the Claude Code CLI's OWN native
+    # auto-compaction/session-resume mechanism writing its fixed English
+    # continuation-summary preamble directly into the transcript with
+    # role="user" every time a session resumes after being compacted.
+    # Confirmed live: tab 1's last 22 "User:" lines were 21 copies of this
+    # (repeated resumes) and exactly ONE real message -- the English
+    # boilerplate completely dominated refresh_language_in_background's
+    # sample and kept mis-detecting an all-Russian tab as English no matter
+    # how many real Russian messages the user actually sent, since this
+    # gets re-added on every single resume.
+    re.compile(r"^This session is being continued from a previous conversation", re.IGNORECASE),
 ]
 
 
@@ -498,6 +521,40 @@ def _read_recent_dialogue_lines(session_id: str | None, tab_id: str, workspace_d
     return lines[-limit:]
 
 
+def _read_recent_user_lines(session_id: str | None, tab_id: str, workspace_dir: str, count: int) -> list[str]:
+    """Per explicit instruction (2026-09-14, see LANGUAGE_DETECTION_USER_
+    LINE_COUNT's own docstring): the last `count` real user messages
+    specifically, independent of how much Caroline/synthetic text sits
+    between them -- NOT _read_recent_dialogue_lines's fixed mixed-line
+    window, which a Caroline-heavy or synthetic-heavy stretch of history
+    can dilute down to zero real user lines. Reuses the exact same sources
+    (session file, then the tab's own continuity archive if that alone
+    isn't enough) and the exact same synthetic-text filtering
+    (_usable_dialogue_lines/_is_synthetic_history_text) -- only the
+    windowing differs: filter to the user's own lines FIRST, THEN take the
+    last `count`, so the scan naturally reaches back as far as it needs to
+    instead of being capped by an unrelated total-line budget."""
+
+    def _user_only(lines: list[str]) -> list[str]:
+        return [line[len("User: "):] for line in lines if line.startswith("User: ")]
+
+    user_lines: list[str] = []
+    if session_id:
+        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+        try:
+            user_lines = _user_only(_usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path))))
+        except Exception as exc:
+            log_event("engine", "recent_user_lines_read_failed", tab_id=tab_id, error=str(exc))
+    if len(user_lines) < count:
+        archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
+        if archive_path:
+            try:
+                user_lines = _user_only(_usable_dialogue_lines(read_archived_entries(archive_path))) + user_lines
+            except Exception as exc:
+                log_event("engine", "recent_user_lines_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
+    return user_lines[-count:]
+
+
 def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session_id: str | None, user_text: str, assistant_text: str) -> None:
     """Bug fix (2026-09-12), per explicit instruction: the small-model
     primary path (small_model_engine.py) never talks to the Claude Code CLI
@@ -579,36 +636,40 @@ def current_language_name(tab_id: str) -> str:
 
 
 def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
-    """Fire-and-forget: gathers the last RECENT_DIALOGUE_WINDOW real,
-    user-visible dialogue lines (_read_recent_dialogue_lines -- shared with
-    _gather_recent_dialogue_for_narration, see its own docstring for why
-    this used to be a separate, drifting reader) and asks
+    """Fire-and-forget: gathers the last LANGUAGE_DETECTION_USER_LINE_COUNT
+    real user messages (_read_recent_user_lines -- see its own docstring
+    for why this is a dedicated user-only reader, not
+    _read_recent_dialogue_lines's mixed-speaker window) and asks
     resolve_user_language (Camerlengo's ai:resolve, NOT ai:detectLanguage)
     what language the user is actually writing in. Never awaited by any
     caller and carries no timeout of its own beyond resolve_user_language's
     own leak-prevention ceiling -- whatever it manages to persist simply
     becomes visible on the NEXT query() construction via
     language_hint_instruction/current_language_name, for THIS SAME tab
-    only."""
+    only.
+
+    History (why this isn't _read_recent_dialogue_lines anymore, 2026-09-14):
+    that shared reader used to feed this function a fixed-size window of
+    MIXED "User: "/"Caroline: " lines, and this function filtered to the
+    user's own lines only AFTER that window was already cut -- correct in
+    principle (Caroline's own output no longer skews detection, confirmed
+    live), but the fixed total-line window itself could still dilute down
+    to zero (or too few) real user lines whenever a stretch of history was
+    heavy on Caroline's own turns or synthetic/service text (confirmed
+    live: one tab's last 80 mixed lines held zero usable user lines after
+    filtering out the Claude Code CLI's own auto-compaction continuation
+    preamble, which -- unlike Caroline's own nudges -- isn't tagged by
+    _SYNTHETIC_TURN_MARKER and had been silently dominating the sample).
+    Per explicit instruction: take the user's last N messages specifically,
+    independent of everything else -- _read_recent_user_lines scans back as
+    far as it needs to for that, instead of being capped by an unrelated
+    total-line budget shared with narration's own, differently-shaped need
+    (real back-and-forth, both speakers)."""
     from app.plugins.voice_api import resolve_user_language
 
     async def _run() -> None:
         try:
-            lines = _read_recent_dialogue_lines(session_id, tab_id, WORKSPACE_DIR, RECENT_DIALOGUE_WINDOW)
-            # Bug fix (2026-09-14), per explicit instruction: filter to the
-            # user's own lines BEFORE sending anything downstream -- this
-            # used to hand resolve_user_language the full mixed transcript
-            # (both "User: "/"Caroline: " lines) and rely on its prompt's own
-            # "ignore assistant text" instruction to sort it out. Confirmed
-            # live (2026-09-13) that this isn't reliable enough: a tab whose
-            # user wrote only in Russian still got persisted as "English"
-            # more than once, apparently swayed by Caroline's own recent
-            # (partly English) output mixed into the same sample -- and once
-            # wrongly persisted, that wrong language feeds the next turn's
-            # forced-translation target too, so the bug compounds itself.
-            # Filtering here is a hard, code-level guarantee instead of a
-            # prompt-level request the small model can silently ignore.
-            user_lines = [line[len("User: "):] for line in lines if line.startswith("User: ")]
+            user_lines = _read_recent_user_lines(session_id, tab_id, WORKSPACE_DIR, LANGUAGE_DETECTION_USER_LINE_COUNT)
             if not user_lines:
                 return
             name = await resolve_user_language("\n".join(user_lines))
