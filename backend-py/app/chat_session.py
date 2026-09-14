@@ -166,6 +166,13 @@ SILENT_USER_WAIT_NUDGE_MS = 90_000
 # actual cosmetic-comment mechanism this drives.
 PROGRESS_NARRATION_INTERVAL_MS = 60_000
 
+# Bug fix (2026-09-14): see consecutive_narration_count's own __init__
+# comment for the incident this caps -- a turn genuinely stuck for many
+# minutes doesn't need a fresh paraphrase of the same stale context every
+# single minute; after this many in a row with no real progress, stop
+# narrating until something real actually happens.
+MAX_CONSECUTIVE_NARRATION_COMMENTS = 3
+
 # Per explicit instruction (2026-09-13/2026-09-14): was a process-wide kill
 # switch (SMALL_MODEL_ENABLED, always False) while the small-model path's
 # reliability was still being diagnosed -- gpt-5.1 repeatedly writing out a
@@ -957,6 +964,38 @@ class ChatSession:
         # that question was, so a comment (if generated) can tie back to it.
         self.last_visible_output_at: float | None = None
         self.last_real_user_question: str | None = None
+        # Bug fix (2026-09-14), per explicit instruction, root-caused via a
+        # real live incident ("Кэролайн ведет беседу сама с собой"):
+        # last_visible_output_at gets bumped by narration's OWN firing too
+        # (it has to, to throttle to one comment per PROGRESS_NARRATION_
+        # INTERVAL_MS) -- so it can't tell "a real reply just happened" from
+        # "narration itself just fired" apart. Confirmed live: when a real
+        # turn stays stuck for many minutes with no genuine progress,
+        # _check_progress_narration kept firing every minute regardless,
+        # each call re-narrating the same stale, unchanging dialogue window
+        # -- individually novel enough to dodge the echo/garbage filters,
+        # but collectively a nonsense stream of paraphrases that read as
+        # Caroline talking to herself. This counter is separate and STRICT:
+        # incremented only by narration actually firing, reset to 0 only by
+        # genuine progress (a real user submit() or the real model's own
+        # visible output, see MAX_CONSECUTIVE_NARRATION_COMMENTS's call
+        # sites) -- never by narration's own output, which is the one
+        # thing it exists to cap.
+        self.consecutive_narration_count = 0
+        # Bug fix (2026-09-14), same incident: _schedule_one_shot_followup_
+        # check's own "Deliberately no rescheduling here" guarantee only
+        # holds within ONE firing -- if the follow-up turn it injects ALSO
+        # concludes by reporting the same still-active usage cap, the CC-
+        # CLI-limit-message handler re-enters _schedule_one_shot_followup_
+        # check fresh (self.one_shot_followup_timer is None again, cleared
+        # at the top of the PREVIOUS firing) and re-arms, unboundedly, for
+        # as long as the cap stays active -- confirmed live, this is
+        # exactly how a single genuine cap hit turned into a self-
+        # perpetuating retry loop. True one-shot PER cap episode now: set
+        # once a follow-up is scheduled, only cleared by a genuine new real
+        # user message (submit()'s is_real_user branch) -- not by the
+        # follow-up firing itself.
+        self.one_shot_followup_used_for_limit = False
 
         # restart budget
         self.restart_timestamps: list[float] = []
@@ -1176,6 +1215,12 @@ class ChatSession:
             self.real_user_turn_answered = False
             self.silence_nudge_sent_for_turn = False
             self.last_visible_output_at = time.monotonic()
+            # Bug fix (2026-09-14): a genuine new real message is the one
+            # thing that should give both of these a clean slate -- see
+            # their own __init__ comments (consecutive_narration_count,
+            # one_shot_followup_used_for_limit) for the incident this fixes.
+            self.consecutive_narration_count = 0
+            self.one_shot_followup_used_for_limit = False
             self.last_real_user_question = text
             # Bug fix (2026-09-11), per explicit instruction: language must
             # be tracked CONTINUOUSLY, not resolved once and left alone --
@@ -1264,6 +1309,8 @@ class ChatSession:
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
         self.last_visible_output_at = time.monotonic()
+        self.consecutive_narration_count = 0
+        self.one_shot_followup_used_for_limit = False
         self.last_real_user_question = text
         refresh_language_in_background(self.last_saved_session_id, self.tab_id)
         save_pending_turn(self.workspace_dir, self.tab_id, text, [])
@@ -1361,6 +1408,7 @@ class ChatSession:
         await self.send({"type": "sdk_message", "message": result_wire, "isVoice": is_voice})
         self.real_user_turn_answered = True
         self.last_visible_output_at = time.monotonic()
+        self.consecutive_narration_count = 0
         clear_pending_turn(self.workspace_dir, self.tab_id)
         self.turn_pending = False
         self._end_small_model_turn()
@@ -1430,6 +1478,18 @@ class ChatSession:
         cancelled = REGISTRY.cancel_for_tab(self.tab_id)
         if cancelled:
             log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+        # Bug fix (2026-09-14), per explicit instruction ("не понимает, что
+        # её прерывали и ход тем самым завершён"): confirmed live -- Stop
+        # never touched api_retry_timer/one_shot_followup_timer, so a
+        # pending auto-recovery nudge (scheduled while THIS turn was still
+        # struggling -- a rate-limit retry, a usage-cap follow-up) fired
+        # anyway, later, as if the user had never stepped in at all. From
+        # the user's side that reads as "I stopped her and she just kept
+        # going" -- an explicit Stop should silence every background
+        # recovery attempt tied to this now-abandoned turn, not just the
+        # turn itself.
+        self._clear_api_retry_timer()
+        self._clear_one_shot_followup_timer()
 
     async def _escalate_stop_if_still_pending(self) -> None:
         """See stop()'s own comment for why this exists. Re-checks BOTH
@@ -1559,10 +1619,28 @@ class ChatSession:
         once, that never re-arms itself no matter what the model replies
         (a genuine [[NO_UPDATE]], a real answer, or nothing at all) --
         unlike api_retry_timer, which reschedules itself every time it
-        fires until something clears it."""
+        fires until something clears it.
+
+        Bug fix (2026-09-14), confirmed live: "never re-arms itself" above
+        was only ever true WITHIN one firing (the timer handle itself is
+        cleared at the top of _fire(), before anything else happens) -- if
+        the follow-up turn it injects ALSO concludes by reporting the SAME
+        still-active usage cap, the CC-CLI-limit-message handler calls
+        this method again fresh, sees one_shot_followup_timer is None
+        (already cleared), and re-arms -- unboundedly, once per
+        ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS, for as long as the cap stays
+        active. That's exactly the forever-retry shape this function's own
+        docstring says it's deliberately NOT supposed to have. See
+        one_shot_followup_used_for_limit's own __init__ comment: true
+        one-shot per CAP EPISODE now, not per firing -- only a genuine new
+        real user message clears it for another try."""
         if self.one_shot_followup_timer:
             log_event("engine", "one_shot_followup_already_pending", tab_id=self.tab_id, reason=reason)
             return
+        if self.one_shot_followup_used_for_limit:
+            log_event("engine", "one_shot_followup_already_used_for_this_limit_episode", tab_id=self.tab_id, reason=reason)
+            return
+        self.one_shot_followup_used_for_limit = True
         log_event(
             "engine", "one_shot_followup_scheduled", tab_id=self.tab_id, reason=reason,
             delay_ms=ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS,
@@ -1578,7 +1656,9 @@ class ChatSession:
                 f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
                 is_voice,
             )
-            # Deliberately no rescheduling here -- this is the whole point.
+            # Deliberately no rescheduling here -- this is the whole point
+            # (one_shot_followup_used_for_limit, set above, is what actually
+            # enforces that now, since this timer handle alone wasn't enough).
 
         loop = asyncio.get_event_loop()
         self.one_shot_followup_timer = loop.call_later(ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS / 1000, _fire)
@@ -1876,6 +1956,13 @@ class ChatSession:
         # mean there's genuinely nothing to narrate about right now.
         if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
             return
+        # Bug fix (2026-09-14): see consecutive_narration_count's own
+        # __init__ comment and MAX_CONSECUTIVE_NARRATION_COMMENTS's own
+        # comment -- a turn stuck this long isn't helped by yet another
+        # paraphrase of the same stale context; stop until real progress
+        # (a real reply, or a fresh real user message) resets the counter.
+        if self.consecutive_narration_count >= MAX_CONSECUTIVE_NARRATION_COMMENTS:
+            return
         now = time.monotonic()
         if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
             return
@@ -1896,7 +1983,8 @@ class ChatSession:
             return
         if not comment:
             return
-        log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment)
+        self.consecutive_narration_count += 1
+        log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment, consecutive_count=self.consecutive_narration_count)
         wire = {
             "type": "assistant",
             "message": {"role": "assistant", "content": [{"type": "text", "text": comment}], "model": None, "stop_reason": None},
@@ -2728,6 +2816,7 @@ class ChatSession:
                                     if has_visible_text:
                                         self.last_visible_output_at = time.monotonic()
                                         self.turn_saw_any_visible_text = True
+                                        self.consecutive_narration_count = 0
 
                     if isinstance(message, ResultMessage):
                         if result_is_fake:
