@@ -470,5 +470,7 @@ def close_windows_after_task_instruction() -> str:
         "you're actively monitoring it for something ongoing, or the task itself isn't actually finished yet (a "
         "multi-step task you'll come back to in the same turn or shortly after doesn't need its window closed and "
         "reopened in between). When in doubt whether the task is really done, leave it open rather than closing "
-        "something still needed."
+        "something still needed. If you need to check what you actually still have open -- before telling the "
+        "user you have no windows, or before trying to close 'the rest' of them -- call list_my_windows rather "
+        "than guessing from memory of the conversation so far."
     )

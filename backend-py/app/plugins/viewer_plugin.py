@@ -21,8 +21,9 @@ from typing import Any
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.office_editor import OfficeEditorError, prepare_office_edit_session
 from app.policies import close_windows_after_task_instruction, read_content_not_headers_instruction
-from app.session_context import get_send
+from app.session_context import get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
+from app.window_registry import register_window, unregister_window
 
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _VIDEO_EXT = {".mp4", ".webm", ".mov", ".avi", ".mkv"}
@@ -45,6 +46,7 @@ def _kind_of(path: str) -> str:
 
 async def open_in_viewer(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     path = args["path"]
+    purpose = args["purpose"]
     if not Path(path).exists():
         return {"text": f"No such file: {path}", "is_error": True}
     request_id = uuid.uuid4().hex
@@ -65,12 +67,14 @@ async def open_in_viewer(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         _open_requests[request_id] = {"path": path}
         await send({"type": "open_editor", "requestId": request_id, "path": path, "kind": kind})
 
+    register_window(f"viewer:{path}", kind=f"viewer_{kind}", label=path, purpose=purpose, tab_id=get_tab_id())
     return {"text": f"Opened {path} in the viewer window."}
 
 
 async def close_viewer(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     send = get_send()
     await send({"type": "close_editor", "path": args["path"]})
+    unregister_window(f"viewer:{args['path']}")
     return {"text": f"Closed the viewer for {args['path']}."}
 
 
@@ -89,8 +93,10 @@ PLUGIN = Plugin(
             "an embedded OnlyOffice editor -- this requires the user to be logged into SquirrelWisdom and a "
             "working internet connection, since the document is briefly uploaded there to be edited and "
             "synced back. Returns immediately -- it does not wait for them to finish, since that could take "
-            "a while.",
-            {"path": str}, open_in_viewer,
+            "a while. purpose is a short note on why you're opening it (e.g. \"showing the user the generated "
+            "invoice\") -- recorded so list_my_windows can later tell you (or the user) what this window is "
+            "for and why it's still open.",
+            {"path": str, "purpose": str}, open_in_viewer,
         ),
         PluginTool(
             "close_viewer",

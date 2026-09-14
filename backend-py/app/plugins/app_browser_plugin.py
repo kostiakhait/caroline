@@ -25,6 +25,8 @@ from app.plugins import app_browser_cdp as cdp
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.voice_api import describe_image_cheap
 from app.policies import close_windows_after_task_instruction, prefer_cropped_screenshots_instruction, prefer_window_targeted_input_instruction
+from app.session_context import get_tab_id
+from app.window_registry import register_window, unregister_window
 
 APP_BROWSER_HOST = "http://127.0.0.1:8767"
 
@@ -36,8 +38,9 @@ OPEN_TIMEOUT_S = 90.0
 
 _ACCOUNT_HINT = (
     "Embedded browser call failed: {exc}. Is Caroline's WPF app running (this tool only works "
-    "inside the desktop app, not headless)? If the problem persists, the standalone caroline-browser "
-    "tools remain available as a fallback."
+    "inside the desktop app, not headless)? The standalone caroline-browser tools are NOT a fallback "
+    "for this -- they're blocked outright (see prefer_embedded_browser_instruction). Report the "
+    "failure to the user instead of reaching for a different browser tool."
 )
 
 
@@ -81,6 +84,7 @@ async def open_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if args.get("url"):
         body["url"] = args["url"]
     result = await _call("/open", body, OPEN_TIMEOUT_S)
+    register_window(f"browser:{args['label']}", kind="browser", label=args["label"], purpose=args["purpose"], tab_id=get_tab_id())
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
@@ -183,6 +187,7 @@ async def app_browser_fill_file_dialog(args: dict[str, Any], _rp: Any) -> dict[s
 
 async def close_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     result = await _call("/close", {"label": args["label"]})
+    unregister_window(f"browser:{args['label']}")
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
@@ -246,11 +251,12 @@ PLUGIN = Plugin(
         PluginTool(
             "open_app_browser",
             "Open (or focus, if already open) Caroline's own embedded browser window for a given label, "
-            "optionally navigating it to a URL. This is her PRIMARY browser -- prefer it over the standalone "
-            "caroline-browser tools for ordinary web/app tasks (WhatsApp Web, Telegram Web, Facebook, Slack, "
-            "general browsing). Each label is its own persistent window living inside the app, not a "
-            "separate Chrome process.",
-            {"label": str, "url": str | None}, open_app_browser,
+            "optionally navigating it to a URL. This is her ONLY browser -- the standalone caroline-browser "
+            "tools are blocked outright, not just discouraged. Each label is its own persistent window living "
+            "inside the app, not a separate Chrome process. purpose is a short note on why you're opening/"
+            "focusing it (e.g. \"checking WhatsApp for a reply\") -- recorded so list_my_windows can later tell "
+            "you (or the user) what this window is for.",
+            {"label": str, "url": str | None, "purpose": str}, open_app_browser,
         ),
         PluginTool(
             "app_browser_navigate",

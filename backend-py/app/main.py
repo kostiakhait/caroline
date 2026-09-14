@@ -41,6 +41,7 @@ from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_own
 from app.sms_account import get_sms_account_status, remove_sms_account, set_sms_account
 from app.subscription_mode import create_topup_checkout_url, get_own_anthropic_api_key, get_sw_status, resolve_mode, set_own_anthropic_api_key
 from app.visual_mode import is_visual_mode_enabled, resolve_visual_model, set_visual_mode_enabled
+from app.window_registry import unregister_window
 from app.workspace_dir import WORKSPACE_DIR
 
 PORT = int(os.environ.get("CAROLINE_PORT", "48765"))
@@ -451,6 +452,11 @@ async def handle_control_request(
         if not request_id or not outcome or not path:
             return {"type": "control_response", "op": op, "ok": False, "stderr": "editor_result requires requestId, outcome, and path", "requestId": request_id}
         log_event("engine", "editor_result", request_id=request_id, outcome=outcome, path=path)
+        # Ground truth for "is this viewer window still open" -- fires
+        # whether Caroline's own close_viewer triggered it or the user
+        # closed the window themselves, so this is the one place a stale
+        # window_registry entry is guaranteed to get cleaned up either way.
+        unregister_window(f"viewer:{path}")
         req = take_viewer_request(request_id)
         if req and req.get("remotePath") and outcome != "error":
             # A document opened via the OnlyOffice flow -- pull back whatever

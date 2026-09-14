@@ -208,6 +208,20 @@ _NARRATION_GARBAGE_PATTERNS = [
     # -- just as much a non-answer, still slipped through unfiltered.
     re.compile(r"\bno (?:specific )?(?:remark|response|sentence|instructions?)\b.{0,40}\b(?:found|derived|generated|drafted|identified|could be)\b", re.IGNORECASE),
     re.compile(r"\bcould not be (?:drafted|generated|derived|produced)\b", re.IGNORECASE),
+    # Bug fix (2026-09-14), confirmed live (caroline.log, 21:45:37): a THIRD
+    # variant of the same underlying problem -- instead of a refusal or
+    # meta-commentary about being an AI, the small model sometimes writes a
+    # dry third-person RECAP of the conversation ("The user asks Caroline to
+    # ...  The Caroline response confirms that ...") instead of a reactive
+    # remark in her own voice. Perfectly well-formed prose, not a refusal,
+    # under the length cap -- none of the patterns above catch it, and it
+    # went out as a real chat bubble. A genuine in-character remark never
+    # refers to "the user" or "Caroline"/"the AI assistant" as a third party
+    # describing what happened; this is the same tell _looks_like_narration_
+    # garbage already uses for refusals, generalized to this shape too.
+    re.compile(r"^\s*the user (?:asks?|asked|wants?|requests?|is asking)\b", re.IGNORECASE),
+    re.compile(r"\bthe (?:caroline|ai assistant('s)?) response\b", re.IGNORECASE),
+    re.compile(r"\bthe ai assistant\b", re.IGNORECASE),
 ]
 _NARRATION_MAX_CHARS = 400
 # Han / Hiragana / Katakana / Hangul. Progress narration for this product
@@ -261,11 +275,28 @@ _NARRATION_EXAMPLE_BAD = "I'll create a GitLab repo and send you the link."
 _NARRATION_EXAMPLE_GOOD = "Setting up a fresh repo for this is usually the fiddly part."
 _NARRATION_EXAMPLE_TAG = "Movers always lowball the box count, every single time."
 
+# Bug fix (2026-09-14), per explicit instruction: pattern-matching specific
+# third-person phrasings after the fact (_NARRATION_GARBAGE_PATTERNS'
+# "the user asks"/"the AI assistant" entries, added 2026-09-13) is the
+# wrong primary fix -- confirmed live (screenshots) that the model finds
+# NEW third-person phrasings the patterns don't happen to cover. The real
+# fix has to be instructing the model correctly in the first place; the
+# patterns stay only as a defense-in-depth safety net, not the mechanism
+# doing the actual work. A second first-person-vs-recap example pair,
+# alongside the existing promise-vs-no-promise one above, specifically
+# illustrating THIS failure shape (a third-person recap of the
+# conversation instead of a first-person in-character remark).
+_NARRATION_EXAMPLE_THIRDPERSON_BAD = "The user asks Caroline to regenerate the report, and the Caroline response confirms the edits were made."
+_NARRATION_EXAMPLE_THIRDPERSON_GOOD = "Regenerated it and reopened it for you to check."
+
 
 def _is_echo_of_prompt_example(text: str) -> bool:
     return any(
         _normalized_overlap(text, example)
-        for example in (_NARRATION_EXAMPLE_BAD, _NARRATION_EXAMPLE_GOOD, _NARRATION_EXAMPLE_TAG)
+        for example in (
+            _NARRATION_EXAMPLE_BAD, _NARRATION_EXAMPLE_GOOD, _NARRATION_EXAMPLE_TAG,
+            _NARRATION_EXAMPLE_THIRDPERSON_BAD, _NARRATION_EXAMPLE_THIRDPERSON_GOOD,
+        )
     )
 
 
@@ -355,14 +386,20 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     response, SW unavailable, or a response that fails the garbage check
     below) -- always a silent skip, never surfaced as an error."""
     prompt = (
-        "You are standing in, for a moment, on behalf of an AI assistant who is mid-conversation with a "
-        "specific person and has been quietly working on their last message for over a minute now without "
-        "saying anything back yet. Draft ONE short remark in her voice to keep the conversation feeling "
-        "alive. This is NOT a status update about internal work -- never say things like \"I'm checking/"
-        "pulling up/sorting through/looking into/working on X\", never mention tools, files, operations, or "
-        "how long anything is taking. Instead, react like someone genuinely engaged with the actual topic "
-        "would: add a real, specific thought connected to what's being discussed -- a relevant detail, a "
-        "follow-up angle, a small observation -- not a generic placeholder that could fit any conversation.\n\n"
+        "For the next few sentences, YOU ARE Caroline, an AI assistant, writing directly to the specific "
+        "person she's mid-conversation with. Not narrating about her, not describing what she or the user "
+        "did -- BE her, speaking in first person, the way she'd actually type a message: \"I\", never \"the "
+        "user\"/\"Caroline\"/\"the AI assistant\" as a third party. She's been quietly working on the user's "
+        "last message for over a minute now without saying anything back yet. Draft ONE short remark, AS "
+        "her, to keep the conversation feeling alive. This is NOT a status update about internal work -- "
+        "never say things like \"I'm checking/pulling up/sorting through/looking into/working on X\", never "
+        "mention tools, files, operations, or how long anything is taking. Instead, react like someone "
+        "genuinely engaged with the actual topic would: add a real, specific thought connected to what's "
+        "being discussed -- a relevant detail, a follow-up angle, a small observation -- not a generic "
+        "placeholder that could fit any conversation, and NOT a recap or summary of the conversation so far "
+        "(that's not a remark, that's a report -- never write it).\n"
+        f"  Bad (third person, a recap instead of a remark): \"{_NARRATION_EXAMPLE_THIRDPERSON_BAD}\"\n"
+        f"  Good (first person, an actual remark): \"{_NARRATION_EXAMPLE_THIRDPERSON_GOOD}\"\n\n"
         "You have no idea what the real assistant is actually doing right now, so NEVER commit to a new "
         "action on her behalf -- no \"I'll do X\", \"I will send/create/check Y\", no new promises or plans "
         "of any kind, however small. Only react to what's ALREADY in the conversation below -- an "
