@@ -117,6 +117,22 @@ HANG_TIMEOUT_MS = 90_000
 STARTUP_TIMEOUT_MS = 5 * 60_000
 WATCHDOG_INTERVAL_MS = 5_000
 HANG_ESCALATION_GRACE_MS = 20_000
+# Bug fix (2026-09-14), per explicit instruction ("надежный рубильник" --
+# a reliable kill switch): confirmed live that a user-initiated Stop could
+# leave a turn permanently stuck -- client.interrupt() alone is a soft ask
+# the CLI/SDK isn't guaranteed to honor (same underlying flakiness
+# _check_hang's own escalation exists to work around for AUTOMATIC hang
+# detection, see HANG_ESCALATION_GRACE_MS above), and stop() never
+# followed up if it didn't work. Much shorter than the automatic
+# detector's own 20s grace -- a user who just clicked Stop is already
+# watching and waiting, not something silently ticking in the background.
+STOP_ESCALATION_GRACE_S = 5.0
+# Upper bound on client.disconnect() itself during stop() escalation --
+# defense in depth against the SAME SDK-level flakiness (documented
+# elsewhere in this codebase, e.g. subprocess_cli.py's close() bug) ever
+# making the "hard kill" step itself hang, which would defeat the entire
+# point of a reliable kill switch.
+STOP_ESCALATION_DISCONNECT_TIMEOUT_S = 10.0
 MAX_RESTARTS_PER_WINDOW = 5
 RESTART_WINDOW_MS = 10 * 60_000
 RESTART_BACKOFF_MS = 60_000
@@ -1306,6 +1322,16 @@ class ChatSession:
                 self._small_model_task.cancel()
         elif self.client:
             asyncio.create_task(self._safe_interrupt())
+            # Bug fix (2026-09-14), per explicit instruction ("надежный
+            # рубильник"): confirmed live -- a soft interrupt() can simply
+            # not work, leaving the turn stuck indefinitely with no way for
+            # the user to regain control short of killing the whole app.
+            # Give it STOP_ESCALATION_GRACE_S to actually resolve the turn;
+            # if it hasn't by then, _escalate_stop_if_still_pending forces
+            # a hard client.disconnect() -- the same real OS-process
+            # terminate()-then-kill() escalation _check_hang's own hang
+            # recovery already relies on, not just a second polite request.
+            asyncio.create_task(self._escalate_stop_if_still_pending())
         # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
         # only stops the model's own generation stream. A tool call that
         # already crossed dispatch()'s fast-path window (app/operations.py)
@@ -1317,6 +1343,24 @@ class ChatSession:
         cancelled = REGISTRY.cancel_for_tab(self.tab_id)
         if cancelled:
             log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+
+    async def _escalate_stop_if_still_pending(self) -> None:
+        """See stop()'s own comment for why this exists. Re-checks BOTH
+        turn_pending (did the turn actually finish?) and
+        user_stop_requested (did the recovery path in _run_loop's own
+        exception handler already consume this exact stop -- e.g. the soft
+        interrupt worked after all, just not instantly) right before
+        acting, so a stop that resolved normally in the meantime is a
+        harmless no-op here, not a redundant/racy second kill."""
+        await asyncio.sleep(STOP_ESCALATION_GRACE_S)
+        if not self.turn_pending or not self.user_stop_requested:
+            return
+        log_event("engine", "user_stop_escalation_force_close", tab_id=self.tab_id)
+        try:
+            if self.client:
+                await asyncio.wait_for(self.client.disconnect(), timeout=STOP_ESCALATION_DISCONNECT_TIMEOUT_S)
+        except Exception as exc:
+            log_event("engine", "user_stop_escalation_close_failed", tab_id=self.tab_id, error=str(exc))
 
     def _push_message(self, text: str, attachments: list[Any], is_voice: bool) -> None:
         sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}"
