@@ -221,11 +221,46 @@ public sealed class BackendProcess : IDisposable
         });
         if (!cleanupTask.Wait(TimeSpan.FromSeconds(5)))
         {
+            // Bug fix (2026-09-14), per explicit instruction, root-caused via a real
+            // live incident: this used to just log and abandon the cleanup here,
+            // trusting that Kill(entireProcessTree:true) was still "probably" working
+            // in the background. Confirmed live it can genuinely stall past this
+            // timeout (backend-py's own process tree grows with every native-exe tool
+            // call it's made -- mouse/keyboard/screenshot/chain/inspect helpers,
+            // local_tts_server.py, the claude.exe CLI subprocess -- and .NET's own
+            // tree-walk can take longer than 5s to enumerate and signal all of them
+            // under load) -- the orphaned pythonw.exe survived past THIS process's own
+            // exit, kept holding Port, and every subsequent launch (including a fresh
+            // install from an in-place update) failed to bind and crash-looped until
+            // the app gave up auto-restarting. "The Process object leaks" turned out
+            // to be the SMALLER of two possible bad outcomes only when the kill
+            // eventually succeeds late; when it doesn't, this is a real, user-visible
+            // outage, not a harmless leak. Fires a DETACHED OS-level `taskkill /F /T`
+            // for the same PID as a backstop -- it doesn't depend on this Process
+            // object's own (evidently sometimes-stuck) internal wait, so it can still
+            // land and finish the job even after this method has already returned.
+            // Not awaited, same "never block the caller" guarantee this timeout exists
+            // for in the first place.
             OutputLine?.Invoke(
-                $"[BackendProcess] Dispose(): background cleanup did not finish within 5.0s -- abandoning it " +
-                "and returning anyway (the Process object leaks; that's a much smaller problem than blocking " +
-                "the caller forever, which is what happened live before this fix)."
+                $"[BackendProcess] Dispose(): background cleanup did not finish within 5.0s -- " +
+                "Kill(entireProcessTree:true) itself was still blocked. Falling back to a detached " +
+                $"`taskkill /F /T /PID {process.Id}` so the process doesn't survive as an orphan holding Port; " +
+                "not waiting for it either."
             );
+            try
+            {
+                System.Diagnostics.Process.Start(new ProcessStartInfo("taskkill.exe", $"/F /T /PID {process.Id}")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                });
+            }
+            catch (Exception ex)
+            {
+                OutputLine?.Invoke($"[BackendProcess] Dispose(): fallback taskkill launch itself failed: {ex.Message}");
+            }
             return;
         }
         OutputLine?.Invoke($"[BackendProcess] Dispose() done, total elapsed {sw.Elapsed.TotalSeconds:F1}s");
