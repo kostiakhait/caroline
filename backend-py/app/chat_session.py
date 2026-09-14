@@ -595,9 +595,23 @@ def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
     async def _run() -> None:
         try:
             lines = _read_recent_dialogue_lines(session_id, tab_id, WORKSPACE_DIR, RECENT_DIALOGUE_WINDOW)
-            if not lines:
+            # Bug fix (2026-09-14), per explicit instruction: filter to the
+            # user's own lines BEFORE sending anything downstream -- this
+            # used to hand resolve_user_language the full mixed transcript
+            # (both "User: "/"Caroline: " lines) and rely on its prompt's own
+            # "ignore assistant text" instruction to sort it out. Confirmed
+            # live (2026-09-13) that this isn't reliable enough: a tab whose
+            # user wrote only in Russian still got persisted as "English"
+            # more than once, apparently swayed by Caroline's own recent
+            # (partly English) output mixed into the same sample -- and once
+            # wrongly persisted, that wrong language feeds the next turn's
+            # forced-translation target too, so the bug compounds itself.
+            # Filtering here is a hard, code-level guarantee instead of a
+            # prompt-level request the small model can silently ignore.
+            user_lines = [line[len("User: "):] for line in lines if line.startswith("User: ")]
+            if not user_lines:
                 return
-            name = await resolve_user_language("\n".join(lines))
+            name = await resolve_user_language("\n".join(user_lines))
             if name:
                 log_event("engine", "language_resolved", tab_id=tab_id, language=name)
                 _save_persisted_language(tab_id, name)
@@ -624,6 +638,33 @@ def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
 # file is ever missing (a fresh install, a cleared workspace).
 _SETTINGS_FILE_NAME = "caroline-settings.json"
 _SETTINGS_FILE_CONTENT = json.dumps({"autoCompactEnabled": True})
+
+# Hard block (2026-09-14), per explicit instruction: "caroline-browser" is a
+# leftover from the old Node backend (workspace.ts's ensureWorkspace()) --
+# a real, separate Playwright/Node browser process, still registered as a
+# user-scope MCP server in ~/.claude.json (never removed during the Python
+# rewrite), so the `claude` CLI subprocess this class spawns picks it up
+# automatically regardless of what this backend's own mcp_servers dict
+# contains. prefer_embedded_browser_instruction (policies.py) already tells
+# the model to prefer open_app_browser/app_browser_* over this -- promoted
+# to ALWAYS_ON_INSTRUCTIONS on 2026-09-11 after a single sentence in the
+# tool description alone wasn't enough -- and confirmed live (2026-09-13)
+# that even ALWAYS_ON prompting still isn't a strong enough guarantee: the
+# model kept reaching for caroline-browser anyway, opening a real, separate
+# Chrome/Chromium window instead of Caroline's own embedded one. A prompt
+# is advisory; disallowed_tools is enforced by the SDK/CLI itself and
+# cannot be talked around, so exclude these outright rather than continue
+# to just ask nicely. Exact tool names (no wildcard support confirmed for
+# this SDK's disallowed_tools), one per tool this external server exposes.
+_DISALLOWED_CAROLINE_BROWSER_TOOLS = [
+    f"mcp__caroline-browser__{name}"
+    for name in (
+        "browser_click", "browser_evaluate", "browser_file_upload", "browser_find",
+        "browser_navigate", "browser_press_key", "browser_resize", "browser_restart_daemon",
+        "browser_run_code_unsafe", "browser_snapshot", "browser_tabs",
+        "browser_take_screenshot", "browser_type", "browser_wait_for",
+    )
+]
 
 
 def _ensure_settings_file(workspace_dir: str) -> str:
@@ -2052,7 +2093,7 @@ class ChatSession:
                     "cwd": self.workspace_dir,
                     "permission_mode": "bypassPermissions",
                     "mcp_servers": mcp_servers,
-                    "disallowed_tools": ["mcp__caroline-notes__notes_login"],
+                    "disallowed_tools": ["mcp__caroline-notes__notes_login", *_DISALLOWED_CAROLINE_BROWSER_TOOLS],
                     "stderr": _stderr_handler,
                     # Claude's own native auto-compaction handles context
                     # ageing now -- explicitly on, and one long-lived client
