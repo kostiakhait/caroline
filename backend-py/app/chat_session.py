@@ -99,7 +99,7 @@ from app.plugins.loader import build_mcp_servers
 from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
-from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction
+from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction
 from app.operations import REGISTRY
 from app.session_context import set_send, set_tab_id
 from app.sw_gate import require_sw_or_prompt
@@ -201,6 +201,12 @@ RECENT_DIALOGUE_WINDOW = 12
 # far as it needs to in order to find this many real user lines, rather
 # than being capped by an unrelated total-line budget.
 LANGUAGE_DETECTION_USER_LINE_COUNT = 5
+
+# Per explicit instruction (2026-09-14): a rolling window, in real hours,
+# not messages -- see recent_dialogue_history_instruction's own docstring
+# (policies.py) and _write_recent_24h_dialogue_file (below) for the full
+# feature this backs.
+RECENT_HISTORY_FILE_WINDOW_HOURS = 24
 
 # Per explicit instruction (2026-09-10): a regular, unconditional safety net
 # independent of our own turn_pending bookkeeping -- confirmed live that
@@ -492,15 +498,21 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"type": "text", "text": f"[Attached file saved to {saved_path} -- read it if relevant to the request.]"}]
 
 
-def _usable_dialogue_lines(entries: list[dict[str, Any]]) -> list[str]:
+def _usable_dialogue_lines(entries: list[dict[str, Any]], min_ts_ms: float | None = None) -> list[str]:
     """Turns _extract_entries_from_jsonl's raw entries into clean
     "Speaker: text" lines -- real, user-visible conversation only. Drops
     anything synthetic/service (_is_synthetic_history_text, which now
     covers both the old wording-blocklist and the new structural
     _SYNTHETIC_TURN_MARKER tag) and bare bracketed placeholder lines (a
-    lone "[<timestamp>]" with nothing else, a compaction stub)."""
+    lone "[<timestamp>]" with nothing else, a compaction stub). min_ts_ms
+    (added 2026-09-14, for _write_recent_24h_dialogue_file) optionally
+    drops any entry older than that epoch-ms cutoff -- entries missing a
+    real timestamp fall back to "now" (see _extract_entries_from_jsonl),
+    so they're never wrongly dropped as too old."""
     out: list[str] = []
     for entry in entries:
+        if min_ts_ms is not None and entry.get("ts", float("inf")) < min_ts_ms:
+            continue
         raw_text = str(entry.get("text") or "")
         clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
         if not clean_text or _is_synthetic_history_text(raw_text):
@@ -577,6 +589,51 @@ def _read_recent_user_lines(session_id: str | None, tab_id: str, workspace_dir: 
             except Exception as exc:
                 log_event("engine", "recent_user_lines_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
     return user_lines[-count:]
+
+
+def _recent_24h_dialogue_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"recent-24h-dialogue-{_sanitize_tab_id(tab_id)}.txt"
+
+
+def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspace_dir: str) -> str:
+    """Per explicit instruction (2026-09-14): see recent_dialogue_history_
+    instruction's own docstring (policies.py) for the full feature this
+    backs. Refreshed synchronously (plain local file I/O, no network call
+    -- unlike refresh_language_in_background, this can't be fire-and-forget
+    since the whole point is that it's current by the time THIS turn's
+    system prompt gets built) from submit() on every real user turn.
+    Gathers real dialogue (_usable_dialogue_lines -- both speakers, real
+    content, synthetic/service text already dropped) from the last
+    RECENT_HISTORY_FILE_WINDOW_HOURS, from the same two sources
+    _read_recent_dialogue_lines/_read_recent_user_lines already draw from
+    (the live session file, plus this tab's own continuity archive for
+    anything a compaction already aged out of the live file within the
+    window). Returns the file's own path unconditionally (even on a
+    read/write failure -- an empty or stale file is still a valid, if
+    unhelpful, thing to point the model at; a missing return value would
+    just make the pointer instruction silently vanish instead)."""
+    out_path = _recent_24h_dialogue_path(workspace_dir, tab_id)
+    cutoff_ms = (time.time() - RECENT_HISTORY_FILE_WINDOW_HOURS * 3600) * 1000
+    lines: list[str] = []
+    if session_id:
+        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+        try:
+            lines = _usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)), min_ts_ms=cutoff_ms)
+        except Exception as exc:
+            log_event("engine", "recent_24h_dialogue_read_failed", tab_id=tab_id, error=str(exc))
+    archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
+    if archive_path:
+        try:
+            lines = _usable_dialogue_lines(read_archived_entries(archive_path), min_ts_ms=cutoff_ms) + lines
+        except Exception as exc:
+            log_event("engine", "recent_24h_dialogue_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(lines) if lines else "(No real messages between you and this user in the last 24 hours.)"
+        out_path.write_text(body, encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "recent_24h_dialogue_write_failed", tab_id=tab_id, error=str(exc))
+    return str(out_path)
 
 
 def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session_id: str | None, user_text: str, assistant_text: str) -> None:
@@ -910,6 +967,19 @@ class ChatSession:
         self.last_saved_session_id: str | None = None
 
         self.current_chat_source: str | None = None
+        # Per explicit instruction (2026-09-14): path to this tab's rolling
+        # 24h-dialogue file -- see recent_dialogue_history_instruction's
+        # own docstring (policies.py) and _write_recent_24h_dialogue_file
+        # (above) for the full feature. The PATH is stable for this tab's
+        # whole lifetime (unlike _system_prompt_language below, its own
+        # system-prompt mention never goes stale/needs a restart to pick
+        # up a change) -- only the file's CONTENT changes, rewritten fresh
+        # before every real user submit(), so the model sees current data
+        # any time it actually reads the file, regardless of how long this
+        # particular query() client has been alive. None until the first
+        # real user turn ever runs (see recent_dialogue_history_
+        # instruction's own None-safe handling).
+        self._recent_24h_dialogue_file_path: str | None = None
         # The language hint baked into the CURRENT query()'s system prompt.
         # A long-lived client doesn't re-read it every turn anymore, so a
         # real user turn that finds the persisted language has changed
@@ -1124,6 +1194,11 @@ class ChatSession:
             # correctness gap (current_language_name() is only ever read
             # at the next query()/narration tick anyway).
             refresh_language_in_background(self.last_saved_session_id, self.tab_id)
+            # Per explicit instruction (2026-09-14): synchronous (plain
+            # local file I/O, not a network call) so this tab's 24h-dialogue
+            # file is genuinely current before this same turn dispatches --
+            # see _write_recent_24h_dialogue_file's own docstring.
+            self._recent_24h_dialogue_file_path = _write_recent_24h_dialogue_file(self.last_saved_session_id, self.tab_id, self.workspace_dir)
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
         # last_real_user_question/the saved pending-turn file above -- those
@@ -2196,6 +2271,7 @@ class ChatSession:
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
+                    recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
                     language_hint_instruction(self._system_prompt_language),
                 ]
                 system_prompt_append = "\n\n".join(p for p in system_prompt_parts if p)

@@ -260,6 +260,39 @@ def continuity_pointer_instruction(archive_path: str | None) -> str:
     )
 
 
+def recent_dialogue_history_instruction(file_path: str | None) -> str:
+    """Per explicit instruction (2026-09-14): dehydration strips old
+    thinking/tool content and Claude's own native auto-compaction summarizes
+    older turns away -- both correctly keep the session usable, but both
+    can leave Caroline unable to recall something the user told her earlier
+    the same day, causing her to re-ask about a task they already
+    explained. This is a SEPARATE, additional safety net on top of
+    whatever dehydration/compaction/continuity_pointer_instruction already
+    provide, not a replacement for any of them: a plain-text file,
+    refreshed before every real user message (chat_session.py's submit()),
+    holding the real dialogue between her and this user for the last 24
+    hours -- both sides' actual words, with internal/service/synthetic
+    text (nudges, timestamp stamps, [[NO_UPDATE]] turns, etc.) already
+    filtered out, same filtering _read_recent_dialogue_lines itself uses.
+    Given as a POINTER (a file path), not inlined -- she reads it via
+    read_file on demand, the same progressive-disclosure principle as
+    get_tool_instructions, rather than paying its token cost on every
+    single turn whether it's needed or not. Only present once there's
+    actually a file for this tab (absent -- returns "" -- for a brand-new
+    tab, e.g. before its first real turn ever writes one)."""
+    if not file_path:
+        return ""
+    return (
+        "Additional material, on top of your own memory of this conversation: the real back-and-forth between "
+        f"you and this specific user over the last 24 hours (their words and yours, internal/service messages "
+        f"already filtered out) is kept at {file_path}, refreshed right before every message they send you. "
+        "Before asking the user to re-explain a task, re-state context, or clarify something you feel unsure "
+        "about, check this file first -- do NOT ask them again if the file already makes clear what's being "
+        "discussed; act on it directly instead. Only ask the user if this file genuinely doesn't cover it "
+        "either."
+    )
+
+
 def task_completion_memory_instruction() -> str:
     """Per explicit instruction (2026-09-09): distinct from
     learn_from_mistakes_instruction (which is specifically for a mistake/
