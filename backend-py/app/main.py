@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, auth_status as cli_auth_status, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
-from app.durability import dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_turn, save_chat_mode
+from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
@@ -89,6 +89,9 @@ _ratatosk_turn_got_reply = False
 _has_greeted = False
 _has_sent_visual_mode_config = False
 _resumed_unfinished_turn_for_tab: set[str] = set()
+# Same "once per process, not per reconnect" shape -- see
+# peek_pending_operations' own recovery block below.
+_resumed_pending_operations_for_tab: set[str] = set()
 # Same "once per process, not per reconnect" shape as the set above -- see
 # ChatSession.needs_startup_compaction/_check_forced_compaction
 # (chat_session.py) for why forced compaction exists and what this flag
@@ -140,17 +143,22 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     return delivered
 
 
-def _inject_companion_message(tab_id: str, text: str) -> bool:
+def _inject_companion_message(tab_id: str, text: str, attachments: list[dict[str, Any]] | None = None) -> bool:
     """Callback for companion_api.start_companion_inbox_loop: inject a
-    phone-originated message into the named tab's live session, exactly as
-    if the user had typed it locally. Returns False (leave it in the phone
+    phone-originated message (text and/or real attachment bytes -- per
+    explicit instruction 2026-09-15, exact correspondence in both
+    directions) into the named tab's live session, exactly as if the user
+    had typed/attached it locally. Returns False (leave it in the phone
     inbox, retry next tick) if that tab has no live session right now."""
     session = sessions.get(tab_id)
     if session is None:
         return False
-    return session.inject_proactive(
+    label = (
         f"[The user sent this from their phone via the Caroline companion app]: {text}"
+        if text else
+        "[The user sent an attachment from their phone via the Caroline companion app.]"
     )
+    return session.inject_proactive(label, attachments)
 
 
 def _active_tab_ids() -> list[str]:
@@ -158,6 +166,20 @@ def _active_tab_ids() -> list[str]:
     now, so history sync (and the inbox drain) covers all of them, not
     just the primary one."""
     return list(sessions.keys())
+
+
+def _companion_tab_status(tab_id: str) -> dict[str, str] | None:
+    """Callback for the same loop: mirrors exactly what drives the desktop
+    app's own lamp 1 / status-bar (chat_session.py's own
+    _compute_public_status(), the same method _publish_status() calls
+    before sending the {type:"status"} WS message) -- the phone gets the
+    real backend-computed state, nothing re-derived client-side, per
+    explicit instruction (2026-09-15)."""
+    session = sessions.get(tab_id)
+    if session is None:
+        return None
+    state, reason = session._compute_public_status()
+    return {"state": state, "reason": reason}
 
 
 def _companion_history_snapshot(tab_id: str) -> list[dict[str, Any]]:
@@ -188,7 +210,10 @@ async def _start_ratatosk_background_loops() -> None:
     # Android companion app: drain phone-originated messages from
     # tabs/<tabId>/inbox into live sessions, and mirror recent history back
     # out to tabs/<tabId>/history. No-op while not logged into SW.
-    start_companion_inbox_loop(WORKSPACE_DIR, _active_tab_ids, _inject_companion_message, _companion_history_snapshot)
+    start_companion_inbox_loop(
+        WORKSPACE_DIR, _active_tab_ids, _inject_companion_message, _companion_history_snapshot,
+        _companion_tab_status, get_ratatosk_channel_status,
+    )
     # Resume any companion operation (SMS send, sms/contacts lookup) that
     # was still in flight when the backend last went down -- see
     # companion_api.py's own module docstring for the never-gives-up
@@ -892,9 +917,43 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 f'finished or answered:\n\n"{unfinished_turn.text}"\n\nResume it now and answer the user -- they '
                 "don't know this happened yet, so tell them you got interrupted and pick up where you left off. "
                 "Don't just re-run everything from scratch if you're not sure what already completed -- check "
-                "first where that makes sense (e.g. was an email already sent, a file already written). Reply in "
-                f"{resume_lang}.]",
+                "first where that makes sense (e.g. was an email already sent, a file already written). "
+                "IMPORTANT: any background operation you'd started before the restart (check_operation_status, "
+                "an operation_id from before now) is GONE -- the restart wiped it completely, with no trace and "
+                "no way to check on it anymore. Do not wait for one to report back, and do not assume it finished, "
+                "partially finished, or is still running -- treat it as if it never happened, and if it still "
+                "needs doing, start it again from scratch (checking first, per above, whether it actually needs "
+                f"redoing). Reply in {resume_lang}.]",
             )
+
+    # Per explicit instruction (2026-09-15), the SEPARATE half of the same
+    # fix above: unlike unfinished_turn (which only exists when the
+    # TRIGGERING turn itself was still unanswered at restart time), a
+    # background operation can survive past its own turn already having
+    # replied and finished normally -- confirmed live as the actual
+    # incident (an 8-mailbox cleanup the model promised to report back on,
+    # then a restart happened, and nothing was ever said). Fires
+    # independently of whether unfinished_turn fired above -- see
+    # durability.peek_pending_operations' own docstring for why anything
+    # found here is, by construction, stale.
+    if tab_id not in _resumed_pending_operations_for_tab:
+        _resumed_pending_operations_for_tab.add(tab_id)
+        stale_operations = peek_pending_operations(WORKSPACE_DIR, tab_id)
+        if stale_operations:
+            log_event("engine", "resuming_stale_pending_operations", tab_id=tab_id, count=len(stale_operations))
+            ops_lang = current_language_name(tab_id)
+            ops_list = "\n".join(f'- {op["tool_name"]} (started {op["started_at_iso"]})' for op in stale_operations)
+            session.inject_proactive(
+                "[Caroline was restarted (app closed or crashed) while one or more background operations were "
+                f"still running, and they never got a chance to report back:\n\n{ops_list}\n\nThese are GONE -- "
+                "the restart wiped all track of them, with no trace and no way to check on them anymore. Do not "
+                "wait for one to report back, and do not assume it finished, partially finished, or is still "
+                "running. If the user is still waiting on one of these (check the recent conversation for what "
+                "you told them), tell them what happened and redo it if it's still needed -- don't silently drop "
+                f"it either. Reply in {ops_lang}.]",
+            )
+            for op in stale_operations:
+                clear_pending_operation(WORKSPACE_DIR, tab_id, op["operation_id"])
 
     # Forced compaction's "at Caroline's startup" trigger (2026-09-11): once
     # per tab per PROCESS lifetime, not per reconnect -- ChatSession itself

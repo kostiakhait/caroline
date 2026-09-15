@@ -1445,7 +1445,7 @@ class ChatSession:
         # That check now lives entirely inside run_small_model_turn() itself
         # (small_model_engine.py), using Camerlengo/OpenRouter models only.
 
-    def inject_proactive(self, text: str, is_voice: bool = False) -> bool:
+    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
         showing is now decided ENTIRELY by the model's own reply content
@@ -1460,9 +1460,10 @@ class ChatSession:
         reply). Removed entirely rather than patched again."""
         if self.ended:
             return False
-        log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text))
+        attachments = attachments or []
+        log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
-        self.submit(text, [], False, is_voice)
+        self.submit(text, attachments, False, is_voice)
         return True
 
     def stop(self) -> None:

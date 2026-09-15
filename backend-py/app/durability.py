@@ -102,6 +102,86 @@ def peek_pending_turn(workspace_dir: str, tab_id: str) -> PendingTurn | None:
         return None
 
 
+# --- per-tab in-flight background operations, for restart recovery -------
+# Per explicit instruction (2026-09-15, "Кэролайн регулярно теряет фоновых
+# агентов" -> agreed follow-up fix): app/operations.py's OperationRegistry
+# is pure in-memory, process-scoped -- a genuine full backend-process
+# restart (crash, a forced relaunch, an in-place update) wipes it
+# completely, with zero trace, for ANY operation that had already left
+# dispatch()'s fast path. pending-turn-<id>.json alone doesn't cover this:
+# it only fires when the TRIGGERING turn itself is still unanswered at
+# restart time, but the confirmed live incident (an 8-mailbox cleanup the
+# model explicitly promised to report back on) had already replied to the
+# user and moved on -- the turn was "done" from the SDK's own perspective,
+# only the background operation itself was still running. This is a
+# SEPARATE small durability file, one per tab, a dict of operation_id ->
+# {tool_name, startedAtIso} for every operation currently past the fast
+# path -- written by operations.py's dispatch() when an operation goes
+# slow, cleared when it actually finishes (see run()'s own completion).
+# Anything still in this file when a tab's session first connects in a
+# NEW process lifetime is, by construction, stale (a live process's own
+# OperationRegistry would already be tracking it) -- main.py's WS handler
+# peeks it the same way it already peeks pending-turn and injects a
+# recovery nudge, mirroring that exact pattern.
+
+
+def _pending_operations_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"pending-operations-{_sanitize_tab_id(tab_id)}.json"
+
+
+def _load_pending_operations(workspace_dir: str, tab_id: str) -> dict:
+    path = _pending_operations_path(workspace_dir, tab_id)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log_event("engine", "load_pending_operations_failed", tab_id=tab_id, error=str(exc))
+        return {}
+
+
+def save_pending_operation(workspace_dir: str, tab_id: str, operation_id: str, tool_name: str) -> None:
+    from datetime import datetime, timezone
+
+    try:
+        operations = _load_pending_operations(workspace_dir, tab_id)
+        operations[operation_id] = {"toolName": tool_name, "startedAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        path = _pending_operations_path(workspace_dir, tab_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(operations, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as exc:
+        # Best-effort -- worst case this specific operation isn't covered
+        # by restart recovery, but that must be visible in the log, not
+        # silently swallowed.
+        log_event("engine", "save_pending_operation_failed", tab_id=tab_id, operation_id=operation_id, error=str(exc))
+
+
+def clear_pending_operation(workspace_dir: str, tab_id: str, operation_id: str) -> None:
+    try:
+        operations = _load_pending_operations(workspace_dir, tab_id)
+        if operation_id not in operations:
+            return
+        del operations[operation_id]
+        path = _pending_operations_path(workspace_dir, tab_id)
+        if operations:
+            path.write_text(json.dumps(operations, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+    except Exception as exc:
+        log_event("engine", "clear_pending_operation_failed", tab_id=tab_id, operation_id=operation_id, error=str(exc))
+
+
+def peek_pending_operations(workspace_dir: str, tab_id: str) -> list[dict]:
+    """Read-only -- does NOT delete the file (same reasoning as
+    peek_pending_turn's own docstring: deletion isn't this function's
+    job). Returns a list of {operation_id, tool_name, started_at_iso}."""
+    operations = _load_pending_operations(workspace_dir, tab_id)
+    return [
+        {"operation_id": op_id, "tool_name": entry.get("toolName", "?"), "started_at_iso": entry.get("startedAtIso", "")}
+        for op_id, entry in operations.items()
+    ]
+
+
 # --- per-tab Claude session id, for resume: instead of continue: true -----
 # continue:true always resumes "the most recent session for this cwd" --
 # fine for a single conversation, but with multiple independent tabs

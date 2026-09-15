@@ -63,7 +63,9 @@ void, and the journal entry is removed.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import mimetypes
 import time
 import uuid
 from pathlib import Path
@@ -92,8 +94,12 @@ def _phase2_backoff_delays():
 # The tabs/<tabId>/inbox drain + tabs/<tabId>/history sync loop cadence --
 # unrelated to the phase1/phase2 protocol above; this is how often the
 # background loop wakes up to check for phone-originated inbox messages
-# and push any new outgoing history.
-INBOX_LOOP_INTERVAL_S = 10.0
+# and push any new outgoing history. Lowered 10.0 -> 3.0 per explicit
+# instruction (2026-09-15) -- the phone's own poll interval was dropped to
+# match (see the Android app's ChatViewModel/TabsViewModel), and there's
+# no point the app polling faster than this loop could ever produce a new
+# synced value.
+INBOX_LOOP_INTERVAL_S = 3.0
 
 
 ReportProgress = Callable[[Any], None] | None
@@ -336,7 +342,11 @@ async def request_response(
 
 # --- restart-survival: resume whatever the journal says is still open -------
 
-InjectToTab = Callable[[str, str], bool]
+# Per explicit instruction (2026-09-15): exact correspondence in BOTH
+# directions -- a phone-originated message can now carry real attachment
+# bytes too (list of {"name", "mimeType", "dataBase64"}, same wire shape
+# chat_session.py's _attachment_to_blocks already consumes), not just text.
+InjectToTab = Callable[[str, str, "list[dict[str, Any]] | None"], bool]
 
 
 async def resume_companion_operations(workspace_dir: str, inject_to_tab: InjectToTab) -> None:
@@ -383,6 +393,15 @@ async def _resume_one(workspace_dir: str, op_id: str, entry: dict[str, Any], inj
 
 HistorySnapshot = Callable[[str], list[dict[str, Any]]]
 GetActiveTabIds = Callable[[], list[str]]
+# Per-tab lamp/status-bar source, matching chat_session.py's own
+# _compute_public_status() exactly: {"state": "ready"|"working"|
+# "recovering"|"error", "reason": str}. None if that tab has no live
+# session right now (e.g. between a companion inbox drain and the tab
+# actually starting up) -- nothing gets published for it that tick.
+TabStatusSnapshot = Callable[[str], dict[str, str] | None]
+# Global (not per-tab) Ratatosk-channel lamp source, matching
+# ratatosk_channel.get_ratatosk_channel_status() exactly.
+ChannelStatusSnapshot = Callable[[], dict[str, Any]]
 
 
 def _history_cursor_path(workspace_dir: str) -> Path:
@@ -411,6 +430,53 @@ def _save_history_cursor(workspace_dir: str, cursors: dict[str, int]) -> None:
         log_event("plugin:companion", "save_history_cursor_failed", error=str(exc))
 
 
+# Per explicit instruction (2026-09-15): "точное соответствие... в обе
+# стороны" -- the phone must show real attachment/image content, not just
+# a filename (there's no channel for it to fetch the file separately; the
+# only wire is this same var:* JSON store). A cap still exists because a
+# single pathological attachment (a multi-hundred-MB video, say) synced
+# into a JSON KV value would be a real problem for both the phone's JSON
+# parser and Camerlengo's storage, not because ordinary photos/documents
+# need one -- 20MB comfortably covers any real photo or PDF a phone would
+# actually be shown.
+MAX_EMBEDDED_ATTACHMENT_BYTES = 20 * 1024 * 1024
+
+
+def _embed_attachment_bytes(attachment: dict[str, Any]) -> dict[str, Any]:
+    """Reads the real file history.py pointed at (chat_session.py's own
+    workspace/uploads/<uuid>-<name>, always on disk for as long as the
+    entry itself exists) and folds its bytes in as dataBase64/mimeType --
+    same shape chat_session.py's _attachment_to_blocks already expects
+    coming the other way, so the phone's own outgoing attachments (see
+    _drain_inbox below) and these incoming ones share one wire format.
+    Best-effort: a missing file or an over-cap file falls back to the
+    previous name-only shape (the Android app already renders that as a
+    plain chip), never raises."""
+    path = attachment.get("path")
+    name = attachment.get("name", "attachment")
+    if not path:
+        return {"name": name}
+    try:
+        file_path = Path(path)
+        size = file_path.stat().st_size
+        if size > MAX_EMBEDDED_ATTACHMENT_BYTES:
+            log_event("plugin:companion", "attachment_too_large_to_embed", path=path, bytes=size)
+            return {"name": name, "tooLarge": True}
+        data = file_path.read_bytes()
+        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return {"name": name, "mimeType": mime_type, "dataBase64": base64.b64encode(data).decode("ascii")}
+    except Exception as exc:  # noqa: BLE001 -- best effort, never break the sync
+        log_event("plugin:companion", "attachment_embed_failed", path=path, error=str(exc))
+        return {"name": name}
+
+
+def _entry_with_embedded_attachments(entry: dict[str, Any]) -> dict[str, Any]:
+    attachments = entry.get("attachments")
+    if not attachments:
+        return entry
+    return {**entry, "attachments": [_embed_attachment_bytes(a) for a in attachments]}
+
+
 async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds, history_snapshot: HistorySnapshot) -> None:
     """Pushes only the entries the phone hasn't received yet, one per key
     under tabs/<tabId>/history/<index> (not one overwritten blob) -- for
@@ -430,7 +496,7 @@ async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds,
             if not new_entries:
                 continue
             for i, entry in enumerate(new_entries, start=already_sent):
-                await set_mine(f"tabs/{tab_id}/history/{i}", entry)
+                await set_mine(f"tabs/{tab_id}/history/{i}", _entry_with_embedded_attachments(entry))
             cursors[tab_id] = len(entries)
             changed = True
             log_event("plugin:companion", "history_synced", tab_id=tab_id, new_entries=len(new_entries), total=len(entries))
@@ -438,6 +504,26 @@ async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds,
             _save_history_cursor(workspace_dir, cursors)
     except Exception as exc:  # noqa: BLE001 -- best effort, never break the loop
         log_event("plugin:companion", "history_sync_failed", error=str(exc))
+
+
+async def _sync_status(
+    get_active_tab_ids: GetActiveTabIds, tab_status_snapshot: TabStatusSnapshot, channel_status_snapshot: ChannelStatusSnapshot,
+) -> None:
+    """Mirrors the SAME lamp/status-bar state the desktop app's own
+    {type:"status"} WS message drives (chat_session.py's
+    _compute_public_status()) out to the phone, per tab, plus the one
+    global Ratatosk-channel lamp -- per explicit instruction (2026-09-15):
+    the phone should show exactly what the desktop shows, not just chat
+    text. No cursor/dedup needed here (unlike history) -- each status blob
+    is tiny, and always overwriting the same key is simpler and cheap."""
+    try:
+        for tab_id in get_active_tab_ids():
+            status = tab_status_snapshot(tab_id)
+            if status is not None:
+                await set_mine(f"tabs/{tab_id}/status", status)
+        await set_mine("channel_status", channel_status_snapshot())
+    except Exception as exc:  # noqa: BLE001 -- best effort, never break the loop
+        log_event("plugin:companion", "status_sync_failed", error=str(exc))
 
 
 async def _drain_inbox(inject_to_tab: InjectToTab) -> None:
@@ -452,11 +538,14 @@ async def _drain_inbox(inject_to_tab: InjectToTab) -> None:
             continue
         for msg_id, msg in list(inbox.items()):
             text = msg.get("text") if isinstance(msg, dict) else None
-            if not isinstance(text, str) or not text.strip():
+            raw_attachments = msg.get("attachments") if isinstance(msg, dict) else None
+            attachments = raw_attachments if isinstance(raw_attachments, list) and raw_attachments else None
+            has_text = isinstance(text, str) and bool(text.strip())
+            if not has_text and not attachments:
                 await _safe_delete(f"tabs/{tab_id}/inbox/{msg_id}")
                 continue
             try:
-                delivered = inject_to_tab(tab_id, text)
+                delivered = inject_to_tab(tab_id, text if has_text else "", attachments)
             except Exception as exc:  # noqa: BLE001
                 log_event("plugin:companion", "inbox_inject_failed", tab_id=tab_id, msg_id=msg_id, error=str(exc))
                 delivered = False
@@ -467,15 +556,18 @@ async def _drain_inbox(inject_to_tab: InjectToTab) -> None:
 
 async def _inbox_loop_tick(
     workspace_dir: str, get_active_tab_ids: GetActiveTabIds, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
+    tab_status_snapshot: TabStatusSnapshot, channel_status_snapshot: ChannelStatusSnapshot,
 ) -> None:
     if not is_logged_in():
         return  # not paired to any SW account yet -- nothing to sync
     await _sync_history(workspace_dir, get_active_tab_ids, history_snapshot)
+    await _sync_status(get_active_tab_ids, tab_status_snapshot, channel_status_snapshot)
     await _drain_inbox(inject_to_tab)
 
 
 def start_companion_inbox_loop(
     workspace_dir: str, get_active_tab_ids: GetActiveTabIds, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
+    tab_status_snapshot: TabStatusSnapshot, channel_status_snapshot: ChannelStatusSnapshot,
     interval_s: float = INBOX_LOOP_INTERVAL_S,
 ) -> "asyncio.Task[None]":
     """Started once from main.py's startup hook (needs a running loop),
@@ -487,7 +579,10 @@ def start_companion_inbox_loop(
         while True:
             await asyncio.sleep(interval_s)
             try:
-                await _inbox_loop_tick(workspace_dir, get_active_tab_ids, inject_to_tab, history_snapshot)
+                await _inbox_loop_tick(
+                    workspace_dir, get_active_tab_ids, inject_to_tab, history_snapshot,
+                    tab_status_snapshot, channel_status_snapshot,
+                )
             except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
                 log_event("plugin:companion", "inbox_loop_tick_failed", error=str(exc))
 

@@ -14,8 +14,9 @@ import kotlinx.coroutines.launch
 
 // Matches the backend's own INBOX_LOOP_INTERVAL_S (companion_api.py) --
 // no point polling the tab directory faster than the backend could ever
-// update it.
-private const val AUTO_REFRESH_INTERVAL_MS = 10_000L
+// update it. Lowered 10s -> 3s per explicit instruction (2026-09-15),
+// matching the backend's own interval drop.
+private const val AUTO_REFRESH_INTERVAL_MS = 3_000L
 
 /**
  * Reads the LIVE tab directory (main repo's main.py "tab_list_set" control

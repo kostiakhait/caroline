@@ -30,8 +30,10 @@ from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server, tool as sdk_tool
 
+from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
 from app.session_context import get_inject_proactive, get_tab_id
+from app.workspace_dir import WORKSPACE_DIR
 
 # How long dispatch() waits before giving up on returning a "done" result
 # synchronously and instead returning a bare operation_id for polling.
@@ -182,6 +184,12 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
             # stop_operation) already knows.
             if op.notify_on_completion and op.status != "cancelled":
                 _notify_operation_completed(plugin_name, op)
+            # Same "only if it was ever persisted" gating -- see
+            # save_pending_operation's own call site below. Clears
+            # regardless of tab_id being set; clear_pending_operation is a
+            # safe no-op if nothing was ever saved for this operation_id.
+            if op.notify_on_completion and op.tab_id:
+                clear_pending_operation(WORKSPACE_DIR, op.tab_id, op.id)
 
     op.task = asyncio.create_task(run())
     log_event(f"plugin:{plugin_name}", "operation_started", tool=tool_name, operation_id=op.id)
@@ -194,6 +202,14 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         return {"operation_id": op.id, "status": "done", "result": result}
     except asyncio.TimeoutError:
         op.notify_on_completion = True
+        # Per explicit instruction (2026-09-15): see durability.py's own
+        # "per-tab in-flight background operations" section for why this
+        # exists -- a full backend-process restart while this is still
+        # running wipes OperationRegistry with zero trace; this is the
+        # trace. Only when tab_id is actually known (a throwaway test
+        # script's dispatched operation has no tab to recover for anyway).
+        if op.tab_id:
+            save_pending_operation(WORKSPACE_DIR, op.tab_id, op.id, tool_name)
         log_event(f"plugin:{plugin_name}", "operation_running", tool=tool_name, operation_id=op.id)
         return {"operation_id": op.id, "status": "running"}
     except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()

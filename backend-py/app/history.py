@@ -48,7 +48,14 @@ def _extract_attachment_note(block_text: str) -> dict[str, str] | None:
         saved_path = (rest[:dash_idx] if dash_idx >= 0 else re.sub(r"\.?\]\s*$", "", rest)).strip()
         base = re.split(r"[\\/]", saved_path)[-1] or saved_path
         name = _UUID_PREFIX_RE.sub("", base)
-        return {"name": name}
+        # "path" points at the real on-disk file (workspace/uploads/... --
+        # see chat_session.py's _save_attachment_to_uploads) so a consumer
+        # that actually needs the bytes (companion_api.py's history sync,
+        # for the Android app) can read and embed them. Desktop's own
+        # chat.js never needs this (same machine, reads the WS
+        # find_attachment op or the file directly) so this is additive,
+        # not a behavior change for it.
+        return {"name": name, "path": saved_path}
     return None
 
 
