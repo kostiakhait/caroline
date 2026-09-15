@@ -912,6 +912,16 @@ class ChatSession:
         self.needs_startup_compaction: bool = False
         self.last_forced_compaction_at: float | None = None
         self.size_at_last_forced_compaction: int | None = None
+        # Per explicit instruction (2026-09-15): set by _apply_conn_state
+        # whenever conn_state leaves "limited" -- see its own comment for
+        # the incident (a forced-compaction attempt that itself hit the
+        # usage cap left forced_compaction_result_pending stuck forever,
+        # silently blocking every future compaction attempt even once the
+        # cap reset). Consumed by _check_forced_compaction, which bypasses
+        # its normal cooldown for this specific reason -- the point is to
+        # retry what the cap just interrupted, not wait for the next
+        # regular cycle.
+        self.needs_post_limit_compaction_check: bool = False
         # Same "this ResultMessage/whatever precedes it isn't real, don't
         # show it or let it touch turn state" shape as
         # hang_interrupt_result_pending/ignore_next_result_recovery -- see
@@ -1619,6 +1629,29 @@ class ChatSession:
         prev_kind = self.conn_state.get("kind")
         self.conn_state = {"kind": kind, "reason": reason}
         log_event("engine", "conn_state", tab_id=self.tab_id, prev=prev_kind, new=kind, reason=reason)
+        # Bug fix (2026-09-15), per explicit instruction: confirmed live --
+        # a forced-compaction attempt that itself hits the usage cap (the
+        # CLI's own "Error during compaction: You've hit your session
+        # limit" message) gets classified through the generic CC-CLI-
+        # limit-message path, which never resets forced_compaction_result_
+        # pending (that only happens in the normal ResultMessage handler,
+        # which this classification path skips via its own `continue`).
+        # Left stuck at True forever after that, _check_forced_compaction's
+        # own first guard blocks EVERY future attempt -- even once the cap
+        # resets, nothing ever retries, so a context that grew large enough
+        # to need compaction in the first place (confirmed live: ~48MB of
+        # accumulated Read-tool image results) never actually shrinks.
+        # Coming out of "limited" is exactly the moment to re-check: set a
+        # dedicated flag here (consumed by _check_forced_compaction, which
+        # also bypasses the normal cooldown for it -- the point is
+        # specifically to retry what the cap just interrupted, not wait for
+        # the next regular cycle) and clear the stuck flag too, in case
+        # that's what actually got stuck.
+        if prev_kind == "limited" and kind != "limited":
+            self.needs_post_limit_compaction_check = True
+            if self.forced_compaction_result_pending:
+                self.forced_compaction_result_pending = False
+                log_event("engine", "forced_compaction_result_pending_cleared_after_limit", tab_id=self.tab_id)
         await self._publish_status()
 
     def _set_conn_state(self, kind: str, reason: str | None = None, arm_ignore_next_result: bool = False) -> None:
@@ -2211,10 +2244,14 @@ class ChatSession:
     def _check_forced_compaction(self) -> None:
         """See FORCED_COMPACTION_HOURLY_MS's own comment for why this
         exists at all (native auto-compaction confirmed never firing on its
-        own). Three triggers, checked in priority order: a pending startup
-        compaction (main.py sets needs_startup_compaction once per tab per
-        process), the hourly clock, or on-disk growth past
-        FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD since the last forced
+        own). Four triggers, checked in priority order: needs_post_limit_
+        compaction_check (per explicit instruction, 2026-09-15 -- see its
+        own __init__ comment; deliberately bypasses the cooldown gate
+        below, since the whole point is retrying what a usage-limit hit
+        just interrupted, not waiting for the next regular cycle), a
+        pending startup compaction (main.py sets needs_startup_compaction
+        once per tab per process), the hourly clock, or on-disk growth
+        past FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD since the last forced
         compaction. Never runs while a real turn is in flight or the
         connection isn't fully settled -- this is maintenance, not
         something to inject into or race with actual work."""
@@ -2225,15 +2262,18 @@ class ChatSession:
         if not self.last_saved_session_id:
             return
         now = time.monotonic()
-        if self.last_forced_compaction_at is not None and now - self.last_forced_compaction_at < FORCED_COMPACTION_MIN_INTERVAL_MS / 1000:
-            return
 
-        reason: str | None = None
-        if self.needs_startup_compaction:
+        if self.needs_post_limit_compaction_check:
+            self.needs_post_limit_compaction_check = False
+            reason = "post_limit"
+        elif self.last_forced_compaction_at is not None and now - self.last_forced_compaction_at < FORCED_COMPACTION_MIN_INTERVAL_MS / 1000:
+            return
+        elif self.needs_startup_compaction:
             reason = "startup"
         elif self.last_forced_compaction_at is None or now - self.last_forced_compaction_at >= FORCED_COMPACTION_HOURLY_MS / 1000:
             reason = "hourly"
         else:
+            reason = None
             size = self._current_session_file_size()
             baseline = self.size_at_last_forced_compaction or 0
             if size is not None and size - baseline >= FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD:

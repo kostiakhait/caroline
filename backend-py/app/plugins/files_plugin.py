@@ -12,11 +12,14 @@ escalating."""
 
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
+
+_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 # Matches the Read tool's own read cap (roughly) so a huge log/data file
 # doesn't blow up the model's context in one call -- truncated rather than
@@ -60,6 +63,33 @@ async def write_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         f.write(content)
     verb = "Appended to" if append else "Wrote"
     return {"text": f"{verb} {p} ({len(content)} characters)."}
+
+
+async def describe_local_image(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Per explicit instruction (2026-09-15): describe_image_cheap
+    (voice_api.py) used to be wired up ONLY for app_browser's own
+    screenshots -- not a deliberate restriction, just never generalized.
+    Confirmed live as a real, costly gap: with no cheap way to check an
+    arbitrary local image file, the model fell back to the native Read
+    tool for routine "did this save correctly" checks -- Read puts the
+    FULL image (raw base64) into Claude's own context permanently (a
+    single real conversation accumulated ~48MB across 41 such reads this
+    way). This is the same cheap Camerlengo ai:describeImage call
+    app_browser_describe already uses, just for any local file instead of
+    only a live embedded-browser screenshot."""
+    p = Path(args["path"])
+    if not p.exists():
+        return {"text": f"No such file: {p}", "is_error": True}
+    if p.suffix.lower() not in _IMAGE_EXT:
+        return {"text": f"Not a recognized image file (by extension): {p}", "is_error": True}
+    from app.plugins.voice_api import describe_image_cheap
+
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    try:
+        result = await describe_image_cheap(b64)
+    except Exception as exc:
+        return {"text": f"Could not describe {p}: {exc}", "is_error": True}
+    return {"text": str(result.get("description") or "(no description returned)")}
 
 
 async def list_directory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -112,6 +142,18 @@ PLUGIN = Plugin(
             "sizes. Use this to see what's already there before reading/writing a file, or to find a file "
             "whose exact name you don't know.",
             {"path": str}, list_directory,
+        ),
+        PluginTool(
+            "describe_local_image",
+            "Get a cheap text description of a local image file (png/jpg/gif/webp/bmp) WITHOUT putting the "
+            "actual image bytes into your own context -- prefer this over the Read tool whenever you're just "
+            "sanity-checking that a file saved correctly, looks roughly right, or matches what you expect "
+            "(e.g. after generating or saving an image). It costs a separate, cheap call instead of your own "
+            "context/tokens, but Read is a real, unavoidable cost every time and stays in your context for the "
+            "rest of the conversation. Only reach for Read on an image when you genuinely need to look closely "
+            "yourself (fine visual detail, exact colors/layout, reading small text in the image) -- something a "
+            "text description can't give you.",
+            {"path": str}, describe_local_image,
         ),
     ],
 )
