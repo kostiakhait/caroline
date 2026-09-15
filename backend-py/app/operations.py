@@ -31,7 +31,7 @@ from typing import Any, Awaitable, Callable
 from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server, tool as sdk_tool
 
 from app.logging_setup import log_event
-from app.session_context import get_tab_id
+from app.session_context import get_inject_proactive, get_tab_id
 
 # How long dispatch() waits before giving up on returning a "done" result
 # synchronously and instead returning a bare operation_id for polling.
@@ -119,6 +119,36 @@ class OperationRegistry:
 REGISTRY = OperationRegistry()
 
 
+def _notify_operation_completed(plugin_name: str, op: Operation) -> None:
+    """Per explicit instruction (2026-09-15): confirmed live as a real,
+    "regular" gap -- a background operation the model already walked away
+    from (dispatch()'s slow-path "running" outcome) had no way to surface
+    its own completion; nothing guaranteed anyone would ever poll
+    check_operation_status again to find out. Fires a proactive nudge into
+    the SAME tab's session via session_context.get_inject_proactive
+    (mirrors viewer_plugin.py's editor_result -> inject_proactive pattern
+    for the identical "async thing finished, tell the model" shape). Silent
+    no-op outside a live ChatSession turn (get_inject_proactive returns
+    None then) -- a throwaway test script's dispatched operation has no
+    session to notify, same non-fatal shape as get_tab_id()."""
+    inject = get_inject_proactive()
+    if inject is None:
+        return
+    if op.status == "done":
+        outcome = f"finished successfully. Result: {op.result}"
+    elif op.status == "error":
+        outcome = f"failed with an error: {op.error}"
+    else:
+        return
+    inject(
+        f"[Internal: a background operation you started earlier (tool: {op.tool_name}, "
+        f"operation_id: {op.id}) just {outcome} You never checked back on this one directly -- "
+        "react to it now if it's relevant (e.g. tell the user what happened), rather than "
+        "leaving it unmentioned.]"
+    )
+    log_event(f"plugin:{plugin_name}", "operation_completion_notified", tool=op.tool_name, operation_id=op.id, status=op.status)
+
+
 async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args: dict[str, Any]) -> dict[str, Any]:
     """Runs one tool call through the uniform start/status/stop contract.
     Always logs call/result/error/duration at the engine level (see
@@ -142,6 +172,16 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
             op.status = "error"
             op.error = str(exc)
             raise
+        finally:
+            # Per explicit instruction (2026-09-15): only for an operation
+            # dispatch() already told its caller "running" for (see the
+            # TimeoutError branch below, which sets notify_on_completion)
+            # -- a fast-path operation's caller already has the real
+            # result synchronously, nothing to notify. Never for
+            # "cancelled" -- whoever cancelled it (REGISTRY.cancel_for_tab,
+            # stop_operation) already knows.
+            if op.notify_on_completion and op.status != "cancelled":
+                _notify_operation_completed(plugin_name, op)
 
     op.task = asyncio.create_task(run())
     log_event(f"plugin:{plugin_name}", "operation_started", tool=tool_name, operation_id=op.id)
@@ -153,6 +193,7 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         REGISTRY.forget(op.id)
         return {"operation_id": op.id, "status": "done", "result": result}
     except asyncio.TimeoutError:
+        op.notify_on_completion = True
         log_event(f"plugin:{plugin_name}", "operation_running", tool=tool_name, operation_id=op.id)
         return {"operation_id": op.id, "status": "running"}
     except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()
