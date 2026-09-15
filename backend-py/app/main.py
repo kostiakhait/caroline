@@ -925,6 +925,28 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "needs doing, start it again from scratch (checking first, per above, whether it actually needs "
                 f"redoing). Reply in {resume_lang}.]",
             )
+            # Bug fix (2026-09-15), root-caused live: inject_proactive()
+            # (called just above) always passes is_real_user=False to
+            # submit(), which sets self.pending_is_real_user = False --
+            # correct for a genuine reminder/backup/ratatosk nudge, but
+            # WRONG here: this text wraps the user's own real, still-
+            # unanswered question, just resumed via internal machinery
+            # instead of a live click. Confirmed live: this left
+            # _check_progress_narration's own pending_is_real_user gate
+            # (added 2026-09-14) permanently False for the rest of this
+            # ChatSession's life -- nothing else ever flips it back to
+            # True except a genuine new real submit(), which never comes
+            # while the user is still waiting on THIS resumed task -- so
+            # narration silently stopped for an actively-running real task,
+            # 50+ minutes with zero comments in the incident that surfaced
+            # this. Overridden back to True here, right after submit() has
+            # already run synchronously (no other await in between, so no
+            # race) -- is_real_user itself stays False on purpose (the
+            # SYNTHETIC_TURN_MARKER wire-tagging and last_real_user_turn_at/
+            # language-refresh side effects of a truly live submit are
+            # still correctly skipped), only the narration-relevant flag is
+            # corrected.
+            session.pending_is_real_user = True
 
     # Per explicit instruction (2026-09-15), the SEPARATE half of the same
     # fix above: unlike unfinished_turn (which only exists when the

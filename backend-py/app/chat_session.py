@@ -2392,6 +2392,14 @@ class ChatSession:
             if self.pending_user_text is not None:
                 log_event("engine", "handle_failure_real_message_arrived_before_nudge", tab_id=self.tab_id)
                 self.inject_proactive(watchdog_note)
+                # Bug fix (2026-09-15): same root cause and same fix as
+                # main.py's resuming_unfinished_turn -- inject_proactive()
+                # just above always sets pending_is_real_user=False, but
+                # pending_user_text is_not_none right here means this IS a
+                # real, still-unanswered user question, just recovering
+                # via internal machinery rather than a live submit(). See
+                # main.py's own call site for the full incident writeup.
+                self.pending_is_real_user = True
             else:
                 log_event("engine", "handle_failure_continue_or_silent_nudge", tab_id=self.tab_id, lang=lang)
                 refresh_language_in_background(self.last_saved_session_id, self.tab_id)
