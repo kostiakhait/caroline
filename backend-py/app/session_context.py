@@ -18,9 +18,11 @@ import contextvars
 from typing import Any, Awaitable, Callable
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
+InjectProactiveFn = Callable[[str], bool]
 
 _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("current_send", default=None)
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
+_current_inject_proactive: contextvars.ContextVar[InjectProactiveFn | None] = contextvars.ContextVar("current_inject_proactive", default=None)
 
 
 def get_send() -> SendFn:
@@ -52,3 +54,20 @@ def get_tab_id() -> str | None:
 
 def set_tab_id(tab_id: str | None) -> contextvars.Token[str | None]:
     return _current_tab_id.set(tab_id)
+
+
+def get_inject_proactive() -> InjectProactiveFn | None:
+    """Per explicit instruction (2026-09-15): lets app/operations.py notify
+    the calling ChatSession on its own, once a background Operation the
+    model already walked away from (the slow-path "running" case -- see
+    dispatch()'s own FAST_PATH_TIMEOUT_S) actually finishes, instead of the
+    result just sitting in OperationRegistry forever unless something
+    happens to poll it. Same non-fatal shape as get_tab_id() -- None
+    outside a live ChatSession turn, callers just skip notifying rather
+    than raising (an Operation dispatched by a throwaway test script has
+    no session to notify anyway)."""
+    return _current_inject_proactive.get()
+
+
+def set_inject_proactive(fn: InjectProactiveFn | None) -> contextvars.Token[InjectProactiveFn | None]:
+    return _current_inject_proactive.set(fn)

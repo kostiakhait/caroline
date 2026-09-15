@@ -37,6 +37,7 @@ import asyncio
 import base64
 import json
 import re
+import subprocess
 import time
 import uuid as uuid_mod
 from datetime import datetime, timezone
@@ -101,7 +102,7 @@ from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction
 from app.operations import REGISTRY
-from app.session_context import set_send, set_tab_id
+from app.session_context import set_inject_proactive, set_send, set_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
@@ -118,21 +119,22 @@ HANG_TIMEOUT_MS = 90_000
 STARTUP_TIMEOUT_MS = 5 * 60_000
 WATCHDOG_INTERVAL_MS = 5_000
 HANG_ESCALATION_GRACE_MS = 20_000
-# Bug fix (2026-09-14), per explicit instruction ("надежный рубильник" --
-# a reliable kill switch): confirmed live that a user-initiated Stop could
-# leave a turn permanently stuck -- client.interrupt() alone is a soft ask
-# the CLI/SDK isn't guaranteed to honor (same underlying flakiness
-# _check_hang's own escalation exists to work around for AUTOMATIC hang
-# detection, see HANG_ESCALATION_GRACE_MS above), and stop() never
-# followed up if it didn't work. Much shorter than the automatic
-# detector's own 20s grace -- a user who just clicked Stop is already
-# watching and waiting, not something silently ticking in the background.
-STOP_ESCALATION_GRACE_S = 5.0
-# Upper bound on client.disconnect() itself during stop() escalation --
-# defense in depth against the SAME SDK-level flakiness (documented
-# elsewhere in this codebase, e.g. subprocess_cli.py's close() bug) ever
-# making the "hard kill" step itself hang, which would defeat the entire
-# point of a reliable kill switch.
+# Bug fix (2026-09-14/15), per explicit instruction ("надежный рубильник",
+# then "Кнопка стоп это абсолютный рубильник... Сразу по нажатии"):
+# confirmed live, twice, that a user-initiated Stop could leave a turn
+# permanently stuck -- client.interrupt() alone is a soft ask the CLI/SDK
+# isn't guaranteed to honor (same underlying flakiness _check_hang's own
+# escalation exists to work around for AUTOMATIC hang detection, see
+# HANG_ESCALATION_GRACE_MS above). Originally tried interrupt() first and
+# only escalated to a hard client.disconnect() after a grace period --
+# replaced (see stop()/_force_stop_client's own comments) with an
+# immediate hard kill, no grace period, since the polite path routinely
+# didn't work anyway and the grace period was just a guaranteed delay.
+# This timeout is now only an upper bound on disconnect() ITSELF (defense
+# in depth against the SAME SDK-level flakiness, documented elsewhere in
+# this codebase, e.g. subprocess_cli.py's close() bug, ever making the
+# "hard kill" step itself hang, which would defeat the entire point of a
+# reliable kill switch) -- not a wait-and-see period before acting.
 STOP_ESCALATION_DISCONNECT_TIMEOUT_S = 10.0
 MAX_RESTARTS_PER_WINDOW = 5
 RESTART_WINDOW_MS = 10 * 60_000
@@ -1476,17 +1478,23 @@ class ChatSession:
             if self._small_model_task is not None:
                 self._small_model_task.cancel()
         elif self.client:
-            asyncio.create_task(self._safe_interrupt())
-            # Bug fix (2026-09-14), per explicit instruction ("надежный
-            # рубильник"): confirmed live -- a soft interrupt() can simply
-            # not work, leaving the turn stuck indefinitely with no way for
-            # the user to regain control short of killing the whole app.
-            # Give it STOP_ESCALATION_GRACE_S to actually resolve the turn;
-            # if it hasn't by then, _escalate_stop_if_still_pending forces
-            # a hard client.disconnect() -- the same real OS-process
-            # terminate()-then-kill() escalation _check_hang's own hang
-            # recovery already relies on, not just a second polite request.
-            asyncio.create_task(self._escalate_stop_if_still_pending())
+            # Bug fix (2026-09-15), per explicit instruction: "Кнопка стоп
+            # это абсолютный рубильник... Сразу по нажатии" -- Stop must
+            # stop EVERYTHING in this tab (dialogue, tasks, agents)
+            # immediately on click, not best-effort or after a grace
+            # period. The previous design (2026-09-14) tried a soft
+            # interrupt() first and only escalated to a hard kill after
+            # STOP_ESCALATION_GRACE_S (5s) -- confirmed live, twice now,
+            # that soft interrupt() alone routinely doesn't work, so that
+            # 5s was just a guaranteed delay before the user got real
+            # control back, not a real chance for the polite path to
+            # succeed. Goes straight for the hard kill now, with no grace
+            # period: _force_stop_client (fires interrupt() AND
+            # disconnect() concurrently, immediately, and falls back to a
+            # direct OS-process kill if disconnect() itself throws -- see
+            # its own docstring for the SDK bug that makes that fallback
+            # necessary).
+            asyncio.create_task(self._force_stop_client())
         # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
         # only stops the model's own generation stream. A tool call that
         # already crossed dispatch()'s fast-path window (app/operations.py)
@@ -1511,23 +1519,64 @@ class ChatSession:
         self._clear_api_retry_timer()
         self._clear_one_shot_followup_timer()
 
-    async def _escalate_stop_if_still_pending(self) -> None:
-        """See stop()'s own comment for why this exists. Re-checks BOTH
-        turn_pending (did the turn actually finish?) and
-        user_stop_requested (did the recovery path in _run_loop's own
-        exception handler already consume this exact stop -- e.g. the soft
-        interrupt worked after all, just not instantly) right before
-        acting, so a stop that resolved normally in the meantime is a
-        harmless no-op here, not a redundant/racy second kill."""
-        await asyncio.sleep(STOP_ESCALATION_GRACE_S)
-        if not self.turn_pending or not self.user_stop_requested:
-            return
-        log_event("engine", "user_stop_escalation_force_close", tab_id=self.tab_id)
+    async def _force_stop_client(self) -> None:
+        """Per explicit instruction (2026-09-15): "Кнопка стоп это
+        абсолютный рубильник... Сразу по нажатии" -- no grace period, no
+        "try the polite way first": fires client.interrupt() (harmless,
+        occasionally lets the CLI wind down more cleanly) AND
+        client.disconnect() (the real OS-process terminate()-then-kill()
+        _check_hang's own hang recovery already relies on) CONCURRENTLY,
+        immediately. disconnect() alone is a strict superset of what's
+        needed -- interrupt() isn't awaited for or depended on, it can
+        only help, never block this.
+
+        Confirmed live (2026-09-15): even disconnect() itself can throw --
+        the same claude_agent_sdk bug _safe_disconnect's own docstring
+        documents (self._process already None inside the SDK's own
+        close()). When it does, this was a dead end before: the turn
+        stayed stuck with NEITHER interrupt() NOR disconnect() having
+        actually worked, and nothing left to fall back to. Falls back to
+        _force_kill_underlying_cli_process (a direct OS-level taskkill by
+        PID, bypassing the SDK's own broken internals entirely) so Stop
+        genuinely cannot fail to land."""
+        if self.client:
+            asyncio.create_task(self._safe_interrupt())
+        log_event("engine", "user_stop_force_close", tab_id=self.tab_id)
         try:
             if self.client:
                 await asyncio.wait_for(self.client.disconnect(), timeout=STOP_ESCALATION_DISCONNECT_TIMEOUT_S)
         except Exception as exc:
-            log_event("engine", "user_stop_escalation_close_failed", tab_id=self.tab_id, error=str(exc))
+            log_event("engine", "user_stop_close_failed", tab_id=self.tab_id, error=str(exc))
+            self._force_kill_underlying_cli_process()
+
+    def _force_kill_underlying_cli_process(self) -> None:
+        """Per explicit instruction (2026-09-15): mirrors BackendProcess.
+        cs's own taskkill fallback for the identical class of problem (a
+        graceful kill that doesn't reliably land) -- see
+        _escalate_stop_if_still_pending's own comment for the incident.
+        Reaches into claude_agent_sdk's private transport/process
+        attributes for the real OS PID and kills it directly, bypassing
+        whatever broken internal state made client.disconnect() itself
+        throw. Best-effort and silent on failure -- the private attribute
+        chain can legitimately not exist (a different SDK version, a
+        custom transport), and this is already the last-resort branch of a
+        last-resort escalation; there is nothing further to fall back to
+        here."""
+        transport = getattr(self.client, "_transport", None)
+        process = getattr(transport, "_process", None)
+        pid = getattr(process, "pid", None)
+        if not pid:
+            log_event("engine", "force_kill_cli_process_no_pid", tab_id=self.tab_id)
+            return
+        log_event("engine", "force_kill_cli_process", tab_id=self.tab_id, pid=pid)
+        try:
+            subprocess.Popen(
+                ["taskkill.exe", "/F", "/T", "/PID", str(pid)],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            log_event("engine", "force_kill_cli_process_failed", tab_id=self.tab_id, error=str(exc))
 
     def _push_message(self, text: str, attachments: list[Any], is_voice: bool) -> None:
         sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}"
@@ -2375,6 +2424,7 @@ class ChatSession:
     async def _run_loop(self) -> None:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)
+        set_inject_proactive(lambda text: self.inject_proactive(text))
         while not self.ended:
             try:
                 self.hang_count = 0

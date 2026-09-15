@@ -69,6 +69,17 @@ class Operation:
     # ChatSession turn (a throwaway test script) -- such an operation is
     # simply never matched by any tab's stop().
     tab_id: str | None = None
+    # Per explicit instruction (2026-09-15): set True by dispatch() exactly
+    # when an operation leaves the FAST_PATH_TIMEOUT_S window (the "running"
+    # outcome, not "done") -- i.e. the caller already walked away without
+    # the real result in hand. Confirmed live as a real, "regular" gap: a
+    # background operation (an 8-mailbox cleanup the model explicitly
+    # promised to report back on) had no way to surface its own completion
+    # unless something happened to poll check_operation_status again later
+    # -- nothing guaranteed that. run()'s own completion checks this flag
+    # to fire a proactive nudge automatically; a fast-path operation never
+    # needs one, since its result already reached the caller synchronously.
+    notify_on_completion: bool = False
 
 
 class OperationRegistry:
