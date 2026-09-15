@@ -1956,6 +1956,21 @@ class ChatSession:
         # mean there's genuinely nothing to narrate about right now.
         if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
             return
+        # Bug fix (2026-09-15), per explicit instruction: narration must
+        # never fire for a turn the user didn't actually start -- a
+        # scheduled reminder, a ratatosk nudge, a startup greeting, a
+        # vault-backup check, any of inject_proactive()'s other callers
+        # (all pass is_real_user=False, tracked here as pending_is_real_
+        # user). Confirmed live: narration comments were reaching the
+        # user at 12:26/1:51/1:59/2:00 AM -- clearly proactive/scheduled
+        # activity, not a live conversation -- because this function never
+        # checked who actually started the turn it was narrating, only
+        # whether SOME turn was pending. The user isn't watching and
+        # waiting on a proactive turn the way they are on one they just
+        # sent, so there's nothing for this cosmetic aside to usefully do
+        # there anyway.
+        if not self.pending_is_real_user:
+            return
         # Bug fix (2026-09-14): see consecutive_narration_count's own
         # __init__ comment and MAX_CONSECUTIVE_NARRATION_COMMENTS's own
         # comment -- a turn stuck this long isn't helped by yet another
