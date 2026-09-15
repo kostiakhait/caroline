@@ -140,15 +140,31 @@ async def translate_text(text: str, language: str, session: str | None = None) -
     lighter check. Text already in the target language should come back
     close to unchanged. Returns None on any failure OR on a garbage/
     refusal-shaped response -- callers must fall back to the original
-    text, never block on this."""
+    text, never block on this.
+
+    Widened (2026-09-15), per explicit instruction: no longer narration-
+    only. Confirmed live -- the real Claude model itself (not narration)
+    can drop a terse English status line into an otherwise-Russian
+    conversation (mid-tool-call-chain text like "Now executing deletes and
+    marks in batches."), and language_hint_instruction's system-prompt
+    nudge is advisory, not a hard guarantee. chat_session.py now runs
+    EVERY real visible assistant text block through this too, not just
+    generate_progress_comment's filler. Two consequences of that widening,
+    both handled below: real replies can be far longer than a narration
+    aside, so the garbage filter's length cap is now sized off the INPUT
+    text's own length rather than the fixed narration-sized constant; and
+    a real reply can contain code/paths/technical content that must not be
+    translated along with the prose, so the prompt now says so explicitly."""
     prompt = (
         f"Translate the following text into {language}. If the text is already in that language, respond with "
         "it unchanged (or only lightly cleaned up) -- do not refuse or explain, translation into the SAME "
-        "language it's already in is a normal, valid case, not an error.\n\n"
+        "language it's already in is a normal, valid case, not an error. Leave code blocks/inline code, file "
+        "paths, URLs, and other literal technical identifiers exactly as they are -- translate only the "
+        "surrounding natural-language prose, and preserve the original formatting/markdown structure.\n\n"
         f"Text to translate:\n---\n{text}\n---\n\n"
         "Output format, follow exactly -- a program parses this, not a person: write ONLY the translated text "
-        "inside a <translation> tag, nothing else anywhere in your reply -- no JSON, no markdown, no code "
-        "fences, no quotes around it, no explanation.\n"
+        "inside a <translation> tag, nothing else anywhere in your reply -- no JSON, no markdown wrapper, no "
+        "code fences around the WHOLE answer, no quotes around it, no explanation.\n"
         "Example, for an unrelated hypothetical translation into French -- copy the TAG, not the words: "
         "<translation>Il pleut à Paris aujourd'hui.</translation>"
     )
@@ -176,7 +192,15 @@ async def translate_text(text: str, language: str, session: str | None = None) -
     if not translated:
         log_event("plugin:voice", "translate_text_unextractable", raw=data["result"][:300])
         return None
-    if _looks_like_narration_garbage(translated, language):
+    # Bug fix (2026-09-15): _NARRATION_MAX_CHARS (400) is sized for
+    # narration's own short asides -- a real reply being translated can
+    # legitimately be much longer, so cap this at a generous multiple of
+    # the ORIGINAL text's own length instead (Russian in particular tends
+    # to run noticeably longer than English for the same content) rather
+    # than the fixed narration-sized constant, which would reject every
+    # long-but-correct translation as "garbage" by length alone.
+    max_chars = max(_NARRATION_MAX_CHARS, len(text) * 3)
+    if _looks_like_narration_garbage(translated, language, max_chars=max_chars):
         log_event("plugin:voice", "translate_text_rejected_garbage", text=translated[:300])
         return None
     return translated
@@ -230,8 +254,8 @@ _NARRATION_MAX_CHARS = 400
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
 
 
-def _looks_like_narration_garbage(text: str, language: str = "") -> bool:
-    if len(text) > _NARRATION_MAX_CHARS:
+def _looks_like_narration_garbage(text: str, language: str = "", max_chars: int = _NARRATION_MAX_CHARS) -> bool:
+    if len(text) > max_chars:
         return True
     if _CJK_RE.search(text) and not re.search(r"chin|japan|korea|mandarin|中文", language, re.IGNORECASE):
         return True

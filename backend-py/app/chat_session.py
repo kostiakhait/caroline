@@ -1380,7 +1380,27 @@ class ChatSession:
         (see _append_small_model_turn_to_session's own docstring) -- both
         engines answer the same conversation and get used interchangeably
         turn by turn, so both must leave the SAME durable history behind,
-        not two that silently diverge."""
+        not two that silently diverge.
+
+        Per explicit instruction (2026-09-15): forced-translates `text`
+        here too, same as the full SDK path's own _translate_wire_visible_
+        text -- this path is just as much a "real visible reply" as that
+        one, and the small model's own language compliance is no more
+        reliable than the full model's. Persists the TRANSLATED text (not
+        the original) to the session .jsonl -- that's genuinely what
+        Caroline said to the user, and every later reader of that history
+        (recent-dialogue narration input, the 24h-dialogue file, a resumed
+        SDK session) should see the same thing the user actually saw."""
+        from app.plugins.voice_api import translate_text
+
+        try:
+            translated = await translate_text(text, current_language_name(self.tab_id))
+        except Exception as exc:
+            log_event("engine", "small_model_translate_failed", tab_id=self.tab_id, error=str(exc))
+            translated = None
+        if translated and translated != text:
+            log_event("engine", "small_model_translate_applied", tab_id=self.tab_id, original_len=len(text), translated_len=len(translated))
+            text = translated
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
         _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
         assistant_wire = {
@@ -1911,6 +1931,46 @@ class ChatSession:
             lines.append(f"User: {question}")
 
         return "\n".join(lines[-limit:])
+
+    async def _translate_wire_visible_text(self, wire: dict[str, Any]) -> dict[str, Any]:
+        """Per explicit instruction (2026-09-15): forced translation used
+        to be narration-only (generate_progress_comment) -- confirmed live
+        this left a real gap: the real Claude model itself dropped a terse
+        English status line ("Now executing deletes and marks in
+        batches.") into an otherwise-Russian conversation mid-tool-call-
+        chain, and language_hint_instruction's system-prompt nudge is
+        advisory, not a guarantee. Runs every REAL visible assistant text
+        block through the same translate_text() forced-correction pass
+        narration already uses, targeting current_language_name(tab_id) --
+        same unconditional-pass philosophy (translate_text itself is a
+        no-op, text-preserving pass when the input is already in the
+        target language). Falls back to the ORIGINAL text per block on any
+        translation failure -- never blocks or drops a real reply over
+        this. Only touches "assistant" wire messages; "result"/"system"/
+        etc. are left exactly as they were."""
+        if wire.get("type") != "assistant":
+            return wire
+        content_blocks = wire.get("message", {}).get("content") or []
+        if not any(isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip() for b in content_blocks):
+            return wire
+        from app.plugins.voice_api import translate_text
+
+        language = current_language_name(self.tab_id)
+        for block in content_blocks:
+            if not (isinstance(block, dict) and block.get("type") == "text"):
+                continue
+            text = block.get("text") or ""
+            if not text.strip():
+                continue
+            try:
+                translated = await translate_text(text, language)
+            except Exception as exc:
+                log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
+                continue
+            if translated and translated != text:
+                log_event("engine", "wire_translate_applied", tab_id=self.tab_id, language=language, original_len=len(text), translated_len=len(translated))
+                block["text"] = translated
+        return wire
 
     async def _check_progress_narration(self) -> None:
         """Per explicit instruction (2026-09-10): the user must see SOME
@@ -2765,6 +2825,7 @@ class ChatSession:
                     if wire is not None and not self.forced_compaction_result_pending and not (isinstance(message, ResultMessage) and result_is_fake):
                         wire = _strip_no_update_from_wire(wire)
                         if wire is not None:
+                            wire = await self._translate_wire_visible_text(wire)
                             # Bug fix (2026-09-10): confirmed live -- voice-reply
                             # auto-play/animation (chat.js checks evt.isVoice on
                             # the "result" event) never fired, because this send
