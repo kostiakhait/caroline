@@ -102,7 +102,8 @@ from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction
 from app.operations import REGISTRY
-from app.session_context import set_inject_proactive, set_send, set_tab_id
+from app.pdf_pages import extract_pdf_page_texts
+from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
@@ -119,6 +120,25 @@ HANG_TIMEOUT_MS = 90_000
 STARTUP_TIMEOUT_MS = 5 * 60_000
 WATCHDOG_INTERVAL_MS = 5_000
 HANG_ESCALATION_GRACE_MS = 20_000
+# Bug fix (2026-09-15), per explicit instruction: "90-секундный таймаут
+# ЗАВИСАНИЯ применим ТОЛЬКО если не идет РЕАЛЬНОЙ работы" -- the plain
+# 90s/300s hang timeout was firing against turns that were NOT actually
+# hung, just doing real, legitimately slow work (a native CLI tool --
+# Bash, browser evaluate, a large fetch/decode -- in flight, no new SDK
+# message possible until it resolves): confirmed live via tab 4's own
+# transcript (2026-09-15) as a genuine "Groundhog Day" loop -- the model
+# re-verifying the same environment state from scratch every 2-4 minutes
+# because this exact timer kept force-killing real, in-progress work
+# before it could finish. A tool call the model just issued
+# (last_tool_use_started_at) is real work by definition -- the CLI
+# cannot produce another SDK message until that call returns, so silence
+# during it is expected, not a hang. Give real work a much longer leash
+# instead of none at all: still eventually force-closes a tool call that
+# is ACTUALLY stuck forever (no legitimate tool in this app should ever
+# run this long), just not at the same threshold used for genuine
+# dead-air silence (no tool in flight at all -- nothing legitimate
+# explains that lasting past HANG_TIMEOUT_MS).
+HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS = 15 * 60_000
 # Bug fix (2026-09-14/15), per explicit instruction ("надежный рубильник",
 # then "Кнопка стоп это абсолютный рубильник... Сразу по нажатии"):
 # confirmed live, twice, that a user-initiated Stop could leave a turn
@@ -174,6 +194,15 @@ PROGRESS_NARRATION_INTERVAL_MS = 60_000
 # single minute; after this many in a row with no real progress, stop
 # narrating until something real actually happens.
 MAX_CONSECUTIVE_NARRATION_COMMENTS = 3
+
+# Bug fix (2026-09-15), per explicit instruction: see
+# _check_progress_narration's own retry-loop comment -- the small model
+# backing generate_progress_comment can fail its own output contract
+# several times in a row (confirmed live: 3 consecutive failures before a
+# 4th attempt succeeded), each one previously costing most of a minute of
+# silence even though the tick itself fired exactly on schedule. Flat, no
+# backoff (matches this codebase's own no-exponential-backoff convention).
+NARRATION_GENERATION_RETRY_ATTEMPTS = 3
 
 # Per explicit instruction (2026-09-13/2026-09-14): was a process-wide kill
 # switch (SMALL_MODEL_ENABLED, always False) while the small-model path's
@@ -401,6 +430,38 @@ def _is_synthetic_history_text(raw_text: str) -> bool:
 
 _NO_UPDATE_SENTINEL = "[[NO_UPDATE]]"
 
+# Bug fix (2026-09-15), confirmed live -- anomaly report: a "No response
+# requested." bubble appeared in the real chat window, styled exactly like
+# a genuine Caroline reply, then even got wire-translated into Russian
+# ("Ответа не требуется.") and shown to the user as if she'd actually said
+# something. Root cause: CONTINUE_OR_SILENT_NUDGE_TEMPLATE instructs the
+# model to reply with EXACTLY the [[NO_UPDATE]] sentinel when it has
+# nothing to add, but the model doesn't always comply with that literal
+# wording -- it sometimes writes a natural-language paraphrase instead.
+# _SYNTHETIC_HISTORY_TEXT_PATTERNS already recognized this exact wording
+# (filtered from language-detection history sampling, confirming it's a
+# known/recurring shape), but nothing stripped it from the WIRE the user
+# actually sees -- only the literal sentinel was (_strip_no_update_from_
+# wire below). Treat a whole assistant text block that's ENTIRELY one of
+# these known "I have nothing to say" paraphrases the same as the
+# sentinel itself: never user-visible, whatever the model worded it as.
+# Whole-text match (not substring, unlike the sentinel check) -- these are
+# ordinary short sentences that could theoretically appear as a genuine
+# fragment inside a longer real reply, so only suppress a block that is
+# NOTHING BUT one of these.
+_SILENT_REPLY_PARAPHRASE_PATTERNS = [
+    re.compile(r"^no response (is )?(requested|needed|required)\.?$", re.IGNORECASE),
+    re.compile(r"^nothing (further |else )?to (add|report|update|say)\.?$", re.IGNORECASE),
+    re.compile(r"^no (further )?(update|action) (is )?(needed|required)\.?$", re.IGNORECASE),
+]
+
+
+def _is_silent_reply_paraphrase(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return any(p.match(stripped) for p in _SILENT_REPLY_PARAPHRASE_PATTERNS)
+
 
 def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
     """Per explicit instruction (2026-09-10): NOTHING containing the
@@ -409,6 +470,9 @@ def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
     dialog -- filter it out server-side here, not only in chat.js, so an
     old/cached client can't leak it either. Substring match, not exact
     equality: the model doesn't always reply with ONLY the sentinel.
+    Also strips a block that's nothing but a known non-compliant
+    paraphrase of the same "nothing to say" outcome (see
+    _SILENT_REPLY_PARAPHRASE_PATTERNS' own comment, 2026-09-15).
     Returns the wire with offending text blocks removed, or None if that
     empties an assistant message of everything worth showing."""
     kind = wire.get("type")
@@ -417,7 +481,8 @@ def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
         kept = [
             b for b in content
             if not (isinstance(b, dict) and b.get("type") == "text"
-                    and isinstance(b.get("text"), str) and _NO_UPDATE_SENTINEL in b["text"])
+                    and isinstance(b.get("text"), str)
+                    and (_NO_UPDATE_SENTINEL in b["text"] or _is_silent_reply_paraphrase(b["text"])))
         ]
         if len(kept) == len(content):
             return wire
@@ -427,7 +492,7 @@ def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
         return wire
     if kind == "result":
         result_text = wire.get("result")
-        if isinstance(result_text, str) and _NO_UPDATE_SENTINEL in result_text:
+        if isinstance(result_text, str) and (_NO_UPDATE_SENTINEL in result_text or _is_silent_reply_paraphrase(result_text)):
             wire["result"] = ""
         return wire
     return wire
@@ -470,6 +535,16 @@ def _save_persisted_language(tab_id: str, lang: str) -> None:
 # that gets overwritten on every subsequent submit().
 _SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
+# How much extracted PDF page text an attachment is allowed to inline
+# directly into the turn before being cut off in favor of pointing the
+# model at read_document_pages instead (2026-09-15, see
+# _attachment_to_blocks' own comment) -- deliberately smaller than
+# RECENT_CONTENT_BUDGET_BYTES's 50KB (dehydration's OWN budget for
+# recently-added tool content, a different concern): this is TEXT the
+# model is guaranteed to actually see in full on this very turn, not
+# content that ages out gracefully later.
+_ATTACHMENT_PDF_INLINE_CHAR_BUDGET = 40_000
+
 
 def _uploads_dir() -> Path:
     return Path(WORKSPACE_DIR) / "uploads"
@@ -499,10 +574,46 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
         ]
     if mime_type == "application/pdf":
         saved_path = _save_attachment_to_uploads(attachment)
-        return [
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": attachment["dataBase64"]}},
-            {"type": "text", "text": f"[This document is also saved at {saved_path}.]"},
-        ]
+        # Bug fix (2026-09-15), per explicit instruction: "Большие
+        # многостраничные документы должны анализировать по частям...
+        # Никогда документ целиком" -- this used to send the whole PDF as
+        # one raw "document" content block (the API/CLI then decides how
+        # much of it to actually look at, with zero page-level control on
+        # our side -- the same failure shape as the 41-image context-bloat
+        # incident this same day, for documents instead of images). Parse
+        # per-page via app/pdf_pages.py and hand the model TEXT ONLY, page
+        # by page, capped inline -- a document too large to fit the cap
+        # gets its first pages inline plus a pointer at read_document_pages
+        # (files_plugin.py) for the rest, so a huge document still never
+        # arrives in context all at once.
+        try:
+            page_texts, total_pages = extract_pdf_page_texts(base64.b64decode(attachment["dataBase64"]))
+        except Exception as exc:
+            return [{
+                "type": "text",
+                "text": f"[Attached PDF saved to {saved_path} -- could not extract its page text ({exc}); "
+                f"use read_document_pages(path=\"{saved_path}\") if you need its content.]",
+            }]
+        included: list[str] = []
+        included_chars = 0
+        for i, text in enumerate(page_texts):
+            block = f"--- Page {i + 1} ---\n{text or '[no extractable text on this page]'}"
+            if included and included_chars + len(block) > _ATTACHMENT_PDF_INLINE_CHAR_BUDGET:
+                break
+            included.append(block)
+            included_chars += len(block)
+        header = (
+            f"[Attached PDF, {total_pages} page(s), also saved at {saved_path} -- parsed page-by-page, "
+            "text only, never sent to you as raw document bytes.]"
+        )
+        if len(included) < total_pages:
+            header += (
+                f" Showing pages 1-{len(included)} inline; the rest wasn't included to avoid dumping the "
+                f"whole document into context at once -- call read_document_pages(path=\"{saved_path}\", "
+                f"page_start={len(included) + 1}) to continue reading further pages, a range at a time, "
+                "if you actually need them."
+            )
+        return [{"type": "text", "text": header + "\n\n" + "\n\n".join(included)}]
     saved_path = _save_attachment_to_uploads(attachment)
     return [{"type": "text", "text": f"[Attached file saved to {saved_path} -- read it if relevant to the request.]"}]
 
@@ -962,6 +1073,19 @@ class ChatSession:
         self.last_tool_use_started_at: float | None = None
         self.hang_interrupted_tool_name: str | None = None
         self.hang_interrupted_tool_elapsed_s: float | None = None
+
+        # Bug fix (2026-09-15, "Стоп должен срабатывать ВСЕГДА"): the real
+        # OS pid of the currently-live CLI subprocess, captured directly at
+        # spawn time via session_context's cli-pid-sink (set right before
+        # each self.client.connect() below) -- see
+        # session_context.get_cli_pid_sink's own docstring for why this
+        # replaced introspecting client._transport._process.pid at
+        # stop-time, which was confirmed live to sometimes come back None
+        # exactly when it was needed most (force_kill_cli_process_no_pid,
+        # 2026-09-15 incident). Reset to None whenever the client that owns
+        # it is torn down so a stale pid from an already-dead process is
+        # never targeted.
+        self._cli_process_pid: int | None = None
 
         # silent user-wait nudge (see SILENT_USER_WAIT_NUDGE_MS) -- tracks
         # only REAL user-typed messages (submit()'s is_real_user=True),
@@ -1565,17 +1689,28 @@ class ChatSession:
         cs's own taskkill fallback for the identical class of problem (a
         graceful kill that doesn't reliably land) -- see
         _escalate_stop_if_still_pending's own comment for the incident.
-        Reaches into claude_agent_sdk's private transport/process
-        attributes for the real OS PID and kills it directly, bypassing
-        whatever broken internal state made client.disconnect() itself
-        throw. Best-effort and silent on failure -- the private attribute
-        chain can legitimately not exist (a different SDK version, a
-        custom transport), and this is already the last-resort branch of a
-        last-resort escalation; there is nothing further to fall back to
-        here."""
-        transport = getattr(self.client, "_transport", None)
-        process = getattr(transport, "_process", None)
-        pid = getattr(process, "pid", None)
+        Kills the real OS PID directly, bypassing whatever broken internal
+        state made client.disconnect() itself throw.
+
+        Bug fix (2026-09-15), confirmed live -- "Стоп опять не сработал":
+        the ORIGINAL version of this method reached into claude_agent_
+        sdk's private client._transport._process.pid at THIS point in
+        time (stop-time), and that came back None in a real incident
+        (force_kill_cli_process_no_pid) at the exact same moment
+        client.disconnect() was failing with the SDK's own confirmed
+        'NoneType' object has no attribute 'returncode' bug -- i.e. Stop
+        had no working path left at all. Use self._cli_process_pid
+        instead: captured directly at process-spawn time (session_
+        context's cli-pid-sink, wired in win_subprocess_patch.py), so it
+        doesn't depend on the SDK's own internal bookkeeping still being
+        intact at the moment something has already gone wrong. Falls back
+        to the old transport introspection only if that capture somehow
+        never happened (defense in depth, not the primary path anymore)."""
+        pid = self._cli_process_pid
+        if not pid:
+            transport = getattr(self.client, "_transport", None)
+            process = getattr(transport, "_process", None)
+            pid = getattr(process, "pid", None)
         if not pid:
             log_event("engine", "force_kill_cli_process_no_pid", tab_id=self.tab_id)
             return
@@ -1976,6 +2111,27 @@ class ChatSession:
 
         lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, limit)
 
+        # Bug fix (2026-09-15), per explicit instruction ("внимательно
+        # смотри... почему он возвращает херню"): confirmed live -- a
+        # tab that repeatedly hit the same usage-limit/error condition can
+        # have the SAME assistant line (e.g. "You've hit your session
+        # limit...") land in the transcript several times in a row (each
+        # one a real reply the user actually saw at the time, so it's not
+        # synthetic-marked and doesn't get filtered as such) -- confirmed
+        # live: 5 of a 12-line window were the identical repeated line.
+        # That dominates the "recent conversation" the narrator is asked
+        # to react to, and directly produced one of its failures (echoing
+        # that exact line back). Collapse consecutive exact repeats to one
+        # occurrence here -- narrator-specific (this function's own
+        # output), not in the shared _read_recent_dialogue_lines/
+        # _usable_dialogue_lines readers, which other consumers (language
+        # detection, get_history) may have their own reasons to keep as-is.
+        deduped: list[str] = []
+        for line in lines:
+            if not deduped or deduped[-1] != line:
+                deduped.append(line)
+        lines = deduped
+
         # Bug fix (2026-09-10): confirmed live -- the disk-persisted
         # transcript doesn't yet contain a real user message that's merely
         # QUEUED (submitted but not yet consumed/flushed by the CLI, e.g.
@@ -2134,11 +2290,28 @@ class ChatSession:
             # empty context for a comment that couldn't mean anything.
             return
         log_event("engine", "progress_narration_context", tab_id=self.tab_id, dialogue_chars=len(dialogue), dialogue_preview=dialogue[-300:])
-        try:
-            comment = await generate_progress_comment(dialogue, current_language_name(self.tab_id))
-        except Exception as exc:
-            log_event("engine", "progress_narration_failed", tab_id=self.tab_id, error=str(exc))
-            return
+        # Bug fix (2026-09-15), per explicit instruction ("Нарратор должен
+        # давать сообщения раз в минуту"): confirmed live -- the SMALL
+        # model backing generate_progress_comment can fail its own output
+        # contract (echoing stale dialogue, truncated/malformed tags,
+        # ignoring the format entirely) several times in a row (a real
+        # incident: 3 straight failures before a 4th attempt succeeded).
+        # Every failure used to just give up silently until the NEXT full
+        # 60s tick -- so a single unlucky small-model run could cost most
+        # of a minute of narration the tick's own timing was otherwise
+        # right on schedule for. Retry a few times in the SAME tick instead
+        # (no gating changes -- last_visible_output_at was already claimed
+        # above, so this can't double-fire against a later tick).
+        comment: str | None = None
+        for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
+            try:
+                comment = await generate_progress_comment(dialogue, current_language_name(self.tab_id))
+            except Exception as exc:
+                log_event("engine", "progress_narration_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))
+                comment = None
+            if comment:
+                break
+            log_event("engine", "progress_narration_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
         if not comment:
             return
         self.consecutive_narration_count += 1
@@ -2293,13 +2466,30 @@ class ChatSession:
         self._push_internal_command("/compact")
 
     async def _check_hang(self) -> None:
-        effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
         elapsed = time.monotonic() - self.last_activity
+        # Bug fix (2026-09-15), per explicit instruction: a tool call the
+        # model just issued and that hasn't resolved yet is real work in
+        # progress, not silence -- the CLI cannot produce another SDK
+        # message (which would reset last_activity) until that call
+        # returns. "started more recently than this hang's own elapsed
+        # window" is what distinguishes a genuinely still-running call
+        # from a stale name left over from an earlier, already-finished
+        # one (the attribution logic below reuses this same check, rather
+        # than re-deriving it a second time).
+        tool_in_flight = (
+            self.last_tool_use_started_at is not None
+            and time.monotonic() - self.last_tool_use_started_at <= elapsed + 1
+        )
+        effective_timeout_s = (
+            HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS if tool_in_flight
+            else (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS)
+        ) / 1000
         log_event(
             "engine", "check_hang_tick", tab_id=self.tab_id, turn_pending=self.turn_pending,
             last_activity_s=round(elapsed, 1), hang_count=self.hang_count,
             hang_interrupted_at=self.hang_interrupted_at, has_seen_init=self.has_seen_init,
-            effective_timeout_s=effective_timeout_s,
+            effective_timeout_s=effective_timeout_s, tool_in_flight=tool_in_flight,
+            tool_in_flight_name=self.last_tool_use_name if tool_in_flight else None,
         )
         if not self.turn_pending and self.has_seen_init:
             self.hang_interrupted_at = None
@@ -2314,10 +2504,11 @@ class ChatSession:
             # tell the model specifically what got force-terminated (per
             # explicit instruction) rather than a generic note -- lets it
             # try something else instead of blindly repeating the same
-            # slow/stuck call. Only meaningful if a tool call started more
-            # recently than this hang's own elapsed window (otherwise it's
-            # a stale name from an earlier, already-finished call).
-            if self.last_tool_use_started_at is not None and time.monotonic() - self.last_tool_use_started_at <= elapsed + 1:
+            # slow/stuck call. Reuses tool_in_flight (computed above) --
+            # if we got this far with it True, real work ran the FULL 15
+            # minutes and genuinely never returned; that's exactly the one
+            # case a tool this app owns should be considered truly stuck.
+            if tool_in_flight:
                 self.hang_interrupted_tool_name = self.last_tool_use_name
                 self.hang_interrupted_tool_elapsed_s = time.monotonic() - self.last_tool_use_started_at
             else:
@@ -2396,14 +2587,17 @@ class ChatSession:
             )
             await asyncio.sleep(RESTART_BACKOFF_MS / 1000)
         self._set_conn_state("restarting", str(exc))
-        # Per explicit instruction (2026-09-10): don't raise the hang
-        # timeout itself (a genuinely slow-but-alive tool call, e.g. a
-        # recursive grep/filesystem scan over a large repo under Windows,
-        # can legitimately exceed it -- confirmed live, HANG_TIMEOUT_MS
-        # stays as-is) -- instead, when it DOES fire, tell the model
-        # exactly what got force-terminated so it can try a different
-        # approach on retry instead of blindly repeating the same
-        # slow/stuck call.
+        # Per explicit instruction (2026-09-10, revised 2026-09-15): a
+        # genuinely slow-but-alive tool call (a recursive grep/filesystem
+        # scan, a slow browser evaluate, a large fetch/decode) gets a much
+        # longer leash now (see _check_hang's own tool_in_flight/
+        # HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS) rather than none at all --
+        # this note only fires once that longer timeout is ALSO exceeded
+        # (real work truly stuck), or when there was no tool in flight to
+        # begin with (genuine dead-air silence past the plain 90s/300s).
+        # Either way, tell the model exactly what got force-terminated so
+        # it can try a different approach on retry instead of blindly
+        # repeating the same slow/stuck call.
         tool_note = ""
         if self.hang_interrupted_tool_name:
             tool_note = (
@@ -2474,6 +2668,7 @@ class ChatSession:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)
         set_inject_proactive(lambda text: self.inject_proactive(text))
+        set_cli_pid_sink(lambda pid: setattr(self, "_cli_process_pid", pid))
         while not self.ended:
             try:
                 self.hang_count = 0
@@ -2592,6 +2787,7 @@ class ChatSession:
                 query_started_at = time.monotonic()
                 log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=mode.chat_source)
                 self.client = ClaudeSDKClient(options=options)
+                self._cli_process_pid = None
                 await self.client.connect(self._input_stream())
 
                 async for raw_message in self.client.receive_messages():

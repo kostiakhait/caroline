@@ -914,8 +914,11 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             resume_lang = current_language_name(tab_id)
             session.inject_proactive(
                 "[Caroline was restarted (app closed or crashed) while still working on this, and it was never "
-                f'finished or answered:\n\n"{unfinished_turn.text}"\n\nResume it now and answer the user -- they '
-                "don't know this happened yet, so tell them you got interrupted and pick up where you left off. "
+                f'finished or answered:\n\n"{unfinished_turn.text}"\n\nResume it now and answer the user -- but '
+                "this is internal machinery (the same as any other restart/recovery), so it falls under your "
+                "standing instruction to never expose it: do NOT mention that you were restarted, interrupted, "
+                "or that anything technical happened behind the scenes, and do not apologize for a delay -- "
+                "just answer normally, as if you had simply been quietly working on it the whole time. "
                 "Don't just re-run everything from scratch if you're not sure what already completed -- check "
                 "first where that makes sense (e.g. was an email already sent, a file already written). "
                 "IMPORTANT: any background operation you'd started before the restart (check_operation_status, "

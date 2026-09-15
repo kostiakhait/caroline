@@ -19,10 +19,12 @@ from typing import Any, Awaitable, Callable
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 InjectProactiveFn = Callable[[str], bool]
+CliPidSinkFn = Callable[[int], None]
 
 _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("current_send", default=None)
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
 _current_inject_proactive: contextvars.ContextVar[InjectProactiveFn | None] = contextvars.ContextVar("current_inject_proactive", default=None)
+_current_cli_pid_sink: contextvars.ContextVar[CliPidSinkFn | None] = contextvars.ContextVar("current_cli_pid_sink", default=None)
 
 
 def get_send() -> SendFn:
@@ -71,3 +73,26 @@ def get_inject_proactive() -> InjectProactiveFn | None:
 
 def set_inject_proactive(fn: InjectProactiveFn | None) -> contextvars.Token[InjectProactiveFn | None]:
     return _current_inject_proactive.set(fn)
+
+
+def get_cli_pid_sink() -> CliPidSinkFn | None:
+    """Per explicit instruction (2026-09-15, "Стоп должен срабатывать
+    ВСЕГДА"): lets win_subprocess_patch.py's anyio.open_process wrapper
+    report the real OS pid of the CLI subprocess it just spawned straight
+    back to the ChatSession that asked for it, captured at the exact
+    moment the process comes into existence -- confirmed live as the
+    fix for a real Stop failure: the previous fallback introspected the
+    SDK's own private `client._transport._process.pid` at stop-time,
+    which came back None (force_kill_cli_process_no_pid) even while
+    client.disconnect() itself was failing with the SDK's own confirmed
+    'NoneType' object has no attribute 'returncode' bug -- i.e. Stop had
+    no working path left at all in that incident. Capturing the pid
+    directly at spawn time, independent of the SDK's own internal
+    bookkeeping, removes that single point of failure. None outside a
+    live ChatSession _run_loop iteration -- same non-fatal shape as
+    get_tab_id()."""
+    return _current_cli_pid_sink.get()
+
+
+def set_cli_pid_sink(fn: CliPidSinkFn | None) -> contextvars.Token[CliPidSinkFn | None]:
+    return _current_cli_pid_sink.set(fn)

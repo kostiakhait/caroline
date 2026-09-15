@@ -92,6 +92,43 @@ async def describe_local_image(args: dict[str, Any], _rp: Any) -> dict[str, Any]
     return {"text": str(result.get("description") or "(no description returned)")}
 
 
+MAX_DOCUMENT_PAGES_PER_CALL = 15
+
+
+async def read_document_pages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Per explicit instruction (2026-09-15): "Большие многостраничные
+    документы должны анализировать по частям... Никогда документ целиком"
+    -- the same reasoning as describe_local_image's own docstring, for
+    multi-page documents instead of images: the native Read tool hands
+    the model a WHOLE PDF's raw bytes/rendered pages at once with no
+    per-page control, which is exactly what silently produced the
+    41-image/~48.5MB context-bloat incident this same day (images there,
+    but the identical failure shape applies to documents). Use this
+    instead -- extracts and returns ONLY the requested page range's plain
+    text, nothing else ever touches your context."""
+    p = Path(args["path"])
+    if not p.exists():
+        return {"text": f"No such file: {p}", "is_error": True}
+    if p.suffix.lower() != ".pdf":
+        return {"text": f"Not a PDF (by extension): {p} -- use read_file for plain text or describe_local_image for images.", "is_error": True}
+    page_start = int(args.get("page_start") or 1)
+    requested_count = args.get("page_count")
+    page_count = min(int(requested_count), MAX_DOCUMENT_PAGES_PER_CALL) if requested_count else MAX_DOCUMENT_PAGES_PER_CALL
+    from app.pdf_pages import extract_pdf_page_texts, format_pages_for_model, PdfPageError
+
+    try:
+        page_texts, total_pages = extract_pdf_page_texts(p.read_bytes(), page_start=page_start, page_count=page_count)
+    except PdfPageError as exc:
+        return {"text": f"Could not read {p}: {exc}", "is_error": True}
+    if not page_texts:
+        return {"text": f"{p} has {total_pages} page(s) -- nothing at page {page_start}."}
+    text = format_pages_for_model(page_texts, page_start, total_pages)
+    next_page = page_start + len(page_texts)
+    if next_page <= total_pages:
+        text += f"\n\n[{total_pages - next_page + 1} more page(s) beyond this range -- call again with page_start={next_page} to continue.]"
+    return {"text": text}
+
+
 async def list_directory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     p = Path(args["path"])
     if not p.exists():
@@ -154,6 +191,17 @@ PLUGIN = Plugin(
             "yourself (fine visual detail, exact colors/layout, reading small text in the image) -- something a "
             "text description can't give you.",
             {"path": str}, describe_local_image,
+        ),
+        PluginTool(
+            "read_document_pages",
+            "Read a local multi-page PDF's TEXT ONLY, a limited page range at a time (default up to "
+            f"{MAX_DOCUMENT_PAGES_PER_CALL} pages per call, starting at page_start, default 1) -- prefer this over "
+            "the Read tool for any PDF, especially a multi-page one: Read hands you the whole document's raw "
+            "bytes/rendered pages at once, permanently, with no per-page control, which is exactly what causes "
+            "runaway context growth on any document of real size. Call it again with a later page_start to keep "
+            "reading further pages -- the result tells you how many pages remain. Scanned/image-only pages "
+            "return no extractable text (not OCR'd).",
+            {"path": str, "page_start": int | None, "page_count": int | None}, read_document_pages,
         ),
     ],
 )

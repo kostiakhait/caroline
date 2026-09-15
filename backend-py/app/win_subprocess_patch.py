@@ -33,6 +33,8 @@ from typing import Any
 
 import anyio
 
+from app import session_context
+
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _real_open_process = anyio.open_process
 _applied = False
@@ -41,7 +43,23 @@ _applied = False
 async def _patched_open_process(*args: Any, **kwargs: Any) -> Any:
     if _NO_WINDOW and "creationflags" not in kwargs:
         kwargs["creationflags"] = _NO_WINDOW
-    return await _real_open_process(*args, **kwargs)
+    process = await _real_open_process(*args, **kwargs)
+    # Bug fix (2026-09-15, "Стоп должен срабатывать ВСЕГДА"): report the
+    # real pid straight back to whichever ChatSession just asked for it
+    # (via session_context.set_cli_pid_sink, set right before connect())
+    # -- see get_cli_pid_sink's own docstring for why this replaced
+    # introspecting the SDK's private transport internals at stop-time.
+    # Best-effort: a missing sink or pid (context var unset, or this
+    # process object not actually exposing one) is not fatal here, Stop's
+    # own fallback chain still has other legs.
+    sink = session_context.get_cli_pid_sink()
+    pid = getattr(process, "pid", None)
+    if sink is not None and pid:
+        try:
+            sink(pid)
+        except Exception:
+            pass
+    return process
 
 
 def apply() -> None:

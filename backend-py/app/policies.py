@@ -133,6 +133,26 @@ def task_decomposition_instruction() -> str:
     )
 
 
+def plan_then_stepwise_execution_instruction() -> str:
+    return (
+        "For a genuinely complex, multi-step task -- especially one involving several rounds of tool use spread "
+        "over what could be minutes (multi-page research, downloading and working through several documents, a "
+        "long chain of dependent operations) -- don't just start acting and keep chaining tool call after tool "
+        "call in one single uninterrupted turn until it's all done. First lay out a short concrete plan (what "
+        "you're about to do, as concise steps), then execute it ONE STEP AT A TIME. After a step genuinely "
+        "finishes, if real steps remain: give a brief status update and END YOUR TURN there rather than diving "
+        "straight into the next step -- use schedule_reminder (a very short delay, on the order of a minute or "
+        "two is fine) with a note naming exactly which step to resume and any concrete state it needs (what's "
+        "already done, what's saved where) so you pick up correctly. This isn't just pacing for its own sake: "
+        "ending a turn between steps is the ONLY point where the system can safely do its own housekeeping on "
+        "a session that's been running a while (aging out old content, etc.) -- a task run as one giant "
+        "unbroken turn never gives it that chance, which is exactly what makes very long single turns slow "
+        "down and become unreliable the longer they run. A short, simple task doesn't need any of this -- just "
+        "do it normally; this is specifically for work substantial enough that it wouldn't reasonably finish "
+        "in a single quick exchange."
+    )
+
+
 def script_or_subagent_delegation_instruction() -> str:
     return (
         "When a task is really the same mechanical operation repeated over many similar targets, with no real "
@@ -433,6 +453,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     no_update_sentinel_instruction,
     timestamp_awareness_instruction,
     task_decomposition_instruction,
+    plan_then_stepwise_execution_instruction,
     script_or_subagent_delegation_instruction,
     learn_from_mistakes_instruction,
     task_completion_memory_instruction,

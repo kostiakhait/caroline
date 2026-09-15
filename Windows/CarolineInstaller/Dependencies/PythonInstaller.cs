@@ -67,7 +67,13 @@ internal static class PythonInstaller
          // CDP endpoint (AppBrowserWindow's own WebView2 instance) via
          // connect_over_cdp(), never launches a local browser itself. The
          // pip package alone ships the driver that requires.
-         "playwright"];
+         "playwright",
+         // app/pdf_pages.py's per-page PDF text extraction (2026-09-15,
+         // "никогда документ целиком" -- multi-page documents must be
+         // parsed page-by-page, text only, never handed to the model as
+         // raw document bytes). Imported as `pymupdf` (the modern name;
+         // `fitz` is the same package's legacy import alias).
+         "pymupdf"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 
