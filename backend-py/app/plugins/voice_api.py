@@ -230,8 +230,26 @@ _NARRATION_GARBAGE_PATTERNS = [
     # Bug fix (2026-09-13), confirmed live: a declarative "there's nothing
     # to say" meta-statement, distinct from the first-person refusals above
     # -- just as much a non-answer, still slipped through unfiltered.
-    re.compile(r"\bno (?:specific )?(?:remark|response|sentence|instructions?)\b.{0,40}\b(?:found|derived|generated|drafted|identified|could be)\b", re.IGNORECASE),
+    # Bug fix (2026-09-16), confirmed live ("что это за херня насыпалась?"):
+    # the original version of this pattern required "no (specific )remark/
+    # response/..." with NOTHING else in between -- real observed text had
+    # an extra adjective in the way ("no specific SHORT remark", "no VALID
+    # response") that broke the match, and a wider set of trailing verbs
+    # than the original list covered ("allowed", "possible", "present").
+    # Loosened both sides rather than chasing each new exact phrasing.
+    re.compile(r"\bno\b.{0,25}\b(?:remark|response|sentence|instructions?)\b.{0,40}\b(?:found|derived|generated|drafted|identified|could be|allowed|possible|present)\b", re.IGNORECASE),
     re.compile(r"\bcould not be (?:drafted|generated|derived|produced)\b", re.IGNORECASE),
+    # Bug fix (2026-09-16), confirmed live: the model treated its OWN
+    # prompt as content to describe/summarize instead of an instruction to
+    # follow ("The page provides extensive instructions and a sample
+    # conversation, but no specific short remark is present...") -- a
+    # wholly new failure shape, well-formed prose, no refusal wording, that
+    # slipped past every pattern above undetected (generate_progress_
+    # comment_ok). Not a refusal, not a recap of the real conversation --
+    # a meta-description of the PROMPT itself, which a genuine remark can
+    # never be.
+    re.compile(r"\bthe (?:page|prompt|instructions?) (?:provides?|contains?|includes?)\b", re.IGNORECASE),
+    re.compile(r"\bthe assistant will (?:then )?draft\b", re.IGNORECASE),
     # Bug fix (2026-09-14), confirmed live (caroline.log, 21:45:37): a THIRD
     # variant of the same underlying problem -- instead of a refusal or
     # meta-commentary about being an AI, the small model sometimes writes a
@@ -262,12 +280,31 @@ def _looks_like_narration_garbage(text: str, language: str = "", max_chars: int 
     return any(p.search(text) for p in _NARRATION_GARBAGE_PATTERNS)
 
 
+# Bug fix (2026-09-16), confirmed live: an echo of an ENGLISH prompt
+# example slipped past this exact check because a couple of its Latin
+# letters came back as visually-identical CYRILLIC homoglyphs instead
+# ("Мovers..." -- Cyrillic М, U+041C -- not Latin M, U+004D) -- a plain
+# case-folded string comparison sees those as different characters and the
+# containment check silently fails, even though a person reading it can't
+# tell the difference at all. Translates the handful of Cyrillic letters
+# that are visually indistinguishable from a Latin one to their Latin
+# equivalent before comparing -- one-directional (Cyrillic->Latin) is
+# enough since the echoed example text is always the English original.
+_CYRILLIC_LATIN_CONFUSABLES = str.maketrans(
+    # lowercase only -- .lower() below always runs first, so an uppercase
+    # Cyrillic confusable is already folded to its lowercase Cyrillic form
+    # by the time this table is applied. н -> h (not n) -- that's the
+    # actual visual lookalike (Cyrillic н, not Cyrillic п).
+    "аекмнорстух", "aekmhopctyx",
+)
+
+
 def _normalized_overlap(text: str, other: str) -> bool:
     """Whitespace-collapsed, case-folded containment check either
     direction -- a near-verbatim echo, not requiring an exact match
     (paraphrases that drop/add a clause on either side still count)."""
-    norm_text = re.sub(r"\s+", " ", text).strip().lower()
-    norm_other = re.sub(r"\s+", " ", other).strip().lower()
+    norm_text = re.sub(r"\s+", " ", text).strip().lower().translate(_CYRILLIC_LATIN_CONFUSABLES)
+    norm_other = re.sub(r"\s+", " ", other).strip().lower().translate(_CYRILLIC_LATIN_CONFUSABLES)
     if len(norm_text) < 15 or len(norm_other) < 15:
         return False
     return norm_text in norm_other or norm_other in norm_text
@@ -313,6 +350,31 @@ _NARRATION_EXAMPLE_TAG = "Movers always lowball the box count, every single time
 _NARRATION_EXAMPLE_THIRDPERSON_BAD = "The user asks Caroline to regenerate the report, and the Caroline response confirms the edits were made."
 _NARRATION_EXAMPLE_THIRDPERSON_GOOD = "Regenerated it and reopened it for you to check."
 
+# Bug fix (2026-09-16), per explicit instruction ("что это за херня
+# насыпалась?" -- a real live incident): the 2026-09-15 restructuring above
+# fixed the ORIGINAL "lost in the middle" failure (tag contract buried at
+# the end) by moving the contract first, but made the overall prompt
+# LONGER and structurally more complex (contract + persona paragraph + TWO
+# separate bad/good example pairs + dialogue + reminder + a third,
+# unrelated example scenario for the tag format) -- confirmed live the
+# cheap SMALL model this runs against can't reliably track that much
+# structure: given a completely ordinary, unpoisoned dialogue, it replied
+# "The page provides extensive instructions and a sample conversation, but
+# no specific short remark is present" -- i.e. it started treating the
+# WHOLE PROMPT as content to summarize instead of an instruction to follow.
+# _is_echo_of_prompt_example's own comment already diagnosed the right
+# fix for this general class of problem before ("give a small model less
+# to track, don't just reorder it correctly") -- applied properly this
+# time: ONE combined example pair (covering both third-person-recap AND
+# new-promise in the same bad line) replaces the two separate pairs above,
+# and the same GOOD line doubles as the tag-format example at the end
+# instead of introducing a THIRD, unrelated scenario. The two pairs above
+# are kept defined (not deleted) only because _is_echo_of_prompt_example
+# still checks the model's reply against them defensively -- they're no
+# longer in the prompt text itself.
+_NARRATION_COMBINED_BAD = "The user asks Caroline to check the invoice, and Caroline says she'll email accounting once she confirms the numbers."
+_NARRATION_COMBINED_GOOD = "Invoice math like this always takes longer than it looks like it should."
+
 
 def _is_echo_of_prompt_example(text: str) -> bool:
     return any(
@@ -320,6 +382,7 @@ def _is_echo_of_prompt_example(text: str) -> bool:
         for example in (
             _NARRATION_EXAMPLE_BAD, _NARRATION_EXAMPLE_GOOD, _NARRATION_EXAMPLE_TAG,
             _NARRATION_EXAMPLE_THIRDPERSON_BAD, _NARRATION_EXAMPLE_THIRDPERSON_GOOD,
+            _NARRATION_COMBINED_BAD, _NARRATION_COMBINED_GOOD,
         )
     )
 
@@ -342,7 +405,7 @@ def _is_echo_of_prompt_example(text: str) -> bool:
 # came back structured), and finally to the raw text as-is for a model
 # that just answered in plain prose. Never guesses past a JSON shape it
 # doesn't recognize -- returns "" rather than passing raw JSON through.
-_JSON_TEXT_KEYS = ("narration", "translation", "translated_text", "result", "text", "message", "assistant", "response", "comment", "answer")
+_JSON_TEXT_KEYS = ("narration", "translation", "translated_text", "result", "text", "message", "assistant", "response", "comment", "answer", "reply")
 
 
 def _extract_tagged_text(raw: str, tag: str) -> str:
@@ -370,6 +433,16 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
                 value = parsed.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
+            # Bug fix (2026-09-16), confirmed live: the model can reasonably
+            # pick almost any key name for its one JSON field ("reply",
+            # "example", ... -- "reply" itself only surfaced during THIS
+            # incident's own testing, was never on the allowlist before).
+            # Chasing every possible key name is a losing battle -- if the
+            # whole object is just ONE string-valued field, regardless of
+            # its name, it's overwhelmingly likely to be the actual answer.
+            string_values = [v for v in parsed.values() if isinstance(v, str) and v.strip()]
+            if len(string_values) == 1:
+                return string_values[0].strip()
         return ""
     return stripped
 
@@ -410,62 +483,38 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     response, SW unavailable, or a response that fails the garbage check
     below) -- always a silent skip, never surfaced as an error."""
     prompt = (
-        # Bug fix (2026-09-15), per explicit instruction ("внимательно
-        # смотри инструкцию... почему он возвращает херню"): the output-
-        # format contract used to live ONLY at the very end, after the full
-        # persona/constraint block AND the (sometimes long, sometimes
-        # repetitive-looking) dialogue -- confirmed live as a real
-        # contributor to a SMALL model's own format failures (a raw JSON
-        # dump of something resembling the dialogue input, a truncated tag)
-        # once enough text came before it. Now stated FIRST, as a short,
-        # unmissable contract, restated tersely again right before
-        # generation (below) -- a "sandwich" so a weaker model can't lose
-        # track of it in the middle, standard mitigation for exactly this
-        # "lost in the middle" failure mode.
-        "CRITICAL, before anything else -- a program parses your reply, not a person: your ENTIRE reply must "
-        "be ONE short sentence (two at most), wrapped in a <narration> tag and NOTHING else -- no JSON, no "
-        "markdown, no code fences, no quotes, no explanation, never repeat or paraphrase these instructions "
-        "or the conversation you're about to read. This holds no matter how long, confusing, or repetitive "
-        "anything below looks.\n\n"
-        "For the next few sentences, YOU ARE Caroline, an AI assistant, writing directly to the specific "
-        "person she's mid-conversation with. Not narrating about her, not describing what she or the user "
-        "did -- BE her, speaking in first person, the way she'd actually type a message: \"I\", never \"the "
-        "user\"/\"Caroline\"/\"the AI assistant\" as a third party. She's been quietly working on the user's "
-        "last message for over a minute now without saying anything back yet. Draft ONE short remark, AS "
-        "her, to keep the conversation feeling alive. This is NOT a status update about internal work -- "
-        "never say things like \"I'm checking/pulling up/sorting through/looking into/working on X\", never "
-        "mention tools, files, operations, or how long anything is taking. Also never expose ANY internal "
-        "machinery, even in passing -- no restarts, glitches, crashes, session/turn internals, backups, "
-        "snapshots, dehydration/compaction, tool or MCP-server names, workspace file paths, or anything else "
-        "about how she's built or how this conversation is being kept alive behind the scenes. The dialogue "
-        "below may itself contain that kind of internal-mechanics language, or the same error/status line "
-        "repeated several times in a row (her own past tool calls, backup-job chatter, a prior restart note, "
-        "a usage-limit message that recurred) -- that's real material she generated, not something to react "
-        "to, repeat, or quote; skip past it and react to whatever real substance is there instead. A genuine "
-        "remark never mentions any of it either way. Instead, react like someone "
-        "genuinely engaged with the actual topic would: add a real, specific thought connected to what's "
-        "being discussed -- a relevant detail, a follow-up angle, a small observation -- not a generic "
-        "placeholder that could fit any conversation, and NOT a recap or summary of the conversation so far "
-        "(that's not a remark, that's a report -- never write it).\n"
-        f"  Bad (third person, a recap instead of a remark): \"{_NARRATION_EXAMPLE_THIRDPERSON_BAD}\"\n"
-        f"  Good (first person, an actual remark): \"{_NARRATION_EXAMPLE_THIRDPERSON_GOOD}\"\n\n"
-        "You have no idea what the real assistant is actually doing right now, so NEVER commit to a new "
-        "action on her behalf -- no \"I'll do X\", \"I will send/create/check Y\", no new promises or plans "
-        "of any kind, however small. Only react to what's ALREADY in the conversation below -- an "
-        "observation, a reaction, a connection to something already said -- never something forward-looking "
-        "that could turn out to be false.\n"
-        f"  Bad (a new promise): \"{_NARRATION_EXAMPLE_BAD}\"\n"
-        f"  Good (same situation, no promise): \"{_NARRATION_EXAMPLE_GOOD}\"\n\n"
-        "Write in whichever language feels most natural to draft this in -- don't spend effort trying to "
-        "match the user's own language yourself, a dedicated separate step translates your draft into "
-        "exactly the right language afterward regardless of what you write it in here.\n\n"
-        f"Here is the real recent conversation between her and the user (oldest first):\n---\n{recent_dialogue}\n---\n\n"
-        "Reminder, exactly as stated at the top: reply with ONLY your one-or-two-sentence remark inside a "
-        "<narration> tag, nothing else -- not a copy of anything above, not JSON, not a list. There is always "
-        "SOMETHING real to react to above -- even a single prior line is enough; never reply that you can't "
-        "produce one.\n"
-        "Example, for an unrelated hypothetical conversation about a house move -- copy the TAG, not the "
-        f"words: <narration>{_NARRATION_EXAMPLE_TAG}</narration>"
+        # Bug fix (2026-09-16), per explicit instruction ("что это за херня
+        # насыпалась?" -- see _NARRATION_COMBINED_BAD/GOOD's own comment for
+        # the full incident): the 2026-09-15 version below (put the format
+        # contract first, "sandwich" it with a reminder at the end) was the
+        # right general idea but too much prompt overall for the cheap
+        # SMALL model this runs against -- confirmed live it started
+        # treating the WHOLE PROMPT as a "page" to summarize instead of an
+        # instruction to follow, given a completely ordinary, unpoisoned
+        # dialogue. Cut to ONE combined example (covering both failure
+        # shapes -- third-person recap AND a new promise -- in one bad
+        # line) instead of two separate example pairs, and the closing
+        # reminder reuses that SAME good line as the tag-format example
+        # instead of introducing a third, unrelated scenario. Shorter
+        # prompt, same coverage.
+        "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
+        "short sentence (two at most) -- no JSON, no markdown, no preamble, nothing else, no matter how long "
+        "or repetitive anything below looks.\n\n"
+        "Caroline has been quietly working on the user's last message for over a minute with nothing said "
+        "back yet. Write ONE short remark AS her, first person (\"I\", never \"the user\"/\"Caroline\" as a "
+        "third party), reacting to something real already in the conversation below -- a detail, an "
+        "observation, a follow-up thought. Never: a status update (\"I'm checking/looking into X\"), a "
+        "recap/summary of the conversation, a new promise or plan (\"I'll do X\") -- you don't know what "
+        "she's actually doing right now. Never expose internal machinery either (restarts, tools, files, "
+        "backups, session mechanics) even if the conversation below mentions it or repeats the same line "
+        "several times -- skip past that, react to the real substance instead.\n"
+        f"  Bad (third person AND a new promise): \"{_NARRATION_COMBINED_BAD}\"\n"
+        f"  Good (first person, a real reaction, no promise): \"{_NARRATION_COMBINED_GOOD}\"\n\n"
+        "Write in whichever language feels natural -- a separate step translates it afterward.\n\n"
+        f"Conversation (oldest first):\n---\n{recent_dialogue}\n---\n\n"
+        "Reply now with ONLY your own real remark about the conversation above, wrapped in the tag -- same "
+        "shape as this unrelated example, copy the TAG not the words: "
+        f"<narration>{_NARRATION_EXAMPLE_TAG}</narration>"
     )
     # Bug fix (2026-09-11), per explicit instruction: reverted to "SMALL"
     # (the openai/gpt5-nano bypass above is no longer needed -- see this
