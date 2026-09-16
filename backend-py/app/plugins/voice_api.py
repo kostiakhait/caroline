@@ -264,6 +264,20 @@ _NARRATION_GARBAGE_PATTERNS = [
     re.compile(r"^\s*the user (?:asks?|asked|wants?|requests?|is asking)\b", re.IGNORECASE),
     re.compile(r"\bthe (?:caroline|ai assistant('s)?) response\b", re.IGNORECASE),
     re.compile(r"\bthe ai assistant\b", re.IGNORECASE),
+    # Bug fix (2026-09-16), confirmed live ("критический дефект" -- третье
+    # лицо): the patterns above only catch "the user asks..."/"the
+    # Caroline response..." shapes -- two genuine live examples slipped
+    # past both: "Caroline wants to know the exact date and time of the
+    # concert..." and "...Caroline is handling the escalation" -- her own
+    # NAME used as a plain third-person subject with all kinds of verb
+    # forms (wants/is handling/raising/...), no "the ... response" wrapper
+    # to match against. Trying to enumerate every verb form is the same
+    # losing game flagged elsewhere in this file -- simpler and more
+    # robust: she has NO legitimate reason to write her own name at all in
+    # a genuine first-person remark (that's what "I" is for), so any
+    # occurrence of the literal word is itself the tell, regardless of
+    # what comes after it.
+    re.compile(r"\bCaroline\b", re.IGNORECASE),
     # Bug fix (2026-09-16), confirmed live AGAIN, same day as the "the page
     # provides extensive instructions" incident fixed above, with entirely
     # different wording this time ("Write a short remark (max two words)
@@ -453,16 +467,35 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
                 value = parsed.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
-            # Bug fix (2026-09-16), confirmed live: the model can reasonably
-            # pick almost any key name for its one JSON field ("reply",
-            # "example", ... -- "reply" itself only surfaced during THIS
-            # incident's own testing, was never on the allowlist before).
-            # Chasing every possible key name is a losing battle -- if the
-            # whole object is just ONE string-valued field, regardless of
-            # its name, it's overwhelmingly likely to be the actual answer.
-            string_values = [v for v in parsed.values() if isinstance(v, str) and v.strip()]
-            if len(string_values) == 1:
-                return string_values[0].strip()
+        # Bug fix (2026-09-16), confirmed live: the model can reasonably
+        # pick almost any key name for its one JSON field ("reply",
+        # "example", ... -- "reply" itself only surfaced during THIS
+        # incident's own testing, was never on the allowlist before), and
+        # can nest it arbitrarily (confirmed live the same day:
+        # `{"responses": [{"tag": "narration", "text": "..."}]}` -- a list
+        # of dicts, not a flat object). Chasing every possible shape one at
+        # a time is a losing battle -- recursively collect every
+        # sentence-length string anywhere in the parsed structure
+        # (excluding short label-like strings such as a bare "narration"
+        # tag name) and use it if there's EXACTLY one candidate. More than
+        # one is genuinely ambiguous -- stay conservative and give up
+        # rather than guess wrong.
+        candidates: list[str] = []
+
+        def _collect(node: Any) -> None:
+            if isinstance(node, str):
+                if len(node.strip()) >= 15:
+                    candidates.append(node.strip())
+            elif isinstance(node, dict):
+                for v in node.values():
+                    _collect(v)
+            elif isinstance(node, list):
+                for v in node:
+                    _collect(v)
+
+        _collect(parsed)
+        if len(candidates) == 1:
+            return candidates[0]
         return ""
     return stripped
 
@@ -530,7 +563,22 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
         "several times -- skip past that, react to the real substance instead.\n"
         f"  Bad (third person AND a new promise): \"{_NARRATION_COMBINED_BAD}\"\n"
         f"  Good (first person, a real reaction, no promise): \"{_NARRATION_COMBINED_GOOD}\"\n\n"
-        "Write in whichever language feels natural -- a separate step translates it afterward.\n\n"
+        # Bug fix (2026-09-16), confirmed live via real logs (two separate
+        # incidents on the same day, RUSSIAN-language drafts both times):
+        # "write in whichever language feels natural" let the model draft
+        # directly in the conversation's own language -- and it kept
+        # producing exactly the third-person-recap failure this prompt's
+        # own rules explicitly forbid ("ÐšÐ°Ñ€Ð¾Ð»Ð°Ð¹Ð½ Ñ…Ð¾Ñ‡ÐµÑ‚ ÑƒÐ·Ð½Ð°Ñ‚ÑŒ..." --
+        # "Caroline wants to know...", "ÐŸÐ¾Ð»ÑŒÐ·Ð¾Ð²Ð°Ñ‚ÐµÐ»ÑŒ Ð¿Ñ€Ð¾ÑÐ¸Ñ‚ ÐšÐ°Ñ€Ð¾Ð»Ð¸Ð½Ñƒ..." --
+        # "The user asks Caroline...") -- invisible to _NARRATION_GARBAGE_
+        # PATTERNS below, which are English-only. Forcing English drafting
+        # unconditionally closes that whole language gap at once instead of
+        # trying to translate every pattern into every language a
+        # conversation might be in -- the translation step already exists
+        # and runs regardless of what language is drafted here.
+        "Write your remark in English, always, no matter what language the conversation below is in -- a "
+        "separate step translates it into the right language afterward. Do not attempt to write in any other "
+        "language yourself.\n\n"
         f"Conversation (oldest first):\n---\n{recent_dialogue}\n---\n\n"
         "Reply now with ONLY your own real remark about the conversation above, wrapped in the tag -- same "
         "shape as this unrelated example, copy the TAG not the words: "
