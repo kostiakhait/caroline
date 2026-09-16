@@ -419,6 +419,37 @@ def system_temp_dir_instruction() -> str:
     )
 
 
+def prefer_command_line_and_scripting_instruction() -> str:
+    """Standing rule, stated by the user directly (2026-09-15). Same shape
+    as prefer_embedded_browser_instruction's own history: a "prefer X over
+    Y" default that has to steer which TOOL CATEGORY gets reached for in
+    the first place, so it has to be ALWAYS_ON rather than discoverable
+    only after the model has already started down the GUI-automation path
+    -- by the time it would think to ask get_tool_instructions about a
+    mouse/keyboard tool, the choice it's meant to prevent has usually
+    already been made. The flush requirement mirrors logging_setup.py's
+    own log_event() convention (print(..., flush=True)) -- confirmed this
+    session to be the actual reason Caroline's own logs are already
+    real-time, so a script it writes should hold itself to the same
+    standard, not buffer output until exit."""
+    return (
+        "When the same task can be done either through the command line (Bash/PowerShell, a CLI tool, a script) "
+        "or through GUI automation (clicking, typing into windows, browsing a page by hand), prefer the command "
+        "line. It's faster, more reliable, and leaves a clear, checkable record of exactly what happened, instead "
+        "of a chain of clicks and screenshots that can silently miss, misclick, or land on the wrong element. "
+        "Example: to download a file, use curl/Invoke-WebRequest or a short script, not opening a browser and "
+        "clicking through a download flow by hand. Reach for GUI automation only when the task is genuinely "
+        "GUI-only -- no CLI/API/scriptable equivalent exists for it (driving a specific app's own UI, say).\n"
+        "When a task calls for writing a script to get it done, use the Python already available to you. Every "
+        "script you write must log its own progress AS IT RUNS, with output flushed immediately as each line is "
+        "written (e.g. print(..., flush=True), not the default buffered-until-exit behavior) -- so a hang or "
+        "stall partway through is visible in real time, not only discoverable after the fact once nothing came "
+        "back. Writing and launching the script is not the end of the task: you must actually watch it run -- "
+        "check its output/log while it's in progress (same idea as checking on anything you've backgrounded, "
+        "see the note on Bash's run_in_background above) -- rather than firing it off and assuming it worked."
+    )
+
+
 def prefer_embedded_browser_instruction() -> str:
     """Bug fix (2026-09-11), per explicit instruction: this priority was
     already stated once, in open_app_browser's own tool description
@@ -465,6 +496,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     prefer_embedded_browser_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
+    prefer_command_line_and_scripting_instruction,
 )
 
 

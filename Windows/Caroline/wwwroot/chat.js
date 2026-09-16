@@ -1939,6 +1939,18 @@
 
   function stopCurrentTurn() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Bug fix (2026-09-15), reported three times live ("не реагирует на
+    // нажатие, через несколько секунд происходит остановка"): this used to
+    // give ZERO local feedback on click, relying entirely on the backend's
+    // own "status" WS message to eventually update the UI -- fine when
+    // that round-trip is near-instant, but chat_session.py's stop() could
+    // legitimately take several real seconds (now separately fixed on that
+    // side too). setToolStatus is purely a transient LABEL, not a fake
+    // carolineStatus/lamp override -- the backend stays the sole source of
+    // truth for the actual state; this just fills the gap the instant the
+    // click happens, until the real status update lands and naturally
+    // overwrites or clears it (stopHeartbeat()/updateHeartbeatText()).
+    setToolStatus("Stopping…");
     ws.send(JSON.stringify({ type: "interrupt" }));
     // The interrupted turn never gets a "result" of its own; the backend
     // immediately submits a new synthetic turn telling Caroline she was

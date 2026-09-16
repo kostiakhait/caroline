@@ -103,6 +103,7 @@ from app.persona import get_persona, persona_system_prompt_append
 from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
+from app.process_activity import ProcessActivityMonitor
 from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
@@ -278,7 +279,16 @@ RECENT_HISTORY_FILE_WINDOW_HOURS = 24
 # connect()+generator wiring, content-as-block-list included, not just the
 # SDK's query(str) convenience path).
 FORCED_COMPACTION_HOURLY_MS = 3_600_000
-FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD = 100_000
+# Bug fix (2026-09-15): replaced the old byte-based growth threshold (see
+# tokens_at_last_forced_compaction's own __init__ comment for why bytes was
+# the wrong signal) -- this is real context tokens, checked against
+# last_known_context_tokens - tokens_at_last_forced_compaction. Own choice
+# of value, not a measured constant: the one real compaction observed live
+# fired at pre_tokens=69422 and left post_tokens=10158, so 60k of NEW
+# growth since the last compaction is a reasonably generous margin below
+# that (compacts again well before context gets that large again) without
+# re-compacting on every small turn.
+FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD = 60_000
 # Minimum gap between two forced compactions on the same tab, regardless of
 # which trigger fires -- keeps the three triggers from stacking (e.g. the
 # hourly clock and the growth threshold both crossing within the same
@@ -1023,6 +1033,30 @@ class ChatSession:
         self.needs_startup_compaction: bool = False
         self.last_forced_compaction_at: float | None = None
         self.size_at_last_forced_compaction: int | None = None
+        # Bug fix (2026-09-15), per explicit instruction -- confirmed live
+        # via a direct test (see the "гипотеза B" investigation): the
+        # on-disk .jsonl transcript is append-only -- a successful /compact
+        # cuts real API-context tokens drastically (confirmed: 69422 ->
+        # 10158, a real compact_boundary system message) but the FILE only
+        # ever grows (never shrinks), so size_at_last_forced_compaction/
+        # FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD above were comparing
+        # against a baseline that can never reflect what compaction
+        # actually accomplished -- the growth trigger was watching the
+        # wrong signal entirely. Track real context tokens instead:
+        # tokens_at_last_forced_compaction is the authoritative baseline,
+        # set from a compact_boundary system message's own
+        # compact_metadata.post_tokens (the CLI's own count of what's left
+        # right after compacting -- see the SystemMessage handling below);
+        # last_known_context_tokens is updated from every REAL (non-fake)
+        # ResultMessage's own usage field, the live "how much is actually
+        # in context right now" signal Claude Code already reports on
+        # every turn. Both None until the first real value arrives --
+        # _check_forced_compaction's growth branch simply doesn't fire
+        # until then (same graceful-startup shape as last_forced_
+        # compaction_at being None), which is fine: "startup" already
+        # forces an initial compaction every process start regardless.
+        self.tokens_at_last_forced_compaction: int | None = None
+        self.last_known_context_tokens: int | None = None
         # Per explicit instruction (2026-09-15): set by _apply_conn_state
         # whenever conn_state leaves "limited" -- see its own comment for
         # the incident (a forced-compaction attempt that itself hit the
@@ -1086,6 +1120,12 @@ class ChatSession:
         # it is torn down so a stale pid from an already-dead process is
         # never targeted.
         self._cli_process_pid: int | None = None
+        # Bug fix (2026-09-15), per explicit instruction (see _check_hang's
+        # own comment for the full reasoning): the real hang-detection
+        # liveness signal, built on the same pid capture above. Recreated
+        # whenever _cli_process_pid changes (a fresh connection); None
+        # until the first pid is captured.
+        self._process_activity_monitor: ProcessActivityMonitor | None = None
 
         # silent user-wait nudge (see SILENT_USER_WAIT_NUDGE_MS) -- tracks
         # only REAL user-typed messages (submit()'s is_real_user=True),
@@ -1341,7 +1381,24 @@ class ChatSession:
         # user speech, producing both nonsense commentary and an English
         # reply for an otherwise-Russian conversation. Tracked alongside
         # pending_user_text so that fallback can tell the difference.
-        self.pending_is_real_user = is_real_user
+        #
+        # Bug fix (2026-09-15), confirmed live -- tab 4, right after this
+        # same session's app restart: a real user message set this True,
+        # then (mid-turn, while turn_pending was ALREADY True from that
+        # same real question) a background-operation-completion nudge
+        # fired via inject_proactive -> submit(is_real_user=False), which
+        # unconditionally overwrote this back to False -- silencing the
+        # narrator for the rest of that turn even though the model was
+        # still working on nothing but the user's own real request the
+        # whole time. A proactive/internal nudge injected INTO an
+        # already-pending turn is additive content for that same turn,
+        # not the start of a new one -- it must never downgrade an
+        # already-True flag. Only actually reset the flag (to whatever
+        # is_real_user says) when this submit() is starting a genuinely
+        # NEW turn (self.turn_pending wasn't already True) -- a real
+        # user message still always wins immediately either way.
+        if is_real_user or not self.turn_pending:
+            self.pending_is_real_user = is_real_user
         self.pending_attachments = attachments
         self.turn_pending = True
         self.last_activity = time.monotonic()
@@ -1673,16 +1730,46 @@ class ChatSession:
         actually worked, and nothing left to fall back to. Falls back to
         _force_kill_underlying_cli_process (a direct OS-level taskkill by
         PID, bypassing the SDK's own broken internals entirely) so Stop
-        genuinely cannot fail to land."""
+        genuinely cannot fail to land.
+
+        Bug fix (2026-09-15), THIRD report of this same shape of bug
+        ("Стоп не останавливает всё немедленно"): the force-kill above
+        used to run ONLY as a fallback, after first awaiting
+        client.disconnect() for up to STOP_ESCALATION_DISCONNECT_TIMEOUT_S
+        (10s) -- meaning a disconnect() that neither throws nor hangs, just
+        runs its own slow internal graceful-shutdown sequence, made every
+        Stop click take however long that took, contradicting "Сразу по
+        нажатии" just as badly as the old soft-interrupt-then-grace-period
+        design this was supposed to have replaced. _force_kill_underlying_
+        cli_process is unconditionally safe to fire immediately, concurrently
+        with disconnect() -- it goes straight for the real OS PID captured
+        at spawn time, not through any SDK state disconnect() might also be
+        touching, and taskkill against a process that's already exiting on
+        its own just fails harmlessly (already caught inside that method).
+        So it now fires first, unconditionally, with disconnect() awaited
+        afterward purely as the SDK's own best-effort internal cleanup --
+        no longer anything externally-visible depends on it finishing or
+        even succeeding."""
         if self.client:
             asyncio.create_task(self._safe_interrupt())
         log_event("engine", "user_stop_force_close", tab_id=self.tab_id)
+        self._force_kill_underlying_cli_process()
         try:
             if self.client:
                 await asyncio.wait_for(self.client.disconnect(), timeout=STOP_ESCALATION_DISCONNECT_TIMEOUT_S)
         except Exception as exc:
             log_event("engine", "user_stop_close_failed", tab_id=self.tab_id, error=str(exc))
-            self._force_kill_underlying_cli_process()
+
+    def _on_cli_process_spawned(self, pid: int) -> None:
+        """session_context's cli-pid-sink callback (see win_subprocess_
+        patch.py) -- fires the moment a fresh claude.exe is actually
+        spawned. Captures the pid (Stop's own fallback, see
+        _force_kill_underlying_cli_process) AND builds this connection's
+        ProcessActivityMonitor (_check_hang's real hang-detection signal,
+        2026-09-15) in one place, since both are keyed off the exact same
+        event and must always agree on which process they're tracking."""
+        self._cli_process_pid = pid
+        self._process_activity_monitor = ProcessActivityMonitor(pid)
 
     def _force_kill_underlying_cli_process(self) -> None:
         """Per explicit instruction (2026-09-15): mirrors BackendProcess.
@@ -2389,8 +2476,11 @@ class ChatSession:
     def _current_session_file_size(self) -> int | None:
         """Bytes on disk for this tab's currently-resumed session transcript,
         or None if there's nothing resolvable yet (no session id, or the
-        file genuinely isn't there). Used by _check_forced_compaction's
-        growth trigger -- see FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD."""
+        file genuinely isn't there). No longer the growth-trigger's own
+        decision signal (2026-09-15 -- see tokens_at_last_forced_
+        compaction's own __init__ comment for why file bytes were wrong for
+        that) -- kept only for the session_size_bytes log field, which is
+        still useful context even though it's not what drives the trigger."""
         if not self.last_saved_session_id:
             return None
         try:
@@ -2423,9 +2513,9 @@ class ChatSession:
         below, since the whole point is retrying what a usage-limit hit
         just interrupted, not waiting for the next regular cycle), a
         pending startup compaction (main.py sets needs_startup_compaction
-        once per tab per process), the hourly clock, or on-disk growth
-        past FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD since the last forced
-        compaction. Never runs while a real turn is in flight or the
+        once per tab per process), the hourly clock, or real context-token
+        growth past FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD since the
+        last forced compaction. Never runs while a real turn is in flight or the
         connection isn't fully settled -- this is maintenance, not
         something to inject into or race with actual work."""
         if self.ended or self.turn_pending or self.forced_compaction_result_pending:
@@ -2447,10 +2537,10 @@ class ChatSession:
             reason = "hourly"
         else:
             reason = None
-            size = self._current_session_file_size()
-            baseline = self.size_at_last_forced_compaction or 0
-            if size is not None and size - baseline >= FORCED_COMPACTION_GROWTH_BYTES_THRESHOLD:
-                reason = "growth"
+            if self.tokens_at_last_forced_compaction is not None and self.last_known_context_tokens is not None:
+                grown = self.last_known_context_tokens - self.tokens_at_last_forced_compaction
+                if grown >= FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD:
+                    reason = "growth"
 
         if reason is None:
             return
@@ -2462,108 +2552,144 @@ class ChatSession:
         log_event(
             "engine", "forced_compaction_triggered", tab_id=self.tab_id, reason=reason,
             session_size_bytes=self.size_at_last_forced_compaction,
+            context_tokens_at_trigger=self.last_known_context_tokens,
+            context_tokens_baseline=self.tokens_at_last_forced_compaction,
         )
         self._push_internal_command("/compact")
 
     async def _check_hang(self) -> None:
-        elapsed = time.monotonic() - self.last_activity
-        # Bug fix (2026-09-15), per explicit instruction: a tool call the
-        # model just issued and that hasn't resolved yet is real work in
-        # progress, not silence -- the CLI cannot produce another SDK
-        # message (which would reset last_activity) until that call
-        # returns. "started more recently than this hang's own elapsed
-        # window" is what distinguishes a genuinely still-running call
-        # from a stale name left over from an earlier, already-finished
-        # one (the attribution logic below reuses this same check, rather
-        # than re-deriving it a second time).
-        tool_in_flight = (
-            self.last_tool_use_started_at is not None
-            and time.monotonic() - self.last_tool_use_started_at <= elapsed + 1
-        )
-        effective_timeout_s = (
-            HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS if tool_in_flight
-            else (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS)
-        ) / 1000
+        # Bug fix (2026-09-15), per explicit instruction: "Это должно быть
+        # 90-секунд отсчитываемых, когда ничего не происходит: процессы не
+        # потребляют процессор и не меняется загрузка памяти. Это не
+        # таймаут выполнения, а таймаут от зависания." -- the real
+        # liveness signal is whether the underlying claude.exe OS process
+        # is doing anything (CPU/memory), not "did an SDK message arrive"
+        # -- those aren't the same thing. Confirmed live via a direct
+        # isolated test: a real /compact against a realistically-sized
+        # session took 109.5s end to end with ZERO intermediate SDK
+        # messages, while the process was genuinely working the whole
+        # time -- the old signal could not tell that apart from an
+        # actually frozen process. See process_activity.py's own module
+        # docstring. Falls back to the old last-SDK-message clock only if
+        # the monitor itself isn't usable (no pid captured yet, or psutil
+        # couldn't read the process for some reason) -- "can't tell" must
+        # never silently mean "assume hung", so the fallback also restores
+        # the tool_in_flight extended leash from the previous version of
+        # this fix, as a second safety net for exactly that degraded case.
+        monitor = self._process_activity_monitor
+        if monitor is not None and monitor.available:
+            monitor.sample()
+            elapsed = monitor.seconds_since_last_activity()
+            signal_source = "process_activity"
+            effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
+            tool_in_flight = False
+        else:
+            elapsed = time.monotonic() - self.last_activity
+            signal_source = "last_sdk_message_fallback"
+            tool_in_flight = (
+                self.last_tool_use_started_at is not None
+                and time.monotonic() - self.last_tool_use_started_at <= elapsed + 1
+            )
+            effective_timeout_s = (
+                HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS if tool_in_flight
+                else (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS)
+            ) / 1000
         log_event(
             "engine", "check_hang_tick", tab_id=self.tab_id, turn_pending=self.turn_pending,
             last_activity_s=round(elapsed, 1), hang_count=self.hang_count,
             hang_interrupted_at=self.hang_interrupted_at, has_seen_init=self.has_seen_init,
-            effective_timeout_s=effective_timeout_s, tool_in_flight=tool_in_flight,
-            tool_in_flight_name=self.last_tool_use_name if tool_in_flight else None,
+            effective_timeout_s=effective_timeout_s, signal_source=signal_source,
+            tool_in_flight=tool_in_flight, tool_in_flight_name=self.last_tool_use_name if tool_in_flight else None,
         )
         if not self.turn_pending and self.has_seen_init:
             self.hang_interrupted_at = None
             return
+
+        # --- Phase 2: already soft-interrupted, waiting on escalation ------
+        # Bug fix (2026-09-15), confirmed live (tab 4, 2026-09-15: real
+        # stream_ended_unexpectedly elapsed_ms up to 351453 -- 3-4x the
+        # intended ~110s = 90s detect + 20s grace): this branch used to be
+        # reachable ONLY when `elapsed` (the SAME clock phase 1 below
+        # uses) was STILL past effective_timeout_s -- so the CLI's own
+        # courtesy "aborted-turn" ResultMessage (which always arrives
+        # moments after a soft interrupt, and always used to reset
+        # last_activity) silently swallowed the whole escalation: elapsed
+        # dropped back near zero, this function returned early every tick
+        # from the check below, and the REAL 20s grace period never
+        # actually got examined until ANOTHER full 90s of silence had
+        # passed on top. Once a hang is already being escalated, only ITS
+        # OWN clock (hang_interrupted_at) should gate it -- checked
+        # unconditionally here, completely independent of whatever the
+        # liveness signal above says in the meantime.
+        if self.hang_interrupted_at is not None:
+            if time.monotonic() - self.hang_interrupted_at < HANG_ESCALATION_GRACE_MS / 1000:
+                return
+            log_event("engine", "hang_escalation_force_close", tab_id=self.tab_id)
+            self.hang_interrupted_at = None
+            try:
+                if self.client:
+                    await self.client.disconnect()
+            except Exception as exc:
+                log_event("engine", "hang_escalation_close_failed", tab_id=self.tab_id, error=str(exc))
+            return
+
+        # --- Phase 1: not yet interrupted -- is THIS tick a fresh hang? ----
         if elapsed < effective_timeout_s:
             return
 
-        if self.hang_interrupted_at is None:
-            self.hang_count += 1
-            # Bug fix (2026-09-10): capture what was actually running,
-            # before interrupting it, so _handle_failure's replay nudge can
-            # tell the model specifically what got force-terminated (per
-            # explicit instruction) rather than a generic note -- lets it
-            # try something else instead of blindly repeating the same
-            # slow/stuck call. Reuses tool_in_flight (computed above) --
-            # if we got this far with it True, real work ran the FULL 15
-            # minutes and genuinely never returned; that's exactly the one
-            # case a tool this app owns should be considered truly stuck.
-            if tool_in_flight:
-                self.hang_interrupted_tool_name = self.last_tool_use_name
-                self.hang_interrupted_tool_elapsed_s = time.monotonic() - self.last_tool_use_started_at
-            else:
-                self.hang_interrupted_tool_name = None
-                self.hang_interrupted_tool_elapsed_s = None
-            if self.hang_count >= 2:
-                log_event("engine", "hang_repeat_force_close", tab_id=self.tab_id, hang_count=self.hang_count)
-                self.hang_interrupt_result_pending = True
-                try:
-                    if self.client:
-                        await self.client.disconnect()
-                except Exception as exc:
-                    log_event("engine", "hang_force_close_failed", tab_id=self.tab_id, error=str(exc))
-                return
-            log_event(
-                "engine", "hang_detected_soft_interrupt", tab_id=self.tab_id,
-                tool_name=self.hang_interrupted_tool_name, tool_elapsed_s=self.hang_interrupted_tool_elapsed_s,
-            )
-            self.hang_interrupted_at = time.monotonic()
-            # Bug fix (2026-09-10): confirmed live -- interrupt() is a soft
-            # ask, not a hard kill; the CLI still sends a final ResultMessage
-            # for the turn it just aborted. Without this flag, that
-            # ResultMessage was treated exactly like a real completion --
-            # wiping turn_pending/pending_user_text AND resetting
-            # silent_turn=True -- so even when _handle_failure's replay
-            # genuinely succeeded a few seconds later, its real answer was
-            # silently swallowed (silent_turn never got reset back to
-            # False, since the replay goes through _push_message directly,
-            # not submit()). See the ResultMessage handler below for the
-            # other half of this fix.
+        self.hang_count += 1
+        # Bug fix (2026-09-10): capture what was actually running, before
+        # interrupting it, so _handle_failure's replay nudge can tell the
+        # model specifically what got force-terminated (per explicit
+        # instruction) rather than a generic note -- lets it try something
+        # else instead of blindly repeating the same slow/stuck call. Only
+        # meaningful in the last_sdk_message_fallback path (tool_in_flight
+        # is always False when the process-activity monitor is the one
+        # driving this, since real work reaching the full 90s of genuine
+        # process inactivity would itself now be a real hang either way).
+        if tool_in_flight:
+            self.hang_interrupted_tool_name = self.last_tool_use_name
+            self.hang_interrupted_tool_elapsed_s = time.monotonic() - self.last_tool_use_started_at
+        else:
+            self.hang_interrupted_tool_name = None
+            self.hang_interrupted_tool_elapsed_s = None
+        if self.hang_count >= 2:
+            log_event("engine", "hang_repeat_force_close", tab_id=self.tab_id, hang_count=self.hang_count)
             self.hang_interrupt_result_pending = True
             try:
                 if self.client:
-                    await self.client.interrupt()
+                    await self.client.disconnect()
             except Exception as exc:
-                log_event("engine", "hang_soft_interrupt_failed", tab_id=self.tab_id, error=str(exc))
-            # Same reasoning as stop()'s own fix -- a hang is plausibly
-            # caused by exactly a detached background operation that never
-            # completes/never gets polled again, so cancel this tab's
-            # in-flight operations here too, not just on an explicit user
-            # Stop.
-            cancelled = REGISTRY.cancel_for_tab(self.tab_id)
-            if cancelled:
-                log_event("engine", "hang_soft_interrupt_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+                log_event("engine", "hang_force_close_failed", tab_id=self.tab_id, error=str(exc))
             return
-
-        if time.monotonic() - self.hang_interrupted_at < HANG_ESCALATION_GRACE_MS / 1000:
-            return
-        log_event("engine", "hang_escalation_force_close", tab_id=self.tab_id)
-        self.hang_interrupted_at = None
+        log_event(
+            "engine", "hang_detected_soft_interrupt", tab_id=self.tab_id,
+            tool_name=self.hang_interrupted_tool_name, tool_elapsed_s=self.hang_interrupted_tool_elapsed_s,
+        )
+        self.hang_interrupted_at = time.monotonic()
+        # Bug fix (2026-09-10): confirmed live -- interrupt() is a soft
+        # ask, not a hard kill; the CLI still sends a final ResultMessage
+        # for the turn it just aborted. Without this flag, that
+        # ResultMessage was treated exactly like a real completion --
+        # wiping turn_pending/pending_user_text AND resetting silent_turn=
+        # True -- so even when _handle_failure's replay genuinely
+        # succeeded a few seconds later, its real answer was silently
+        # swallowed (silent_turn never got reset back to False, since the
+        # replay goes through _push_message directly, not submit()). See
+        # the ResultMessage handler below for the other half of this fix.
+        self.hang_interrupt_result_pending = True
         try:
             if self.client:
-                await self.client.disconnect()
+                await self.client.interrupt()
         except Exception as exc:
-            log_event("engine", "hang_escalation_close_failed", tab_id=self.tab_id, error=str(exc))
+            log_event("engine", "hang_soft_interrupt_failed", tab_id=self.tab_id, error=str(exc))
+        # Same reasoning as stop()'s own fix -- a hang is plausibly caused
+        # by exactly a detached background operation that never completes/
+        # never gets polled again, so cancel this tab's in-flight
+        # operations here too, not just on an explicit user Stop.
+        cancelled = REGISTRY.cancel_for_tab(self.tab_id)
+        if cancelled:
+            log_event("engine", "hang_soft_interrupt_cancelled_operations", tab_id=self.tab_id, count=cancelled)
 
     # ------------------------------------------------------------- failure --
 
@@ -2668,7 +2794,7 @@ class ChatSession:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)
         set_inject_proactive(lambda text: self.inject_proactive(text))
-        set_cli_pid_sink(lambda pid: setattr(self, "_cli_process_pid", pid))
+        set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:
                 self.hang_count = 0
@@ -2788,6 +2914,7 @@ class ChatSession:
                 log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=mode.chat_source)
                 self.client = ClaudeSDKClient(options=options)
                 self._cli_process_pid = None
+                self._process_activity_monitor = None
                 await self.client.connect(self._input_stream())
 
                 async for raw_message in self.client.receive_messages():
@@ -2936,6 +3063,33 @@ class ChatSession:
                             compact_error=message.data.get("compact_error"),
                         )
 
+                    # --- system/compact_boundary (2026-09-15) -- fires for
+                    # EVERY compaction, ours (forced) or the CLI's own
+                    # native auto-compaction alike, carrying the authoritative
+                    # post-compaction token count in compact_metadata.
+                    # post_tokens -- confirmed live via a direct isolated
+                    # test (a real /compact against a copy of a real bloated
+                    # session: pre_tokens=69422, post_tokens=10158). This is
+                    # the new growth-trigger baseline (see
+                    # tokens_at_last_forced_compaction's own __init__
+                    # comment for why file bytes were the wrong signal).
+                    if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
+                        post_tokens = (message.data.get("compact_metadata") or {}).get("post_tokens")
+                        log_event(
+                            "engine", "compact_boundary_observed", tab_id=self.tab_id,
+                            pre_tokens=(message.data.get("compact_metadata") or {}).get("pre_tokens"),
+                            post_tokens=post_tokens, trigger=(message.data.get("compact_metadata") or {}).get("trigger"),
+                        )
+                        if isinstance(post_tokens, int):
+                            self.tokens_at_last_forced_compaction = post_tokens
+                            # A boundary is itself the freshest possible
+                            # reading of "what's in context right now" --
+                            # keep the two baselines in sync so the growth
+                            # branch doesn't compare a stale pre-compaction
+                            # last_known_context_tokens against the brand
+                            # new baseline on its very next check.
+                            self.last_known_context_tokens = post_tokens
+
                     # --- system/api_retry ---
                     if isinstance(message, SystemMessage) and message.subtype == "api_retry":
                         self.last_api_retry_error = message.data.get("error")
@@ -2981,6 +3135,30 @@ class ChatSession:
                         save_tab_session_id(self.workspace_dir, self.tab_id, sid)
 
                     if isinstance(message, ResultMessage):
+                        # Bug fix (2026-09-15): the live "how much is
+                        # actually in context right now" signal for the
+                        # growth trigger (see tokens_at_last_forced_
+                        # compaction's own __init__ comment) -- every real
+                        # turn's own ResultMessage.usage already reports
+                        # this, no separate query needed. Deliberately
+                        # OUTSIDE the result_is_fake check below: even a
+                        # hang-interrupted or otherwise "fake" turn's
+                        # ResultMessage still reflects a real API call
+                        # against the real current context, which is
+                        # exactly the number this is meant to track --
+                        # only the compaction command's OWN ResultMessage
+                        # would be misleading here, and that's excluded
+                        # explicitly (compaction's own token accounting
+                        # comes from compact_boundary instead, see above).
+                        usage = getattr(message, "usage", None)
+                        if isinstance(usage, dict) and not self.forced_compaction_result_pending:
+                            context_tokens = sum(
+                                v for k, v in usage.items()
+                                if k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+                                and isinstance(v, int)
+                            )
+                            if context_tokens:
+                                self.last_known_context_tokens = context_tokens
                         # Bug fix (2026-09-11): confirmed live -- a
                         # RateLimitEvent(rejected) sets
                         # ignore_next_result_recovery=True specifically so

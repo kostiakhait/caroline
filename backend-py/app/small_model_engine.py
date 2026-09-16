@@ -304,7 +304,26 @@ async def _resolve_agentic_with_watchdog(ai: Any, tracker: _TurnTracker, **resol
     task: asyncio.Task[str] = asyncio.create_task(asyncio.to_thread(ai.resolve_agentic, **resolve_kwargs))
     try:
         while True:
-            done, _pending = await asyncio.wait({task}, timeout=5.0)
+            try:
+                done, _pending = await asyncio.wait({task}, timeout=5.0)
+            except asyncio.CancelledError:
+                # Bug fix (2026-09-15), confirmed live -- a manual Stop
+                # cancels the OUTER task wrapping this whole coroutine
+                # (chat_session.py's stop() -> ChatSession._small_model_task
+                # .cancel()), which used to unwind straight out through
+                # here without ever touching tracker.cancelled -- the exact
+                # flag executor_fn (below) checks before every tool
+                # dispatch to refuse acting for an abandoned turn. Result:
+                # the UI flipped back to ready, but the orphaned worker
+                # thread kept right on making real tool calls (an email
+                # send, an IMAP login, ...) completely unsupervised, with
+                # Stop having done nothing to it at all. Same "tell the
+                # thread to stop doing further real-world damage" signal
+                # the stall/absolute-timeout branches below already set --
+                # a user-initiated Stop deserves it at least as much as an
+                # automatic giveup does, arguably more.
+                tracker.cancelled.set()
+                raise
             if task in done:
                 return task.result()
             now = time.monotonic()

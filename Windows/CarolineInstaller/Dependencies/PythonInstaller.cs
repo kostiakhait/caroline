@@ -73,7 +73,13 @@ internal static class PythonInstaller
          // parsed page-by-page, text only, never handed to the model as
          // raw document bytes). Imported as `pymupdf` (the modern name;
          // `fitz` is the same package's legacy import alias).
-         "pymupdf"];
+         "pymupdf",
+         // app/process_activity.py's CPU%/RSS-based hang detection
+         // (2026-09-15, "Это должно быть 90-секунд отсчитываемых, когда
+         // ничего не происходит: процессы не потребляют процессор и не
+         // меняется загрузка памяти") -- the only practical way to read
+         // another process's CPU/memory usage from Python on Windows.
+         "psutil"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 
