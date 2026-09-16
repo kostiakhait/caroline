@@ -264,6 +264,26 @@ _NARRATION_GARBAGE_PATTERNS = [
     re.compile(r"^\s*the user (?:asks?|asked|wants?|requests?|is asking)\b", re.IGNORECASE),
     re.compile(r"\bthe (?:caroline|ai assistant('s)?) response\b", re.IGNORECASE),
     re.compile(r"\bthe ai assistant\b", re.IGNORECASE),
+    # Bug fix (2026-09-16), confirmed live AGAIN, same day as the "the page
+    # provides extensive instructions" incident fixed above, with entirely
+    # different wording this time ("Write a short remark (max two words)
+    # reacting to the given conversation, using the <narration> tag,
+    # without any JSON, markdown, or preamble.") -- the model isn't quoting
+    # its instructions verbatim (which _is_echo_of_prompt_example could
+    # catch), it's PARAPHRASING them in its own words. Chasing each new
+    # exact phrasing one at a time is a losing game (already flagged as
+    # such elsewhere in this file) -- this instead matches on the
+    # characteristic META-VOCABULARY of the prompt's own instructions
+    # (words like "narration tag", "markdown", "preamble" have no reason to
+    # ever appear in a genuine first-person remark about the user's actual
+    # conversation, whatever topic that is) rather than any exact sentence
+    # shape. Broader and more durable than another one-off pattern.
+    re.compile(r"<narration>", re.IGNORECASE),
+    re.compile(r"\bnarration tag\b", re.IGNORECASE),
+    re.compile(r"\b(?:no|without any) (?:json|markdown|preamble)\b", re.IGNORECASE),
+    re.compile(r"\bshort remark\b", re.IGNORECASE),
+    re.compile(r"\breacting to (?:the|this|a) (?:given |real )?conversation\b", re.IGNORECASE),
+    re.compile(r"\b(?:max|maximum) (?:one|two|three|1|2|3) (?:words?|sentences?)\b", re.IGNORECASE),
 ]
 _NARRATION_MAX_CHARS = 400
 # Han / Hiragana / Katakana / Hangul. Progress narration for this product

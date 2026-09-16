@@ -36,6 +36,42 @@ class SwApiError(Exception):
     pass
 
 
+# Bug fix (2026-09-16), per explicit instruction: "при исчерпании баланса
+# на клоде или опенроутере эта информация явно прокидывалась в кэролайн и
+# высвечивалась на статус-баре" -- Camerlengo proxies several tiers
+# (narration/translation/consult/SW-mode chat, ...) through OpenRouter;
+# confirmed live it can return a real, structured "insufficient funds"
+# envelope (`{'.status': 'error', '.errcode': '998', '.reason':
+# 'OpenRouter returned 402 Insufficient funds'}`) with a normal HTTP 200 --
+# _post_json is the ONE choke point every such call already goes through
+# (voice_api.py imports this exact function directly, not a duplicate), so
+# this is the one place that can reliably detect it regardless of which
+# higher-level feature triggered the call. Tracked as simple module state
+# (this balance is a single account-wide resource, not per-tab) --
+# get_funds_exhausted_reason() lets chat_session.py surface it without
+# this module needing to know anything about tabs/sessions/WS. Cleared by
+# the next genuinely successful call (proves the balance recovered), not
+# by any other kind of failure -- an unrelated transient error must never
+# silently erase a real "still exhausted" signal.
+_funds_exhausted_reason: str | None = None
+
+
+def get_funds_exhausted_reason() -> str | None:
+    return _funds_exhausted_reason
+
+
+def _check_funds_exhaustion(envelope: Any) -> None:
+    global _funds_exhausted_reason
+    if not isinstance(envelope, dict):
+        return
+    if envelope.get(".status") == "ok":
+        _funds_exhausted_reason = None
+        return
+    reason = envelope.get(".reason")
+    if isinstance(reason, str) and ("insufficient funds" in reason.lower() or " 402" in reason):
+        _funds_exhausted_reason = reason
+
+
 async def _post_json(body: dict[str, Any]) -> Any:
     async with httpx.AsyncClient(timeout=30.0) as client:
         last_err: Exception | None = None
@@ -52,7 +88,9 @@ async def _post_json(body: dict[str, Any]) -> Any:
             raise last_err  # type: ignore[misc]
         if res.status_code >= 400:
             raise SwApiError(f'SquirrelWisdom API HTTP {res.status_code} for command "{body.get("command")}"')
-        return res.json()
+        result = res.json()
+        _check_funds_exhaustion(result)
+        return result
 
 
 async def call_v2(command: str, **extra: Any) -> dict[str, Any]:

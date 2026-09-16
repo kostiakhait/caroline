@@ -246,7 +246,16 @@
     if (!wsConnected) return "reconnecting…";
     if (carolineStatus === "error") return carolineStatusReason || "Something needs your attention.";
     if (carolineStatus === "recovering") return carolineStatusReason || "Recovering…";
-    return "connected";
+    // Bug fix (2026-09-16), per explicit instruction ("при исчерпании
+    // баланса... высвечивалась на статус-баре"): "ready"/"working" used
+    // to hardcode away carolineStatusReason entirely -- fine for every
+    // OTHER case (those two states never carried a reason before), but
+    // chat_session.py's _compute_public_status now can attach a non-
+    // blocking note (an exhausted SquirrelWisdom/OpenRouter balance) even
+    // while the tab is otherwise perfectly ready/working. Appended, not
+    // replacing "connected" -- this is informational, not a real status
+    // change.
+    return carolineStatusReason ? `connected -- ${carolineStatusReason}` : "connected";
   }
 
   // The one place that pushes carolineStatus/wsConnected out to every piece

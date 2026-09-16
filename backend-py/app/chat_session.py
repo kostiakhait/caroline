@@ -105,6 +105,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.plugins.sw_api import get_funds_exhausted_reason
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
@@ -140,6 +141,18 @@ HANG_ESCALATION_GRACE_MS = 20_000
 # dead-air silence (no tool in flight at all -- nothing legitimate
 # explains that lasting past HANG_TIMEOUT_MS).
 HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS = 15 * 60_000
+# Bug fix (2026-09-16), per explicit instruction: the process-activity
+# signal (see process_activity.py) has no ceiling of its own -- a process
+# showing SOME CPU/RSS/IO movement at least once every <90s is "alive" by
+# that definition forever, however long the actual turn has gone
+# unanswered. Confirmed live: a real turn sat pending 15.5 minutes with
+# hang_count staying 0 the whole time (the process apparently kept
+# showing just enough activity, likely its own periodic internal retries,
+# to never trip the 90s idle check). This is a hard backstop ON TOP of
+# the activity signal, not a replacement for it -- checked against
+# turn_pending_since (when the CURRENT turn actually started), completely
+# independent of whatever the activity monitor says.
+HANG_ABSOLUTE_CEILING_MS = 15 * 60_000
 # Bug fix (2026-09-14/15), per explicit instruction ("надежный рубильник",
 # then "Кнопка стоп это абсолютный рубильник... Сразу по нажатии"):
 # confirmed live, twice, that a user-initiated Stop could leave a turn
@@ -970,6 +983,8 @@ class ChatSession:
         # = False, so construction doesn't trigger a premature status
         # publish before start() has even run.
         self._turn_pending = False
+        self.turn_pending_since: float | None = None
+        self._last_known_funds_exhausted_reason: str | None = None
         self.pending_user_text: str | None = None
         self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
@@ -1320,11 +1335,36 @@ class ChatSession:
             return
         log_event("engine", "turn_pending_changed", tab_id=self.tab_id, prev=self._turn_pending, new=value)
         self._turn_pending = value
+        # Bug fix (2026-09-16), per explicit instruction: _check_hang's
+        # process-activity signal (2026-09-15) has no absolute ceiling of
+        # its own -- a process that keeps showing SOME CPU/RSS/IO movement
+        # at least once every <90s (its own periodic retries, background
+        # chatter, anything) is "alive" by that definition forever, no
+        # matter how long the actual turn has gone unanswered. Confirmed
+        # live: a real turn sat pending for 15.5 minutes with hang_count
+        # staying at 0 the entire time. This timestamp -- when the CURRENT
+        # turn actually started, independent of the activity signal -- is
+        # what lets _check_hang enforce a hard ceiling on top of it.
+        self.turn_pending_since = time.monotonic() if value else None
         # Every one of the ~9 places in this file that flips turn_pending
         # now republishes status automatically -- no call site has to
         # remember to do it itself (that "remember to do it everywhere"
         # pattern is exactly what produced tonight's whole run of bugs).
         asyncio.create_task(self._publish_status())
+
+    def _check_funds_exhaustion_status(self) -> None:
+        """Per explicit instruction (2026-09-16): sw_api.py's exhaustion
+        flag is set/cleared as a side effect of whatever REAL call
+        happened to notice it (a narration tick, a translation, ...) --
+        nothing proactively tells THIS tab's own status bar when it
+        changes on its own. Polled once per watchdog tick (cheap, no
+        network call -- just reads a module-level string) so a change
+        reaches the status bar within one tick either direction, not only
+        the next time something else happens to trigger a republish."""
+        current = get_funds_exhausted_reason()
+        if current != self._last_known_funds_exhausted_reason:
+            self._last_known_funds_exhausted_reason = current
+            asyncio.create_task(self._publish_status())
 
     def _compute_public_status(self) -> tuple[str, str]:
         kind = self.conn_state.get("kind")
@@ -1333,9 +1373,23 @@ class ChatSession:
             return "error", reason
         if kind in ("restarting", "restart_backoff", "limited"):
             return "recovering", reason
+        # Bug fix (2026-09-16), per explicit instruction: "при исчерпании
+        # баланса на клоде или опенроутере эта информация явно
+        # прокидывалась в кэролайн и высвечивалась на статус-баре" -- see
+        # sw_api.get_funds_exhausted_reason's own comment for how this is
+        # detected. Deliberately NOT surfaced as "error" here (unlike
+        # Claude's own billing_blocked above) -- an exhausted SquirrelWisdom/
+        # OpenRouter balance doesn't block a tab using its own Claude
+        # subscription at all, only narration/translation/consult/SW-mode
+        # chat, which is why this rides along as extra reason text on
+        # ready/working instead of overriding the actual state.
+        funds_note = ""
+        funds_reason = get_funds_exhausted_reason()
+        if funds_reason:
+            funds_note = f"SquirrelWisdom/OpenRouter balance exhausted -- narration/translation/SW features are down until it's topped up ({funds_reason})"
         if self.turn_pending:
-            return "working", ""
-        return "ready", ""
+            return "working", funds_note
+        return "ready", funds_note
 
     async def _publish_status(self) -> None:
         state, reason = self._compute_public_status()
@@ -2163,6 +2217,7 @@ class ChatSession:
                     self._check_user_wait_nudge()
                     await self._check_progress_narration()
                     self._check_forced_compaction()
+                    self._check_funds_exhaustion_status()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 -- must log, never let this tick die silently
@@ -2594,12 +2649,30 @@ class ChatSession:
                 HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS if tool_in_flight
                 else (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS)
             ) / 1000
+        # Bug fix (2026-09-16), per explicit instruction: hard backstop on
+        # top of the activity signal -- see HANG_ABSOLUTE_CEILING_MS's own
+        # comment for the incident (a real turn stuck 15.5 minutes,
+        # hang_count never left 0 because the process kept showing just
+        # enough activity to look "alive" every tick). Checked against
+        # turn_pending_since (when THIS turn actually started), not the
+        # activity clock -- entirely independent axis.
+        turn_elapsed_s = (time.monotonic() - self.turn_pending_since) if self.turn_pending_since is not None else 0.0
+        past_absolute_ceiling = turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
         log_event(
             "engine", "check_hang_tick", tab_id=self.tab_id, turn_pending=self.turn_pending,
             last_activity_s=round(elapsed, 1), hang_count=self.hang_count,
             hang_interrupted_at=self.hang_interrupted_at, has_seen_init=self.has_seen_init,
             effective_timeout_s=effective_timeout_s, signal_source=signal_source,
             tool_in_flight=tool_in_flight, tool_in_flight_name=self.last_tool_use_name if tool_in_flight else None,
+            turn_elapsed_s=round(turn_elapsed_s, 1), past_absolute_ceiling=past_absolute_ceiling,
+            # Bug fix (2026-09-16): raw numbers behind the activity
+            # boolean, not just the final verdict -- see ProcessActivity
+            # Monitor's own comment for the incident this closes (no way
+            # to tell from the log alone WHY a process kept looking
+            # "active").
+            monitor_cpu_percent=monitor.last_cpu_percent if monitor is not None else None,
+            monitor_rss_delta=monitor.last_rss_delta if monitor is not None else None,
+            monitor_io_delta=monitor.last_io_delta if monitor is not None else None,
         )
         if not self.turn_pending and self.has_seen_init:
             self.hang_interrupted_at = None
@@ -2634,8 +2707,16 @@ class ChatSession:
             return
 
         # --- Phase 1: not yet interrupted -- is THIS tick a fresh hang? ----
-        if elapsed < effective_timeout_s:
+        # past_absolute_ceiling (computed above) can force this even while
+        # the activity signal alone says "still alive" -- see
+        # HANG_ABSOLUTE_CEILING_MS's own comment.
+        if elapsed < effective_timeout_s and not past_absolute_ceiling:
             return
+        if past_absolute_ceiling and elapsed < effective_timeout_s:
+            log_event(
+                "engine", "hang_absolute_ceiling_override", tab_id=self.tab_id,
+                turn_elapsed_s=round(turn_elapsed_s, 1), signal_source=signal_source,
+            )
 
         self.hang_count += 1
         # Bug fix (2026-09-10): capture what was actually running, before

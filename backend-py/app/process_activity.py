@@ -71,6 +71,15 @@ class ProcessActivityMonitor:
         self._io_supported = True
         self._last_activity_at = time.monotonic()
         self._available = True
+        # Bug fix (2026-09-16), confirmed live: a real incident (a turn
+        # genuinely stuck 15+ minutes, hang-detection never fired) left
+        # nothing in the log to say WHY the monitor kept calling the
+        # process "active" -- only the final boolean was ever logged, not
+        # the raw numbers that produced it. Exposed here so
+        # ChatSession._check_hang can log them every tick.
+        self.last_cpu_percent: float | None = None
+        self.last_rss_delta: int | None = None
+        self.last_io_delta: int | None = None
         try:
             self._process = psutil.Process(pid)
             # Prime cpu_percent() -- psutil's own documented contract: the
@@ -117,14 +126,16 @@ class ProcessActivityMonitor:
             self._available = False
             return True
         io_bytes = self._read_io_bytes()
+        rss_delta = abs(mem - self._last_rss) if self._last_rss is not None else None
+        io_delta = (io_bytes - self._last_io_bytes) if (io_bytes is not None and self._last_io_bytes is not None) else None
         active = (
             cpu >= CPU_ACTIVITY_THRESHOLD_PERCENT
-            or (self._last_rss is not None and abs(mem - self._last_rss) >= MEMORY_ACTIVITY_THRESHOLD_BYTES)
-            or (
-                io_bytes is not None and self._last_io_bytes is not None
-                and io_bytes - self._last_io_bytes >= IO_ACTIVITY_THRESHOLD_BYTES
-            )
+            or (rss_delta is not None and rss_delta >= MEMORY_ACTIVITY_THRESHOLD_BYTES)
+            or (io_delta is not None and io_delta >= IO_ACTIVITY_THRESHOLD_BYTES)
         )
+        self.last_cpu_percent = cpu
+        self.last_rss_delta = rss_delta
+        self.last_io_delta = io_delta
         self._last_rss = mem
         if io_bytes is not None:
             self._last_io_bytes = io_bytes

@@ -15,7 +15,12 @@ reads or writes them itself.
 
 Every command still requires a Camerlengo session (`auth: user_role`) --
 that identifies the CALLER for abuse-prevention/logging, unrelated to
-which mailbox credentials are being operated on.
+which mailbox credentials are being operated on. One exception, confirmed
+live 2026-09-16: email_send's own email:send command predates the rest of
+this file (the newer multi-account IMAP surface added 2026-09-09) and is
+still on the OLDER `auth: scope` model, grouped with sms:send -- it needs
+EMAIL_SERVICE_KEY passed alongside session, not session alone. See
+EMAIL_SERVICE_KEY's own comment for the incident this fixes.
 
 Bug fix (2026-09-10): a real send failed 3/3 tries with a confusing SMTP/TLS
 error. Root cause: Camerlengo silently reused the IMAP host as the SMTP host
@@ -45,6 +50,25 @@ from app.plugins.sw_api import SessionManager, call_v2
 from app.policies import read_content_not_headers_instruction
 
 _sessions = SessionManager()
+
+# Bug fix (2026-09-16), confirmed live ("Что за ошибка revoked key?"):
+# email:send (unlike the rest of this file's email:* commands) is one of
+# the ORIGINAL, pre-existing Camerlengo email commands (grouped with
+# sms:send under `auth: scope` in reforce's own docs/api/commands.md, NOT
+# the newer `auth: user_role` multi-account IMAP surface added 2026-09-09
+# that every other function below actually uses) -- it needs a scoped
+# service key IN ADDITION TO session, the same shape sms_plugin.py's own
+# SMS_SERVICE_KEY already provides for sms:send. This file never sent one
+# at all (confirmed via git history: email:send was written fresh
+# directly in this Python port, never carried over from anywhere that
+# already had a key) -- every single send was failing unconditionally,
+# for every mailbox, with Camerlengo's own generic "Missing, unknown,
+# expired or revoked key" error (matches "missing" here, not an actual
+# revocation). Granted a real email:send scope to the existing
+# "caroline-email-provisioning" key (reforce's key_scopes table, id 20 --
+# previously scoped only to email:create) rather than mint a whole new
+# credential for the same feature area.
+EMAIL_SERVICE_KEY = "SVdTcM0PwAm1qmZD-ucFUqHpcEiClVGTuJXdHbOEajg"
 
 _ACCOUNT_PARAM_NOTE = (
     " Look up this mailbox's saved credentials first (see this plugin's own usage instructions) -- "
@@ -154,7 +178,8 @@ async def email_download_attachment(args: dict[str, Any], _rp: Any) -> dict[str,
 async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         extra: dict[str, Any] = {
-            "session": session, "to": args["to"], "subject": args["subject"], "text": args.get("text") or "",
+            "key": EMAIL_SERVICE_KEY, "session": session, "to": args["to"], "subject": args["subject"],
+            "text": args.get("text") or "",
         }
         if args.get("address"):
             extra.update(_creds_kwargs(args))
