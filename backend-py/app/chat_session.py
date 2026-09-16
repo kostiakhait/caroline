@@ -667,7 +667,9 @@ def _usable_dialogue_lines(entries: list[dict[str, Any]], min_ts_ms: float | Non
     return out
 
 
-def _read_recent_dialogue_lines(session_id: str | None, tab_id: str, workspace_dir: str, limit: int) -> list[str]:
+def _read_recent_dialogue_lines(
+    session_id: str | None, tab_id: str, workspace_dir: str, limit: int, min_ts_ms: float | None = None,
+) -> list[str]:
     """Bug fix (2026-09-10): the real, single source of "what the user
     actually saw" -- replaces two independently-maintained readers
     (refresh_language_in_background's own hand-rolled block walker, and
@@ -682,19 +684,29 @@ def _read_recent_dialogue_lines(session_id: str | None, tab_id: str, workspace_d
     sampling was itself part of the problem. Falls back to this tab's own
     continuity-archive file (the pre-compaction transcript the PreCompact
     hook saved, per-tab, never shared) when the live session file alone is
-    too thin, e.g. right after a native auto-compaction."""
+    too thin, e.g. right after a native auto-compaction.
+
+    Bug fix (2026-09-16), per explicit instruction: "нарратор должен
+    комментировать только текущую задачу, а не весь предыдущий диалог" --
+    min_ts_ms (was already accepted by _usable_dialogue_lines itself, just
+    never threaded through this wrapper) lets a caller exclude anything
+    from BEFORE a given wall-clock cutoff -- see
+    _gather_recent_dialogue_for_narration's own use of this, passing the
+    current real user turn's own start time, so an old already-finished
+    task never bleeds into what the narrator reacts to. None (the
+    default) keeps every other caller's existing behavior unchanged."""
     lines: list[str] = []
     if session_id:
         path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
         try:
-            lines = _usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)))
+            lines = _usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)), min_ts_ms)
         except Exception as exc:
             log_event("engine", "recent_dialogue_read_failed", tab_id=tab_id, error=str(exc))
     if len(lines) < limit:
         archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
         if archive_path:
             try:
-                lines = _usable_dialogue_lines(read_archived_entries(archive_path)) + lines
+                lines = _usable_dialogue_lines(read_archived_entries(archive_path), min_ts_ms) + lines
             except Exception as exc:
                 log_event("engine", "recent_dialogue_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
     return lines[-limit:]
@@ -1146,6 +1158,11 @@ class ChatSession:
         # only REAL user-typed messages (submit()'s is_real_user=True),
         # not proactive/reminder/retry turns
         self.last_real_user_turn_at: float | None = None
+        # Bug fix (2026-09-16): wall-clock (epoch-ms) twin of the monotonic
+        # field above -- see its own comment at the real submit() call
+        # site for why a separate one is needed (transcript timestamps on
+        # disk are wall-clock, not process-uptime-relative).
+        self.last_real_user_turn_started_at_ms: float | None = None
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
 
@@ -1459,6 +1476,16 @@ class ChatSession:
         if is_real_user:
             self.last_user_activity = time.monotonic()
             self.last_real_user_turn_at = time.monotonic()
+            # Bug fix (2026-09-16), per explicit instruction: "нарратор
+            # должен комментировать только текущую задачу" -- last_real_
+            # user_turn_at above is monotonic (process-uptime-relative),
+            # not comparable to the transcript's own wall-clock
+            # timestamps. This is the SAME moment, in wall-clock epoch-ms,
+            # so _gather_recent_dialogue_for_narration can use it as a
+            # floor -- excluding anything left over from a previous,
+            # already-finished task instead of a blind last-N-lines window
+            # that doesn't know where the current task actually started.
+            self.last_real_user_turn_started_at_ms = time.time() * 1000
             self.real_user_turn_answered = False
             self.silence_nudge_sent_for_turn = False
             self.last_visible_output_at = time.monotonic()
@@ -1553,6 +1580,7 @@ class ChatSession:
         self.last_activity = time.monotonic()
         self.last_user_activity = time.monotonic()
         self.last_real_user_turn_at = time.monotonic()
+        self.last_real_user_turn_started_at_ms = time.time() * 1000
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
         self.last_visible_output_at = time.monotonic()
@@ -2251,7 +2279,19 @@ class ChatSession:
         if self.small_model_active and self.small_model_live_dialogue:
             return "\n".join(self.small_model_live_dialogue[-limit:])
 
-        lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, limit)
+        # Bug fix (2026-09-16), per explicit instruction: "нарратор должен
+        # комментировать только текущую задачу, а не весь предыдущий
+        # диалог" -- bounded to the CURRENT real user turn's own start
+        # (see last_real_user_turn_started_at_ms's own comment), not just
+        # a blind last-`limit`-lines window that could still reach back
+        # into an earlier, already-finished task if the current one hasn't
+        # produced `limit` lines of its own yet. None (no real user turn
+        # started yet this process lifetime) keeps the old unbounded
+        # behavior -- nothing to anchor to.
+        lines = _read_recent_dialogue_lines(
+            self.last_saved_session_id, self.tab_id, self.workspace_dir, limit,
+            min_ts_ms=self.last_real_user_turn_started_at_ms,
+        )
 
         # Bug fix (2026-09-15), per explicit instruction ("внимательно
         # смотри... почему он возвращает херню"): confirmed live -- a
