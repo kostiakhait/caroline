@@ -1007,7 +1007,15 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type")
-            log_event("ws", "message_received", tab_id=tab_id, msg_type=msg_type)
+            # Bug fix (2026-09-16), per explicit instruction ("поставь
+            # куда надо логи и сам их читай"): this log line never
+            # included WHICH control op arrived, only that "some
+            # control_request" did -- made it impossible to tell from the
+            # log alone whether e.g. chat_mode_get/persona_get/auth_status
+            # were ever actually reaching the backend (they weren't, for
+            # openSettings()'s whole batch, for days -- see chat.js's own
+            # fix for why). Cheap, always-useful visibility going forward.
+            log_event("ws", "message_received", tab_id=tab_id, msg_type=msg_type, op=data.get("op") if msg_type == "control_request" else None)
             if msg_type == "user_message":
                 session.submit_or_try_small_model(data.get("text", ""), data.get("attachments") or [], bool(data.get("voice")))
             elif msg_type == "interrupt":

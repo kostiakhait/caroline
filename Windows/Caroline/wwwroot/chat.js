@@ -31,6 +31,30 @@
       if (window.chrome?.webview) window.chrome.webview.postMessage({ type: "client_log", tabId, message: line });
     } catch { /* best-effort only -- logging itself must never break anything */ }
   }
+
+  // Bug fix (2026-09-16), per explicit instruction ("Логи ВЕЗДЕ добавь. Я
+  // не хочу слышать, что у тебя нет какой-то информации"): clog() itself
+  // has existed since 2026-09-10 specifically to get frontend diagnostics
+  // into caroline.log without needing live DevTools -- but confirmed live
+  // it was only ever WIRED into 3 narrow call sites (visual-mode playback,
+  // one stuck-turn watchdog) in this whole file, so it never actually
+  // fired for anything else (zero "chat.js[tab=" lines in the entire log
+  // history). These two handlers close the biggest remaining blind spot:
+  // ANY uncaught JS exception or unhandled promise rejection anywhere in
+  // this file now reaches caroline.log automatically, the same way a
+  // Python traceback already does on the backend side -- no more needing
+  // to ask for a DevTools screenshot to find out one happened at all.
+  window.addEventListener("error", (e) => {
+    clog(`UNCAUGHT ERROR: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}`, {
+      stack: e.error?.stack ? String(e.error.stack).slice(0, 2000) : undefined,
+    });
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const reason = e.reason;
+    clog(`UNHANDLED PROMISE REJECTION: ${reason?.message || String(reason)}`, {
+      stack: reason?.stack ? String(reason.stack).slice(0, 2000) : undefined,
+    });
+  });
   // Native/WPF-only setting (MainWindow.Topmost) -- the backend has no stake in it at
   // all, so it's read once, synchronously, from the query string MainWindow.xaml.cs
   // already stamps onto this page's own URL, same as port/tab above, rather than
@@ -1275,6 +1299,13 @@
       }
       pollChannelStatus();
       sendControl("visual_mode_get");
+      // Bug fix (2026-09-16): if Settings was already open (typically:
+      // opened during the ~20-30s window right after a backend restart,
+      // before this connection existed at all) its whole "load current
+      // state" batch never went out -- see refreshSettingsPanel's own
+      // comment. Self-heal on every successful (re)connect instead of
+      // requiring the user to notice and manually close/reopen the panel.
+      if (settingsOverlay.classList.contains("open")) refreshSettingsPanel();
       // See replayTranscript()/history.ts: an empty localStorage transcript
       // doesn't necessarily mean no history exists -- it might just be a
       // fresh origin (e.g. after the file:// -> https://caroline.local
@@ -1307,12 +1338,36 @@
     ws.addEventListener("message", (ev) => {
       let evt;
       try { evt = JSON.parse(ev.data); } catch { return; }
-      handleEvent(evt);
+      // Bug fix (2026-09-16), per explicit instruction ("Логи ВЕЗДЕ
+      // добавь"): an exception thrown while handling one specific WS
+      // message (a malformed/unexpected field shape, a null DOM
+      // reference, ...) used to propagate as a genuinely uncaught
+      // exception right out of this listener -- the window "error"
+      // handler above still catches it now, but with no idea WHICH
+      // message caused it. This gives that exact context (type/op)
+      // directly at the point of failure, which is far more useful for
+      // diagnosis than a bare stack trace alone.
+      try {
+        handleEvent(evt);
+      } catch (err) {
+        clog(`handleEvent THREW for type=${evt?.type} op=${evt?.op}: ${err?.message || err}`, {
+          stack: err?.stack ? String(err.stack).slice(0, 2000) : undefined,
+        });
+      }
     });
   }
 
   function sendControl(op, extra) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // Bug fix (2026-09-16): this used to silently do nothing -- exactly
+      // what made the Settings-panel-stuck-on-"Checking..." bug
+      // undiagnosable from logs alone (zero trace anywhere that any of
+      // these calls had even been attempted, let alone dropped). clog()
+      // uses the native WebView2 bridge, not this WebSocket, so it still
+      // reaches caroline.log even in the exact situation being reported.
+      clog(`sendControl DROPPED (socket not open, readyState=${ws ? ws.readyState : "no ws"}): op=${op}`);
+      return;
+    }
     ws.send(JSON.stringify({ type: "control_request", op, ...extra }));
   }
 
@@ -1484,6 +1539,19 @@
   }
 
   function handleControlResponse(evt) {
+    // Bug fix (2026-09-16), per explicit instruction ("Логи ВЕЗДЕ
+    // добавь"): a backend-reported failure (ok:false) only ever became
+    // visible to the USER for the handful of ops with their own explicit
+    // addBanner() call below -- most others (chat_mode_get, sw_status,
+    // auth_status, persona_get, ...) just parse evt.stdout directly with
+    // no ok check at all, so a failure silently produced the same "empty/
+    // default" UI state as never having asked in the first place, with
+    // nothing in caroline.log either way to tell the two apart. One
+    // catch-all here covers every current AND future op uniformly,
+    // instead of relying on each handler to remember its own check.
+    if (evt.ok === false) {
+      clog(`control_response FAILED: op=${evt.op} stderr=${evt.stderr || "(none)"}`);
+    }
     if (evt.op === "get_history") {
       if (evt.ok) {
         try {
@@ -1506,11 +1574,22 @@
         } catch { /* leave the chat empty rather than show garbage */ }
       }
     } else if (evt.op === "auth_status") {
+      // Bug fix (2026-09-16), per explicit instruction ("все время
+      // предлагается логин... но нигде не индицируется состояние уже
+      // существующих подписок"): authStatusText already correctly said
+      // "Logged in as ..." once its own bug (settings batch stuck on
+      // "Checking..." -- fixed separately) let it actually resolve, but
+      // "Log in to Claude" sat right next to it regardless, unconditionally,
+      // whether logged in or not -- nothing ever toggled it. Looks exactly
+      // like being asked to log in again even with a real, active
+      // subscription. Show only whichever button is actually actionable.
       try {
         const s = JSON.parse(evt.stdout || "{}");
         authStatusText.textContent = s.loggedIn
           ? `Logged in as ${s.email || "?"} (${s.subscriptionType || s.apiProvider || "unknown plan"})`
           : "Not logged in.";
+        loginBtn.style.display = s.loggedIn ? "none" : "";
+        logoutBtn.style.display = s.loggedIn ? "" : "none";
       } catch {
         authStatusText.textContent = evt.ok ? "Status unavailable." : (evt.stderr || "Error checking status.");
       }
@@ -1540,6 +1619,12 @@
       }
       renderSwUpsellHint();
     } else if (evt.op === "sw_status") {
+      // Bug fix (2026-09-16), same reasoning as auth_status above: "Log in
+      // / Register with SquirrelWisdom" showed unconditionally next to the
+      // status text, even for an account already logged in with a real
+      // balance -- swapped for "Top up" (only actually useful once logged
+      // in) so the two buttons together reflect current state instead of
+      // both always being offered regardless of it.
       try {
         const s = JSON.parse(evt.stdout || "{}");
         if (!s.loggedIn) {
@@ -1550,6 +1635,8 @@
           swAccountStatus.textContent = `Logged in as ${s.email}. Balance: ${s.balancePia} PIA.`;
         }
         lastSwLoggedIn = !!s.loggedIn;
+        swLoginBtn.style.display = s.loggedIn ? "none" : "";
+        swTopUpBtn.style.display = s.loggedIn ? "" : "none";
       } catch {
         swAccountStatus.textContent = "Status unavailable.";
         lastSwLoggedIn = null;
@@ -1722,10 +1809,22 @@
     if (!any) mcpListOutput.textContent = raw || "(no servers)";
   }
 
-  function openSettings() {
-    settingsOverlay.classList.add("open");
-    authLoginOutput.textContent = "";
-    authLoginOutput.style.display = "none";
+  // Bug fix (2026-09-16), confirmed live via caroline.log ("поставь куда
+  // надо логи и сам их читай"): this whole batch is fired exactly ONCE,
+  // at the moment Settings is opened -- sendControl() silently no-ops
+  // (`if (!ws || ws.readyState !== WebSocket.OPEN) return;`) if the
+  // socket isn't open THAT INSTANT, with no error, no retry, nothing.
+  // Confirmed backend-side: zero of these nine ops were ever received
+  // for 6+ days across many restarts, while the WS's own reconnect log
+  // shows a real ~20-30s window after every backend (re)start where it's
+  // genuinely not open yet (matching init_received's own elapsed_ms).
+  // Anyone opening Settings during that window got every field stuck on
+  // its static "Checking.../Loading..." placeholder forever -- nothing
+  // ever re-requested it once the connection actually came up. Extracted
+  // so the SAME batch can be re-fired from the WS "open" handler below
+  // whenever Settings happens to already be open at (re)connect time,
+  // not just at the original click.
+  function refreshSettingsPanel() {
     sendControl("auth_status");
     sendControl("mcp_list");
     sendControl("persona_get");
@@ -1736,6 +1835,13 @@
     sendControl("own_anthropic_key_get");
     sendControl("ratatosk_status_get");
     sendControl("sms_account_get");
+  }
+
+  function openSettings() {
+    settingsOverlay.classList.add("open");
+    authLoginOutput.textContent = "";
+    authLoginOutput.style.display = "none";
+    refreshSettingsPanel();
   }
 
   ratatoskRegisterBtn.addEventListener("click", () => {
