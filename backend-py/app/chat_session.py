@@ -964,6 +964,30 @@ _DISALLOWED_CAROLINE_BROWSER_TOOLS = [
 ]
 
 
+def clear_tab_disk_state(workspace_dir: str, tab_id: str) -> None:
+    """Per explicit instruction (2026-09-17): the on-disk half of a full,
+    deliberate, user-confirmed tab wipe (see ChatSession.clear_tab for the
+    in-memory/live-client half) -- deletes the real session transcript
+    file itself, not just the pointer to it (unlike
+    _reset_unrecoverable_session, which archives the old transcript and
+    keeps it reachable, this is a genuine delete with nothing kept). A
+    free function (not a ChatSession method) so main.py's control handler
+    can call it even when no live ChatSession exists yet for this tab
+    (the tab was never opened this process lifetime) -- the durability
+    files are addressed by workspace_dir+tab_id alone, no live object
+    needed."""
+    old_session_id = load_tab_session_id(workspace_dir, tab_id)
+    if old_session_id:
+        try:
+            (claude_project_dir(workspace_dir) / f"{old_session_id}.jsonl").unlink(missing_ok=True)
+        except Exception as exc:
+            log_event("engine", "clear_tab_delete_session_file_failed", tab_id=tab_id, error=str(exc))
+    clear_tab_session_id(workspace_dir, tab_id)
+    clear_tab_continuity_archive(workspace_dir, tab_id)
+    clear_pending_turn(workspace_dir, tab_id)
+    log_event("engine", "clear_tab_disk_state_done", tab_id=tab_id, old_session_id=old_session_id)
+
+
 def _ensure_settings_file(workspace_dir: str) -> str:
     path = Path(workspace_dir) / _SETTINGS_FILE_NAME
     try:
@@ -2166,6 +2190,38 @@ class ChatSession:
         self.restart_for_unrecoverable_session = True
         if self.client:
             asyncio.create_task(self._safe_disconnect(self.client))
+
+    def clear_tab(self) -> None:
+        """Per explicit instruction (2026-09-17): a deliberate, user-
+        confirmed (via the frontend's own modal -- this method trusts
+        that already happened) full wipe of this tab's conversation.
+        Unlike _reset_unrecoverable_session (which archives the old
+        transcript and replays whatever was pending -- that reset is
+        involuntary/recovery, never meant to lose anything), this is a
+        genuine delete: no archive, no replay, nothing carried forward --
+        see clear_tab_disk_state for the on-disk half.
+
+        Stops/kills whatever's currently running first and unconditionally
+        forces the live client to reconnect (unlike stop(), which no-ops
+        when nothing's pending) -- an IDLE but still-connected client
+        holds the old conversation in its own process memory regardless
+        of what the on-disk file says, so leaving it alone would silently
+        undo the clear the moment the user sent a new message."""
+        log_event("engine", "clear_tab", tab_id=self.tab_id)
+        clear_tab_disk_state(self.workspace_dir, self.tab_id)
+        self.last_saved_session_id = None
+        self.pending_user_text = None
+        self.pending_attachments = []
+        self.pending_is_real_user = False
+        self.restart_pending = True
+        if self.small_model_active:
+            if self._small_model_task is not None:
+                self._small_model_task.cancel()
+        elif self.client:
+            asyncio.create_task(self._force_stop_client())
+        cancelled = REGISTRY.cancel_for_tab(self.tab_id)
+        if cancelled:
+            log_event("engine", "clear_tab_cancelled_operations", tab_id=self.tab_id, count=cancelled)
 
     async def _pre_compact_hook(self, hook_input: Any, tool_use_id: Any, context: Any) -> dict[str, Any]:
         """Fires just before Claude's own compaction summarises older turns

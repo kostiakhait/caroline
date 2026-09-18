@@ -24,7 +24,22 @@
   <div class="header">
     <div class="header-title">Caroline</div>
     <div class="header-right">
+      <button id="clearChatBtn" class="icon-btn" title="Clear conversation">🗑</button>
       <button id="settingsBtn" class="icon-btn" title="Settings">⚙</button>
+    </div>
+  </div>
+
+  <!-- Bug fix (2026-09-17), per explicit instruction: a full tab wipe is
+       destructive and irreversible -- confirm via a real modal before it
+       ever reaches the backend, not just an immediate click-to-delete. -->
+  <div class="confirm-overlay" id="clearConfirmOverlay">
+    <div class="confirm-modal">
+      <div class="confirm-title">Clear this conversation?</div>
+      <div class="confirm-body">This permanently deletes the entire chat history for this tab, on this device and on the server. This cannot be undone.</div>
+      <div class="confirm-actions">
+        <button id="clearConfirmCancelBtn" class="secondary">Cancel</button>
+        <button id="clearConfirmOkBtn" class="danger">Clear</button>
+      </div>
     </div>
   </div>
 

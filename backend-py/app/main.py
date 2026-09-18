@@ -20,7 +20,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, current_language_name, refresh_language_in_background
+from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, auth_status as cli_auth_status, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
@@ -634,6 +634,20 @@ async def handle_control_request(
             }
         save_chat_mode(WORKSPACE_DIR, tab_id, requested_mode)
         log_event("engine", "chat_mode_set", tab_id=tab_id, mode=requested_mode)
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "clear_tab":
+        # Bug fix (2026-09-17), per explicit instruction: a full, deliberate
+        # tab wipe -- the frontend's own confirm modal already gated this
+        # before it ever reached here. session may be None (this tab was
+        # never opened this process lifetime) -- the on-disk half doesn't
+        # need a live ChatSession at all; only the in-memory/live-client
+        # half (an idle-but-connected client still holding the old
+        # conversation in its own process memory) does.
+        tab_id = session.tab_id if session is not None else PRIMARY_TAB_ID
+        if session is not None:
+            session.clear_tab()
+        else:
+            clear_tab_disk_state(WORKSPACE_DIR, tab_id)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "own_anthropic_key_get":
         key = get_own_anthropic_api_key(WORKSPACE_DIR)

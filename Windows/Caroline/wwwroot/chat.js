@@ -68,6 +68,11 @@
   const sendBtn = document.getElementById("sendBtn");
   const stopBtn = document.getElementById("stopBtn");
 
+  const clearChatBtn = document.getElementById("clearChatBtn");
+  const clearConfirmOverlay = document.getElementById("clearConfirmOverlay");
+  const clearConfirmCancelBtn = document.getElementById("clearConfirmCancelBtn");
+  const clearConfirmOkBtn = document.getElementById("clearConfirmOkBtn");
+
   const settingsBtn = document.getElementById("settingsBtn");
   const closeSettingsBtn = document.getElementById("closeSettingsBtn");
   const settingsOverlay = document.getElementById("settingsOverlay");
@@ -1664,6 +1669,13 @@
     } else if (evt.op === "chat_mode_set") {
       if (!evt.ok) addBanner(`Could not change chat mode: ${evt.stderr || "unknown error"}`);
       sendControl("chat_mode_get");
+    } else if (evt.op === "clear_tab") {
+      if (evt.ok) {
+        clearLocalTranscript();
+        setStatusBarText("Conversation cleared.", 3000);
+      } else {
+        addBanner(`Could not clear this conversation: ${evt.stderr || "unknown error"}`);
+      }
     } else if (evt.op === "ratatosk_status_get") {
       try {
         const s = JSON.parse(evt.stdout || "{}");
@@ -1926,6 +1938,30 @@
   settingsOverlay.addEventListener("click", (e) => {
     if (e.target === settingsOverlay) closeSettings();
   });
+
+  // Bug fix (2026-09-17), per explicit instruction ("подтверждение
+  // стилизованной модалкой"): the confirm modal is the ONLY thing that can
+  // trigger clear_tab -- the button itself just opens it.
+  clearChatBtn.addEventListener("click", () => clearConfirmOverlay.classList.add("open"));
+  clearConfirmCancelBtn.addEventListener("click", () => clearConfirmOverlay.classList.remove("open"));
+  clearConfirmOverlay.addEventListener("click", (e) => {
+    if (e.target === clearConfirmOverlay) clearConfirmOverlay.classList.remove("open");
+  });
+  clearConfirmOkBtn.addEventListener("click", () => {
+    clearConfirmOverlay.classList.remove("open");
+    sendControl("clear_tab");
+  });
+
+  // Wipes this tab's own local copy -- the backend's own side (the real
+  // session file, durability pointers) is cleared server-side by
+  // clear_tab's own handler; this only needs to happen once the backend
+  // confirms it actually succeeded (see the "clear_tab" branch in
+  // handleControlResponse below), not optimistically before that.
+  function clearLocalTranscript() {
+    try { localStorage.removeItem(TRANSCRIPT_KEY); } catch { /* private mode/quota -- nothing to clear then anyway */ }
+    messagesEl.innerHTML = "";
+    turnQueue = [];
+  }
 
   loginBtn.addEventListener("click", () => {
     authLoginOutput.textContent = "";
