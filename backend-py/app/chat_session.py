@@ -2645,9 +2645,21 @@ class ChatSession:
 
         Sets _awaiting_post_turn_check_reply so THIS check's own reply
         (submitted via inject_proactive, always is_real_user=False) can't
-        chain into firing the proactive-empty branch above again on itself
-        -- fires at most once per originating turn, never an infinite loop
-        of self-nudges even if the reply is ALSO empty.
+        chain into firing the proactive-empty branch above again ON ITSELF
+        if that reply comes back genuinely empty -- never an infinite tight
+        loop of a check chasing its own silence.
+
+        Bug fix (2026-09-18), per a real live incident: this flag used to
+        ALSO suppress a re-check when the reply was NOT empty -- confirmed
+        live, a check's reply turned into a whole further round of real
+        work (tool calls, real visible text) that then ALSO ended mid-task,
+        and nothing ever checked it again, leaving the tab silently stuck
+        until the user manually nudged it. A reply with real visible
+        content is evidence of genuine continued work, not a final answer
+        -- it gets re-armed for another check right alongside a real user
+        turn (see the call site), so a genuinely multi-step task keeps
+        getting checked round after round until it's either actually done
+        or truly falls silent, not just once per originating turn.
 
         Still asks the model directly rather than trusting our own
         bookkeeping (confirmed live that bookkeeping alone can be wrong --
@@ -3429,7 +3441,34 @@ class ChatSession:
                             # actually done -- see _fire_post_turn_completion_
                             # check's own doc comment for why this replaced a
                             # periodic timer instead.
-                            if was_real_user_turn:
+                            #
+                            # Bug fix (2026-09-18), per a real live incident:
+                            # was_awaiting_post_turn_check_reply used to
+                            # blanket-suppress EVERY completion that followed
+                            # a check's own nudge, no matter what that
+                            # completion actually contained -- confirmed live
+                            # on a real multi-step task (checking a grant
+                            # budget file for a typo): the check fired once,
+                            # the nudge's reply turned into a whole further
+                            # round of real work (multiple tool calls, real
+                            # visible text: "Нашла реальную проблему...
+                            # Ищу, где именно."), and THAT round then also
+                            # ended mid-task with no further text -- but
+                            # since it was "the check's reply", the guard
+                            # blocked any further check forever, leaving the
+                            # tab silently stuck until the user manually
+                            # typed "и?" two minutes later to push it along.
+                            # The guard's actual purpose (per its own
+                            # original comment below) was only ever to stop
+                            # an INFINITE TIGHT LOOP of a check chasing its
+                            # own GENUINELY EMPTY reply -- a reply that did
+                            # real, visible work is exactly the case that
+                            # still needs checking again, same as a fresh
+                            # real user turn. Re-arm on it, right alongside
+                            # was_real_user_turn; still suppressed for a
+                            # check-reply that came back with nothing at all
+                            # (the elif below, unchanged for that case).
+                            if was_real_user_turn or (was_awaiting_post_turn_check_reply and self.turn_saw_any_visible_text):
                                 self._fire_post_turn_completion_check()
                             elif not was_awaiting_post_turn_check_reply and not self.turn_saw_any_visible_text:
                                 # Per explicit instruction (2026-09-13), after a
@@ -3442,11 +3481,11 @@ class ChatSession:
                                 # via a real NO_UPDATE text block (which DOES
                                 # count as "visible" here, see turn_saw_any_
                                 # visible_text's own comment) -- this only fires
-                                # for the genuinely-empty case, and the
-                                # was_awaiting_post_turn_check_reply guard means
-                                # it can fire at most once per originating turn,
-                                # never chain into itself if its own reply is
-                                # ALSO empty.
+                                # for the genuinely-empty case; a check-reply
+                                # that's ALSO genuinely empty stops here (see
+                                # the branch above for the non-empty case),
+                                # never chaining into an infinite tight loop of
+                                # a check chasing its own silence.
                                 log_event("engine", "post_turn_completion_check_proactive_empty", tab_id=self.tab_id)
                                 self._fire_post_turn_completion_check()
                         self.classifier_refusal_retry_count = 0
