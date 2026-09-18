@@ -59,7 +59,27 @@ class TabsViewModel(private val repository: CamerlengoRepository = CamerlengoRep
             error = null
         } catch (exc: Exception) {
             Logger.e("TabsViewModel refresh failed", exc)
-            error = exc.message ?: "Couldn't load tabs."
+            // Bug fix (2026-09-16), confirmed live: this used to
+            // unconditionally set `error` on ANY failed poll -- and
+            // CompanionTabsScreen renders a non-null error as a full-screen
+            // replacement for the tabs+ChatScreen branch, tearing ChatScreen
+            // completely out of composition on a single transient hiccup
+            // (one flaky network tick out of many). That silently destroyed
+            // every bit of ChatScreen's own local state, including an
+            // in-flight attachment-picker registration -- confirmed live:
+            // picking a file, then a routine 3s poll failing while the
+            // system picker was still open, orphaned the pick entirely with
+            // no error shown to the user, because the NEW ChatScreen
+            // instance that replaced the old one never called
+            // attachmentPicker.launch() itself. Once we have a real tabs
+            // list, a refresh failure is background noise -- log it, keep
+            // showing the last known list (same "best-effort, keep last
+            // value" pattern ChatViewModel.refreshStatus() already uses).
+            // Only surface the error screen when there's nothing to fall
+            // back to yet (the very first load).
+            if (tabs.isEmpty()) {
+                error = exc.message ?: "Couldn't load tabs."
+            }
         } finally {
             isLoading = false
         }
