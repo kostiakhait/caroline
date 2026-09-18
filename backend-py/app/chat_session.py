@@ -2825,8 +2825,33 @@ class ChatSession:
         queued = self.compaction_queued_turns
         self.compaction_queued_turns = []
         log_event("engine", "compaction_queue_drained", tab_id=self.tab_id, count=len(queued))
+        had_real_user_turn = any(item["is_real_user"] for item in queued)
         for item in queued:
             self.submit(item["text"], item["attachments"], item["is_real_user"], item["is_voice"])
+        if had_real_user_turn:
+            # Per explicit instruction (2026-09-18), after a real incident:
+            # a real user message got queued behind compaction and the
+            # reply that followed falsely claimed the message itself "got
+            # cut off" -- context had just been summarized right as it
+            # arrived. recent_dialogue_history_instruction (policies.py,
+            # always in the system prompt, unaffected by compaction -- it
+            # summarizes conversation turns, not the system prompt) already
+            # covers this in general, but an explicit, in-the-moment
+            # reminder right here is more reliable than trusting the model
+            # to recall a general standing rule at exactly the one moment
+            # it matters most. Queued AFTER the real message(s) above, not
+            # merged into their own text (last_real_user_question/
+            # pending_user_text must stay the user's actual clean words).
+            lang = current_language_name(self.tab_id)
+            self.submit(
+                "[Internal: a forced compaction just finished right as the user's message above arrived -- your "
+                "context just got summarized, so some detail may not obviously still be there. Before asking the "
+                "user to re-explain anything or claiming their message was incomplete/cut off, check your recent "
+                "dialogue history file (the path is in your system prompt, refreshed independently of compaction) "
+                f"first -- it still has the real recent back-and-forth. Then answer their actual message normally. "
+                f"Reply in {lang}. Don't mention this note itself.]",
+                [], False, False,
+            )
 
     async def _check_hang(self) -> None:
         # Bug fix (2026-09-15), per explicit instruction: "Это должно быть
@@ -3144,6 +3169,26 @@ class ChatSession:
                 resume_session_id = self._resolve_resume_session_id()
                 if resume_session_id:
                     self.last_saved_session_id = resume_session_id
+                    # Bug fix (2026-09-18), confirmed live: _recent_24h_
+                    # dialogue_file_path used to only ever get (re)written
+                    # inside submit()'s real-user branch -- meaning the
+                    # VERY FIRST turn of a freshly (re)built session (the
+                    # resumed-unfinished-turn injection included, which is
+                    # is_real_user=False and so never reaches that branch
+                    # at all) had recent_dialogue_history_instruction
+                    # return "" -- no safety net whatsoever right when a
+                    # restart makes Caroline most likely to have lost track
+                    # of what she was doing. Confirmed live: exactly this
+                    # produced a real incident where a resumed task's own
+                    # details had to be re-explained by the user because
+                    # nothing pointed her at where to look. Populate it
+                    # here too, proactively, on every fresh session build --
+                    # not conditional on a real submit() having happened
+                    # yet this process lifetime.
+                    try:
+                        self._recent_24h_dialogue_file_path = _write_recent_24h_dialogue_file(self.last_saved_session_id, self.tab_id, self.workspace_dir)
+                    except Exception as exc:
+                        log_event("engine", "recent_24h_dialogue_file_refresh_failed", tab_id=self.tab_id, error=str(exc))
 
                 mcp_servers = build_mcp_servers()
                 self._system_prompt_language = current_language_name(self.tab_id)

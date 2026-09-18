@@ -306,10 +306,16 @@ def recent_dialogue_history_instruction(file_path: str | None) -> str:
         "Additional material, on top of your own memory of this conversation: the real back-and-forth between "
         f"you and this specific user over the last 24 hours (their words and yours, internal/service messages "
         f"already filtered out) is kept at {file_path}, refreshed right before every message they send you. "
-        "Before asking the user to re-explain a task, re-state context, or clarify something you feel unsure "
-        "about, check this file first -- do NOT ask them again if the file already makes clear what's being "
-        "discussed; act on it directly instead. Only ask the user if this file genuinely doesn't cover it "
-        "either."
+        "This is MANDATORY, not optional, and applies with extra force right after any restart/reconnect, when "
+        "the conversation can look deceptively like it just started even though it didn't: before EVER asking "
+        "the user to re-explain a task, re-state context, remind you what \"it\"/\"the task\"/\"the thing we "
+        "discussed\" refers to, or clarify something you feel unsure about -- read this file FIRST, every "
+        "single time, no exceptions for how obvious or minor the question feels. If the user says something "
+        "like \"you have a task\", \"do you remember\", \"look at what I sent\", or refers back to something "
+        "without repeating it, that is your cue to go look, not to ask them to repeat it. Do NOT ask the user "
+        "to re-supply information that is already sitting in this file -- that reads as not having listened, "
+        "and it directly wastes their time when the answer was one read_file call away. Only ask the user if "
+        "you have actually checked this file and it genuinely doesn't cover it."
     )
 
 
