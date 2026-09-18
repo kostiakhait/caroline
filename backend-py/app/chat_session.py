@@ -1123,6 +1123,21 @@ class ChatSession:
         # hang_interrupt_result_pending/ignore_next_result_recovery -- see
         # result_is_fake's own computation in the message loop.
         self.forced_compaction_result_pending: bool = False
+        # Bug fix (2026-09-18), per explicit instruction after a real
+        # incident: a real user message submitted WHILE a forced compaction
+        # is still in flight for this tab used to race straight into the
+        # live client's input stream -- confirmed live, the CLI's own
+        # compact boundary landed BEFORE that message got processed, and
+        # the reply that eventually came back claimed the user's own
+        # phrase "got cut off" (it genuinely had -- the compacted context
+        # didn't include it). submit() now queues here instead of pushing
+        # to the client whenever forced_compaction_result_pending is True;
+        # _drain_compaction_queue() replays every queued item, in order,
+        # through the normal submit() path (so post_turn_completion_check/
+        # narration/durability all apply exactly as they would for a live
+        # submit -- nothing special-cased) the moment compaction actually
+        # finishes.
+        self.compaction_queued_turns: list[dict[str, Any]] = []
 
         # activity / hang tracking
         self.last_activity = time.monotonic()
@@ -1438,6 +1453,19 @@ class ChatSession:
         # subscription at all, only narration/translation/consult/SW-mode
         # chat, which is why this rides along as extra reason text on
         # ready/working instead of overriding the actual state.
+        # Per explicit instruction (2026-09-18): compaction must be visible
+        # on the status bar (the yellow "recovering" lamp, same as
+        # restarting/restart_backoff/limited above) -- previously silent,
+        # since forced compaction deliberately bypasses turn_pending
+        # entirely (see _check_forced_compaction's own docstring) and
+        # nothing else was publishing a status change for it. Checked
+        # before turn_pending: a real message submitted during compaction
+        # is now queued (see compaction_queued_turns), not pushed, so
+        # turn_pending itself stays False throughout -- this is the ONLY
+        # signal that would otherwise tell the user anything is happening.
+        if self.forced_compaction_result_pending:
+            queued_note = f" ({len(self.compaction_queued_turns)} message(s) queued)" if self.compaction_queued_turns else ""
+            return "recovering", f"Compacting conversation, one moment…{queued_note}"
         funds_note = ""
         funds_reason = get_funds_exhausted_reason()
         if funds_reason:
@@ -1472,6 +1500,25 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        # Bug fix (2026-09-18), per explicit instruction after a real
+        # incident: never push straight into the live client while a
+        # forced compaction is still in flight for this tab -- confirmed
+        # live that a real user message submitted mid-compaction raced
+        # the CLI's own compact boundary and came back as a reply claiming
+        # the user's own phrase "got cut off" (it genuinely had). Queue
+        # here instead; _drain_compaction_queue() replays every queued
+        # item, in order, through this exact same submit() once
+        # forced_compaction_result_pending goes back to False -- nothing
+        # about a queued item's own eventual handling is special-cased,
+        # it's a completely normal submit() just delayed.
+        if self.forced_compaction_result_pending:
+            log_event(
+                "engine", "submit_queued_during_compaction", tab_id=self.tab_id, is_real_user=is_real_user,
+                is_voice=is_voice, text_len=len(text), attachment_count=len(attachments),
+            )
+            self.compaction_queued_turns.append({"text": text, "attachments": attachments, "is_real_user": is_real_user, "is_voice": is_voice})
+            asyncio.create_task(self._publish_status())
+            return
         log_event(
             "engine", "submit", tab_id=self.tab_id, is_real_user=is_real_user, is_voice=is_voice,
             text_len=len(text), attachment_count=len(attachments),
@@ -1994,6 +2041,7 @@ class ChatSession:
             if self.forced_compaction_result_pending:
                 self.forced_compaction_result_pending = False
                 log_event("engine", "forced_compaction_result_pending_cleared_after_limit", tab_id=self.tab_id)
+                self._drain_compaction_queue()
         await self._publish_status()
 
     def _set_conn_state(self, kind: str, reason: str | None = None, arm_ignore_next_result: bool = False) -> None:
@@ -2754,7 +2802,31 @@ class ChatSession:
             context_tokens_at_trigger=self.last_known_context_tokens,
             context_tokens_baseline=self.tokens_at_last_forced_compaction,
         )
+        # Per explicit instruction (2026-09-18): this flag flipping is the
+        # ONLY thing that makes compaction visible on the status bar (see
+        # _compute_public_status) -- nothing else republishes status for
+        # it, since compaction deliberately never touches turn_pending
+        # (whose own setter is the usual auto-publish trigger).
+        asyncio.create_task(self._publish_status())
         self._push_internal_command("/compact")
+
+    def _drain_compaction_queue(self) -> None:
+        """Called right after forced_compaction_result_pending flips back
+        to False (both places: the normal ResultMessage consumption path,
+        and _apply_conn_state's own post-usage-cap-limit recovery edge
+        case) -- replays every submit() call that arrived while compaction
+        was still in flight, in the order they originally arrived, through
+        the exact same submit() they'd have gone through immediately if
+        compaction hadn't been running at all. See submit()'s own guard
+        and compaction_queued_turns' __init__ comment for the incident
+        this fixes."""
+        if not self.compaction_queued_turns:
+            return
+        queued = self.compaction_queued_turns
+        self.compaction_queued_turns = []
+        log_event("engine", "compaction_queue_drained", tab_id=self.tab_id, count=len(queued))
+        for item in queued:
+            self.submit(item["text"], item["attachments"], item["is_real_user"], item["is_voice"])
 
     async def _check_hang(self) -> None:
         # Bug fix (2026-09-15), per explicit instruction: "Это должно быть
@@ -3632,6 +3704,16 @@ class ChatSession:
                             if self.forced_compaction_result_pending:
                                 self.forced_compaction_result_pending = False
                                 log_event("engine", "forced_compaction_done", tab_id=self.tab_id, subtype=message.subtype)
+                                # Per explicit instruction (2026-09-18): the
+                                # status-bar yellow dot (_compute_public_
+                                # status) and anything else that treats
+                                # forced_compaction_result_pending as "still
+                                # compacting" needs to hear about this edge
+                                # THE MOMENT it happens, not whenever the
+                                # next unrelated turn_pending flip republishes
+                                # status -- compaction touches neither.
+                                asyncio.create_task(self._publish_status())
+                                self._drain_compaction_queue()
                             elif self.clear_tab_result_pending:
                                 self.clear_tab_result_pending = False
                                 log_event("engine", "clear_tab_result_discarded", tab_id=self.tab_id, subtype=message.subtype)

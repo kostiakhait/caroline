@@ -893,7 +893,25 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
     # Per explicit instruction: Caroline must never come back up silently.
     # Fires once per backend-process lifetime, tied to the primary tab.
-    if tab_id == PRIMARY_TAB_ID and not _has_greeted:
+    #
+    # Bug fix (2026-09-18), confirmed live: this used to fire UNCONDITIONALLY,
+    # even when the primary tab also has a real unfinished turn waiting to
+    # be resumed (the block right below this one) -- both got pushed into
+    # the same fresh session back to back, greeting first. Confirmed live:
+    # the model replied ONLY to the generic greeting ("Привет! Я на месте,
+    # всё работает -- готова заняться делами.") and never addressed the
+    # actual pending question at all ("Да, давай сделаем аккаунт на
+    # портале") -- from the user's side this looked exactly like the real
+    # message had been dropped/ignored on reconnect. The resumed-turn's own
+    # wrapper prompt (right below) already tells the model to "just answer
+    # normally, as if you had simply been quietly working on it the whole
+    # time" -- it already covers the "I'm back" framing on its own, so a
+    # separate generic greeting alongside it is redundant at best and
+    # actively harmful (a second, competing thing to reply to) at worst.
+    # Peeked here (read-only, see peek_pending_turn's own docstring) just to
+    # decide this -- the resume block below does its own full peek+consume
+    # right after, unaffected by this one being read-only.
+    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not peek_pending_turn(WORKSPACE_DIR, PRIMARY_TAB_ID):
         _has_greeted = True
 
         lang = current_language_name(PRIMARY_TAB_ID)
