@@ -1265,6 +1265,20 @@ class ChatSession:
         # query down and rebuild it cleanly next _run_loop iteration" signal
         # (auth-failure escalation, a settings/language change).
         self.restart_pending = False
+        # Bug fix (2026-09-18), confirmed live: clear_tab()'s own kill
+        # sometimes produces a normal, non-exceptional trailing
+        # ResultMessage (the CLI winds down gracefully instead of the
+        # connection just dying) -- without this, that ResultMessage was
+        # treated as a genuine turn completion, which fired _fire_post_
+        # turn_completion_check()'s "did you actually finish?" nudge
+        # against the now-EMPTY freshly-cleared session. The model had
+        # nothing to reference, produced SOME visible reply to it anyway,
+        # and that reply became the first thing shown in the "cleared"
+        # tab -- looking exactly like the clear had silently failed. Same
+        # result_is_fake shape as hang_interrupt_result_pending/
+        # forced_compaction_result_pending, one more reason a trailing
+        # ResultMessage must never be treated as real.
+        self.clear_tab_result_pending = False
         self.restart_for_unrecoverable_session = False
         self.unrecoverable_session_replay_text: str | None = None
         self.unrecoverable_session_replay_attachments: list[Any] = []
@@ -2214,6 +2228,28 @@ class ChatSession:
         self.pending_attachments = []
         self.pending_is_real_user = False
         self.restart_pending = True
+        # Bug fix (2026-09-18): the force-kill below can still surface as a
+        # normal, non-exceptional trailing ResultMessage rather than a dead
+        # connection -- without this flag that message was treated as a
+        # genuine turn completion, which fired the post-turn-completion
+        # "did you actually finish?" nudge against the now-EMPTY,
+        # freshly-cleared session, producing a confusing reply that made
+        # the clear look like it had silently failed. See result_is_fake.
+        self.clear_tab_result_pending = True
+        # Bug fix (2026-09-18), found immediately after the fix above:
+        # marking the trailing ResultMessage fake means the message loop's
+        # OWN normal completion path (the one that sets turn_pending=False)
+        # never runs for it either -- unlike hang_interrupt_result_pending
+        # (which leaves turn_pending alone deliberately, because a REPLAY
+        # is expected to come through submit() and manage it itself) or
+        # forced_compaction_result_pending (turn_pending is already False
+        # the whole time that runs), clear_tab has explicitly declared "no
+        # replay, nothing carried forward" -- there is no other path left
+        # that will ever flip turn_pending back to False. Without this,
+        # the tab would stay stuck showing turn_pending=True forever after
+        # a clear. Set it here, synchronously, the same way pending_user_
+        # text/pending_attachments above already are.
+        self.turn_pending = False
         if self.small_model_active:
             if self._small_model_task is not None:
                 self._small_model_task.cancel()
@@ -3372,7 +3408,7 @@ class ChatSession:
                         # here would risk clobbering pending_user_text/
                         # pending_attachments for something ELSE that got
                         # queued in the meantime.
-                        result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending
+                        result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending or self.clear_tab_result_pending
                         if not result_is_fake:
                             was_real_user_turn = self.pending_is_real_user
                             # Captured (and consumed) BEFORE the checks below can
@@ -3557,6 +3593,9 @@ class ChatSession:
                             if self.forced_compaction_result_pending:
                                 self.forced_compaction_result_pending = False
                                 log_event("engine", "forced_compaction_done", tab_id=self.tab_id, subtype=message.subtype)
+                            elif self.clear_tab_result_pending:
+                                self.clear_tab_result_pending = False
+                                log_event("engine", "clear_tab_result_discarded", tab_id=self.tab_id, subtype=message.subtype)
                             else:
                                 log_event("engine", "fake_result_message_preserved", tab_id=self.tab_id)
                         else:
