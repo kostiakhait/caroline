@@ -145,6 +145,20 @@ internal static class Program
 
         AppPaths.EnsureRootExists();
 
+        // Per explicit instruction (2026-09-18): check free disk space up
+        // front, before spending any time downloading anything -- a full
+        // drive used to only surface as a confusing late IOException deep
+        // inside whichever step happened to run out of room. 6 GB covers
+        // the base app (the downloaded zip and its extracted copy exist on
+        // disk at the same time, briefly) plus the isolated runtimes
+        // (Node/Python/Git Bash/ffmpeg) plus Playwright's Chromium, with
+        // real margin -- NOT the talking-head models, which are tens of GB
+        // each and checked individually, per-file, right before each one
+        // downloads (see ModelsInstaller.cs) since failing the whole
+        // install over an optional, best-effort feature would be wrong.
+        const long RequiredBaseFreeBytes = 6L * 1024 * 1024 * 1024;
+        DiskSpace.RequireFreeSpace(AppPaths.Root, RequiredBaseFreeBytes, "install Caroline");
+
         // Step 1: isolated runtimes. Node first -- Playwright's install step
         // later needs it, and neither install touches the system otherwise,
         // so order between Node/Python doesn't matter beyond that.

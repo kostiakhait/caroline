@@ -33,6 +33,7 @@ internal sealed class InstallerException : Exception
 internal static class ErrorCodes
 {
     public const string CleanupPreviousInstall = "E01";
+    public const string DiskSpaceCheck = "E15";
     public const string NodeInstall = "E02";
     public const string PythonInstall = "E03";
     public const string GitBashInstall = "E04";
