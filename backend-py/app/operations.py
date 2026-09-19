@@ -297,12 +297,74 @@ def _build_get_tool_instructions_tool(tool_instructions: dict[str, str]) -> SdkM
     return get_tool_instructions
 
 
-def build_operations_mcp_server(tool_instructions: dict[str, str] | None = None) -> McpServerConfig:
+def _build_describe_own_backend_tool(own_plugins: list[dict[str, Any]]) -> SdkMcpTool[Any]:
+    """Per explicit instruction (2026-09-18), after a real incident and a
+    direct architectural correction: Caroline is a product installed on
+    many different machines, each with its own, potentially completely
+    different set of independently-registered MCP servers -- nothing
+    about any SPECIFIC external server name can ever be hardcoded
+    anywhere in this codebase (a prior attempt at exactly that, naming
+    caroline-browser/caroline-voice/caroline-screen-video directly in
+    policies.py and chat_session.py's disallowed_tools, was explicitly
+    rejected as the wrong shape of fix -- the same rewrite-it-again
+    anti-pattern every time some OTHER machine's install turns out to
+    have yet another stale external server registered).
+
+    The general fix: this tool is THE single source of truth for "what's
+    mine" -- built fresh every turn (own_plugins, passed in by
+    plugins/loader.py's build_mcp_servers(), reflects THIS install's
+    actual current plugin set, discovered dynamically via
+    discover_plugins(), never a fixed list) so Caroline can always tell
+    her own backend-provided tools apart from anything else she might see
+    (an external MCP server registered independently of this backend,
+    which varies install to install and this backend has no way to know
+    about ahead of time), on demand, without any name ever needing to be
+    written down in advance -- see prefer_own_backend_tools_instruction
+    (policies.py), which points at this tool instead of naming anything
+    itself."""
+
+    @sdk_tool(
+        "describe_own_backend",
+        "Returns a live, authoritative description of your own backend right now, on this exact install -- "
+        "which plugins/tools it currently provides. Call this whenever you're unsure whether a specific tool "
+        "belongs to your own backend or comes from somewhere else (a separately/independently-registered MCP "
+        "server, which varies from machine to machine), or when the user asks about your own architecture, "
+        "setup, or capabilities.",
+        {},
+    )
+    async def describe_own_backend(args: dict[str, Any]) -> dict[str, Any]:
+        log_event("engine", "describe_own_backend_called", plugin_count=len(own_plugins))
+        body = {
+            "architecture": (
+                "You run on a Python backend with a plugin system. Every plugin is exposed to you as its own "
+                "MCP server, named \"caroline-<plugin-name>\" (see \"plugins\" below for the exact current "
+                "list, name and tools included) -- rebuilt fresh from this backend's actual plugin set on "
+                "every turn, so this is always accurate for right now, not something memorized or stale. Any "
+                "OTHER MCP server you can see that is NOT in this list comes from somewhere else entirely -- "
+                "registered independently of this backend, on this specific machine, outside this backend's "
+                "knowledge or control, and not guaranteed to even be working. Whenever a task can be done by "
+                "a tool listed here, always prefer it over a same-purpose tool from an unlisted server, even "
+                "if the other one looks more convenient, is already connected, or seems more familiar."
+            ),
+            "plugins": own_plugins,
+        }
+        return {"content": [{"type": "text", "text": str(body)}]}
+
+    return describe_own_backend
+
+
+def build_operations_mcp_server(tool_instructions: dict[str, str] | None = None, own_plugins: list[dict[str, Any]] | None = None) -> McpServerConfig:
     """The generic operation-control tools (check_operation_status/
-    stop_operation) plus get_tool_instructions, registered ONCE at the
-    engine level (not per plugin) -- every plugin tool call goes through
-    dispatch() above, which is what makes the first two apply
-    universally; get_tool_instructions is built fresh per call here since
-    it needs this turn's actual tool_instructions map."""
-    tools = [check_operation_status, stop_operation, _build_get_tool_instructions_tool(tool_instructions or {})]
+    stop_operation) plus get_tool_instructions and describe_own_backend,
+    registered ONCE at the engine level (not per plugin) -- every plugin
+    tool call goes through dispatch() above, which is what makes the
+    first two apply universally; get_tool_instructions/describe_own_backend
+    are built fresh per call here since they need this turn's actual
+    tool_instructions/own_plugins data (see plugins/loader.py's
+    build_mcp_servers(), which computes both from discover_plugins())."""
+    tools = [
+        check_operation_status, stop_operation,
+        _build_get_tool_instructions_tool(tool_instructions or {}),
+        _build_describe_own_backend_tool(own_plugins or []),
+    ]
     return create_sdk_mcp_server(name="operations", tools=tools)

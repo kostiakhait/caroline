@@ -10,8 +10,9 @@ press_key/evaluate) go over a real CDP connection instead
 (app_browser_cdp.py), since CDP isn't subject to a page's own CSP the way
 ExecuteScriptAsync-injected script is.
 
-This is Caroline's PRIMARY browsing tool -- prefer it over the standalone
-caroline-browser/other browser MCP servers for ordinary web/app tasks.
+This is Caroline's PRIMARY browsing tool -- see policies.py's
+prefer_own_backend_tools_instruction for why any other, non-backend-owned
+browser tool she might see should never be used as a fallback for this one.
 """
 
 from __future__ import annotations
@@ -38,9 +39,9 @@ OPEN_TIMEOUT_S = 90.0
 
 _ACCOUNT_HINT = (
     "Embedded browser call failed: {exc}. Is Caroline's WPF app running (this tool only works "
-    "inside the desktop app, not headless)? The standalone caroline-browser tools are NOT a fallback "
-    "for this -- they're blocked outright (see prefer_embedded_browser_instruction). Report the "
-    "failure to the user instead of reaching for a different browser tool."
+    "inside the desktop app, not headless)? Do NOT fall back to a different browser tool for this -- "
+    "if it's not in describe_own_backend's own list, it's not a substitute for your own embedded "
+    "browser (see prefer_own_backend_tools_instruction). Report the failure to the user instead."
 )
 
 

@@ -936,32 +936,34 @@ def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:
 _SETTINGS_FILE_NAME = "caroline-settings.json"
 _SETTINGS_FILE_CONTENT = json.dumps({"autoCompactEnabled": True})
 
-# Hard block (2026-09-14), per explicit instruction: "caroline-browser" is a
+# Bug fix (2026-09-14), per explicit instruction: "caroline-browser" is a
 # leftover from the old Node backend (workspace.ts's ensureWorkspace()) --
 # a real, separate Playwright/Node browser process, still registered as a
 # user-scope MCP server in ~/.claude.json (never removed during the Python
 # rewrite), so the `claude` CLI subprocess this class spawns picks it up
 # automatically regardless of what this backend's own mcp_servers dict
-# contains. prefer_embedded_browser_instruction (policies.py) already tells
-# the model to prefer open_app_browser/app_browser_* over this -- promoted
-# to ALWAYS_ON_INSTRUCTIONS on 2026-09-11 after a single sentence in the
-# tool description alone wasn't enough -- and confirmed live (2026-09-13)
-# that even ALWAYS_ON prompting still isn't a strong enough guarantee: the
-# model kept reaching for caroline-browser anyway, opening a real, separate
-# Chrome/Chromium window instead of Caroline's own embedded one. A prompt
-# is advisory; disallowed_tools is enforced by the SDK/CLI itself and
-# cannot be talked around, so exclude these outright rather than continue
-# to just ask nicely. Exact tool names (no wildcard support confirmed for
-# this SDK's disallowed_tools), one per tool this external server exposes.
-_DISALLOWED_CAROLINE_BROWSER_TOOLS = [
-    f"mcp__caroline-browser__{name}"
-    for name in (
-        "browser_click", "browser_evaluate", "browser_file_upload", "browser_find",
-        "browser_navigate", "browser_press_key", "browser_resize", "browser_restart_daemon",
-        "browser_run_code_unsafe", "browser_snapshot", "browser_tabs",
-        "browser_take_screenshot", "browser_type", "browser_wait_for",
-    )
-]
+# contains. A hard, hardcoded disallowed_tools exclusion (one exact tool
+# name per tool caroline-browser exposes) used to live here for this one
+# specific external server.
+#
+# REMOVED (2026-09-18), per an emphatic, direct architectural correction:
+# hardcoding a specific external server's tool names into this file is
+# EXACTLY the anti-pattern this correction was about -- Caroline is a
+# product installed on many different machines, each with its own,
+# potentially completely different set of independently-registered MCP
+# servers; caroline-browser being the one that happened to cause trouble
+# on THIS machine doesn't mean it exists, or is the only offender, on any
+# other install. The general fix now lives entirely in policies.py's
+# prefer_own_backend_tools_instruction + operations.py's
+# describe_own_backend (built fresh every turn from this install's own
+# actual plugin set, never a fixed list) -- prompt-level only, no
+# server/tool name hardcoded anywhere. This is a deliberate trade-off,
+# stated explicitly rather than silently: SDK-enforced disallowed_tools
+# is stronger than prompting alone (confirmed live, 2026-09-13, that
+# prompting alone previously wasn't enough for this exact case) -- but a
+# hardcoded, install-specific enforcement list was explicitly rejected as
+# worse than that risk, not weighed as safe to keep alongside the general
+# fix.
 
 
 def clear_tab_disk_state(workspace_dir: str, tab_id: str) -> None:
@@ -3211,7 +3213,7 @@ class ChatSession:
                     "cwd": self.workspace_dir,
                     "permission_mode": "bypassPermissions",
                     "mcp_servers": mcp_servers,
-                    "disallowed_tools": ["mcp__caroline-notes__notes_login", *_DISALLOWED_CAROLINE_BROWSER_TOOLS],
+                    "disallowed_tools": ["mcp__caroline-notes__notes_login"],
                     "stderr": _stderr_handler,
                     # Claude's own native auto-compaction handles context
                     # ageing now -- explicitly on, and one long-lived client

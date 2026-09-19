@@ -427,7 +427,7 @@ def system_temp_dir_instruction() -> str:
 
 def prefer_command_line_and_scripting_instruction() -> str:
     """Standing rule, stated by the user directly (2026-09-15). Same shape
-    as prefer_embedded_browser_instruction's own history: a "prefer X over
+    as prefer_own_backend_tools_instruction's own history: a "prefer X over
     Y" default that has to steer which TOOL CATEGORY gets reached for in
     the first place, so it has to be ALWAYS_ON rather than discoverable
     only after the model has already started down the GUI-automation path
@@ -456,26 +456,54 @@ def prefer_command_line_and_scripting_instruction() -> str:
     )
 
 
-def prefer_embedded_browser_instruction() -> str:
-    """Bug fix (2026-09-11), per explicit instruction: this priority was
-    already stated once, in open_app_browser's own tool description
-    (appbrowser_plugin.py -- present since this backend's very first
-    commit, 2026-09-09) -- confirmed live that a single sentence in one
-    tool's own description isn't a strong enough signal on its own:
-    Caroline kept reaching for the standalone caroline-browser
-    (Playwright, a completely separate real browser window) for ordinary
-    tasks anyway. Promoted to ALWAYS_ON so it's guaranteed visible BEFORE
-    any tool gets chosen, not just discoverable after the model has
-    already leaned toward caroline-browser and never looked at
-    open_app_browser's own text."""
+def prefer_own_backend_tools_instruction() -> str:
+    """Bug fix (2026-09-11), per explicit instruction: a browser-specific
+    version of this priority was already stated once, in
+    open_app_browser's own tool description (appbrowser_plugin.py) --
+    confirmed live that a single sentence in one tool's own description
+    isn't a strong enough signal on its own: Caroline kept reaching for
+    the standalone caroline-browser (a completely separate real browser
+    window) for ordinary tasks anyway. Promoted to ALWAYS_ON so it's
+    guaranteed visible BEFORE any tool gets chosen.
+
+    Rebuilt from scratch (2026-09-18), per a direct, emphatic
+    architectural correction, after a real live incident: the version in
+    between this one and the original hardcoded specific external
+    server/tool names directly into this file (caroline-browser,
+    caroline-voice, caroline-screen-video) AND into chat_session.py's
+    disallowed_tools -- explicitly rejected, in the strongest terms, as
+    the wrong shape of fix entirely: "Кэролайн это продукт, который может
+    быть установлен на самых разных машинах с самыми разными
+    конфигурациями, в т.ч. MCP-серверов. Весь хардкод нужно выкинуть."
+    Confirmed live, independently, that the hardcoded version was ALSO
+    simply wrong on its own terms: it told Caroline to never use MCP
+    servers at all, when literally every tool she has (email, notes,
+    files, shell, browser) IS an MCP server -- a real internal
+    contradiction she correctly caught and got stuck on ("у меня вообще
+    нет других инструментов, кроме MCP-серверов... это правило меня
+    парализует").
+
+    The general fix: no server/tool name is named here, or anywhere else
+    in this codebase, ever, for this purpose. describe_own_backend (app/
+    operations.py, built fresh every turn from THIS install's actual
+    current plugin set via plugins/loader.py's discover_plugins()) is the
+    single source of truth for "what's mine" on whatever machine this
+    happens to be running on -- this instruction only points at it and
+    states the priority rule in the abstract. Works identically whether
+    an install has zero, one, or a dozen unrelated externally-registered
+    MCP servers, and never needs editing again just because some
+    particular machine turns out to have yet another stale one."""
     return (
-        "For ordinary web/app browsing (WhatsApp Web, Telegram Web, Facebook, Slack, general sites), prefer your "
-        "OWN embedded browser (open_app_browser and the other app_browser_* tools) over the standalone "
-        "caroline-browser tools -- the embedded one lives inside the app itself, the user can see it, and it's "
-        "the default for a reason. Only reach for caroline-browser when there's a real, specific reason the "
-        "embedded browser can't do the job (e.g. it genuinely lacks a capability you need, or the embedded one "
-        "has already failed at this specific task) -- not out of habit or because a caroline-browser session "
-        "already happens to be open."
+        "This machine may have OTHER MCP tools available to you beyond the ones your own backend provides -- "
+        "from servers registered independently of your backend, which vary install to install and are outside "
+        "your backend's knowledge or control ahead of time. Call describe_own_backend at any point to get the "
+        "current, authoritative list of tools YOUR OWN backend provides right now (rebuilt fresh every turn, "
+        "always accurate for this exact moment), and how to tell them apart from anything else you might see. "
+        "Whenever a task can be done with one of your own backend's tools, ALWAYS use that one -- never reach "
+        "for a different, non-listed tool of similar purpose for the same job, even if it looks more "
+        "convenient, is already connected, or you're more familiar with it. If you're ever unsure whether a "
+        "specific tool is one of your own, check describe_own_backend first rather than guessing from its name "
+        "or assuming what's true on one machine holds on another."
     )
 
 
@@ -499,7 +527,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     no_alarming_internal_recovery_instruction,
     vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
-    prefer_embedded_browser_instruction,
+    prefer_own_backend_tools_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     prefer_command_line_and_scripting_instruction,

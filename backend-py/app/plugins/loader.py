@@ -179,22 +179,40 @@ def build_mcp_servers() -> dict[str, McpServerConfig]:
     SDK MCP server per discovered plugin. One discover_plugins() call, so
     a plugin's "plugin_loaded" log line appears exactly once per turn.
     Always includes the generic "operations" server (check_operation_status/
-    stop_operation/get_tool_instructions, app/operations.py) -- those apply
-    uniformly to every plugin tool call, not just one plugin's own.
-    get_tool_instructions is built with THIS turn's tool_instructions map
-    (every tool name a loaded plugin exposes -> that plugin's own
-    usage_instructions, if it set one) so the model can fetch a specific
-    tool's detailed guidance on demand instead of it being injected into
-    the system prompt (see policies.py's module docstring for why).
+    stop_operation/get_tool_instructions/describe_own_backend,
+    app/operations.py) -- those apply uniformly to every plugin tool
+    call, not just one plugin's own. get_tool_instructions is built with
+    THIS turn's tool_instructions map (every tool name a loaded plugin
+    exposes -> that plugin's own usage_instructions, if it set one) so
+    the model can fetch a specific tool's detailed guidance on demand
+    instead of it being injected into the system prompt (see policies.py's
+    module docstring for why).
+
+    Per explicit instruction (2026-09-18): own_plugins (server_name + each
+    tool's name/description, one entry per plugin discovered THIS turn)
+    is built here, alongside tool_instructions, and handed to
+    build_operations_mcp_server for describe_own_backend -- this is the
+    ONE place that knows the real, current plugin set, so it's the only
+    place that should ever compute it. Never hardcode a specific plugin/
+    server/tool name anywhere else in this codebase to reason about "is
+    this one of Caroline's own tools" -- always derive it from here,
+    fresh, since which plugins exist can differ across installs and even
+    across a single install's own history as plugins are added/removed.
     """
     plugins = discover_plugins()
     tool_instructions: dict[str, str] = {}
+    own_plugins: list[dict[str, Any]] = []
     mcp_servers: dict[str, McpServerConfig] = {}
     for plugin in plugins:
         wrapped_tools = [wrap_tool(plugin.name, t) for t in plugin.tools]
-        mcp_servers[f"caroline-{plugin.name}"] = create_sdk_mcp_server(name=plugin.name, tools=wrapped_tools)
+        server_name = f"caroline-{plugin.name}"
+        mcp_servers[server_name] = create_sdk_mcp_server(name=plugin.name, tools=wrapped_tools)
+        own_plugins.append({
+            "server_name": server_name,
+            "tools": [{"name": t.name, "description": t.description} for t in plugin.tools],
+        })
         if plugin.usage_instructions:
             for t in plugin.tools:
                 tool_instructions[t.name] = plugin.usage_instructions
-    mcp_servers["caroline-operations"] = build_operations_mcp_server(tool_instructions)
+    mcp_servers["caroline-operations"] = build_operations_mcp_server(tool_instructions, own_plugins)
     return mcp_servers

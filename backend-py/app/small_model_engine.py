@@ -95,7 +95,7 @@ from app.policies import (
     no_internal_mechanics_to_user_instruction,
     no_remote_filesystem_scans_instruction,
     no_unauthorized_secret_changes_instruction,
-    prefer_embedded_browser_instruction,
+    prefer_own_backend_tools_instruction,
     proactive_context_recovery_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
@@ -124,7 +124,7 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     task_completion_memory_instruction,
     vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
-    prefer_embedded_browser_instruction,
+    prefer_own_backend_tools_instruction,
     learn_from_mistakes_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
@@ -484,6 +484,20 @@ _OPERATIONS_TOOL_DEFS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {"tool_name": {"type": "string"}}, "required": ["tool_name"]},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_own_backend",
+            "description": (
+                "Returns a live, authoritative description of your own backend right now, on this exact "
+                "install -- which plugins/tools it currently provides. Call this whenever you're unsure whether "
+                "a specific tool belongs to your own backend or comes from somewhere else (a separately/"
+                "independently-registered MCP server, which varies from machine to machine), or when the user "
+                "asks about your own architecture, setup, or capabilities."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 _OPERATIONS_TOOL_NAMES = {t["function"]["name"] for t in _OPERATIONS_TOOL_DEFS}
@@ -615,6 +629,12 @@ class ToolRegistry:
     # own doc comment for why this is fetched on demand rather than injected
     # into the system prompt outright.
     tool_instructions: dict[str, str] = field(default_factory=dict)
+    # Same own_plugins shape as plugins/loader.py's build_mcp_servers() builds
+    # for the SDK path's describe_own_backend -- server_name + each tool's
+    # name/description, one entry per plugin discovered THIS turn. See
+    # policies.py's prefer_own_backend_tools_instruction for why this must
+    # never be a fixed/hardcoded list.
+    own_plugins: list[dict[str, Any]] = field(default_factory=list)
 
 
 def build_tool_registry() -> ToolRegistry:
@@ -633,15 +653,20 @@ def build_tool_registry() -> ToolRegistry:
     tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS)
     lookup: dict[str, tuple[str, PluginTool]] = {}
     tool_instructions: dict[str, str] = {}
+    own_plugins: list[dict[str, Any]] = []
     for plugin in discover_plugins():
+        plugin_tools_for_summary = []
         for t in plugin.tools:
             if t.name in _DISALLOWED_TOOL_NAMES:
                 continue
             tool_defs.append(to_openai_tool_def(t))
             lookup[t.name] = (plugin.name, t)
+            plugin_tools_for_summary.append({"name": t.name, "description": t.description})
             if plugin.usage_instructions:
                 tool_instructions[t.name] = plugin.usage_instructions
-    return ToolRegistry(tool_defs=tool_defs, lookup=lookup, tool_instructions=tool_instructions)
+        if plugin_tools_for_summary:
+            own_plugins.append({"server_name": f"caroline-{plugin.name}", "tools": plugin_tools_for_summary})
+    return ToolRegistry(tool_defs=tool_defs, lookup=lookup, tool_instructions=tool_instructions, own_plugins=own_plugins)
 
 
 async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRegistry, tracker: _TurnTracker) -> str:
@@ -676,6 +701,22 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
         if text is None:
             return f'No detailed usage instructions for "{tool_name}" -- its own short description is all there is.'
         return text
+    if name == "describe_own_backend":
+        body = {
+            "architecture": (
+                "You run on a Python backend with a plugin system. Every plugin is exposed to you as its own "
+                "tool group, named \"caroline-<plugin-name>\" (see \"plugins\" below for the exact current "
+                "list, name and tools included) -- rebuilt fresh from this backend's actual plugin set on "
+                "every turn, so this is always accurate for right now, not something memorized or stale. Any "
+                "OTHER MCP server you can see that is NOT in this list comes from somewhere else entirely -- "
+                "registered independently of this backend, on this specific machine, outside this backend's "
+                "knowledge or control, and not guaranteed to even be working. Whenever a task can be done by "
+                "a tool listed here, always prefer it over a same-purpose tool from an unlisted server, even "
+                "if the other one looks more convenient, is already connected, or seems more familiar."
+            ),
+            "plugins": registry.own_plugins,
+        }
+        return str(body)
     return f"ERROR: unknown operations tool '{name}'"
 
 
