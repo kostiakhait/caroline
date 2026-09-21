@@ -34,9 +34,11 @@ import httpx
 # auth status" call. getattr(..., 0) keeps this a no-op on non-Windows.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+from app.account_state import CachedAsyncValue
 from app.logging_setup import log_event
 from app.plugins.notes_api import load_credentials, verify_password
 from app.plugins.sw_api import API_URL, mint_v2_session
+from app.workspace_dir import WORKSPACE_DIR
 
 SQUIRRELWISDOM_ORIGIN = "https://www.squirrelwisdom.com"
 
@@ -98,20 +100,60 @@ def set_own_anthropic_api_key(workspace_dir: str, key: str | None) -> None:
 
 # --- mode resolve ------------------------------------------------------------
 
+# --- cached account state ----------------------------------------------------
+#
+# See app/account_state.py's docstring for the incident and the design: the
+# Claude login state and the SW balance are computed ONCE (single-flight),
+# kept warm in the background, and every reader -- Settings' auth_status/
+# mode_get/chat_mode_get/sw_status, and every tab's session start -- just
+# reads the cache instead of spawning its own `claude auth status` / making
+# its own network call from scratch.
+
+# How old a cached value may be before a reader triggers a background refresh
+# (readers still get the old value INSTANTLY -- stale-while-revalidate).
+AUTH_STATUS_TTL_S = 120.0
+SW_STATUS_TTL_S = 60.0
+# How often the background refresher re-checks both, so the cache is warm
+# before anyone asks (Settings opening, a tab starting).
+ACCOUNT_STATE_REFRESH_INTERVAL_S = 120.0
+# `claude auth status` normally answers in ~3 s; anything past this is a
+# wedged CLI, not a slow one -- killed (see cli_control._run), and the last
+# good value stays in place (see account_state's stale-on-error).
+AUTH_STATUS_TIMEOUT_S = 45.0
+
+
+async def _fetch_claude_auth_status() -> dict[str, Any]:
+    from app.cli_control import auth_status as cli_auth_status_raw
+
+    return await cli_auth_status_raw(WORKSPACE_DIR, AUTH_STATUS_TIMEOUT_S)
+
+
+_claude_auth_status_cache: CachedAsyncValue[dict[str, Any]] = CachedAsyncValue("claude_auth_status", _fetch_claude_auth_status)
+
+
+async def get_claude_auth_status(*, serve_stale: bool = True) -> dict[str, Any]:
+    """The raw `claude auth status` result ({code, stdout, stderr}), from the
+    cache. Raises only if there is no value at all AND the very first fetch
+    failed."""
+    return await _claude_auth_status_cache.get(max_age_s=AUTH_STATUS_TTL_S, serve_stale=serve_stale)
+
+
+def invalidate_claude_auth_status() -> None:
+    """Call right after the user logs in or out of Claude on purpose --
+    hard, so nothing shows the old state even for a moment."""
+    _claude_auth_status_cache.invalidate(hard=True)
+
+
 async def _has_own_anthropic_oauth(cwd: str) -> bool:
     """`claude auth status` prints JSON ({loggedIn, email,
     subscriptionType, apiProvider}) -- same shape the frontend already
-    parses for the Settings UI."""
+    parses for the Settings UI. `cwd` is unused now: the login state is
+    machine-wide, one cache serves every caller."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(CLAUDE_EXE), "auth", "status", cwd=cwd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            creationflags=_NO_WINDOW,
-        )
-        stdout, _stderr = await proc.communicate()
-        if proc.returncode != 0:
+        r = await get_claude_auth_status()
+        if r.get("code") != 0:
             return False
-        status = json.loads(stdout or b"{}")
+        status = json.loads(r.get("stdout") or "{}")
         return status.get("loggedIn") is True
     except Exception as exc:
         log_event("engine", "has_own_anthropic_oauth_failed", error=str(exc))
@@ -177,25 +219,74 @@ class SwStatus:
         self.balance_error = balance_error
 
 
-async def get_sw_status() -> SwStatus:
+async def _fetch_sw_status() -> SwStatus:
+    """The real work (a session mint plus a v2 wallet:getBalance call --
+    measured >= 9 s), uncached; see get_sw_status for the cached entry
+    point everything else uses. A failure RAISES here (rather than being
+    packaged as a SwStatus with balance_error) so the cache keeps the last
+    GOOD balance instead of replacing it with an error for a whole TTL."""
+    creds = load_credentials()
+    if not creds:
+        return SwStatus(False, None, None, None)
+    email = creds["email"]
+    session = await mint_v2_session(creds["email"], creds["password"])
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(API_URL, json={"command": "wallet:getBalance", "key": SW_SERVICE_KEY, "session": session})
+        data = res.json()
+    if data.get(".status") != "ok":
+        raise RuntimeError(str(data.get(".reason") or "Balance check failed"))
+    balance_pia = float((data.get("balances") or {}).get("PIA") or 0)
+    return SwStatus(True, email, balance_pia, None)
+
+
+_sw_status_cache: CachedAsyncValue[SwStatus] = CachedAsyncValue("sw_status", _fetch_sw_status)
+
+
+def invalidate_sw_status() -> None:
+    """Call when the balance is about to change on purpose (a top-up) --
+    hard, so the next read waits for the real new number."""
+    _sw_status_cache.invalidate(hard=True)
+
+
+async def get_sw_status(*, serve_stale: bool = True) -> SwStatus:
     """Backs the Settings "Account & Billing" section -- needs the actual
     PIA balance (a real v2 wallet:getBalance call), not just "is SW login
-    configured at all"."""
+    configured at all". Served from the cache (see account_state.py) --
+    only the "is anyone logged in / as whom" part is read fresh, from the
+    local credentials file, every call, so a logout (or a login as a
+    different account) shows up instantly without any invalidation."""
     creds = load_credentials()
     if not creds:
         return SwStatus(False, None, None, None)
     email = creds["email"]
     try:
-        session = await mint_v2_session(creds["email"], creds["password"])
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            res = await client.post(API_URL, json={"command": "wallet:getBalance", "key": SW_SERVICE_KEY, "session": session})
-            data = res.json()
-        if data.get(".status") != "ok":
-            return SwStatus(True, email, None, str(data.get(".reason") or "Balance check failed"))
-        balance_pia = float((data.get("balances") or {}).get("PIA") or 0)
-        return SwStatus(True, email, balance_pia, None)
+        cached = await _sw_status_cache.get(max_age_s=SW_STATUS_TTL_S, serve_stale=serve_stale)
+        if cached.email != email:
+            # A different account than the one the cached balance belongs to.
+            _sw_status_cache.invalidate(hard=True)
+            cached = await _sw_status_cache.get(max_age_s=SW_STATUS_TTL_S, serve_stale=False)
+        return cached
     except Exception as exc:
         return SwStatus(True, email, None, str(exc))
+
+
+async def run_account_state_refresher() -> None:
+    """Started once at backend startup (main.py): computes both cached values
+    immediately -- so by the time anyone opens Settings or a tab starts, the
+    answer is already there -- and re-checks every
+    ACCOUNT_STATE_REFRESH_INTERVAL_S so it stays warm. A failure of either
+    is logged by the cache itself and simply retried next round."""
+    while True:
+        try:
+            await _claude_auth_status_cache.refresh()
+        except Exception:
+            pass
+        if load_credentials():
+            try:
+                await _sw_status_cache.refresh()
+            except Exception:
+                pass
+        await asyncio.sleep(ACCOUNT_STATE_REFRESH_INTERVAL_S)
 
 
 # --- top-up / pay ------------------------------------------------------------

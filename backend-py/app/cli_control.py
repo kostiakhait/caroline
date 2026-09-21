@@ -44,13 +44,25 @@ def resolve_claude_exe() -> str:
     raise CliNotFoundError("Claude Code CLI (claude.exe) not found -- bundled path, PATH, and ~/.local/bin all missed.")
 
 
-async def _run(args: list[str], cwd: str) -> dict[str, object]:
+async def _run(args: list[str], cwd: str, timeout_s: float | None = None) -> dict[str, object]:
+    """timeout_s (added 2026-09-20): None keeps the old wait-forever behavior
+    for the commands that are genuinely interactive/long. A command that's
+    supposed to answer quickly (auth status) passes one, so a wedged CLI
+    can't leave its caller -- and everything queued behind it -- waiting
+    forever: the process is killed and asyncio.TimeoutError raised."""
     proc = await asyncio.create_subprocess_exec(
         resolve_claude_exe(), *args, cwd=cwd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         creationflags=_NO_WINDOW,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise
     return {
         "code": proc.returncode if proc.returncode is not None else -1,
         "stdout": stdout.decode("utf-8", errors="replace"),
@@ -58,8 +70,8 @@ async def _run(args: list[str], cwd: str) -> dict[str, object]:
     }
 
 
-async def auth_status(cwd: str) -> dict[str, object]:
-    return await _run(["auth", "status"], cwd)
+async def auth_status(cwd: str, timeout_s: float | None = None) -> dict[str, object]:
+    return await _run(["auth", "status"], cwd, timeout_s)
 
 
 async def auth_logout(cwd: str) -> dict[str, object]:

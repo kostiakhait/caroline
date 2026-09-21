@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
-from app.cli_control import auth_logout as cli_auth_logout, auth_status as cli_auth_status, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
+from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
@@ -39,7 +39,10 @@ from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.sms_account import get_sms_account_status, remove_sms_account, set_sms_account
-from app.subscription_mode import chat_mode_eligible, create_topup_checkout_url, get_own_anthropic_api_key, get_sw_status, resolve_mode, set_own_anthropic_api_key
+from app.subscription_mode import (
+    chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
+    invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
+)
 from app.visual_mode import is_visual_mode_enabled, resolve_visual_model, set_visual_mode_enabled
 from app.window_registry import unregister_window
 from app.workspace_dir import WORKSPACE_DIR
@@ -201,6 +204,13 @@ async def _start_ratatosk_background_loops() -> None:
     # be started from the synchronous __main__ block below, which is why
     # this lives as a FastAPI startup hook instead (uvicorn.run() only
     # actually creates/runs the loop once it's called).
+    # Per explicit instruction (2026-09-20): warm the Claude-login and SW-
+    # balance state NOW, in the background, and keep it warm -- so Settings
+    # opens with the answer already there (instead of "Checking..." while
+    # three `claude auth status` subprocesses and a network call run from
+    # scratch) and every tab's session start reads it instead of spawning
+    # its own. See app/account_state.py.
+    asyncio.create_task(run_account_state_refresher())
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Checked every 20s (plus once immediately, catching anything that came
@@ -571,7 +581,10 @@ async def handle_control_request(
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "auth_status":
         try:
-            r = await cli_auth_status(WORKSPACE_DIR)
+            # From the account-state cache (see app/account_state.py) --
+            # instant once warm; never spawns its own `claude auth status`
+            # per request the way this used to.
+            r = await get_claude_auth_status()
         except Exception as exc:
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
         log_event("engine", "auth_status", ok=r["code"] == 0)
@@ -588,12 +601,14 @@ async def handle_control_request(
         except Exception as exc:
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
         log_event("engine", "auth_login_closed", ok=ok)
+        invalidate_claude_auth_status()  # the user just changed this on purpose -- never show the old state
         return {"type": "control_response", "op": op, "ok": ok, "requestId": request_id}
     if op == "auth_logout":
         try:
             r = await cli_auth_logout(WORKSPACE_DIR)
         except Exception as exc:
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
+        invalidate_claude_auth_status()
         log_event("engine", "auth_logout", ok=r["code"] == 0)
         return {"type": "control_response", "op": op, "ok": r["code"] == 0, "stdout": r["stdout"], "stderr": r["stderr"], "requestId": request_id}
     if op == "force_restart":
@@ -678,6 +693,7 @@ async def handle_control_request(
         except Exception as exc:
             log_event("engine", "open_payment_from_settings_failed", error=str(exc))
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
+        invalidate_sw_status()  # the balance is about to change on purpose -- the next read must fetch the real new number
         if send is not None:
             import uuid as _uuid
             await send({"type": "open_payment", "requestId": _uuid.uuid4().hex, "checkoutUrl": checkout_url})

@@ -36,8 +36,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import subprocess
+import threading
 import time
 import uuid as uuid_mod
 from datetime import datetime, timezone
@@ -82,7 +84,7 @@ from app.durability import (
     save_tab_continuity_archive,
     save_tab_session_id,
 )
-from app.history import _extract_entries_from_jsonl, _HISTORY_STAMP_PATTERN, read_archived_entries
+from app.history import _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -667,6 +669,37 @@ def _usable_dialogue_lines(entries: list[dict[str, Any]], min_ts_ms: float | Non
     return out
 
 
+def _recent_usable_lines(
+    path: Path, *, limit: int | None = None, min_ts_ms: float | None = None, user_only: bool = False,
+) -> list[str]:
+    """The newest usable dialogue lines of a transcript, oldest-first --
+    exactly what `_usable_dialogue_lines(<every entry of the whole file>)`
+    (then a [-limit:] slice, then optionally "User: " lines only) used to
+    compute by parsing ALL of it (see history.py's tail-reading comment for
+    the outage that made that unacceptable). Walks the transcript newest ->
+    oldest via history.iter_entries_reversed and stops as soon as it has
+    `limit` lines, or (with min_ts_ms) once it's past everything that new --
+    so the cost follows how much is asked for, never how big the file is.
+    Filtering is per-entry (_usable_dialogue_lines has no cross-entry
+    context), which is what makes stopping early equivalent. user_only
+    returns the text WITHOUT its "User: " prefix, same as before."""
+    out: list[str] = []
+    for entry in iter_entries_reversed(path, str(path), min_ts_ms=min_ts_ms):
+        usable = _usable_dialogue_lines([entry], min_ts_ms)
+        if not usable:
+            continue
+        line = usable[0]
+        if user_only:
+            if not line.startswith("User: "):
+                continue
+            line = line[len("User: "):]
+        out.append(line)
+        if limit is not None and len(out) >= limit:
+            break
+    out.reverse()
+    return out
+
+
 def _read_recent_dialogue_lines(
     session_id: str | None, tab_id: str, workspace_dir: str, limit: int, min_ts_ms: float | None = None,
 ) -> list[str]:
@@ -699,14 +732,14 @@ def _read_recent_dialogue_lines(
     if session_id:
         path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
         try:
-            lines = _usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)), min_ts_ms)
+            lines = _recent_usable_lines(path, limit=limit, min_ts_ms=min_ts_ms)
         except Exception as exc:
             log_event("engine", "recent_dialogue_read_failed", tab_id=tab_id, error=str(exc))
     if len(lines) < limit:
         archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
         if archive_path:
             try:
-                lines = _usable_dialogue_lines(read_archived_entries(archive_path), min_ts_ms) + lines
+                lines = _recent_usable_lines(Path(archive_path), limit=limit, min_ts_ms=min_ts_ms) + lines
             except Exception as exc:
                 log_event("engine", "recent_dialogue_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
     return lines[-limit:]
@@ -726,21 +759,18 @@ def _read_recent_user_lines(session_id: str | None, tab_id: str, workspace_dir: 
     last `count`, so the scan naturally reaches back as far as it needs to
     instead of being capped by an unrelated total-line budget."""
 
-    def _user_only(lines: list[str]) -> list[str]:
-        return [line[len("User: "):] for line in lines if line.startswith("User: ")]
-
     user_lines: list[str] = []
     if session_id:
         path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
         try:
-            user_lines = _user_only(_usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path))))
+            user_lines = _recent_usable_lines(path, limit=count, user_only=True)
         except Exception as exc:
             log_event("engine", "recent_user_lines_read_failed", tab_id=tab_id, error=str(exc))
     if len(user_lines) < count:
         archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
         if archive_path:
             try:
-                user_lines = _user_only(_usable_dialogue_lines(read_archived_entries(archive_path))) + user_lines
+                user_lines = _recent_usable_lines(Path(archive_path), limit=count, user_only=True) + user_lines
             except Exception as exc:
                 log_event("engine", "recent_user_lines_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
     return user_lines[-count:]
@@ -753,12 +783,8 @@ def _recent_24h_dialogue_path(workspace_dir: str, tab_id: str) -> Path:
 def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspace_dir: str) -> str:
     """Per explicit instruction (2026-09-14): see recent_dialogue_history_
     instruction's own docstring (policies.py) for the full feature this
-    backs. Refreshed synchronously (plain local file I/O, no network call
-    -- unlike refresh_language_in_background, this can't be fire-and-forget
-    since the whole point is that it's current by the time THIS turn's
-    system prompt gets built) from submit() on every real user turn.
-    Gathers real dialogue (_usable_dialogue_lines -- both speakers, real
-    content, synthetic/service text already dropped) from the last
+    backs. Gathers real dialogue (_usable_dialogue_lines -- both speakers,
+    real content, synthetic/service text already dropped) from the last
     RECENT_HISTORY_FILE_WINDOW_HOURS, from the same two sources
     _read_recent_dialogue_lines/_read_recent_user_lines already draw from
     (the live session file, plus this tab's own continuity archive for
@@ -766,26 +792,39 @@ def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspa
     window). Returns the file's own path unconditionally (even on a
     read/write failure -- an empty or stale file is still a valid, if
     unhelpful, thing to point the model at; a missing return value would
-    just make the pointer instruction silently vanish instead)."""
+    just make the pointer instruction silently vanish instead).
+
+    Bug fix (2026-09-20), confirmed live: this used to read and parse the
+    ENTIRE session transcript synchronously, on the asyncio event loop --
+    an outage once sessions reached hundreds of MB (see history.py's
+    tail-reading comment). Now (1) reads only the last 24 hours (cost
+    follows the window, not the file size) and (2) is meant to be called
+    OFF the event loop -- ChatSession._schedule_recent_24h_dialogue_refresh
+    runs it in a worker thread; the path it returns never changes for a
+    tab, so the system prompt only ever needs the path, not this call's
+    completion. The file is written atomically (temp file + rename) so the
+    model can never read a half-written one while a refresh is in flight."""
     out_path = _recent_24h_dialogue_path(workspace_dir, tab_id)
     cutoff_ms = (time.time() - RECENT_HISTORY_FILE_WINDOW_HOURS * 3600) * 1000
     lines: list[str] = []
     if session_id:
         path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
         try:
-            lines = _usable_dialogue_lines(_extract_entries_from_jsonl(path.read_text(encoding="utf-8"), str(path)), min_ts_ms=cutoff_ms)
+            lines = _recent_usable_lines(path, min_ts_ms=cutoff_ms)
         except Exception as exc:
             log_event("engine", "recent_24h_dialogue_read_failed", tab_id=tab_id, error=str(exc))
     archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
     if archive_path:
         try:
-            lines = _usable_dialogue_lines(read_archived_entries(archive_path), min_ts_ms=cutoff_ms) + lines
+            lines = _recent_usable_lines(Path(archive_path), min_ts_ms=cutoff_ms) + lines
         except Exception as exc:
             log_event("engine", "recent_24h_dialogue_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         body = "\n".join(lines) if lines else "(No real messages between you and this user in the last 24 hours.)"
-        out_path.write_text(body, encoding="utf-8")
+        tmp_path = out_path.with_name(out_path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp_path.write_text(body, encoding="utf-8")
+        os.replace(tmp_path, out_path)
     except Exception as exc:
         log_event("engine", "recent_24h_dialogue_write_failed", tab_id=tab_id, error=str(exc))
     return str(out_path)
@@ -827,12 +866,14 @@ def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session
         return
     try:
         last_uuid: str | None = None
-        existing = path.read_text(encoding="utf-8")
-        for line in reversed(existing.rstrip("\n").split("\n")):
-            if not line.strip():
+        # Only the LAST line matters -- read it from the end of the file
+        # (history.iter_lines_reversed), never the whole transcript (which
+        # can be hundreds of MB; see history.py's tail-reading comment).
+        for raw_line in iter_lines_reversed(path):
+            if not raw_line.strip():
                 continue
             try:
-                last_uuid = json.loads(line).get("uuid")
+                last_uuid = json.loads(raw_line).get("uuid")
             except Exception:
                 last_uuid = None
             break
@@ -1268,6 +1309,12 @@ class ChatSession:
         # real user turn ever runs (see recent_dialogue_history_
         # instruction's own None-safe handling).
         self._recent_24h_dialogue_file_path: str | None = None
+        # Single-flight state for _schedule_recent_24h_dialogue_refresh (see
+        # its own docstring) -- at most one worker-thread refresh in flight
+        # per tab; a request that arrives meanwhile just sets _dirty so one
+        # more pass runs afterward, instead of piling up N parallel readers.
+        self._recent_24h_refresh_task: "asyncio.Task[None] | None" = None
+        self._recent_24h_refresh_dirty = False
         # The language hint baked into the CURRENT query()'s system prompt.
         # A long-lived client doesn't re-read it every turn anymore, so a
         # real user turn that finds the persisted language has changed
@@ -1423,6 +1470,43 @@ class ChatSession:
         # remember to do it itself (that "remember to do it everywhere"
         # pattern is exactly what produced tonight's whole run of bugs).
         asyncio.create_task(self._publish_status())
+
+    def _schedule_recent_24h_dialogue_refresh(self) -> None:
+        """Rebuilds this tab's 24h-dialogue file in a WORKER THREAD, never on
+        the event loop (see _write_recent_24h_dialogue_file's docstring for
+        the outage that made that necessary). Single-flight: at most one
+        refresh runs per tab at a time -- a request that arrives while one
+        is in flight just marks it dirty so exactly one more pass runs after
+        it, instead of N submits queuing N parallel transcript readers.
+        Fire-and-forget by design: the file's PATH is stable and already in
+        the system prompt, so nothing waits on this; a failure is logged and
+        leaves the previous (stale but valid) file in place. With no running
+        event loop (a plain script/test calling into ChatSession
+        synchronously) it just runs inline."""
+        if self._recent_24h_refresh_task is not None and not self._recent_24h_refresh_task.done():
+            self._recent_24h_refresh_dirty = True
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                _write_recent_24h_dialogue_file(self.last_saved_session_id, self.tab_id, self.workspace_dir)
+            except Exception as exc:
+                log_event("engine", "recent_24h_dialogue_file_refresh_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        self._recent_24h_refresh_task = loop.create_task(self._refresh_recent_24h_dialogue_async())
+
+    async def _refresh_recent_24h_dialogue_async(self) -> None:
+        while True:
+            self._recent_24h_refresh_dirty = False
+            started = time.monotonic()
+            try:
+                await asyncio.to_thread(_write_recent_24h_dialogue_file, self.last_saved_session_id, self.tab_id, self.workspace_dir)
+                log_event("engine", "recent_24h_dialogue_file_refreshed", tab_id=self.tab_id, ms=round((time.monotonic() - started) * 1000))
+            except Exception as exc:
+                log_event("engine", "recent_24h_dialogue_file_refresh_failed", tab_id=self.tab_id, error=str(exc))
+            if not self._recent_24h_refresh_dirty:
+                return
 
     def _check_funds_exhaustion_status(self) -> None:
         """Per explicit instruction (2026-09-16): sw_api.py's exhaustion
@@ -1600,11 +1684,15 @@ class ChatSession:
             # correctness gap (current_language_name() is only ever read
             # at the next query()/narration tick anyway).
             refresh_language_in_background(self.last_saved_session_id, self.tab_id)
-            # Per explicit instruction (2026-09-14): synchronous (plain
-            # local file I/O, not a network call) so this tab's 24h-dialogue
-            # file is genuinely current before this same turn dispatches --
-            # see _write_recent_24h_dialogue_file's own docstring.
-            self._recent_24h_dialogue_file_path = _write_recent_24h_dialogue_file(self.last_saved_session_id, self.tab_id, self.workspace_dir)
+            # Per explicit instruction (2026-09-14): this tab's 24h-dialogue
+            # file is refreshed on every real user turn -- see
+            # _write_recent_24h_dialogue_file's own docstring. Bug fix
+            # (2026-09-20): no longer synchronous on the event loop (see
+            # _schedule_recent_24h_dialogue_refresh) -- the path is stable,
+            # so setting it now is instant; the content catches up in a
+            # worker thread within a moment, long before the model reads it.
+            self._recent_24h_dialogue_file_path = str(_recent_24h_dialogue_path(self.workspace_dir, self.tab_id))
+            self._schedule_recent_24h_dialogue_refresh()
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
         # last_real_user_question/the saved pending-turn file above -- those
@@ -3187,10 +3275,22 @@ class ChatSession:
                     # here too, proactively, on every fresh session build --
                     # not conditional on a real submit() having happened
                     # yet this process lifetime.
-                    try:
-                        self._recent_24h_dialogue_file_path = _write_recent_24h_dialogue_file(self.last_saved_session_id, self.tab_id, self.workspace_dir)
-                    except Exception as exc:
-                        log_event("engine", "recent_24h_dialogue_file_refresh_failed", tab_id=self.tab_id, error=str(exc))
+                    #
+                    # Bug fix (2026-09-20), confirmed live: that eager
+                    # write used to be SYNCHRONOUS here, on the event loop,
+                    # reading each tab's WHOLE transcript -- with four tabs
+                    # starting at once (two of them 147/368 MB) the backend
+                    # stopped answering /api/status for minutes and its
+                    # watchdog killed it, repeatedly. Now only the (stable)
+                    # PATH is set below, instantly, and the content is
+                    # built by a single-flight worker-thread refresh
+                    # reading just the last 24 hours (see
+                    # _schedule_recent_24h_dialogue_refresh) -- moved OUT
+                    # of this `if` too: right after an unrecoverable-
+                    # session reset there is no resume id but there IS a
+                    # continuity archive, exactly when this file matters.
+                self._recent_24h_dialogue_file_path = str(_recent_24h_dialogue_path(self.workspace_dir, self.tab_id))
+                self._schedule_recent_24h_dialogue_refresh()
 
                 mcp_servers = build_mcp_servers()
                 self._system_prompt_language = current_language_name(self.tab_id)

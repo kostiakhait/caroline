@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 from app.durability import claude_project_dir
 from app.logging_setup import log_event
@@ -120,10 +120,18 @@ def _split_user_submessages(content: Any) -> list[Any]:
 
 
 def _extract_entries_from_jsonl(raw: str, source_label: str) -> list[dict[str, Any]]:
+    return _extract_entries_from_lines(raw.split("\n"), source_label)
+
+
+def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list[dict[str, Any]]:
+    """The one real parser -- takes lines from ANY source (a whole file split
+    in memory, a lazily-iterated file object, a single line handed over by
+    iter_entries_reversed below) so a caller never has to materialize a
+    whole multi-hundred-MB transcript just to reach its last few lines."""
     import time as _time
 
     entries: list[dict[str, Any]] = []
-    for line in raw.split("\n"):
+    for line in lines:
         if not line.strip():
             continue
         try:
@@ -196,12 +204,122 @@ def _extract_entries_from_jsonl(raw: str, source_label: str) -> list[dict[str, A
     return entries
 
 
+# --- tail reading ------------------------------------------------------------
+#
+# Bug fix (2026-09-20), confirmed live: every "what's recent?" reader in this
+# codebase (the 24h dialogue file, narration, language detection, get_history,
+# the companion-app sync) used to `read_text()` the ENTIRE session transcript
+# and parse every line just to use its last few entries -- fine while a
+# session was small, a real outage once one grew to hundreds of MB (a
+# 368 MB / 147 MB pair of tabs, read into memory as ~2 GB of str + a second
+# copy from split(), simultaneously for every tab at startup, on the asyncio
+# event loop itself: the backend stopped answering /api/status for minutes,
+# its watchdog killed and restarted it, and it did the same thing again).
+# A transcript is append-only and chronological -- everything asked of it here
+# is "the newest N" or "everything since T" -- so the cost of answering must
+# depend on how much is being ASKED for, never on how large the file has
+# grown. iter_lines_reversed/iter_entries_reversed are the one shared way to
+# do that; nothing should call read_text() on a session transcript again.
+
+_REVERSE_READ_INITIAL_CHUNK_BYTES = 1 * 1024 * 1024
+# Raw-line timestamp lookup: Claude Code writes the top-level "timestamp"
+# field at the END of each JSONL record (after the message content, however
+# large), so only the tail of a line needs scanning for it -- never the whole
+# (possibly multi-MB) line. A nested "timestamp" inside message content is
+# JSON-escaped (\"timestamp\") and can't match this pattern.
+_RAW_TS_RE = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
+_RAW_TS_TAIL_BYTES = 4096
+# A single old-looking line isn't proof everything before it is old too (a
+# resumed/forked transcript can carry a stray out-of-order record) -- only
+# stop scanning after this many CONSECUTIVE lines older than the cutoff.
+_STALE_LINES_BEFORE_STOP = 8
+
+
+def iter_lines_reversed(path: str | Path, initial_chunk_bytes: int = _REVERSE_READ_INITIAL_CHUNK_BYTES) -> Iterator[bytes]:
+    """Yields the file's lines (as raw bytes, no trailing newline), NEWEST
+    first, reading backwards in chunks -- never more of the file in memory
+    than the chunk plus whatever single line straddles a chunk boundary. A
+    line larger than one chunk (a multi-MB tool result) just doubles the
+    chunk size until it fits. Splits on b"\\n" at the byte level, which is
+    safe for UTF-8 (0x0A never appears inside a multi-byte sequence) and for
+    JSONL (a raw newline can only ever separate records -- inside a JSON
+    string it's escaped)."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        pos = f.tell()
+        chunk_bytes = max(1, initial_chunk_bytes)
+        buf = b""
+        while pos > 0:
+            n = min(chunk_bytes, pos)
+            pos -= n
+            f.seek(pos)
+            buf = f.read(n) + buf
+            pieces = buf.split(b"\n")
+            if len(pieces) == 1:
+                # No newline anywhere in what's been read so far -- this one
+                # line is bigger than the chunk. Read more per step.
+                chunk_bytes *= 2
+                continue
+            buf = pieces[0]  # possibly-incomplete first line; completed by the next chunk back
+            for piece in reversed(pieces[1:]):
+                yield piece
+        yield buf
+
+
+def _raw_line_ts_ms(raw: bytes) -> float | None:
+    m = _RAW_TS_RE.search(raw[-_RAW_TS_TAIL_BYTES:])
+    if not m:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(m.group(1).decode("ascii", errors="ignore").replace("Z", "+00:00")).timestamp() * 1000
+    except Exception:
+        return None
+
+
+def iter_entries_reversed(path: str | Path, source_label: str, min_ts_ms: float | None = None) -> Iterator[dict[str, Any]]:
+    """The entries _extract_entries_from_lines would produce for this file,
+    NEWEST first, produced lazily -- the caller stops iterating the moment it
+    has enough. With min_ts_ms, also stops on its own once it's read past
+    everything that new (see _STALE_LINES_BEFORE_STOP); entries it still
+    yields just before stopping can be slightly older than the cutoff, so a
+    caller needing an exact cutoff must still filter by entry["ts"], same as
+    it always did."""
+    stale_run = 0
+    for raw in iter_lines_reversed(path):
+        if not raw.strip():
+            continue
+        if min_ts_ms is not None:
+            ts = _raw_line_ts_ms(raw)
+            if ts is not None:
+                if ts < min_ts_ms:
+                    stale_run += 1
+                    if stale_run >= _STALE_LINES_BEFORE_STOP:
+                        return
+                else:
+                    stale_run = 0
+        line_entries = _extract_entries_from_lines([raw.decode("utf-8", errors="replace")], source_label)
+        yield from reversed(line_entries)
+
+
+def read_recent_entries(path: str | Path, limit: int, source_label: str | None = None) -> list[dict[str, Any]]:
+    """The newest `limit` entries of a transcript, oldest-first -- what
+    `_extract_entries_from_jsonl(whole_file)[-limit:]` used to compute by
+    parsing all of it."""
+    out: list[dict[str, Any]] = []
+    for entry in iter_entries_reversed(path, source_label or str(path)):
+        out.append(entry)
+        if len(out) >= limit:
+            break
+    out.reverse()
+    return out
+
+
 def read_recent_history(workspace_dir: str, limit: int = 200) -> list[dict[str, Any]]:
     file = _latest_session_file(workspace_dir)
     if not file:
         return []
-    entries = _extract_entries_from_jsonl(file.read_text(encoding="utf-8"), str(file))
-    return entries[-limit:]
+    return read_recent_entries(file, limit)
 
 
 def read_recent_history_for_session(workspace_dir: str, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -217,9 +335,15 @@ def read_recent_history_for_session(workspace_dir: str, session_id: str, limit: 
     file = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
     if not file.exists():
         return []
-    entries = _extract_entries_from_jsonl(file.read_text(encoding="utf-8"), str(file))
-    return entries[-limit:]
+    return read_recent_entries(file, limit)
 
 
 def read_archived_entries(file_path: str) -> list[dict[str, Any]]:
-    return _extract_entries_from_jsonl(Path(file_path).read_text(encoding="utf-8"), file_path)
+    """EVERY entry of an archive file -- only for a caller that genuinely
+    needs the whole thing (expand_dehydrated_ref showing one archive back to
+    a human). Lazily iterates the file rather than read_text()-ing it, so
+    memory is proportional to the entries produced, not to raw file size x2.
+    A caller that only wants recent entries must use iter_entries_reversed/
+    read_recent_entries instead."""
+    with open(file_path, encoding="utf-8", errors="replace") as f:
+        return _extract_entries_from_lines(f, file_path)
