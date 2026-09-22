@@ -1428,6 +1428,21 @@ class ChatSession:
         # conn state / api retry / rate limit memory
         self.conn_state: dict[str, Any] = {"kind": "connected"}
         self.ignore_next_result_recovery = False
+        # Bug fix (2026-09-22), confirmed live: the cc_cli_limit_message branch
+        # below deliberately does NOT set ignore_next_result_recovery (per the
+        # 2026-09-11 fix's own reasoning -- a real AssistantMessage came
+        # through, so turn_pending must clear normally, not pretend the turn
+        # never happened). But that flag ALSO gates the generic "reset
+        # conn_state to connected" a little further down -- so conn_state,
+        # set to "limited" moments earlier for a real, still-active usage
+        # limit, was being silently overwritten back to "connected" by that
+        # SAME turn's own trailing ResultMessage well under a second later.
+        # Confirmed live: the status lamp/text never had a real chance to
+        # show it. A narrower, single-purpose flag: protects ONLY the
+        # conn_state reset for the one ResultMessage immediately following a
+        # real limit hit, leaving turn_pending/the retry timer completely
+        # unaffected (a genuine fix, not a revert of the 2026-09-11 one).
+        self.suppress_next_conn_state_reset = False
         self.api_retry_timer: asyncio.TimerHandle | None = None
         # See _schedule_one_shot_followup_check's own doc comment -- a
         # separate timer from api_retry_timer above, deliberately never
@@ -3688,6 +3703,7 @@ class ChatSession:
                             # apply here; see _schedule_one_shot_followup_check's own
                             # doc comment for the distinction.
                             self._set_conn_state("limited", limit_text)
+                            self.suppress_next_conn_state_reset = True
                             self._schedule_one_shot_followup_check("cc_cli_limit_message", self.turn_is_voice)
                             continue
 
@@ -3940,7 +3956,9 @@ class ChatSession:
                             self.ignore_next_result_recovery = False
                         else:
                             self._clear_api_retry_timer()
-                            if self.conn_state.get("kind") != "connected":
+                            if self.suppress_next_conn_state_reset:
+                                self.suppress_next_conn_state_reset = False
+                            elif self.conn_state.get("kind") != "connected":
                                 self._set_conn_state("connected")
 
                     wire = message_to_wire(message)
