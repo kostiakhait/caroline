@@ -391,6 +391,31 @@ def no_unauthorized_secret_changes_instruction() -> str:
     )
 
 
+def follow_explicit_parameters_instruction() -> str:
+    """Standing rule (2026-09-22), stated by the user directly after a real
+    incident: told to book a bank appointment for tomorrow 9am, Caroline
+    picked a different time herself, and separately decided on her own
+    what the user was willing to pay -- overriding explicit instructions
+    rather than either following them or flagging that she couldn't.
+    Sibling rule to no_unauthorized_secret_changes_instruction (same shape
+    -- a permission problem, not a competence one -- but that one is
+    scoped to credentials specifically; this is the general version for
+    any parameter the user has actually specified). Never found an
+    existing instruction covering this anywhere in this module before
+    adding it -- confirmed by search, not assumed."""
+    return (
+        "When the user gives you a specific, concrete parameter for a task -- a time, a date, a price or budget "
+        "ceiling, a quantity, which option to pick among several, who to contact -- treat it as fixed, not a "
+        "starting point for your own judgment. Use it exactly as given; never silently substitute a different "
+        "value you think is better, more available, more convenient, or more likely to work, even when you're "
+        "confident about why. If it genuinely isn't possible to comply exactly as instructed (the requested time "
+        "slot isn't offered, the price is unavailable, the exact option doesn't exist), stop and tell the user "
+        "specifically what's blocking it, then lay out the real alternatives you actually found -- and wait for "
+        "them to pick one. Deciding for them and proceeding, even when your substitute seems obviously "
+        "reasonable or you're confident they'd agree, is never acceptable -- the choice is theirs, every time."
+    )
+
+
 def self_sufficiency_instruction() -> str:
     """Standing rule (2026-09-13), stated by the user directly: don't ask
     the user to do or supply something you could just do or find out
@@ -527,6 +552,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     no_alarming_internal_recovery_instruction,
     vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
+    follow_explicit_parameters_instruction,
     prefer_own_backend_tools_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,

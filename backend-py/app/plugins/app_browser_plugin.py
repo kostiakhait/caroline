@@ -252,9 +252,12 @@ PLUGIN = Plugin(
         PluginTool(
             "open_app_browser",
             "Open (or focus, if already open) Caroline's own embedded browser window for a given label, "
-            "optionally navigating it to a URL. This is her ONLY browser -- the standalone caroline-browser "
-            "tools are blocked outright, not just discouraged. Each label is its own persistent window living "
-            "inside the app, not a separate Chrome process. purpose is a short note on why you're opening/"
+            "optionally navigating it to a URL. This is her ONLY browser -- any other independently-registered "
+            "MCP tool with the exact same purpose (its own bare tool name matching one of app_browser's) is "
+            "auto-detected from the live tool list and hard-blocked at the SDK level (see durability.py's "
+            "compute_foreign_tool_overlap), not just discouraged by prompt. "
+            "Each label is its own persistent window living inside the app, not a separate Chrome process. "
+            "purpose is a short note on why you're opening/"
             "focusing it (e.g. \"checking WhatsApp for a reply\") -- recorded so list_my_windows can later tell "
             "you (or the user) what this window is for.",
             {"label": str, "url": str | None, "purpose": str}, open_app_browser,

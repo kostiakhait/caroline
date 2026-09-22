@@ -113,7 +113,7 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name or None
 
 
-async def translate_text(text: str, language: str, session: str | None = None) -> str | None:
+async def translate_text(text: str, language: str, session: str | None = None, timeout: float = 30.0) -> str | None:
     """Per explicit instruction (2026-09-13): the target language for a
     generated piece of text (progress narration, today) must come from
     Caroline's own DEDICATED, already-continuously-refreshed language
@@ -154,7 +154,12 @@ async def translate_text(text: str, language: str, session: str | None = None) -
     aside, so the garbage filter's length cap is now sized off the INPUT
     text's own length rather than the fixed narration-sized constant; and
     a real reply can contain code/paths/technical content that must not be
-    translated along with the prose, so the prompt now says so explicitly."""
+    translated along with the prose, so the prompt now says so explicitly.
+
+    `timeout` (2026-09-22): forwarded to _post_json's own per-attempt
+    budget, default unchanged (30s) for the two real-visible-reply call
+    sites (chat_session.py) -- narration passes a much shorter value, see
+    generate_progress_comment's own doc comment for why."""
     prompt = (
         f"Translate the following text into {language}. If the text is already in that language, respond with "
         "it unchanged (or only lightly cleaned up) -- do not refuse or explain, translation into the SAME "
@@ -181,7 +186,7 @@ async def translate_text(text: str, language: str, session: str | None = None) -
     if session:
         body["session"] = session
     try:
-        data = await _post_json(body)
+        data = await _post_json(body, timeout=timeout)
     except Exception as exc:
         log_event("plugin:voice", "translate_text_request_failed", error=str(exc))
         return None
@@ -500,7 +505,9 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
     return stripped
 
 
-async def generate_progress_comment(recent_dialogue: str, language: str, session: str | None = None) -> str | None:
+async def generate_progress_comment(
+    recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0,
+) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
     without genuinely disrupting whatever she's doing (the SDK only
@@ -522,6 +529,21 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     The real session never sees or knows about this -- it's a cosmetic
     stand-in for "I'm still working on it", not something she said or
     will remember.
+
+    `timeout` (2026-09-22), per explicit instruction ("Нарратор должен
+    срабатывать КАЖДУЮ МИНУТУ"): forwarded to both the draft _post_json
+    call below AND the translate_text() pass -- confirmed live this whole
+    generate+translate chain took 71s end to end once, on top of
+    chat_session.py's own PROGRESS_NARRATION_INTERVAL_MS=60s wait, because
+    both legs used the default 30s-per-attempt/3-attempt budget every
+    OTHER (real, user-facing) SW API call gets. Narration is cosmetic
+    filler under a 60s promise, not worth that patience -- callers doing
+    the actual 60s-cadence narration loop should pass a much shorter
+    value (chat_session.py's own NARRATION_NETWORK_TIMEOUT_S) so a
+    slow/hung attempt fails fast and the OUTER retry loop
+    (NARRATION_GENERATION_RETRY_ATTEMPTS) gets a real chance to try again
+    within the same minute, instead of one slow attempt eating most of
+    it. Default (30.0) keeps every other caller's behavior unchanged.
 
     Redesigned (2026-09-10) after live evidence (screenshots) that the
     original single-question + tool-names-as-"activity" version produced
@@ -591,7 +613,7 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     if session:
         body["session"] = session
     try:
-        data = await _post_json(body)
+        data = await _post_json(body, timeout=timeout)
     except Exception as exc:
         log_event("plugin:voice", "generate_progress_comment_request_failed", error=str(exc))
         return None
@@ -621,7 +643,7 @@ async def generate_progress_comment(recent_dialogue: str, language: str, session
     # report a language mismatch, so a forced pass is the only guarantee.
     # Falls back to the untranslated text on any failure -- a narration
     # comment in the wrong language is still better than none at all.
-    translated = await translate_text(text, language, session=session)
+    translated = await translate_text(text, language, session=session, timeout=timeout)
     final_text = translated or text
     if translated is None:
         log_event("plugin:voice", "generate_progress_comment_translate_failed_using_original", text=text[:300])

@@ -367,3 +367,121 @@ def find_most_recent_claude_session_id(workspace_dir: str) -> str | None:
     except Exception as exc:
         log_event("engine", "find_most_recent_claude_session_id_failed", workspace_dir=workspace_dir, error=str(exc))
         return None
+
+
+# --- dynamic block on foreign tools that duplicate one of Caroline's own ---
+
+# Per explicit, categorical instruction (2026-09-22): NO hardcoded list of
+# any kind -- not server names, not capability keywords, not a one-time
+# "known legacy names" migration list either -- as a method for solving
+# this or any other problem. A list is only ever correct at the moment
+# it's written; a new MCP server (own or foreign) added later silently
+# stops being covered, with no signal that the list is now wrong. An
+# EARLIER version of this fix hardcoded a keyword-per-plugin mapping (e.g.
+# "appbrowser" -> "browser") and, briefly, a one-time list of legacy
+# server names to clean up -- both rejected outright, the keyword mapping
+# for the same structural reason.
+#
+# The real fix: confirmed live (2026-09-22, an isolated probe against the
+# bundled claude.exe, nothing to do with Caroline's own running process)
+# that the CLI's own "system"/"init" message -- already read by
+# ChatSession's own run loop, see its "tools" field -- carries the EXACT,
+# fully-qualified name of every tool available THIS session, own and
+# foreign alike (e.g. "mcp__caroline-notes__notes_login",
+# "mcp__windows-mouse__click_mouse"). That's real, live, always-current
+# ground truth for "what exists and what's it called" -- no need to guess
+# a server's purpose from its name at all. A foreign tool whose BARE name
+# (after its own "mcp__<server>__" prefix) is IDENTICAL to one of
+# Caroline's own tools' bare names is, by definition, meant for the exact
+# same job -- exact equality, not a keyword/substring guess, so nothing
+# about matching is hardcoded either.
+#
+# Bootstrap note: the very first query() of a process lifetime hasn't seen
+# an init message yet, so it can't know what foreign tools exist before
+# connecting (disallowed_tools has to be set before that). Cached to disk
+# (see save_discovered_foreign_tool_overlap/load_discovered_foreign_tool_
+# overlap below) so this only ever lags by one query, including across a
+# full app restart -- never a fixed list, always what was actually last
+# observed on the wire.
+
+def _tool_names_overlap(a: str, b: str) -> bool:
+    """Symmetric substring containment, not exact equality -- confirmed live
+    (2026-09-22) that Caroline's own tool names don't always match a
+    same-purpose foreign tool's name exactly: her embedded browser plugin's
+    own tools are "app_browser_click"/"app_browser_navigate"/... (an "app_"
+    prefix distinguishing them from a generic browser-automation server's
+    "browser_click"/"browser_navigate") while her mouse/keyboard/screenshot
+    plugins happen to use the exact same bare names as their generic
+    counterparts. Containment in either direction catches both shapes with
+    one generic rule -- no naming-convention table, no per-plugin mapping,
+    nothing that goes stale as tools are renamed or added. Length-guarded
+    so two totally unrelated but short names (say "time" as a substring of
+    some unrelated longer name) can't false-positive on each other -- the
+    threshold is a generic property of string-matching noise, not a lookup
+    keyed by any specific name."""
+    if len(a) < 6 or len(b) < 6:
+        return a == b
+    return a in b or b in a
+
+
+def compute_foreign_tool_overlap(all_tool_names: list[str], own_server_names: set[str]) -> list[str]:
+    """Pure function: given the exact flat tool-name list from a real init
+    message's own "tools" field, and the set of server names THIS backend's
+    own build_mcp_servers() just registered for this query (its return
+    value's own keys -- see that function's docstring for why that's the
+    one source of truth for "what's mine"), returns every foreign tool's
+    fully-qualified name whose bare name overlaps (see _tool_names_overlap)
+    one of Caroline's own tools' bare names. A tool with no "mcp__" prefix
+    at all (a CLI built-in like Bash/Read) is never foreign in the relevant
+    sense here -- skipped, not a server Caroline could have "her own"
+    equivalent MCP server for anyway."""
+    own_bare_names: set[str] = set()
+    foreign: dict[str, str] = {}  # bare_name -> fully-qualified name, first one wins for dedup
+    for qualified in all_tool_names:
+        if not qualified.startswith("mcp__"):
+            continue
+        rest = qualified[len("mcp__"):]
+        if "__" not in rest:
+            continue
+        server_name, bare_name = rest.split("__", 1)
+        if server_name in own_server_names:
+            own_bare_names.add(bare_name)
+        else:
+            foreign.setdefault(bare_name, qualified)
+    return [
+        qualified for bare_name, qualified in foreign.items()
+        if any(_tool_names_overlap(bare_name, own_name) for own_name in own_bare_names)
+    ]
+
+
+def _foreign_tool_overlap_path(workspace_dir: str) -> Path:
+    return Path(workspace_dir) / "discovered-foreign-tool-overlap.json"
+
+
+def save_discovered_foreign_tool_overlap(workspace_dir: str, qualified_names: list[str]) -> None:
+    """Persists what THIS query's own init message just revealed (see
+    compute_foreign_tool_overlap) so the NEXT query build -- including the
+    first one of a fresh process, before any init message of its own has
+    arrived -- can already disallow them, instead of only catching up one
+    query late every single time. Always overwrites with the current
+    finding (even an empty list, once a previously-foreign server goes
+    away) -- never accumulates stale entries a past init once saw but the
+    current one doesn't. Never raises."""
+    try:
+        path = _foreign_tool_overlap_path(workspace_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(qualified_names, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "save_discovered_foreign_tool_overlap_failed", error=str(exc))
+
+
+def load_discovered_foreign_tool_overlap(workspace_dir: str) -> list[str]:
+    path = _foreign_tool_overlap_path(workspace_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        log_event("engine", "load_discovered_foreign_tool_overlap_failed", error=str(exc))
+        return []

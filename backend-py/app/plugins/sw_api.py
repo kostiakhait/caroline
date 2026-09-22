@@ -72,8 +72,18 @@ def _check_funds_exhaustion(envelope: Any) -> None:
         _funds_exhausted_reason = reason
 
 
-async def _post_json(body: dict[str, Any]) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+async def _post_json(body: dict[str, Any], timeout: float = 30.0) -> Any:
+    """`timeout` is per-attempt (up to 3 attempts on a transport-level
+    failure, see below -- httpx.TimeoutException is itself a
+    TransportError, so a short timeout here also bounds how long a single
+    attempt can hang on a slow-but-not-actually-dead response). Defaults
+    to 30.0 (unchanged behavior for every existing caller); progress
+    narration (chat_session.py's _check_progress_narration, via voice_api.
+    py's generate_progress_comment/translate_text) passes a much shorter
+    value -- per explicit instruction (2026-09-22), narration is cosmetic
+    filler under a 60s promise, not worth the same patience a real
+    user-facing call deserves."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
         last_err: Exception | None = None
         for attempt in range(3):
             try:

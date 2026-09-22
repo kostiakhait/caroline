@@ -77,11 +77,14 @@ from app.durability import (
     clear_pending_turn,
     clear_tab_continuity_archive,
     clear_tab_session_id,
+    compute_foreign_tool_overlap,
     dehydrated_dir,
     find_most_recent_claude_session_id,
     load_chat_mode,
+    load_discovered_foreign_tool_overlap,
     load_tab_continuity_archive,
     load_tab_session_id,
+    save_discovered_foreign_tool_overlap,
     save_pending_turn,
     save_tab_continuity_archive,
     save_tab_session_id,
@@ -229,6 +232,31 @@ MAX_CONSECUTIVE_NARRATION_COMMENTS = 3
 # silence even though the tick itself fired exactly on schedule. Flat, no
 # backoff (matches this codebase's own no-exponential-backoff convention).
 NARRATION_GENERATION_RETRY_ATTEMPTS = 3
+
+# Bug fix (2026-09-22), per explicit instruction ("Нарратор должен
+# срабатывать КАЖДУЮ МИНУТУ"): confirmed live -- a single narration
+# generate+translate round-trip took 71s end to end (each leg using the
+# default 30s-per-attempt/3-attempt budget every OTHER, real user-facing
+# SW API call gets), so the EFFECTIVE gap between comments was "60s wait +
+# however long that chain happened to take", not a clean 60s. Narration is
+# cosmetic filler under a 60s promise, not worth that patience -- a short,
+# narration-specific per-attempt timeout (forwarded to voice_api.py's
+# generate_progress_comment/translate_text, which forward it to sw_api.
+# py's _post_json) makes a slow/hung attempt fail fast so the OUTER retry
+# loop above gets a real chance to try again within the same minute.
+NARRATION_NETWORK_TIMEOUT_S = 6.0
+
+# Bug fix (2026-09-22), same instruction: _check_progress_narration used
+# to claim the 60s interval (last_visible_output_at) BEFORE attempting
+# generation, and only on a genuine success -- meaning a run where ALL
+# NARRATION_GENERATION_RETRY_ATTEMPTS failed left last_visible_output_at
+# untouched, so the interval check passed again on literally the NEXT 5s
+# watchdog tick, hammering the SW API every 5s during an outage instead of
+# backing off at all. This is the cooldown a fully-failed attempt gets
+# instead -- long enough to not hammer, short enough that the user isn't
+# left with a full extra silent minute on top of the one that already
+# produced nothing.
+NARRATION_FAILURE_RETRY_S = 15.0
 
 # Per explicit instruction (2026-09-13/2026-09-14): was a process-wide kill
 # switch (SMALL_MODEL_ENABLED, always False) while the small-model path's
@@ -1366,6 +1394,12 @@ class ChatSession:
         # (a real reply OR a generated stand-in progress comment), and what
         # that question was, so a comment (if generated) can tie back to it.
         self.last_visible_output_at: float | None = None
+        # Bug fix (2026-09-22): see NARRATION_FAILURE_RETRY_S's own comment
+        # -- a fully-failed generation attempt (all retries exhausted)
+        # gets this short cooldown instead of either hammering the SW API
+        # on the very next 5s watchdog tick or silently eating a full
+        # extra 60s on top of the one that already produced nothing.
+        self.last_narration_failed_at: float | None = None
         self.last_real_user_question: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
@@ -2868,7 +2902,21 @@ class ChatSession:
         now = time.monotonic()
         if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
             return
-        self.last_visible_output_at = now  # claim this tick immediately -- a slow ai:resolve call must not let a second tick double-fire
+        # Bug fix (2026-09-22): a fully-failed attempt (see below) gets
+        # its own short cooldown instead of re-passing the main 60s gate
+        # above on literally the next 5s watchdog tick.
+        if self.last_narration_failed_at is not None and now - self.last_narration_failed_at < NARRATION_FAILURE_RETRY_S:
+            return
+        # Bug fix (2026-09-22): last_visible_output_at is claimed AFTER a
+        # successful send now (see below), not eagerly here -- confirmed
+        # live the old eager claim let one slow generate+translate round-
+        # trip (71s, real incident) silently cost an EXTRA clean 60s on
+        # top of its own latency, since the interval was measured from the
+        # ATTEMPT'S START rather than its actual completion. Re-entrancy
+        # (the original reason given for the eager claim) isn't actually
+        # possible here: _watchdog_loop awaits this whole coroutine
+        # sequentially, one tick at a time -- no other tick can start
+        # until this one returns, slow or not.
         from app.plugins.voice_api import generate_progress_comment
 
         dialogue = self._gather_recent_dialogue_for_narration()
@@ -2884,16 +2932,18 @@ class ChatSession:
         # contract (echoing stale dialogue, truncated/malformed tags,
         # ignoring the format entirely) several times in a row (a real
         # incident: 3 straight failures before a 4th attempt succeeded).
-        # Every failure used to just give up silently until the NEXT full
-        # 60s tick -- so a single unlucky small-model run could cost most
-        # of a minute of narration the tick's own timing was otherwise
-        # right on schedule for. Retry a few times in the SAME tick instead
-        # (no gating changes -- last_visible_output_at was already claimed
-        # above, so this can't double-fire against a later tick).
+        # Retry a few times in the SAME tick instead of waiting for the
+        # next one. Each attempt also gets NARRATION_NETWORK_TIMEOUT_S
+        # (2026-09-22, well under the default 30s-per-attempt SW API
+        # budget -- see that constant's own comment for the 71s real
+        # incident this fixes) so a slow/hung attempt fails fast and this
+        # loop gets a real chance to try again within the SAME tick.
         comment: str | None = None
         for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
             try:
-                comment = await generate_progress_comment(dialogue, current_language_name(self.tab_id))
+                comment = await generate_progress_comment(
+                    dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
+                )
             except Exception as exc:
                 log_event("engine", "progress_narration_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))
                 comment = None
@@ -2901,7 +2951,10 @@ class ChatSession:
                 break
             log_event("engine", "progress_narration_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
         if not comment:
+            self.last_narration_failed_at = time.monotonic()
             return
+        self.last_narration_failed_at = None
+        self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count += 1
         log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment, consecutive_count=self.consecutive_narration_count)
         wire = {
@@ -3667,6 +3720,15 @@ class ChatSession:
                 self._schedule_recent_24h_dialogue_refresh()
 
                 mcp_servers = build_mcp_servers()
+                # Dynamic backstop (2026-09-22), zero hardcoded names or
+                # keywords -- see compute_foreign_tool_overlap's own
+                # docstring. What THIS turn disallows is exactly what the
+                # PREVIOUS init message actually observed on the wire
+                # (refreshed below once this connection's own init
+                # arrives); empty on this process's very first-ever query,
+                # self-healing one query later and from every query after
+                # that, including across a full restart (cached to disk).
+                dynamic_disallowed_tools = load_discovered_foreign_tool_overlap(self.workspace_dir)
                 self._system_prompt_language = current_language_name(self.tab_id)
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
@@ -3688,7 +3750,7 @@ class ChatSession:
                     "cwd": self.workspace_dir,
                     "permission_mode": "bypassPermissions",
                     "mcp_servers": mcp_servers,
-                    "disallowed_tools": ["mcp__caroline-notes__notes_login"],
+                    "disallowed_tools": ["mcp__caroline-notes__notes_login", *dynamic_disallowed_tools],
                     "stderr": _stderr_handler,
                     # Claude's own native auto-compaction handles context
                     # ageing now -- explicitly on, and one long-lived client
@@ -4313,6 +4375,17 @@ class ChatSession:
                             for server_name in failed_servers:
                                 if self.client and server_name:
                                     self._schedule_mcp_reconnect(self.client, server_name)
+                        # See dynamic_disallowed_tools' own comment above --
+                        # this init message's own "tools" field is the real,
+                        # live ground truth for what's actually available THIS
+                        # connection (own and foreign alike); persisted so the
+                        # NEXT query build (not this already-in-flight one --
+                        # disallowed_tools is already locked in for it) closes
+                        # the loop instead of staying wrong forever.
+                        overlap = compute_foreign_tool_overlap(message.data.get("tools") or [], set(mcp_servers.keys()))
+                        save_discovered_foreign_tool_overlap(self.workspace_dir, overlap)
+                        if overlap:
+                            log_event("engine", "foreign_tool_overlap_discovered", tab_id=self.tab_id, tools=overlap)
 
                 if not self.ended:
                     log_event("engine", "stream_ended_unexpectedly", tab_id=self.tab_id, elapsed_ms=round((time.monotonic() - query_started_at) * 1000), has_seen_init=self.has_seen_init)
