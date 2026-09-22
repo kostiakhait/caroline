@@ -1349,20 +1349,6 @@ class ChatSession:
         # sites) -- never by narration's own output, which is the one
         # thing it exists to cap.
         self.consecutive_narration_count = 0
-        # Bug fix (2026-09-14), same incident: _schedule_one_shot_followup_
-        # check's own "Deliberately no rescheduling here" guarantee only
-        # holds within ONE firing -- if the follow-up turn it injects ALSO
-        # concludes by reporting the same still-active usage cap, the CC-
-        # CLI-limit-message handler re-enters _schedule_one_shot_followup_
-        # check fresh (self.one_shot_followup_timer is None again, cleared
-        # at the top of the PREVIOUS firing) and re-arms, unboundedly, for
-        # as long as the cap stays active -- confirmed live, this is
-        # exactly how a single genuine cap hit turned into a self-
-        # perpetuating retry loop. True one-shot PER cap episode now: set
-        # once a follow-up is scheduled, only cleared by a genuine new real
-        # user message (submit()'s is_real_user branch) -- not by the
-        # follow-up firing itself.
-        self.one_shot_followup_used_for_limit = False
 
         # restart budget
         self.restart_timestamps: list[float] = []
@@ -1793,11 +1779,9 @@ class ChatSession:
             self.silence_nudge_sent_for_turn = False
             self.last_visible_output_at = time.monotonic()
             # Bug fix (2026-09-14): a genuine new real message is the one
-            # thing that should give both of these a clean slate -- see
-            # their own __init__ comments (consecutive_narration_count,
-            # one_shot_followup_used_for_limit) for the incident this fixes.
+            # thing that should give this a clean slate -- see its own
+            # __init__ comment for the incident this fixes.
             self.consecutive_narration_count = 0
-            self.one_shot_followup_used_for_limit = False
             self.last_real_user_question = text
             # Bug fix (2026-09-11), per explicit instruction: language must
             # be tracked CONTINUOUSLY, not resolved once and left alone --
@@ -1892,7 +1876,6 @@ class ChatSession:
         self.silence_nudge_sent_for_turn = False
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count = 0
-        self.one_shot_followup_used_for_limit = False
         self.last_real_user_question = text
         refresh_language_in_background(self.last_saved_session_id, self.tab_id)
         save_pending_turn(self.workspace_dir, self.tab_id, text, [])
@@ -2318,42 +2301,36 @@ class ChatSession:
     def _schedule_one_shot_followup_check(self, reason: str, is_voice: bool) -> None:
         """Per explicit instruction (2026-09-11): distinguishes "the
         operation never even started" (a genuine rejection -- no balance,
-        or an in-flight rate-limit rejection -- see _schedule_api_retry,
-        which correctly keeps retrying every 90s forever for THAT case,
-        since nothing costs anything until a request actually gets
-        through) from "the operation genuinely completed" (a real
-        AssistantMessage came through -- e.g. the CC CLI's own "you've hit
-        your session limit" reply -- the turn is over, just concluded by
-        reporting a cap). For the second case, _schedule_api_retry's
-        forever-retry is wrong: confirmed live, it kept firing every 90s
-        for HOURS after a tab's real task was already finished, because it
-        couldn't tell "completed" from "never ran" apart. This is the
-        correct shape for "completed" instead: ONE follow-up check, fired
-        once, that never re-arms itself no matter what the model replies
-        (a genuine [[NO_UPDATE]], a real answer, or nothing at all) --
-        unlike api_retry_timer, which reschedules itself every time it
-        fires until something clears it.
+        or an in-flight rate-limit rejection -- see _schedule_api_retry) from
+        "the operation genuinely completed" (a real AssistantMessage came
+        through -- e.g. the CC CLI's own "you've hit your session limit"
+        reply -- the turn is over, just concluded by reporting a cap). Both
+        cases retry forever, flat interval, same as every other retry in
+        this codebase (RESTART_BACKOFF_MS, MCP_RECONNECT_INTERVAL_MS,
+        api_retry_timer) -- the only real difference is HOW each retry is
+        delivered: _schedule_api_retry resubmits the same still-pending
+        turn (nothing happened yet), this one injects a fresh follow-up
+        check (the turn already completed once).
 
-        Bug fix (2026-09-14), confirmed live: "never re-arms itself" above
-        was only ever true WITHIN one firing (the timer handle itself is
-        cleared at the top of _fire(), before anything else happens) -- if
-        the follow-up turn it injects ALSO concludes by reporting the SAME
-        still-active usage cap, the CC-CLI-limit-message handler calls
-        this method again fresh, sees one_shot_followup_timer is None
-        (already cleared), and re-arms -- unboundedly, once per
-        ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS, for as long as the cap stays
-        active. That's exactly the forever-retry shape this function's own
-        docstring says it's deliberately NOT supposed to have. See
-        one_shot_followup_used_for_limit's own __init__ comment: true
-        one-shot per CAP EPISODE now, not per firing -- only a genuine new
-        real user message clears it for another try."""
+        Bug fix (2026-09-22), per explicit instruction, after a real
+        incident: a 2026-09-14 change (since reverted -- see git history)
+        made this give up permanently after exactly one retry per "cap
+        episode" (one_shot_followup_used_for_limit), reasoning that
+        _schedule_api_retry's own forever-retry had once fired for hours
+        after a task was already genuinely finished. That reasoning doesn't
+        apply here: this branch only ever fires when the model's own reply
+        JUST reported a real, current usage cap -- there is no ambiguity to
+        protect against, and confirmed live, giving up after one attempt
+        left a real, still-pending task abandoned for 6+ hours after the
+        cap had long since reset, with nothing to resume it. Every firing
+        that ALSO concludes by reporting the same still-active cap goes
+        through the SAME cc_cli_limit_message handler again, which calls
+        this method again -- and now simply re-arms, exactly like every
+        other flat retry in this codebase, until a real answer (anything
+        other than another cap report) comes through."""
         if self.one_shot_followup_timer:
             log_event("engine", "one_shot_followup_already_pending", tab_id=self.tab_id, reason=reason)
             return
-        if self.one_shot_followup_used_for_limit:
-            log_event("engine", "one_shot_followup_already_used_for_this_limit_episode", tab_id=self.tab_id, reason=reason)
-            return
-        self.one_shot_followup_used_for_limit = True
         log_event(
             "engine", "one_shot_followup_scheduled", tab_id=self.tab_id, reason=reason,
             delay_ms=ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS,
@@ -2365,13 +2342,14 @@ class ChatSession:
                 return
             log_event("engine", "one_shot_followup_firing", tab_id=self.tab_id, reason=reason)
             self.inject_proactive(
-                f"[Internal: one-time follow-up check -- your previous turn concluded by reporting a usage cap.] "
+                f"[Internal: automatic follow-up check -- your previous turn concluded by reporting a usage cap.] "
                 f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
                 is_voice,
             )
-            # Deliberately no rescheduling here -- this is the whole point
-            # (one_shot_followup_used_for_limit, set above, is what actually
-            # enforces that now, since this timer handle alone wasn't enough).
+            # No rescheduling here -- if the cap is still active, the model's
+            # own reply reports it again, which routes back through the
+            # cc_cli_limit_message handler and calls this method fresh. That
+            # IS the retry loop now, same shape as every other flat retry.
 
         loop = asyncio.get_event_loop()
         self.one_shot_followup_timer = loop.call_later(ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS / 1000, _fire)
