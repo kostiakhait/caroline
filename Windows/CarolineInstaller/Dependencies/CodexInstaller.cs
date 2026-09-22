@@ -1,3 +1,4 @@
+using System.Formats.Tar;
 using System.IO.Compression;
 
 namespace CarolineInstaller.Dependencies;
@@ -5,25 +6,32 @@ namespace CarolineInstaller.Dependencies;
 /// <summary>
 /// Downloads the Codex app-server (OpenAI's agent runtime, the engine behind Caroline's
 /// "OpenAI" answer source -- see backend-py/app/engines/codex_engine.py) into
-/// AppPaths.CodexDir. It is a single self-contained exe; the release ships it zipped.
+/// AppPaths.CodexDir.
 ///
-/// Mirrored on our own server with a pinned hash, same convention as every other
-/// dependency (see AppPaths.DependencyMirrorBaseUrl). Bumping the version is a
-/// deliberate act: upload the new zip to the mirror, then change Version and
-/// ExpectedSha256 together.
+/// Ships as the upstream release's own "package" tar.gz, NOT the bare standalone exe --
+/// confirmed live (2026-09-22) that codex-app-server.exe alone is not enough: its default
+/// "code mode" tool-calling path spawns a SEPARATE sibling process, codex-code-mode-host.exe,
+/// only present in this package archive. Missing it doesn't error visibly -- the model just
+/// silently narrates a plausible-looking tool result instead of a real one (see the incident
+/// this fixes). The package also ships codex-path/rg.exe and codex-resources/*.exe, whatever
+/// else Codex's own tools may need; extracted preserving the archive's own relative layout
+/// so codex-app-server.exe finds every sibling exactly where it itself expects to find them,
+/// rather than us guessing at a flattened one.
 ///
-/// Optional feature: unlike Python or Git Bash, a failure here must NOT stop Caroline
-/// from installing -- Program.cs treats this step as non-fatal, and the app simply
-/// shows OpenAI as unavailable until a later install run succeeds. Idempotent: does
-/// nothing if AppPaths.CodexExe already exists (a newer pinned Version replaces it,
-/// see VersionMarker).
+/// Mirrored on our own server with a pinned hash, same convention as every other dependency
+/// (see AppPaths.DependencyMirrorBaseUrl). Bumping the version is a deliberate act: upload the
+/// new archive to the mirror, then change Version and ExpectedSha256 together.
+///
+/// A normal fatal step like every other dependency (see Program.cs) -- nothing installs
+/// partially. Idempotent: does nothing if AppPaths.CodexExe already exists at the pinned
+/// version (see VersionMarker).
 /// </summary>
 internal static class CodexInstaller
 {
-    // openai/codex release rust-v0.155.1, codex-app-server-x86_64-pc-windows-msvc.exe.zip.
+    // openai/codex release rust-v0.155.1, codex-app-server-package-x86_64-pc-windows-msvc.tar.gz.
     private const string Version = "0.155.1";
-    private const string ZipFileName = $"codex-app-server-{Version}-win-x64.zip";
-    private const string ExpectedSha256 = "99f220829a611756f41484839cfd086e32695afdfba5b1b9a2c04433557e7b16";
+    private const string ArchiveFileName = $"codex-app-server-package-{Version}-win-x64.tar.gz";
+    private const string ExpectedSha256 = "fcb5234b13ca915a68a1de1e4bcdcca1c789da5702f2f281733882608570aee7";
 
     private static string VersionMarker => Path.Combine(AppPaths.CodexDir, "version.txt");
 
@@ -40,24 +48,38 @@ internal static class CodexInstaller
         }
 
         Directory.CreateDirectory(AppPaths.CodexDir);
-        var zipPath = Path.Combine(AppPaths.Root, ZipFileName);
+        var archivePath = Path.Combine(AppPaths.Root, ArchiveFileName);
         onStatus("Downloading OpenAI support (Codex)…");
-        await downloader.DownloadAsync($"{AppPaths.DependencyMirrorBaseUrl}/{ZipFileName}", zipPath, ExpectedSha256,
+        await downloader.DownloadAsync($"{AppPaths.DependencyMirrorBaseUrl}/{ArchiveFileName}", archivePath, ExpectedSha256,
             p => onProgress(p), ct);
 
         onStatus("Installing OpenAI support (Codex)…");
-        var tmpExe = AppPaths.CodexExe + ".new";
+        var tmpDir = AppPaths.CodexDir + ".new";
         await Task.Run(() =>
         {
-            using (var zip = ZipFile.OpenRead(zipPath))
+            if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
+            Directory.CreateDirectory(tmpDir);
+            using (var fileStream = File.OpenRead(archivePath))
+            using (var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress))
             {
-                var entry = zip.Entries.FirstOrDefault(e => e.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    ?? throw new InvalidOperationException("Codex zip contains no .exe");
-                entry.ExtractToFile(tmpExe, overwrite: true);
+                TarFile.ExtractToDirectory(gzipStream, tmpDir, overwriteFiles: true);
             }
-            File.Move(tmpExe, AppPaths.CodexExe, overwrite: true);
+
+            // Move each extracted entry into place individually (not a directory swap --
+            // AppPaths.CodexDir may already exist, e.g. left over from a prior failed
+            // attempt) so a partial prior state never blocks a clean reinstall.
+            foreach (var entry in Directory.GetFileSystemEntries(tmpDir))
+            {
+                var dest = Path.Combine(AppPaths.CodexDir, Path.GetFileName(entry));
+                if (Directory.Exists(dest)) Directory.Delete(dest, recursive: true);
+                else if (File.Exists(dest)) File.Delete(dest);
+                if (Directory.Exists(entry)) Directory.Move(entry, dest);
+                else File.Move(entry, dest);
+            }
+            Directory.Delete(tmpDir, recursive: true);
+
             File.WriteAllText(VersionMarker, Version);
-            File.Delete(zipPath);
+            File.Delete(archivePath);
         }, ct);
 
         if (!File.Exists(AppPaths.CodexExe))

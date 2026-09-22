@@ -355,6 +355,23 @@ CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
     "{language}."
 )
 
+# Per explicit instruction (2026-09-22), after a real incident: on the OpenAI
+# engine specifically -- confirmed live, and specifically NOT observed on
+# Claude, so this is deliberately not in ALWAYS_ON_INSTRUCTIONS -- the model
+# narrated a plausible, confident-sounding "I checked X, here's what I found"
+# without ever actually calling a real tool, when a tool call had in fact
+# silently failed underneath it (root cause: a missing companion binary,
+# since fixed -- see CodexInstaller.cs -- but the underlying tendency to
+# paper over a failed/skipped tool call with a fabricated-sounding result is
+# a real, separate risk worth guarding against regardless).
+OPENAI_TOOL_HONESTY_INSTRUCTION = (
+    "Before reporting that you checked, read, listed, opened, or otherwise looked at something real (a file, an "
+    "inbox, a screenshot, a search result, anything outside your own reasoning), confirm to yourself that a real "
+    "tool call actually ran and actually returned that content -- never describe a result you did not receive "
+    "from an actual tool call, even if it sounds plausible or is what you'd expect to find. If a tool call "
+    "errored, timed out, or wasn't available, say so plainly instead of substituting a made-up-sounding answer."
+)
+
 # Fires once per backend-process lifetime, the moment the primary tab's
 # very first turn is about to run -- Caroline must never come back up
 # silently: every fresh launch or restart she should proactively say
@@ -3477,6 +3494,7 @@ class ChatSession:
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
                     language_hint_instruction(self._system_prompt_language),
+                    OPENAI_TOOL_HONESTY_INSTRUCTION if self.engine_kind == "openai" else None,
                 ]
                 system_prompt_append = "\n\n".join(p for p in system_prompt_parts if p)
 

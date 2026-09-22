@@ -79,7 +79,11 @@ internal static class AppPaths
     /// <summary>Codex app-server, the engine behind the "OpenAI" answer source (see
     /// CodexInstaller.cs). Its own state lives in Root\codex-home, written by the backend.</summary>
     public static string CodexDir => Path.Combine(RuntimeDir, "codex");
-    public static string CodexExe => Path.Combine(CodexDir, "codex-app-server.exe");
+    // Inside CodexDir's own bin\ subfolder -- CodexInstaller.cs extracts the upstream
+    // release archive preserving its own layout (bin/, codex-path/, codex-resources/),
+    // so codex-app-server.exe finds its sibling codex-code-mode-host.exe exactly where
+    // it itself expects it.
+    public static string CodexExe => Path.Combine(CodexDir, "bin", "codex-app-server.exe");
 
     public static void EnsureRootExists() => Directory.CreateDirectory(Root);
 }

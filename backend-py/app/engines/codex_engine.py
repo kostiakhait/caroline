@@ -228,6 +228,14 @@ class CodexEngine:
 
     async def connect(self, input_stream: AsyncIterable[dict[str, Any]]) -> None:
         await self._bridge.open()
+        # Diagnostic (2026-09-22), per explicit instruction after a live incident
+        # where the model narrated a plausible-sounding excuse ("почта сейчас не
+        # открывается") instead of actually calling a real tool: this makes the
+        # ACTUAL list of tools handed to Codex this turn verifiable from the log,
+        # rather than having to reconstruct it after the fact. Every name here is
+        # "<backend-py plugin>__<tool>" (see ToolBridge.open()/build_mcp_servers())
+        # -- Caroline's own in-process plugins, never the legacy Node/MCP servers.
+        log_event("engine", "codex_tools_available", count=len(self._bridge.specs), tools=[s["name"] for s in self._bridge.specs])
         self._rpc = CodexRpcClient(
             codex_argv(self._o.codex_exe, self._o.config_overrides), build_env(self._o.codex_home, self._o.extra_env),
             on_notification=self._on_notification, on_server_request=self._on_server_request,

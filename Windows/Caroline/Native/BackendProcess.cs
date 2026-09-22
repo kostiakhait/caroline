@@ -89,7 +89,14 @@ public sealed class BackendProcess : IDisposable
         // hardcoding sys.executable there.
         // Codex app-server (OpenAI support): installed by CodexInstaller, may be absent
         // (an optional dependency) -- the backend checks the file exists before using it.
-        psi.Environment["CAROLINE_CODEX_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "codex", "codex-app-server.exe");
+        // Bug fix (2026-09-22): codex-app-server.exe alone silently produces fabricated
+        // tool results instead of real ones -- its default "code mode" tool-calling path
+        // needs a sibling codex-code-mode-host.exe, which only ships in the upstream
+        // release's own package archive. CodexInstaller.cs now extracts that archive
+        // preserving its own bin/ layout (see AppPaths.CodexExe's own comment) -- kept in
+        // sync with that path here rather than duplicating AppPaths (this project doesn't
+        // reference CarolineInstaller's).
+        psi.Environment["CAROLINE_CODEX_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "codex", "bin", "codex-app-server.exe");
         psi.Environment["CAROLINE_PYTHON_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "python.exe");
 
         // Per explicit instruction (2026-09-13): Port above is the ONE place
