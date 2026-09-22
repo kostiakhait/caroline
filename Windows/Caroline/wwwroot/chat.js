@@ -1322,6 +1322,17 @@
       }
       pollChannelStatus();
       sendControl("visual_mode_get");
+      // Bug fix (2026-09-22), confirmed live: chat_mode_get used to only be
+      // requested when Settings was open (it used to feed nothing else) --
+      // now the native tab-header menu mirrors its `available`/`mode`
+      // fields on every connect via tab_state, but nothing sent this on a
+      // plain reconnect with Settings closed (the normal case). Confirmed
+      // live: after an app restart, every tab's header showed Squirrel
+      // Wisdom (and any other real-but-unmirrored source) as unavailable
+      // no matter its real state, because MainWindow's own ModeAvailable
+      // default (all false except Claude) was never corrected. Sent
+      // unconditionally now, same as visual_mode_get right above.
+      sendControl("chat_mode_get");
       // Bug fix (2026-09-16): if Settings was already open (typically:
       // opened during the ~20-30s window right after a backend restart,
       // before this connection existed at all) its whole "load current

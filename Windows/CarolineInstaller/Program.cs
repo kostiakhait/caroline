@@ -208,26 +208,19 @@ internal static class Program
             Logger.Log("ffmpeg already present, skipping");
         }
 
-        // Codex (OpenAI support) is an optional feature: a failure here must not stop
-        // Caroline itself from installing, so it is logged and the install carries on;
-        // the app shows OpenAI as unavailable until a later run succeeds.
+        // Bug fix (2026-09-22), per explicit instruction: a step that fails must
+        // stop the whole install with a clear, coded message box -- never continue
+        // silently into a partial install. (An earlier version of this step made
+        // Codex's own failure non-fatal, reasoning it was an "optional feature";
+        // that was my own unilateral call and the user overruled it: nothing
+        // installs partially, ever -- same WithStepAsync/ErrorCodes contract as
+        // every other dependency below.)
         if (!CodexInstaller.IsInstalled())
         {
-            try
-            {
-                await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
-                    s => window.SetStatus(s),
-                    p => window.SetDownloadProgress("Downloading OpenAI support…", p),
-                    ct));
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                Logger.Log($"Codex install failed, continuing without OpenAI support: {ex}");
-            }
+            await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
+                s => window.SetStatus(s),
+                p => window.SetDownloadProgress("Downloading OpenAI support…", p),
+                ct));
         }
         else
         {

@@ -431,7 +431,6 @@ public partial class MainWindow : Window
         public required string Id;
         public required Grid ContentHost;
         public required WpfButton HeaderButton;
-        public required WpfButton CloseButton;
         public required string Name;
         // Built once (in AddTabAsync) and reused by every RebuildTabStrip()
         // call -- confirmed live (2026-08-31) that creating a NEW DockPanel
@@ -442,12 +441,16 @@ public partial class MainWindow : Window
         // RebuildTabStrip only re-inserts this same wrapper into TabStrip
         // and restyles it in place, never creates a new one.
         public required DockPanel HeaderWrapper;
-        // Per-tab answer-source switcher ("Claude / SW / OpenAI") and clear
-        // button, shown in the tab header next to the title and the close
-        // button. The web page (chat.js) owns the real state and reports it
-        // via a "tab_state" web message; these are only its mirror.
-        public required Dictionary<string, WpfButton> ModeButtons;
-        public required WpfButton ClearButton;
+        // Single "sandwich" (hamburger) menu button in the tab header, replacing
+        // the earlier separate mode/clear/close buttons (per explicit instruction,
+        // 2026-09-21: those were cluttered -- one neat button instead). Its
+        // ContextMenu holds a "Mode" submenu (Claude/Squirrel Wisdom/OpenAI,
+        // checkable) plus "Clear" and "Close". The web page (chat.js) owns the
+        // real mode/availability state and reports it via a "tab_state" web
+        // message; ModeMenuItems is only its mirror.
+        public required WpfButton MenuButton;
+        public required Dictionary<string, MenuItem> ModeMenuItems;
+        public required MenuItem CloseMenuItem;
         public string ChatMode = "claude";
         public Dictionary<string, bool> ModeAvailable = new() { ["claude"] = true, ["sw"] = false, ["openai"] = false };
         public WebView2? WebView;
@@ -546,85 +549,68 @@ public partial class MainWindow : Window
             Foreground = System.Windows.Media.Brushes.White,
             BorderThickness = new Thickness(0),
         };
-        var closeButton = new WpfButton
+        // Single "sandwich" menu button (per explicit instruction, 2026-09-21,
+        // replacing an earlier cluttered row of separate mode/clear/close
+        // buttons): Mode (submenu: Claude / Squirrel Wisdom / OpenAI) / Clear /
+        // Close.
+        var menuButton = new WpfButton
         {
-            Content = "✕",
-            Padding = new Thickness(4, 0, 4, 0),
-            Margin = new Thickness(0, 0, 4, 0),
-            Background = System.Windows.Media.Brushes.Transparent,
-            Foreground = System.Windows.Media.Brushes.LightGray,
-            BorderThickness = new Thickness(0),
-            ToolTip = "Close tab",
-        };
-
-        var clearButton = new WpfButton
-        {
-            Content = "🗑",
-            Padding = new Thickness(4, 0, 4, 0),
+            Content = "☰",
+            Padding = new Thickness(6, 0, 6, 0),
             Margin = new Thickness(0, 0, 2, 0),
             Background = System.Windows.Media.Brushes.Transparent,
             Foreground = System.Windows.Media.Brushes.LightGray,
             BorderThickness = new Thickness(0),
-            ToolTip = "Clear conversation",
+            ToolTip = "Tab menu",
         };
-        var modeButtons = new Dictionary<string, WpfButton>();
-        var modePanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
-        foreach (var (modeId, modeLabel) in new[] { ("claude", "Claude"), ("sw", "SW"), ("openai", "OpenAI") })
+
+        var contextMenu = new ContextMenu();
+        var modeMenuItem = new MenuItem { Header = "Mode" };
+        var modeMenuItems = new Dictionary<string, MenuItem>();
+        foreach (var (modeId, modeLabel) in new[] { ("claude", "Claude"), ("sw", "Squirrel Wisdom"), ("openai", "OpenAI") })
         {
-            if (modePanel.Children.Count > 0)
-            {
-                modePanel.Children.Add(new System.Windows.Controls.TextBlock
-                {
-                    Text = "/", Foreground = System.Windows.Media.Brushes.DimGray,
-                    VerticalAlignment = VerticalAlignment.Center,
-                });
-            }
-            var modeButton = new WpfButton
-            {
-                Content = modeLabel,
-                Padding = new Thickness(4, 0, 4, 0),
-                Background = System.Windows.Media.Brushes.Transparent,
-                BorderThickness = new Thickness(0),
-                FontSize = 11,
-                Tag = modeId,
-            };
-            modeButtons[modeId] = modeButton;
-            modePanel.Children.Add(modeButton);
+            var item = new MenuItem { Header = modeLabel, IsCheckable = true, Tag = modeId };
+            modeMenuItems[modeId] = item;
+            modeMenuItem.Items.Add(item);
         }
+        var clearMenuItem = new MenuItem { Header = "Clear" };
+        var closeMenuItem = new MenuItem { Header = "Close" };
+        contextMenu.Items.Add(modeMenuItem);
+        contextMenu.Items.Add(new Separator());
+        contextMenu.Items.Add(clearMenuItem);
+        contextMenu.Items.Add(closeMenuItem);
+        menuButton.ContextMenu = contextMenu;
+        menuButton.Click += (_, _) => { contextMenu.PlacementTarget = menuButton; contextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom; contextMenu.IsOpen = true; };
 
         var headerWrapper = new DockPanel { LastChildFill = true };
-        DockPanel.SetDock(closeButton, Dock.Right);
-        headerWrapper.Children.Add(closeButton);
-        DockPanel.SetDock(clearButton, Dock.Right);
-        headerWrapper.Children.Add(clearButton);
-        DockPanel.SetDock(modePanel, Dock.Right);
-        headerWrapper.Children.Add(modePanel);
+        DockPanel.SetDock(menuButton, Dock.Right);
+        headerWrapper.Children.Add(menuButton);
         headerWrapper.Children.Add(headerButton);
 
         var tab = new ChatTab
         {
             Id = tabId, ContentHost = contentHost, HeaderButton = headerButton,
-            CloseButton = closeButton, HeaderWrapper = headerWrapper, Name = tabName,
-            ModeButtons = modeButtons, ClearButton = clearButton,
+            HeaderWrapper = headerWrapper, Name = tabName,
+            MenuButton = menuButton, ModeMenuItems = modeMenuItems, CloseMenuItem = closeMenuItem,
         };
-        foreach (var (modeId, modeButton) in modeButtons)
+        foreach (var (modeId, item) in modeMenuItems)
         {
             var id = modeId;
-            modeButton.Click += (_, _) =>
+            item.Click += (_, _) =>
             {
                 if (tab.ChatMode == id || !tab.ModeAvailable.GetValueOrDefault(id)) return;
                 _ = tab.WebView?.CoreWebView2?.ExecuteScriptAsync($"window.carolineSetChatMode && window.carolineSetChatMode({JsonSerializer.Serialize(id)});");
             };
         }
-        clearButton.Click += (_, _) =>
+        clearMenuItem.Click += (_, _) =>
         {
             SelectTab(tab);
             _ = tab.WebView?.CoreWebView2?.ExecuteScriptAsync("window.carolineRequestClear && window.carolineRequestClear();");
         };
+        closeMenuItem.Click += async (_, _) => await CloseTabAsync(tab);
         ApplyTabModeStyle(tab);
         headerButton.Click += (_, _) => SelectTab(tab);
         headerButton.MouseDoubleClick += (_, e) => { BeginRenameTab(tab); e.Handled = true; };
-        closeButton.Click += async (_, _) => await CloseTabAsync(tab);
 
         _tabs.Add(tab);
         RebuildTabStrip();
@@ -826,12 +812,21 @@ public partial class MainWindow : Window
         foreach (var tab in _tabs)
         {
             var isActive = tab == _activeTab;
-            tab.HeaderButton.Background = isActive
-                ? System.Windows.Media.Brushes.RoyalBlue
-                : System.Windows.Media.Brushes.Transparent;
+            // Bug fix (2026-09-22), confirmed live: only HeaderButton got the
+            // active highlight, not MenuButton right next to it -- with no
+            // visual boundary between one tab's own [name][☰] pair and the
+            // next tab's, the active tab's own menu button read as floating
+            // between tabs, belonging to neither. Both elements of a tab now
+            // share the same background, and HeaderWrapper itself gets a
+            // thin separating margin, so each tab reads as one contiguous
+            // unit regardless of which is active.
+            var background = isActive ? System.Windows.Media.Brushes.RoyalBlue : System.Windows.Media.Brushes.Transparent;
+            tab.HeaderButton.Background = background;
+            tab.MenuButton.Background = background;
+            tab.HeaderWrapper.Margin = new Thickness(0, 0, 1, 0);
             // Never allow closing the last tab -- there must always be
             // somewhere to actually chat.
-            tab.CloseButton.Visibility = _tabs.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+            tab.CloseMenuItem.IsEnabled = _tabs.Count > 1;
 
             // Reuse the SAME wrapper built once in AddTabAsync -- see
             // ChatTab.HeaderWrapper's doc comment for why a fresh DockPanel
@@ -857,20 +852,20 @@ public partial class MainWindow : Window
         TabStrip.Children.Add(_addTabButton);
     }
 
-    /// <summary>Restyles a tab's "Claude / SW / OpenAI" text switcher from its mirrored state: the active source is bold white, an available one light gray, an unavailable one dark gray and inert.</summary>
+    /// <summary>Restyles a tab's "Mode" submenu from its mirrored state: the
+    /// active source is checked, an unavailable one disabled with a tooltip
+    /// explaining why. Also updates the menu button's own text to the current
+    /// mode's short name, so the tab header shows at a glance which source
+    /// this tab is answering through without opening the menu.</summary>
     private static void ApplyTabModeStyle(ChatTab tab)
     {
-        foreach (var (modeId, button) in tab.ModeButtons)
+        foreach (var (modeId, item) in tab.ModeMenuItems)
         {
             var available = tab.ModeAvailable.GetValueOrDefault(modeId);
             var active = tab.ChatMode == modeId;
-            button.IsEnabled = available && !active;
-            button.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
-            button.Foreground = active
-                ? System.Windows.Media.Brushes.White
-                : available ? System.Windows.Media.Brushes.Silver : System.Windows.Media.Brushes.DimGray;
-            button.Cursor = available && !active ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow;
-            button.ToolTip = available ? null : modeId switch
+            item.IsEnabled = available;
+            item.IsChecked = active;
+            item.ToolTip = available ? null : modeId switch
             {
                 "sw" => "Needs a Claude subscription and a paid SquirrelWisdom balance",
                 "openai" => "Set up OpenAI in Settings",
@@ -1058,7 +1053,7 @@ public partial class MainWindow : Window
                     if (root.TryGetProperty("mode", out var modeEl) && modeEl.GetString() is { } mode) stateTab.ChatMode = mode;
                     if (root.TryGetProperty("available", out var availEl) && availEl.ValueKind == JsonValueKind.Object)
                     {
-                        foreach (var id in stateTab.ModeButtons.Keys)
+                        foreach (var id in stateTab.ModeMenuItems.Keys)
                         {
                             stateTab.ModeAvailable[id] = availEl.TryGetProperty(id, out var v) && v.ValueKind == JsonValueKind.True;
                         }
