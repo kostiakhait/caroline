@@ -44,6 +44,7 @@ import time
 import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
@@ -54,7 +55,9 @@ from claude_agent_sdk import (
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from app import win_subprocess_patch
@@ -1111,6 +1114,21 @@ def _ensure_settings_file(workspace_dir: str) -> str:
     return str(path)
 
 
+@dataclass
+class ToolOutcome:
+    """Ground truth for one tool this real-user episode has called, keyed by
+    tool NAME (not call id -- see turn_tool_outcomes' own comment for why):
+    what the tool actually returned, independent of whatever the model's own
+    closing narration claims. Populated purely by reading ToolUseBlock/
+    ToolResultBlock pairs already on the wire (see the top of _run_loop's
+    per-message handling) -- works identically for Claude and OpenAI, since
+    both engines produce the exact same SDK message shapes here."""
+
+    name: str
+    is_error: bool
+    result_preview: str
+
+
 class ChatSession:
     def __init__(self, tab_id: str, workspace_dir: str, send: SendFn) -> None:
         self.tab_id = tab_id
@@ -1324,6 +1342,24 @@ class ChatSession:
         self.last_real_user_turn_started_at_ms: float | None = None
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
+
+        # Ground-truth tool-outcome tracking for the self-check/push-through
+        # mechanism (2026-09-22, per explicit instruction: "Кэролайн должна
+        # не просто формально 'завершать ход', она должна решать задачу до
+        # конца"). Scoped to the whole real-user EPISODE (reset only by a
+        # fresh real submit(), same lifetime as real_user_turn_answered right
+        # above), not per-turn like turn_saw_any_visible_text -- an internal
+        # follow-up check is itself a new "turn" from submit()'s point of
+        # view, and the whole point is remembering a tool failure ACROSS
+        # those follow-ups until it's genuinely resolved (a later call to the
+        # SAME tool succeeding overwrites/clears the earlier failure -- see
+        # turn_tool_outcomes' own key). _pending_tool_calls is the id->name
+        # scratch space bridging a ToolUseBlock to its eventual
+        # ToolResultBlock; population happens once, at the top of _run_loop's
+        # per-message handling, off the raw SDK objects both engines produce
+        # identically -- see ToolOutcome's own docstring.
+        self._pending_tool_calls: dict[str, str] = {}
+        self.turn_tool_outcomes: dict[str, ToolOutcome] = {}
 
         # periodic mid-turn progress narration (see PROGRESS_NARRATION_INTERVAL_MS)
         # -- when a real user's own question was last actually shown something
@@ -1777,6 +1813,14 @@ class ChatSession:
             self.last_real_user_turn_started_at_ms = time.time() * 1000
             self.real_user_turn_answered = False
             self.silence_nudge_sent_for_turn = False
+            # A genuine new real-user episode starts with a clean ground-truth
+            # slate -- see the field's own __init__ comment for why this is
+            # episode-scoped rather than per-turn. A leftover in-flight tool
+            # call from whatever the PREVIOUS episode was doing can never be
+            # resolved now (that episode is over), so it's discarded here
+            # too rather than left to dangle in _pending_tool_calls forever.
+            self._pending_tool_calls = {}
+            self.turn_tool_outcomes = {}
             self.last_visible_output_at = time.monotonic()
             # Bug fix (2026-09-14): a genuine new real message is the one
             # thing that should give this a clean slate -- see its own
@@ -1874,6 +1918,9 @@ class ChatSession:
         self.last_real_user_turn_started_at_ms = time.time() * 1000
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
+        # See the matching reset in submit() for why this is cleared here too.
+        self._pending_tool_calls = {}
+        self.turn_tool_outcomes = {}
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count = 0
         self.last_real_user_question = text
@@ -2874,6 +2921,72 @@ class ChatSession:
             [], False, False,
         )
 
+    def _track_tool_outcomes(self, message: Any) -> None:
+        """Ground-truth tool-outcome tracking (see ToolOutcome's own
+        docstring and the field comments in __init__): every ToolUseBlock is
+        remembered here by call id until its matching ToolResultBlock (on
+        the following UserMessage) arrives, at which point it's recorded
+        into turn_tool_outcomes keyed by NAME -- so a later successful retry
+        of the same tool overwrites an earlier failure instead of the two
+        coexisting. Called once per raw SDK message at the top of the
+        per-message loop, off the exact same objects both ClaudeEngine and
+        CodexEngine already produce there, so this works identically for
+        either engine with zero engine-specific code. Split out as its own
+        method (rather than left inline in the loop) so it can be exercised
+        directly against fake SDK messages without a live engine."""
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, ToolUseBlock):
+                    self._pending_tool_calls[block.id] = block.name
+            return
+        if isinstance(message, UserMessage) and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    tool_name = self._pending_tool_calls.pop(block.tool_use_id, None) or "unknown_tool"
+                    content = block.content
+                    if isinstance(content, list):
+                        # SDK's own shape here is raw dicts (e.g.
+                        # {"type": "text", "text": ...}), NOT TextBlock
+                        # objects -- see ToolResultBlock's own type in
+                        # claude_agent_sdk.types.
+                        preview = " ".join(
+                            item.get("text", "") for item in content
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        )
+                    elif isinstance(content, str):
+                        preview = content
+                    else:
+                        preview = ""
+                    preview = preview.strip()[:300]
+                    self.turn_tool_outcomes[tool_name] = ToolOutcome(
+                        name=tool_name, is_error=bool(block.is_error), result_preview=preview,
+                    )
+
+    def _turn_outcomes_summary(self) -> str:
+        """Ground-truth text for the current real-user episode's tool calls
+        (see turn_tool_outcomes' own __init__ comment) -- literally the
+        name/is_error/content already on the wire, never inferred or
+        guessed. Empty string when there's nothing to report (no tool calls
+        yet, or every one of them succeeded), so callers can just check
+        truthiness before appending it to a nudge. Deliberately reports
+        EVERY outcome, not just errors -- a reader reconciling "did I
+        actually finish" needs the full picture, not just the bad news."""
+        if not self.turn_tool_outcomes:
+            return ""
+        lines = []
+        for outcome in self.turn_tool_outcomes.values():
+            status = f"ERROR ({outcome.result_preview})" if outcome.is_error else "ok"
+            lines.append(f"{outcome.name} -> {status}")
+        return "Ground truth for tool calls this task actually made so far (not your own account of it): " + "; ".join(lines) + "."
+
+    def _turn_has_unresolved_tool_error(self) -> bool:
+        """True when the ground-truth record (see _turn_outcomes_summary)
+        shows at least one tool call still sitting at is_error=True for this
+        episode -- used to refuse a blind [[NO_UPDATE]] rather than trust
+        the model's own self-report over what its own tool calls actually
+        returned."""
+        return any(outcome.is_error for outcome in self.turn_tool_outcomes.values())
+
     def _fire_post_turn_completion_check(self) -> None:
         """Sanity check run right after a turn finishes -- per explicit
         correction (2026-09-13), replacing a periodic timer-based version
@@ -2917,9 +3030,19 @@ class ChatSession:
         if self.ended:
             return
         lang = current_language_name(self.tab_id)
-        log_event("engine", "post_turn_completion_check", tab_id=self.tab_id)
+        # Ground-truth cross-check (2026-09-22, see ToolOutcome's own
+        # docstring): grounds this nudge in what the last turn's own tool
+        # calls actually returned, instead of leaving it pure introspection
+        # -- appended, never replacing CONTINUE_OR_SILENT_NUDGE_TEMPLATE
+        # itself, so every existing call site of that template elsewhere
+        # keeps behaving exactly as before.
+        outcomes_summary = self._turn_outcomes_summary()
+        nudge = CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang)
+        if outcomes_summary:
+            nudge = f"{nudge}\n\n{outcomes_summary}"
+        log_event("engine", "post_turn_completion_check", tab_id=self.tab_id, has_tool_outcomes=bool(outcomes_summary))
         self._awaiting_post_turn_check_reply = True
-        self.inject_proactive(CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang))
+        self.inject_proactive(nudge)
 
     def _current_session_file_size(self) -> int | None:
         """Bytes on disk for this tab's currently-resumed session transcript,
@@ -3573,6 +3696,10 @@ class ChatSession:
                             self.last_tool_use_name = tool_use_block.name
                             self.last_tool_use_started_at = time.monotonic()
 
+                    # Ground-truth tool-outcome tracking -- see
+                    # _track_tool_outcomes' own docstring.
+                    self._track_tool_outcomes(message)
+
                     # --- classifier refusal ---
                     if isinstance(message, AssistantMessage):
                         refusal_text = next(
@@ -3908,6 +4035,30 @@ class ChatSession:
                                 # never chaining into an infinite tight loop of
                                 # a check chasing its own silence.
                                 log_event("engine", "post_turn_completion_check_proactive_empty", tab_id=self.tab_id)
+                                self._fire_post_turn_completion_check()
+                            elif was_awaiting_post_turn_check_reply and not self.turn_saw_any_visible_text and self._turn_has_unresolved_tool_error():
+                                # Ground-truth override (2026-09-22), per
+                                # explicit instruction that Caroline must
+                                # push through to a real answer rather than
+                                # formally "end a turn": neither branch
+                                # above caught this case -- a bare
+                                # [[NO_UPDATE]] check-reply (stripped before
+                                # turn_saw_any_visible_text is ever set, see
+                                # _strip_no_update_from_wire's own call
+                                # site) would otherwise be accepted at face
+                                # value and silently drop the check here.
+                                # But this episode's own ground truth (see
+                                # ToolOutcome/turn_tool_outcomes) shows a
+                                # tool call that's still sitting at
+                                # is_error=True -- the model's silence is
+                                # not evidence the work is actually done, so
+                                # don't trust it; re-fire the same check
+                                # again, now carrying that ground truth (see
+                                # _fire_post_turn_completion_check's own
+                                # _turn_outcomes_summary() call), same flat
+                                # re-ask-forever shape every other internal
+                                # nudge here already uses.
+                                log_event("engine", "post_turn_completion_check_ground_truth_override", tab_id=self.tab_id)
                                 self._fire_post_turn_completion_check()
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
