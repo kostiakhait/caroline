@@ -1447,6 +1447,20 @@ class ChatSession:
         self.unrecoverable_session_replay_attachments: list[Any] = []
         self.skip_migration_fallback_once = False
 
+        # Cross-engine handoff framing (2026-09-22), per explicit instruction
+        # after a real incident: switch_engine_if_needed()'s force_restart()
+        # ends the stream exactly like any other unexpected disconnect, so it
+        # landed in _handle_failure's generic "internal failure, infrastructure
+        # self-healing" framing -- which is simply WRONG for a deliberate,
+        # user-requested engine switch, and (confirmed live) gives the newly
+        # active engine no hint that it just inherited a conversation from a
+        # DIFFERENT engine with none of its own memory of it. Set right before
+        # force_restart() in switch_engine_if_needed(), consumed once (and
+        # reset to None) at the top of _handle_failure, which swaps in a
+        # dedicated note instead of the generic one when this is populated --
+        # see _handle_failure's own comment for the incident this fixes.
+        self.restart_engine_switch: tuple[str, str] | None = None
+
         # conn state / api retry / rate limit memory
         self.conn_state: dict[str, Any] = {"kind": "connected"}
         self.ignore_next_result_recovery = False
@@ -1553,6 +1567,10 @@ class ChatSession:
             self._drain_compaction_queue()
         self.needs_post_limit_compaction_check = False
         self.forced_compaction_blocked_until = 0.0
+        # See restart_engine_switch's own __init__ comment -- consumed once
+        # by _handle_failure, which is where force_restart()'s stream-end
+        # actually lands.
+        self.restart_engine_switch = (self.engine_kind, wanted)
         self.force_restart()
         return "switching"
 
@@ -3403,6 +3421,12 @@ class ChatSession:
 
     async def _handle_failure(self, exc: BaseException, extra_note: str | None = None) -> None:
         log_event("engine", "handle_failure_entered", tab_id=self.tab_id, hang_count=self.hang_count, turn_pending=self.turn_pending, error=str(exc))
+        # See restart_engine_switch's own __init__ comment. Consumed once,
+        # right here, since switch_engine_if_needed()'s force_restart() ends
+        # the stream the exact same way any other disconnect does -- this is
+        # the one place that stream-end always lands, regardless of cause.
+        engine_switch = self.restart_engine_switch
+        self.restart_engine_switch = None
         # Any pending per-server reconnect retries belong to the client
         # instance that's being torn down -- _schedule_mcp_reconnect's own
         # self.client-identity check would catch this anyway, but clearing
@@ -3432,22 +3456,62 @@ class ChatSession:
         # Either way, tell the model exactly what got force-terminated so
         # it can try a different approach on retry instead of blindly
         # repeating the same slow/stuck call.
-        tool_note = ""
-        if self.hang_interrupted_tool_name:
-            tool_note = (
-                f" The tool call in progress ('{self.hang_interrupted_tool_name}') had not finished after "
-                f"{round(self.hang_interrupted_tool_elapsed_s or 0)}s and was force-terminated -- if this is still "
-                "relevant, try a different approach instead of just repeating that same call, since whatever made "
-                "it slow or stuck likely hasn't changed."
+        if engine_switch:
+            # Confirmed live (2026-09-22): the generic "internal failure,
+            # infrastructure self-healing" framing below is actively
+            # misleading here, and gives the newly active engine no hint
+            # that it just inherited a conversation from a DIFFERENT engine
+            # with none of its own memory of it -- it resumes its OWN prior
+            # session (if any) via native --resume, which has a hole for
+            # exactly however long the other engine was active; the only
+            # bridge across that hole is the cross-engine dialogue-history
+            # file (recent_dialogue_history_instruction, already in this
+            # tab's system prompt). Confirmed live the model, told only
+            # "you recovered from a failure, carry on", read that file but
+            # then treated its narrated summary as settled history rather
+            # than something to actively verify/continue -- replying
+            # [[NO_UPDATE]] to a real, unresolved "continue" from the user.
+            from_engine, to_engine = engine_switch
+            watchdog_note = (
+                f"[System note: this tab just switched engines, from {from_engine} to {to_engine}, per the "
+                "user's own explicit request -- a deliberate handoff, not a failure; don't mention any 'error' "
+                "or 'recovery' about it unless the user specifically asks what happened. You do NOT have this "
+                f"tab's own memory of whatever happened while {from_engine} was active -- that work only exists "
+                "in the cross-engine dialogue-history file this system prompt already points you at (see the "
+                "instruction about it earlier in this prompt). If you haven't already, read that file FIRST, "
+                "before answering anything below it -- and don't just treat what it describes as settled "
+                "history: if it shows a task that isn't actually finished, or the user's own message below is "
+                "asking you to continue something, actually continue it for real, the same as if you'd been "
+                "working on it yourself the whole time.]"
             )
-        self.hang_interrupted_tool_name = None
-        self.hang_interrupted_tool_elapsed_s = None
-        watchdog_note = (
-            f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}):"
-            f"{tool_note} {exc}.{(' ' + extra_note) if extra_note else ''} This is Caroline's own infrastructure "
-            "self-healing, already handled -- for your own situational awareness only. Do not mention this or "
-            "sound any alarm about it to the user unless they specifically ask what happened just now.]"
-        )
+        else:
+            # Per explicit instruction (2026-09-10, revised 2026-09-15): a
+            # genuinely slow-but-alive tool call (a recursive grep/filesystem
+            # scan, a slow browser evaluate, a large fetch/decode) gets a much
+            # longer leash now (see _check_hang's own tool_in_flight/
+            # HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS) rather than none at all --
+            # this note only fires once that longer timeout is ALSO exceeded
+            # (real work truly stuck), or when there was no tool in flight to
+            # begin with (genuine dead-air silence past the plain 90s/300s).
+            # Either way, tell the model exactly what got force-terminated so
+            # it can try a different approach on retry instead of blindly
+            # repeating the same slow/stuck call.
+            tool_note = ""
+            if self.hang_interrupted_tool_name:
+                tool_note = (
+                    f" The tool call in progress ('{self.hang_interrupted_tool_name}') had not finished after "
+                    f"{round(self.hang_interrupted_tool_elapsed_s or 0)}s and was force-terminated -- if this is still "
+                    "relevant, try a different approach instead of just repeating that same call, since whatever made "
+                    "it slow or stuck likely hasn't changed."
+                )
+            self.hang_interrupted_tool_name = None
+            self.hang_interrupted_tool_elapsed_s = None
+            watchdog_note = (
+                f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}):"
+                f"{tool_note} {exc}.{(' ' + extra_note) if extra_note else ''} This is Caroline's own infrastructure "
+                "self-healing, already handled -- for your own situational awareness only. Do not mention this or "
+                "sound any alarm about it to the user unless they specifically ask what happened just now.]"
+            )
         if self.pending_user_text is not None:
             log_event("engine", "handle_failure_replay_pending", tab_id=self.tab_id, text_len=len(self.pending_user_text))
             self._push_message(f"{watchdog_note}\n\n{self.pending_user_text}", self.pending_attachments, False)
