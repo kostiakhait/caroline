@@ -98,6 +98,35 @@ def set_own_anthropic_api_key(workspace_dir: str, key: str | None) -> None:
     path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
 
 
+# --- model override: which model a provider uses ----------------------------
+# Unset means "automatic" -- the provider's own default, never a name pinned
+# here. Claude's choices are the CLI's family aliases (each always resolves to
+# that family's current model); OpenAI's come from Codex's own model list.
+
+CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku")
+_MODEL_KEYS = {"claude": "claudeModel", "openai": "openaiModel"}
+
+
+def get_model_override(workspace_dir: str, provider: str) -> str | None:
+    value = _load_settings(workspace_dir).get(_MODEL_KEYS[provider])
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def set_model_override(workspace_dir: str, provider: str, model: str | None) -> None:
+    key = _MODEL_KEYS[provider]
+    if provider == "claude" and model and model not in CLAUDE_MODEL_ALIASES:
+        raise ValueError(f"unknown Claude model: {model}")
+    settings = _load_settings(workspace_dir)
+    trimmed = model.strip() if model else None
+    if trimmed:
+        settings[key] = trimmed
+    else:
+        settings.pop(key, None)
+    path = _settings_path(workspace_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + chr(10), encoding="utf-8")
+
+
 # --- mode resolve ------------------------------------------------------------
 
 # --- cached account state ----------------------------------------------------

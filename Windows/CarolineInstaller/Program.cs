@@ -208,6 +208,32 @@ internal static class Program
             Logger.Log("ffmpeg already present, skipping");
         }
 
+        // Codex (OpenAI support) is an optional feature: a failure here must not stop
+        // Caroline itself from installing, so it is logged and the install carries on;
+        // the app shows OpenAI as unavailable until a later run succeeds.
+        if (!CodexInstaller.IsInstalled())
+        {
+            try
+            {
+                await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
+                    s => window.SetStatus(s),
+                    p => window.SetDownloadProgress("Downloading OpenAI support…", p),
+                    ct));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"Codex install failed, continuing without OpenAI support: {ex}");
+            }
+        }
+        else
+        {
+            Logger.Log("Codex already present, skipping");
+        }
+
         // Caroline's own window is a WebView2 host -- without the Runtime present,
         // the app fails to show a window (or crashes) on first launch, AFTER this
         // installer would otherwise have already reported success. See

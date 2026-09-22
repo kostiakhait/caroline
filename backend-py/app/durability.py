@@ -38,6 +38,21 @@ def claude_project_dir(workspace_dir: str) -> Path:
     return Path.home() / ".claude" / "projects" / encoded
 
 
+def openai_transcripts_dir(workspace_dir: str) -> Path:
+    """workspace/openai-transcripts/ -- the conversation log of tabs answered
+    by the OpenAI engine, in the same JSONL shape Claude Code writes, so every
+    history reader works on it unchanged (see session_transcript_path)."""
+    return Path(workspace_dir) / "openai-transcripts"
+
+
+def session_transcript_path(workspace_dir: str, session_id: str) -> Path:
+    """Where a session's transcript lives: an OpenAI thread's own log if one
+    exists under that id, else Claude Code's file. Ids never collide across
+    engines (Claude session ids and Codex thread ids are distinct UUIDs)."""
+    own = openai_transcripts_dir(workspace_dir) / f"{session_id}.jsonl"
+    return own if own.exists() else claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+
+
 def dehydrated_dir(workspace_dir: str) -> Path:
     """workspace/dehydrated/ -- where the PreCompact hook copies a
     pre-compaction transcript so earlier context stays recoverable, and
@@ -193,34 +208,57 @@ def _tab_session_id_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"tab-session-{_sanitize_tab_id(tab_id)}.json"
 
 
-def load_tab_session_id(workspace_dir: str, tab_id: str) -> str | None:
+# One file per tab holds the resume id of EACH engine that has run in it
+# ("sessionId" = the Claude session, "openaiThreadId" = the Codex thread), so
+# switching a tab between engines never loses either conversation.
+_SESSION_KEY = {"claude": "sessionId", "openai": "openaiThreadId"}
+
+
+def _read_tab_session_file(workspace_dir: str, tab_id: str) -> dict:
     path = _tab_session_id_path(workspace_dir, tab_id)
     if not path.exists():
-        return None
+        return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data.get("sessionId")
+        return data if isinstance(data, dict) else {}
     except Exception as exc:
         log_event("engine", "load_tab_session_id_failed", tab_id=tab_id, error=str(exc))
-        return None
+        return {}
 
 
-def save_tab_session_id(workspace_dir: str, tab_id: str, session_id: str) -> None:
+def load_tab_session_id(workspace_dir: str, tab_id: str, engine: str = "claude") -> str | None:
+    return _read_tab_session_file(workspace_dir, tab_id).get(_SESSION_KEY[engine])
+
+
+def save_tab_session_id(workspace_dir: str, tab_id: str, session_id: str, engine: str = "claude") -> None:
     try:
         path = _tab_session_id_path(workspace_dir, tab_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"sessionId": session_id}, indent=2) + "\n", encoding="utf-8")
+        data = _read_tab_session_file(workspace_dir, tab_id)
+        data[_SESSION_KEY[engine]] = session_id
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except Exception as exc:
         log_event("engine", "save_tab_session_id_failed", tab_id=tab_id, error=str(exc))
 
 
-def clear_tab_session_id(workspace_dir: str, tab_id: str) -> None:
+def clear_tab_session_id(workspace_dir: str, tab_id: str, engine: str | None = "claude") -> None:
     """The next runLoop iteration for this tab omits `resume` from its
     query() options, so the SDK starts a genuinely new session instead of
     resuming anything. Used by compaction's backoff path and by
-    reset-unrecoverable-session."""
+    reset-unrecoverable-session. engine=None clears every engine's id (a full
+    tab wipe)."""
     try:
-        _tab_session_id_path(workspace_dir, tab_id).unlink(missing_ok=True)
+        path = _tab_session_id_path(workspace_dir, tab_id)
+        if engine is None:
+            path.unlink(missing_ok=True)
+            return
+        data = _read_tab_session_file(workspace_dir, tab_id)
+        if data.pop(_SESSION_KEY[engine], None) is None:
+            return
+        if data:
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
     except Exception as exc:
         log_event("engine", "clear_tab_session_id_failed", tab_id=tab_id, error=str(exc))
 
@@ -243,7 +281,14 @@ def load_tab_continuity_archive(workspace_dir: str, tab_id: str) -> str | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data.get("archivePath")
+        archive_path = data.get("archivePath")
+        # A pointer to a file that no longer exists (an archive pruned as
+        # redundant, deleted by hand) is worse than no pointer: the system
+        # prompt would send the model to read something that isn't there.
+        if archive_path and not Path(archive_path).exists():
+            log_event("engine", "tab_continuity_archive_missing", tab_id=tab_id, archive_path=archive_path)
+            return None
+        return archive_path
     except Exception as exc:
         log_event("engine", "load_tab_continuity_archive_failed", tab_id=tab_id, error=str(exc))
         return None
@@ -286,7 +331,7 @@ def load_chat_mode(workspace_dir: str, tab_id: str) -> str:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         mode = data.get("mode")
-        return mode if mode in ("claude", "sw") else "claude"
+        return mode if mode in ("claude", "sw", "openai") else "claude"
     except Exception as exc:
         log_event("engine", "load_chat_mode_failed", tab_id=tab_id, error=str(exc))
         return "claude"

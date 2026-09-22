@@ -195,7 +195,7 @@ internal static class Autostart
         // of stuck/lingering processes over many hours left literally zero trace
         // here: nothing to tell us whether this loop ever ran, found candidates,
         // or correctly/incorrectly skipped them.
-        foreach (var name in new[] { "node", "claude" })
+        foreach (var name in new[] { "node", "claude", "codex-app-server" })
         {
             var procs = Process.GetProcessesByName(name);
             Logger.Log($"StopRunningClient: found {procs.Length} '{name}' process(es) on the machine");

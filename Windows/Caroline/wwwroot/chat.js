@@ -68,7 +68,6 @@
   const sendBtn = document.getElementById("sendBtn");
   const stopBtn = document.getElementById("stopBtn");
 
-  const clearChatBtn = document.getElementById("clearChatBtn");
   const clearConfirmOverlay = document.getElementById("clearConfirmOverlay");
   const clearConfirmCancelBtn = document.getElementById("clearConfirmCancelBtn");
   const clearConfirmOkBtn = document.getElementById("clearConfirmOkBtn");
@@ -90,6 +89,19 @@
   const ownAnthropicKeySaveBtn = document.getElementById("ownAnthropicKeySaveBtn");
   const ownAnthropicKeyClearBtn = document.getElementById("ownAnthropicKeyClearBtn");
   const ownAnthropicKeyStatus = document.getElementById("ownAnthropicKeyStatus");
+  const openaiStatusText = document.getElementById("openaiStatusText");
+  const openaiChatgptBtn = document.getElementById("openaiChatgptBtn");
+  const openaiDeviceBtn = document.getElementById("openaiDeviceBtn");
+  const openaiLogoutBtn = document.getElementById("openaiLogoutBtn");
+  const openaiPendingBox = document.getElementById("openaiPendingBox");
+  const openaiKeyInput = document.getElementById("openaiKeyInput");
+  const openaiKeySaveBtn = document.getElementById("openaiKeySaveBtn");
+  const openaiKeyClearBtn = document.getElementById("openaiKeyClearBtn");
+  const openaiKeyStatus = document.getElementById("openaiKeyStatus");
+  let openaiPollTimer = null;
+  const claudeModelSelect = document.getElementById("claudeModelSelect");
+  const openaiModelSelect = document.getElementById("openaiModelSelect");
+  let modelOverrides = { claude: { selected: null, options: [] }, openai: { selected: null } };
   const swAccountStatus = document.getElementById("swAccountStatus");
   const swUpsellHint = document.getElementById("swUpsellHint");
   const swLoginBtn = document.getElementById("swLoginBtn");
@@ -115,9 +127,6 @@
     swUpsellHint.style.display = show ? "" : "none";
   }
   const swTopUpBtn = document.getElementById("swTopUpBtn");
-  const chatModeField = document.getElementById("chatModeField");
-  const chatModeSelect = document.getElementById("chatModeSelect");
-  const chatModeHint = document.getElementById("chatModeHint");
 
   const ratatoskStatusText = document.getElementById("ratatoskStatusText");
   const ratatoskRegisterBtn = document.getElementById("ratatoskRegisterBtn");
@@ -1657,15 +1666,40 @@
       }
       renderSwUpsellHint();
     } else if (evt.op === "chat_mode_get") {
+      // The switcher itself lives in the native tab header (MainWindow),
+      // not on this page -- just report the state up to it.
+      let state = { mode: "claude", available: { claude: false, sw: false, openai: false } };
       try {
         const m = JSON.parse(evt.stdout || "{}");
-        chatModeField.style.display = m.eligible ? "" : "none";
-        chatModeHint.style.display = m.eligible ? "none" : "";
-        if (m.eligible) chatModeSelect.value = m.mode === "sw" ? "sw" : "claude";
-      } catch {
-        chatModeField.style.display = "none";
-        chatModeHint.style.display = "";
+        state = { mode: m.mode || "claude", available: m.available || state.available };
+      } catch {}
+      if (window.chrome?.webview) window.chrome.webview.postMessage({ type: "tab_state", tabId, mode: state.mode, available: state.available });
+    } else if (evt.op === "model_override_get") {
+      if (evt.ok) {
+        modelOverrides = JSON.parse(evt.stdout || "{}");
+        fillModelSelect(claudeModelSelect, (modelOverrides.claude.options || []).map((id) => ({ id, displayName: id.charAt(0).toUpperCase() + id.slice(1) })), modelOverrides.claude.selected);
+        fillModelSelect(openaiModelSelect, lastOpenaiModels, modelOverrides.openai.selected);
       }
+    } else if (evt.op === "model_override_set") {
+      if (!evt.ok) addBanner(`Could not change the model: ${evt.stderr || "unknown error"}`);
+      sendControl("model_override_get");
+    } else if (evt.op === "openai_status") {
+      renderOpenaiStatus(evt.ok ? JSON.parse(evt.stdout || "{}") : { error: evt.stderr });
+    } else if (evt.op === "openai_key_get") {
+      if (evt.ok) {
+        const s = JSON.parse(evt.stdout || "{}");
+        openaiKeyStatus.textContent = s.isSet ? "A key is currently saved." : "No key saved.";
+      } else {
+        openaiKeyStatus.textContent = "";
+      }
+    } else if (evt.op === "openai_key_set") {
+      if (!evt.ok) addBanner(`Could not save the OpenAI key: ${evt.stderr || "unknown error"}`);
+      sendControl("openai_key_get");
+      sendControl("chat_mode_get");
+    } else if (evt.op === "openai_login" || evt.op === "openai_logout" || evt.op === "openai_cancel_login") {
+      if (!evt.ok) addBanner(`OpenAI: ${evt.stderr || "unknown error"}`);
+      sendControl("openai_status");
+      sendControl("chat_mode_get");
     } else if (evt.op === "chat_mode_set") {
       if (!evt.ok) addBanner(`Could not change chat mode: ${evt.stderr || "unknown error"}`);
       sendControl("chat_mode_get");
@@ -1854,12 +1888,82 @@
     sendControl("sw_status");
     sendControl("chat_mode_get");
     sendControl("own_anthropic_key_get");
+    sendControl("openai_status");
+    sendControl("openai_key_get");
+    sendControl("model_override_get");
     sendControl("ratatosk_status_get");
     sendControl("sms_account_get");
   }
 
+  // Renders the OpenAI settings block; while a browser sign-in is pending it
+  // keeps polling until the backend reports it finished.
+  let lastOpenaiModels = [];
+  function fillModelSelect(select, models, selected) {
+    select.textContent = "";
+    const auto = document.createElement("option");
+    auto.value = ""; auto.textContent = "Automatic";
+    select.appendChild(auto);
+    for (const m of models) {
+      const o = document.createElement("option");
+      o.value = m.id; o.textContent = m.displayName || m.id;
+      select.appendChild(o);
+    }
+    select.value = selected && models.some((m) => m.id === selected) ? selected : "";
+  }
+  claudeModelSelect.addEventListener("change", () => sendControl("model_override_set", { provider: "claude", model: claudeModelSelect.value || null }));
+  openaiModelSelect.addEventListener("change", () => sendControl("model_override_set", { provider: "openai", model: openaiModelSelect.value || null }));
+
+  function renderOpenaiStatus(s) {
+    clearTimeout(openaiPollTimer);
+    lastOpenaiModels = s.models || [];
+    fillModelSelect(openaiModelSelect, lastOpenaiModels, modelOverrides.openai && modelOverrides.openai.selected);
+    const login = s.login;
+    const pending = !!login && login.state === "pending";
+    openaiLogoutBtn.style.display = s.loggedIn ? "" : "none";
+    openaiChatgptBtn.disabled = openaiDeviceBtn.disabled = !s.installed || pending;
+    openaiKeySaveBtn.disabled = openaiKeyClearBtn.disabled = !s.installed;
+    // This status is ChatGPT/device only -- a saved API key is reported
+    // separately by openai_key_get, same split as Claude's auth_status vs
+    // own_anthropic_key_get.
+    if (s.error) openaiStatusText.textContent = `Status unavailable: ${s.error}`;
+    else if (!s.installed) openaiStatusText.textContent = s.unavailableReason || "OpenAI support is not installed.";
+    else if (s.loggedIn) {
+      const how = "ChatGPT" + (s.plan ? ` (${s.plan})` : "") + (s.email ? ` -- ${s.email}` : "");
+      openaiStatusText.textContent = `Signed in: ${how}`;
+    } else openaiStatusText.textContent = "Not signed in with ChatGPT.";
+    if (pending) {
+      openaiPendingBox.style.display = "";
+      openaiPendingBox.textContent = login.userCode
+        ? `Open ${login.url} and enter the code ${login.userCode}. Waiting for you to finish…`
+        : "Finish signing in in the browser window that opened. Waiting…";
+      openaiPollTimer = setTimeout(() => sendControl("openai_status"), 2000);
+    } else if (login && login.state === "error") {
+      openaiPendingBox.style.display = "";
+      openaiPendingBox.textContent = `Sign-in failed: ${login.error || "not completed"}`;
+    } else {
+      openaiPendingBox.style.display = "none";
+      if (login && login.state === "done") sendControl("chat_mode_get");
+    }
+  }
+
+  openaiChatgptBtn.addEventListener("click", () => sendControl("openai_login", { method: "chatgpt" }));
+  openaiDeviceBtn.addEventListener("click", () => sendControl("openai_login", { method: "device" }));
+  openaiLogoutBtn.addEventListener("click", () => sendControl("openai_logout"));
+  openaiKeySaveBtn.addEventListener("click", () => {
+    const key = openaiKeyInput.value.trim();
+    if (!key) return;
+    openaiKeyInput.value = "";
+    sendControl("openai_key_set", { apiKey: key });
+  });
+  openaiKeyClearBtn.addEventListener("click", () => {
+    sendControl("openai_key_set", { apiKey: null });
+  });
+
   function openSettings() {
     settingsOverlay.classList.add("open");
+    sendControl("openai_status");
+    sendControl("openai_key_get");
+    sendControl("model_override_get");
     authLoginOutput.textContent = "";
     authLoginOutput.style.display = "none";
     refreshSettingsPanel();
@@ -1892,9 +1996,6 @@
   });
   swTopUpBtn.addEventListener("click", () => {
     sendControl("open_payment_from_settings");
-  });
-  chatModeSelect.addEventListener("change", () => {
-    sendControl("chat_mode_set", { mode: chatModeSelect.value });
   });
 
   personaSaveBtn.addEventListener("click", () => {
@@ -1942,7 +2043,8 @@
   // Bug fix (2026-09-17), per explicit instruction ("подтверждение
   // стилизованной модалкой"): the confirm modal is the ONLY thing that can
   // trigger clear_tab -- the button itself just opens it.
-  clearChatBtn.addEventListener("click", () => clearConfirmOverlay.classList.add("open"));
+  window.carolineRequestClear = () => clearConfirmOverlay.classList.add("open");
+  window.carolineSetChatMode = (mode) => sendControl("chat_mode_set", { mode });
   clearConfirmCancelBtn.addEventListener("click", () => clearConfirmOverlay.classList.remove("open"));
   clearConfirmOverlay.addEventListener("click", (e) => {
     if (e.target === clearConfirmOverlay) clearConfirmOverlay.classList.remove("open");

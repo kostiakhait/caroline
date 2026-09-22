@@ -442,6 +442,14 @@ public partial class MainWindow : Window
         // RebuildTabStrip only re-inserts this same wrapper into TabStrip
         // and restyles it in place, never creates a new one.
         public required DockPanel HeaderWrapper;
+        // Per-tab answer-source switcher ("Claude / SW / OpenAI") and clear
+        // button, shown in the tab header next to the title and the close
+        // button. The web page (chat.js) owns the real state and reports it
+        // via a "tab_state" web message; these are only its mirror.
+        public required Dictionary<string, WpfButton> ModeButtons;
+        public required WpfButton ClearButton;
+        public string ChatMode = "claude";
+        public Dictionary<string, bool> ModeAvailable = new() { ["claude"] = true, ["sw"] = false, ["openai"] = false };
         public WebView2? WebView;
     }
 
@@ -549,16 +557,71 @@ public partial class MainWindow : Window
             ToolTip = "Close tab",
         };
 
+        var clearButton = new WpfButton
+        {
+            Content = "🗑",
+            Padding = new Thickness(4, 0, 4, 0),
+            Margin = new Thickness(0, 0, 2, 0),
+            Background = System.Windows.Media.Brushes.Transparent,
+            Foreground = System.Windows.Media.Brushes.LightGray,
+            BorderThickness = new Thickness(0),
+            ToolTip = "Clear conversation",
+        };
+        var modeButtons = new Dictionary<string, WpfButton>();
+        var modePanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+        foreach (var (modeId, modeLabel) in new[] { ("claude", "Claude"), ("sw", "SW"), ("openai", "OpenAI") })
+        {
+            if (modePanel.Children.Count > 0)
+            {
+                modePanel.Children.Add(new System.Windows.Controls.TextBlock
+                {
+                    Text = "/", Foreground = System.Windows.Media.Brushes.DimGray,
+                    VerticalAlignment = VerticalAlignment.Center,
+                });
+            }
+            var modeButton = new WpfButton
+            {
+                Content = modeLabel,
+                Padding = new Thickness(4, 0, 4, 0),
+                Background = System.Windows.Media.Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                FontSize = 11,
+                Tag = modeId,
+            };
+            modeButtons[modeId] = modeButton;
+            modePanel.Children.Add(modeButton);
+        }
+
         var headerWrapper = new DockPanel { LastChildFill = true };
         DockPanel.SetDock(closeButton, Dock.Right);
         headerWrapper.Children.Add(closeButton);
+        DockPanel.SetDock(clearButton, Dock.Right);
+        headerWrapper.Children.Add(clearButton);
+        DockPanel.SetDock(modePanel, Dock.Right);
+        headerWrapper.Children.Add(modePanel);
         headerWrapper.Children.Add(headerButton);
 
         var tab = new ChatTab
         {
             Id = tabId, ContentHost = contentHost, HeaderButton = headerButton,
             CloseButton = closeButton, HeaderWrapper = headerWrapper, Name = tabName,
+            ModeButtons = modeButtons, ClearButton = clearButton,
         };
+        foreach (var (modeId, modeButton) in modeButtons)
+        {
+            var id = modeId;
+            modeButton.Click += (_, _) =>
+            {
+                if (tab.ChatMode == id || !tab.ModeAvailable.GetValueOrDefault(id)) return;
+                _ = tab.WebView?.CoreWebView2?.ExecuteScriptAsync($"window.carolineSetChatMode && window.carolineSetChatMode({JsonSerializer.Serialize(id)});");
+            };
+        }
+        clearButton.Click += (_, _) =>
+        {
+            SelectTab(tab);
+            _ = tab.WebView?.CoreWebView2?.ExecuteScriptAsync("window.carolineRequestClear && window.carolineRequestClear();");
+        };
+        ApplyTabModeStyle(tab);
         headerButton.Click += (_, _) => SelectTab(tab);
         headerButton.MouseDoubleClick += (_, e) => { BeginRenameTab(tab); e.Handled = true; };
         closeButton.Click += async (_, _) => await CloseTabAsync(tab);
@@ -794,6 +857,28 @@ public partial class MainWindow : Window
         TabStrip.Children.Add(_addTabButton);
     }
 
+    /// <summary>Restyles a tab's "Claude / SW / OpenAI" text switcher from its mirrored state: the active source is bold white, an available one light gray, an unavailable one dark gray and inert.</summary>
+    private static void ApplyTabModeStyle(ChatTab tab)
+    {
+        foreach (var (modeId, button) in tab.ModeButtons)
+        {
+            var available = tab.ModeAvailable.GetValueOrDefault(modeId);
+            var active = tab.ChatMode == modeId;
+            button.IsEnabled = available && !active;
+            button.FontWeight = active ? FontWeights.Bold : FontWeights.Normal;
+            button.Foreground = active
+                ? System.Windows.Media.Brushes.White
+                : available ? System.Windows.Media.Brushes.Silver : System.Windows.Media.Brushes.DimGray;
+            button.Cursor = available && !active ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow;
+            button.ToolTip = available ? null : modeId switch
+            {
+                "sw" => "Needs a Claude subscription and a paid SquirrelWisdom balance",
+                "openai" => "Set up OpenAI in Settings",
+                _ => "Set up Claude in Settings",
+            };
+        }
+    }
+
     private void SelectTab(ChatTab tab)
     {
         _activeTab = tab;
@@ -962,6 +1047,24 @@ public partial class MainWindow : Window
                 var tabIdForLog = root.TryGetProperty("tabId", out var t) ? t.GetString() : "?";
                 var clientMessage = root.TryGetProperty("message", out var m) ? m.GetString() : "";
                 Logger.Log($"chat.js[tab={tabIdForLog}]: {clientMessage}");
+                return;
+            }
+
+            if (type == "tab_state")
+            {
+                var stateTab = _tabs.FirstOrDefault(t => t.WebView == webView);
+                if (stateTab != null)
+                {
+                    if (root.TryGetProperty("mode", out var modeEl) && modeEl.GetString() is { } mode) stateTab.ChatMode = mode;
+                    if (root.TryGetProperty("available", out var availEl) && availEl.ValueKind == JsonValueKind.Object)
+                    {
+                        foreach (var id in stateTab.ModeButtons.Keys)
+                        {
+                            stateTab.ModeAvailable[id] = availEl.TryGetProperty(id, out var v) && v.ValueKind == JsonValueKind.True;
+                        }
+                    }
+                    ApplyTabModeStyle(stateTab);
+                }
                 return;
             }
 

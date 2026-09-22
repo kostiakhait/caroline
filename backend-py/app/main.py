@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import webbrowser
 import mimetypes
 import os
 from pathlib import Path
@@ -23,6 +24,9 @@ from pydantic import BaseModel
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode
+from app.archive_prune import prune_workspace_archives
+from app import openai_account
+from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
@@ -42,6 +46,7 @@ from app.sms_account import get_sms_account_status, remove_sms_account, set_sms_
 from app.subscription_mode import (
     chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
     invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
+    CLAUDE_MODEL_ALIASES, get_model_override, set_model_override,
 )
 from app.visual_mode import is_visual_mode_enabled, resolve_visual_model, set_visual_mode_enabled
 from app.window_registry import unregister_window
@@ -198,6 +203,19 @@ def _companion_history_snapshot(tab_id: str) -> list[dict[str, Any]]:
     return read_recent_history_for_session(WORKSPACE_DIR, session_id)
 
 
+async def _prune_redundant_archives_in_background() -> None:
+    """One-time-per-start cleanup of full-transcript copies the old
+    pre-compaction hook left in workspace/dehydrated/ (see app/archive_prune.py
+    for why they're redundant and how each one is PROVEN so before deletion).
+    Runs in a worker thread, a couple of minutes after startup, so it never
+    competes with tabs starting; a no-op once there's nothing left to prune."""
+    await asyncio.sleep(120)
+    try:
+        await asyncio.to_thread(prune_workspace_archives, WORKSPACE_DIR, throttle_s=0.02)
+    except Exception as exc:
+        log_event("engine", "archive_prune_crashed", error=str(exc))
+
+
 @app.on_event("startup")
 async def _start_ratatosk_background_loops() -> None:
     # Needs a running event loop (asyncio.create_task inside both) -- can't
@@ -211,6 +229,7 @@ async def _start_ratatosk_background_loops() -> None:
     # scratch) and every tab's session start reads it instead of spawning
     # its own. See app/account_state.py.
     asyncio.create_task(run_account_state_refresher())
+    asyncio.create_task(_prune_redundant_archives_in_background())
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Checked every 20s (plus once immediately, catching anything that came
@@ -310,6 +329,65 @@ async def post_message(body: MessageBody, tab: str = PRIMARY_TAB_ID) -> JSONResp
         )
     session.submit_or_try_small_model(body.text, body.attachments)
     return JSONResponse({"ok": True}, status_code=202)
+
+
+# --- REST endpoints for the answer source (Claude / SW / OpenAI) -------------
+# Thin wrappers over the same control ops the chat page's WebSocket uses, so
+# there is one implementation: switching a tab, and OpenAI sign-in/status.
+
+async def _control_json(op: str, tab: str, params: dict[str, Any] | None = None) -> JSONResponse:
+    async def _drop(_event: dict[str, Any]) -> None:
+        return None
+
+    result = await handle_control_request({"op": op, "tabId": tab, **(params or {})}, _drop, sessions.get(tab))
+    ok = bool(result.get("ok"))
+    payload: dict[str, Any] = json.loads(result["stdout"]) if result.get("stdout") else {}
+    if not ok:
+        payload = {"error": result.get("stderr") or "failed"}
+    return JSONResponse({"ok": ok, **payload}, status_code=200 if ok else 400)
+
+
+@app.get("/api/mode")
+async def get_mode(tab: str = PRIMARY_TAB_ID) -> JSONResponse:
+    """{ok, mode, available:{claude,sw,openai}, eligible} for a tab."""
+    return await _control_json("chat_mode_get", tab)
+
+
+class ModeBody(BaseModel):
+    mode: str
+
+
+@app.post("/api/mode")
+async def post_mode(body: ModeBody, tab: str = PRIMARY_TAB_ID) -> JSONResponse:
+    """Switches a tab to "claude", "sw" or "openai". A Claude<->OpenAI change
+    restarts that tab's session on the other engine ("engine": "switching");
+    if a turn is in flight it is saved and applies at the next start ("busy")."""
+    return await _control_json("chat_mode_set", tab, {"mode": body.mode})
+
+
+@app.get("/api/openai")
+async def get_openai_status() -> JSONResponse:
+    return await _control_json("openai_status", PRIMARY_TAB_ID)
+
+
+class OpenaiLoginBody(BaseModel):
+    method: str
+    apiKey: str | None = None
+
+
+@app.post("/api/openai/login")
+async def post_openai_login(body: OpenaiLoginBody) -> JSONResponse:
+    return await _control_json("openai_login", PRIMARY_TAB_ID, {"method": body.method, "apiKey": body.apiKey})
+
+
+@app.post("/api/openai/logout")
+async def post_openai_logout() -> JSONResponse:
+    return await _control_json("openai_logout", PRIMARY_TAB_ID)
+
+
+@app.post("/api/openai/cancel")
+async def post_openai_cancel() -> JSONResponse:
+    return await _control_json("openai_cancel_login", PRIMARY_TAB_ID)
 
 
 class ControlBody(BaseModel):
@@ -631,16 +709,31 @@ async def handle_control_request(
         clear_credentials()
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "chat_mode_get":
-        tab_id = session.tab_id if session is not None else PRIMARY_TAB_ID
+        tab_id = str(parsed.get("tabId") or (session.tab_id if session is not None else PRIMARY_TAB_ID))
         current_mode = load_chat_mode(WORKSPACE_DIR, tab_id)
+        if current_mode == "openai" and not openai_available(WORKSPACE_DIR):
+            # OpenAI was chosen but can no longer be used (signed out, Codex
+            # missing): the tab runs on Claude, so say so instead of showing
+            # OpenAI as active.
+            log_event("engine", "chat_mode_reverted_openai_unavailable", tab_id=tab_id)
+            current_mode = "claude"
+            save_chat_mode(WORKSPACE_DIR, tab_id, current_mode)
         eligible = await chat_mode_eligible(WORKSPACE_DIR, tab_id)
-        stdout = json.dumps({"mode": current_mode, "eligible": eligible})
+        resolved = await resolve_mode(WORKSPACE_DIR, tab_id)
+        available = {
+            "claude": resolved.chat_source in ("own-anthropic-oauth", "own-anthropic-key"),
+            "sw": eligible,
+            "openai": openai_available(WORKSPACE_DIR),
+        }
+        stdout = json.dumps({"mode": current_mode, "eligible": eligible, "available": available})
         return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}
     if op == "chat_mode_set":
-        tab_id = session.tab_id if session is not None else PRIMARY_TAB_ID
+        tab_id = str(parsed.get("tabId") or (session.tab_id if session is not None else PRIMARY_TAB_ID))
         requested_mode = parsed.get("mode")
-        if requested_mode not in ("claude", "sw"):
-            return {"type": "control_response", "op": op, "ok": False, "stderr": "mode must be 'claude' or 'sw'", "requestId": request_id}
+        if requested_mode not in ("claude", "sw", "openai"):
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "mode must be 'claude', 'sw' or 'openai'", "requestId": request_id}
+        if requested_mode == "openai" and not openai_available(WORKSPACE_DIR):
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "OpenAI is not available for this tab.", "requestId": request_id}
         if requested_mode == "sw" and not await chat_mode_eligible(WORKSPACE_DIR, tab_id):
             return {
                 "type": "control_response", "op": op, "ok": False,
@@ -649,6 +742,55 @@ async def handle_control_request(
             }
         save_chat_mode(WORKSPACE_DIR, tab_id, requested_mode)
         log_event("engine", "chat_mode_set", tab_id=tab_id, mode=requested_mode)
+        switch = session.switch_engine_if_needed() if session is not None else "unchanged"
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps({"mode": requested_mode, "engine": switch}), "requestId": request_id}
+    if op == "model_override_get":
+        stdout = json.dumps({
+            "claude": {"selected": get_model_override(WORKSPACE_DIR, "claude"), "options": list(CLAUDE_MODEL_ALIASES)},
+            "openai": {"selected": get_model_override(WORKSPACE_DIR, "openai")},
+        })
+        return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}
+    if op == "model_override_set":
+        provider = parsed.get("provider")
+        if provider not in ("claude", "openai"):
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "provider must be 'claude' or 'openai'", "requestId": request_id}
+        try:
+            set_model_override(WORKSPACE_DIR, provider, parsed.get("model") or None)
+        except ValueError as exc:
+            return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
+        log_event("engine", "model_override_set", provider=provider, model=parsed.get("model") or None)
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op in ("openai_status", "openai_login", "openai_logout", "openai_cancel_login"):
+        # ChatGPT/device sign-in only -- the shared ~/.codex identity. A pasted
+        # API key is a separate, independent setting (openai_key_get/_set
+        # below), exactly like own_anthropic_key_get/_set is independent of
+        # auth_status/login/logout above.
+        try:
+            if op == "openai_status":
+                payload = await openai_account.status(WORKSPACE_DIR)
+            elif op == "openai_login":
+                payload = await openai_account.start_login(WORKSPACE_DIR, str(parsed.get("method") or ""))
+                if payload.get("url"):
+                    # The backend runs on the user's own machine: open the browser here,
+                    # nothing for the chat page to do.
+                    webbrowser.open(payload["url"])
+            elif op == "openai_logout":
+                await openai_account.logout(WORKSPACE_DIR)
+                payload = {}
+            else:
+                await openai_account.cancel_login()
+                payload = {}
+            return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(payload), "requestId": request_id}
+        except Exception as exc:
+            log_event("engine", "openai_control_failed", op=op, error=str(exc))
+            return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
+    if op == "openai_key_get":
+        key = get_own_openai_api_key(WORKSPACE_DIR)
+        log_event("engine", "openai_key_get", is_set=bool(key))
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps({"isSet": bool(key)}), "requestId": request_id}
+    if op == "openai_key_set":
+        log_event("engine", "openai_key_set", clearing=not parsed.get("apiKey"))
+        set_own_openai_api_key(WORKSPACE_DIR, parsed.get("apiKey") or None)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "clear_tab":
         # Bug fix (2026-09-17), per explicit instruction: a full, deliberate
@@ -658,7 +800,7 @@ async def handle_control_request(
         # need a live ChatSession at all; only the in-memory/live-client
         # half (an idle-but-connected client still holding the old
         # conversation in its own process memory) does.
-        tab_id = session.tab_id if session is not None else PRIMARY_TAB_ID
+        tab_id = str(parsed.get("tabId") or (session.tab_id if session is not None else PRIMARY_TAB_ID))
         if session is not None:
             session.clear_tab()
         else:
@@ -924,10 +1066,23 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # time" -- it already covers the "I'm back" framing on its own, so a
     # separate generic greeting alongside it is redundant at best and
     # actively harmful (a second, competing thing to reply to) at worst.
-    # Peeked here (read-only, see peek_pending_turn's own docstring) just to
-    # decide this -- the resume block below does its own full peek+consume
-    # right after, unaffected by this one being read-only.
-    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not peek_pending_turn(WORKSPACE_DIR, PRIMARY_TAB_ID):
+    # Bug fix (2026-09-22), confirmed live -- the SAME failure mode as the
+    # 2026-09-18 incident above recurred anyway: a real user question ("Дай
+    # почту Полины Грейсман") never got answered after a watchdog-forced
+    # backend restart; the resumed session talked about an unrelated
+    # earlier task instead. Root cause: this greeting check and the resume
+    # block below each called peek_pending_turn() SEPARATELY -- two
+    # independent reads of the same file, a few lines apart, with nothing
+    # guaranteeing they'd agree. Confirmed live they didn't: the greeting's
+    # own peek came back empty (so it fired) while the resume block's peek,
+    # moments later, found a real pending turn (so it ALSO fired) -- both
+    # competing injections landed in the fresh session again, just via a
+    # different path than the one the first fix closed. Fixed at the root
+    # this time: peek ONCE, before either decision, and have both branches
+    # share that single result, so there is no second read left to disagree
+    # with the first.
+    pending_turn_for_primary = peek_pending_turn(WORKSPACE_DIR, PRIMARY_TAB_ID) if tab_id == PRIMARY_TAB_ID else None
+    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not pending_turn_for_primary:
         _has_greeted = True
 
         lang = current_language_name(PRIMARY_TAB_ID)
@@ -945,9 +1100,19 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # sitting in the conversation with no reply.
     if tab_id not in _resumed_unfinished_turn_for_tab:
         _resumed_unfinished_turn_for_tab.add(tab_id)
-        unfinished_turn = peek_pending_turn(WORKSPACE_DIR, tab_id)
+        unfinished_turn = pending_turn_for_primary if tab_id == PRIMARY_TAB_ID else peek_pending_turn(WORKSPACE_DIR, tab_id)
         if unfinished_turn:
-            log_event("engine", "resuming_unfinished_turn", tab_id=tab_id, text_len=len(unfinished_turn.text))
+            # text_preview added 2026-09-22: text_len alone made the incident
+            # above take real time to root-cause after the fact -- with only
+            # a number logged, there was no way to tell, after the fact,
+            # whether the resumed text was actually the real pending
+            # question or something stale, without reconstructing it from
+            # the durability file's own on-disk history (already gone,
+            # overwritten many times over by the time anyone looked).
+            log_event(
+                "engine", "resuming_unfinished_turn", tab_id=tab_id, text_len=len(unfinished_turn.text),
+                text_preview=unfinished_turn.text[:200], submitted_at_iso=unfinished_turn.submitted_at_iso,
+            )
             # Bug fix (2026-09-10): confirmed live -- this is the real
             # question the user originally asked, just replayed after a
             # restart rather than arriving via a live submit(); setting it

@@ -76,6 +76,10 @@ internal static class AppPaths
     /// installed -- confirmed as a real gap (2026-09-03), not just a theoretical one.</summary>
     public static string FfmpegDir => Path.Combine(RuntimeDir, "ffmpeg");
     public static string FfmpegExe => Path.Combine(FfmpegDir, "ffmpeg.exe");
+    /// <summary>Codex app-server, the engine behind the "OpenAI" answer source (see
+    /// CodexInstaller.cs). Its own state lives in Root\codex-home, written by the backend.</summary>
+    public static string CodexDir => Path.Combine(RuntimeDir, "codex");
+    public static string CodexExe => Path.Combine(CodexDir, "codex-app-server.exe");
 
     public static void EnsureRootExists() => Directory.CreateDirectory(Root);
 }

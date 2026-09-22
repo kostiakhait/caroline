@@ -229,6 +229,20 @@ close (`shutdown_sync` control op, triggered from `chat.js`'s `pagehide` — the
 WebView2 actually unloads rather than just minimizing to tray; best-effort, since the WPF shell
 doesn't wait for it before `Process.Kill()`).
 
+## OpenAI as a third answer source (Codex engine)
+
+A tab answers through Claude, SW or OpenAI, chosen with the `Claude / SW / OpenAI` text switcher in the native tab header (next to the tab name, the clear button and close; `MainWindow.xaml.cs`). The page (`chat.js`) owns the real state and mirrors it to the header with a `tab_state` web message; the header calls back `window.carolineSetChatMode` / `window.carolineRequestClear`. The mode is stored per tab (`durability.load_chat_mode`); `chat_mode_get` returns which sources are `available` and reverts a tab to Claude if OpenAI stopped being usable.
+
+**Engines.** `ChatSession` talks to an `AgentEngine` (`backend-py/app/engines/base.py`): `ClaudeEngine` wraps `ClaudeSDKClient`; `CodexEngine` runs one `codex-app-server` process per tab (JSON-RPC over stdio, `codex_rpc.py`) and adapts its thread/turn/item events into the same `claude_agent_sdk` message objects, so wire format, failure classification, status and history are shared. Caroline's plugin tools are handed to Codex as `dynamicTools` and answered over an in-process MCP client (`ToolBridge`), so a tool behaves the same under both engines. Caroline's system prompt is sent as developer instructions (appended to Codex's own prompt). Codex runs with approvals off and full-access sandbox, matching Claude's `bypassPermissions`.
+
+**Codex is embedded, not exposed.** Every launch adds `features.plugins=false`, `check_for_update_on_startup=false`, `analytics.enabled=false` (`BASE_CONFIG_OVERRIDES`): without them Codex clones a third-party plugin repository from GitHub into its home at startup. Its state lives in `<Caroline root>\codex-home`, separate from any Codex the user runs themselves.
+
+**Sign-in and account** (`openai_account.py`, ops `openai_status/login/logout/cancel_login`): ChatGPT subscription (browser), the same with a device code, or a pasted API key; credentials are Codex's own `auth.json`. Settings has an OpenAI block and a Models block: Claude (family aliases) and OpenAI (Codex's `model/list`) each default to Automatic, with an override (`claudeModel` / `openaiModel` in `subscription.json`).
+
+**Sessions and history.** Each tab keeps one resume id per engine in `tab-session-<tab>.json` (`sessionId`, `openaiThreadId`). The OpenAI engine writes a Claude-shaped transcript to `workspace/openai-transcripts/<threadId>.jsonl`, so `session_transcript_path` lets every history reader work unchanged. The recent-24h dialogue file merges every engine's transcript by timestamp, which is how a tab keeps its context across a switch. Claude-only machinery (forced compaction, transcript rotation, archive prune) is skipped for OpenAI tabs; Codex compacts itself, and a context overflow is compacted and retried once inside the engine. A usage limit reaches `ChatSession` as an assistant line the existing limit classifier already recognises.
+
+**Install.** `CodexInstaller.cs` (pinned version and sha256, mirrored like every dependency) puts `codex-app-server.exe` in `runtime\codex`; a failure there is logged and never blocks installing Caroline. `BackendProcess.cs` passes `CAROLINE_CODEX_PATH`. Without the file OpenAI is simply unavailable.
+
 ## Settings screen (`chat.html`/`chat.js`)
 
 Personality (persona editor), Window (always-on-top), Voice (auto-send toggle), Visual mode,

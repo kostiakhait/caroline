@@ -49,7 +49,6 @@ from typing import Any, Awaitable, Callable
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     HookMatcher,
     RateLimitEvent,
     ResultMessage,
@@ -83,8 +82,15 @@ from app.durability import (
     save_pending_turn,
     save_tab_continuity_archive,
     save_tab_session_id,
+    session_transcript_path,
+    openai_transcripts_dir,
 )
-from app.history import _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed
+from app.engines.base import AgentEngine
+from app.engines.claude_engine import ClaudeEngine
+from app.engines.codex_engine import CodexEngine
+from app.openai_mode import build_codex_options, openai_available
+from app.transcript_rotate import rotate_transcript
+from app.history import _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -111,6 +117,7 @@ from app.plugins.sw_api import get_funds_exhausted_reason
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
+    get_model_override,
     resolve_mode,
 )
 from app.wire import message_to_wire
@@ -309,6 +316,25 @@ FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD = 60_000
 # hourly clock and the growth threshold both crossing within the same
 # watchdog tick) into back-to-back /compact calls.
 FORCED_COMPACTION_MIN_INTERVAL_MS = 300_000
+# Per explicit instruction (2026-09-20), after a real, measured outage (see
+# _check_forced_compaction / _note_compaction_hit_limit): a forced compaction
+# that itself hits the usage cap ("You've hit your session limit · resets
+# 9pm") used to flip the tab limited -> connected within a millisecond (the
+# error's own trailing ResultMessage), which re-armed the post-limit retry
+# with no cooldown -- a compaction every ~5 s for as long as the cap lasted
+# (1,464 in a single hour), each one copying the whole transcript to disk
+# (892 GB by the time it was found). After such a failure no forced
+# compaction is attempted for this long. FLAT, never growing (standing rule:
+# no exponential backoff anywhere) -- own choice of value, not a measured
+# constant; the cap resets on the order of hours, so this is a "check again
+# a couple of times per episode" cadence, not a tight loop.
+FORCED_COMPACTION_LIMIT_PAUSE_MS = 30 * 60_000
+# A forced compaction of a context this small has nothing to compact --
+# measured live: the hourly/startup compactions on idle tabs all ran with
+# 3.5K-7K tokens in context (5.7K -> 6.0K "after"), while every compaction
+# that did real work started at 52K-99K. This sits clearly between the two.
+# Own choice of value, not a specified one.
+FORCED_COMPACTION_MIN_CONTEXT_TOKENS = 20_000
 
 # How many consecutive "authentication_failed" system/api_retry messages on
 # one connection before forcing a clean restart (re-resolves the mode and
@@ -700,6 +726,20 @@ def _recent_usable_lines(
     return out
 
 
+def _recent_usable_lines_across_sessions(paths: list[Path], min_ts_ms: float | None) -> list[str]:
+    """Like _recent_usable_lines over several transcripts at once (the
+    different engines a tab has used), merged oldest-first by each entry's own
+    timestamp -- so a conversation continues seamlessly across an engine switch."""
+    items: list[tuple[float, str]] = []
+    for path in paths:
+        for entry in iter_entries_reversed(path, str(path), min_ts_ms=min_ts_ms):
+            usable = _usable_dialogue_lines([entry], min_ts_ms)
+            if usable:
+                items.append((entry["ts"], usable[0]))
+    items.sort(key=lambda item: item[0])
+    return [line for _, line in items]
+
+
 def _read_recent_dialogue_lines(
     session_id: str | None, tab_id: str, workspace_dir: str, limit: int, min_ts_ms: float | None = None,
 ) -> list[str]:
@@ -730,7 +770,7 @@ def _read_recent_dialogue_lines(
     default) keeps every other caller's existing behavior unchanged."""
     lines: list[str] = []
     if session_id:
-        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+        path = session_transcript_path(workspace_dir, session_id)
         try:
             lines = _recent_usable_lines(path, limit=limit, min_ts_ms=min_ts_ms)
         except Exception as exc:
@@ -761,7 +801,7 @@ def _read_recent_user_lines(session_id: str | None, tab_id: str, workspace_dir: 
 
     user_lines: list[str] = []
     if session_id:
-        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+        path = session_transcript_path(workspace_dir, session_id)
         try:
             user_lines = _recent_usable_lines(path, limit=count, user_only=True)
         except Exception as exc:
@@ -807,12 +847,18 @@ def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspa
     out_path = _recent_24h_dialogue_path(workspace_dir, tab_id)
     cutoff_ms = (time.time() - RECENT_HISTORY_FILE_WINDOW_HOURS * 3600) * 1000
     lines: list[str] = []
-    if session_id:
-        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
-        try:
-            lines = _recent_usable_lines(path, min_ts_ms=cutoff_ms)
-        except Exception as exc:
-            log_event("engine", "recent_24h_dialogue_read_failed", tab_id=tab_id, error=str(exc))
+    # Every engine this tab has used, not just the current one: switching a tab
+    # between Claude and OpenAI must not make the new engine start blind.
+    session_ids = [session_id, *(load_tab_session_id(workspace_dir, tab_id, kind) for kind in ("claude", "openai"))]
+    paths: list[Path] = []
+    for sid in dict.fromkeys(i for i in session_ids if i):
+        path = session_transcript_path(workspace_dir, sid)
+        if path.exists() and path not in paths:
+            paths.append(path)
+    try:
+        lines = _recent_usable_lines_across_sessions(paths, cutoff_ms)
+    except Exception as exc:
+        log_event("engine", "recent_24h_dialogue_read_failed", tab_id=tab_id, error=str(exc))
     archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
     if archive_path:
         try:
@@ -1025,7 +1071,13 @@ def clear_tab_disk_state(workspace_dir: str, tab_id: str) -> None:
             (claude_project_dir(workspace_dir) / f"{old_session_id}.jsonl").unlink(missing_ok=True)
         except Exception as exc:
             log_event("engine", "clear_tab_delete_session_file_failed", tab_id=tab_id, error=str(exc))
-    clear_tab_session_id(workspace_dir, tab_id)
+    openai_thread_id = load_tab_session_id(workspace_dir, tab_id, "openai")
+    if openai_thread_id:
+        try:
+            (openai_transcripts_dir(workspace_dir) / f"{openai_thread_id}.jsonl").unlink(missing_ok=True)
+        except Exception as exc:
+            log_event("engine", "clear_tab_delete_openai_transcript_failed", tab_id=tab_id, error=str(exc))
+    clear_tab_session_id(workspace_dir, tab_id, engine=None)
     clear_tab_continuity_archive(workspace_dir, tab_id)
     clear_pending_turn(workspace_dir, tab_id)
     log_event("engine", "clear_tab_disk_state_done", tab_id=tab_id, old_session_id=old_session_id)
@@ -1048,7 +1100,11 @@ class ChatSession:
         self.workspace_dir = workspace_dir
         self.send = send
 
-        self.client: ClaudeSDKClient | None = None
+        self.client: AgentEngine | None = None
+        # Which engine the current/next query() runs on: "openai" only while the
+        # tab is switched to OpenAI AND it is actually usable, else "claude".
+        self.engine_kind: str = "claude"
+        self.engine_switch_pending = False
         self.ended = False
         self.user_stop_requested = False
 
@@ -1161,6 +1217,10 @@ class ChatSession:
         # retry what the cap just interrupted, not wait for the next
         # regular cycle.
         self.needs_post_limit_compaction_check: bool = False
+        # time.monotonic() before which no forced compaction is attempted --
+        # set when a forced compaction itself hits the usage cap (see
+        # FORCED_COMPACTION_LIMIT_PAUSE_MS / _note_compaction_hit_limit).
+        self.forced_compaction_blocked_until: float = 0.0
         # Same "this ResultMessage/whatever precedes it isn't real, don't
         # show it or let it touch turn state" shape as
         # hang_interrupt_result_pending/ignore_next_result_recovery -- see
@@ -1402,6 +1462,46 @@ class ChatSession:
         if self.client:
             asyncio.create_task(self._safe_disconnect(self.client))
 
+    def _check_deferred_engine_switch(self) -> None:
+        """Applies a switch that had to wait for a running turn, as soon as the
+        session is idle (watchdog tick) -- nothing is ever interrupted for it."""
+        if self.engine_switch_pending and not self.turn_pending and not self.ended:
+            self.engine_switch_pending = False
+            self.switch_engine_if_needed()
+
+    def switch_engine_if_needed(self) -> str:
+        """Called after the tab's answer source changed. Only Claude <-> OpenAI
+        needs a fresh session (they are different agent processes); SW routing
+        is decided per message. Returns "unchanged", "switching" (the running
+        session was torn down and the run loop rebuilds it on the new engine)
+        or "busy" (a turn is in flight -- the switch is saved and applied by the
+        watchdog as soon as the turn ends; nothing is interrupted)."""
+        wanted = "openai" if load_chat_mode(self.workspace_dir, self.tab_id) == "openai" and openai_available(self.workspace_dir) else "claude"
+        if wanted == self.engine_kind or self.client is None:
+            return "unchanged"
+        if self.turn_pending:
+            log_event("engine", "engine_switch_deferred_turn_pending", tab_id=self.tab_id, wanted=wanted)
+            self.engine_switch_pending = True
+            return "busy"
+        log_event("engine", "engine_switch", tab_id=self.tab_id, from_engine=self.engine_kind, to_engine=wanted)
+        # All of this is Claude-CLI-specific compaction bookkeeping (dehydration/
+        # forced-compaction machinery, see transcript_rotate.py's module docstring
+        # and _check_forced_compaction) -- it must not survive onto the other
+        # engine, which owns its own compaction and has no equivalent state.
+        # Confirmed live: leaving forced_compaction_result_pending=True stuck
+        # after a switch silently hid every subsequent reply from the client
+        # forever (see the wire-send gate a few hundred lines down) and pinned
+        # the status lamp on "Compacting conversation..." -- a real incident,
+        # not a theoretical one. Any real user message queued behind that
+        # compaction is replayed via the normal drain path, not dropped.
+        if self.forced_compaction_result_pending:
+            self.forced_compaction_result_pending = False
+            self._drain_compaction_queue()
+        self.needs_post_limit_compaction_check = False
+        self.forced_compaction_blocked_until = 0.0
+        self.force_restart()
+        return "switching"
+
     async def _safe_interrupt(self) -> None:
         try:
             if self.client:
@@ -1409,7 +1509,7 @@ class ChatSession:
         except Exception as exc:
             log_event("engine", "dispose_interrupt_failed", tab_id=self.tab_id, error=str(exc))
 
-    async def _safe_disconnect(self, client: ClaudeSDKClient) -> None:
+    async def _safe_disconnect(self, client: AgentEngine) -> None:
         """Fire-and-forget disconnect wrapper -- claude_agent_sdk's own
         subprocess_cli.py's close() has a confirmed live bug (2026-09-09):
         it doesn't guard against self._process already being None (a
@@ -2052,9 +2152,7 @@ class ChatSession:
         never happened (defense in depth, not the primary path anymore)."""
         pid = self._cli_process_pid
         if not pid:
-            transport = getattr(self.client, "_transport", None)
-            process = getattr(transport, "_process", None)
-            pid = getattr(process, "pid", None)
+            pid = self.client.process_pid() if self.client else None
         if not pid:
             log_event("engine", "force_kill_cli_process_no_pid", tab_id=self.tab_id)
             return
@@ -2256,7 +2354,7 @@ class ChatSession:
             t.cancel()
         self.mcp_reconnect_timers.clear()
 
-    def _schedule_mcp_reconnect(self, client: ClaudeSDKClient, name: str, attempt: int = 0) -> None:
+    def _schedule_mcp_reconnect(self, client: AgentEngine, name: str, attempt: int = 0) -> None:
         """Keeps retrying client.reconnect_mcp_server(name) on a FLAT
         interval until it succeeds -- so a server that's down for a
         moment (its target not up yet, a transient launch race) comes
@@ -2286,7 +2384,7 @@ class ChatSession:
         loop = asyncio.get_event_loop()
         self.mcp_reconnect_timers[name] = loop.call_later(MCP_RECONNECT_INTERVAL_MS / 1000, _fire)
 
-    async def _do_mcp_reconnect(self, client: ClaudeSDKClient, name: str, attempt: int) -> None:
+    async def _do_mcp_reconnect(self, client: AgentEngine, name: str, attempt: int) -> None:
         try:
             await client.reconnect_mcp_server(name)
             log_event("engine", "mcp_server_reconnected", tab_id=self.tab_id, server=name, attempt=attempt)
@@ -2295,9 +2393,11 @@ class ChatSession:
             self._schedule_mcp_reconnect(client, name, attempt + 1)
 
     def _resolve_resume_session_id(self) -> str | None:
-        stored = load_tab_session_id(self.workspace_dir, self.tab_id)
+        stored = load_tab_session_id(self.workspace_dir, self.tab_id, self.engine_kind)
         if stored:
             return stored
+        if self.engine_kind != "claude":
+            return None  # no pre-existing Claude session to migrate into another engine
         if self.skip_migration_fallback_once:
             self.skip_migration_fallback_once = False
             log_event("engine", "skip_migration_fallback", tab_id=self.tab_id)
@@ -2401,25 +2501,25 @@ class ChatSession:
         """Fires just before Claude's own compaction summarises older turns
         -- either its own native auto-compaction, or our forced "/compact"
         (see FORCED_COMPACTION_HOURLY_MS; trigger is "manual" for that one,
-        live-confirmed). Copies the current transcript to
-        workspace/dehydrated/ and points the continuity pointer at it, so
-        if the summary ever drops something the user asks about, Caroline
-        has a real file to Read (main.py's expand_dehydrated_ref serves it
-        back). Best-effort; never blocks or fails compaction."""
-        try:
-            trigger = hook_input.get("trigger") if isinstance(hook_input, dict) else None
-            transcript_path = hook_input.get("transcript_path") if isinstance(hook_input, dict) else None
-            if trigger not in ("auto", "manual") or not transcript_path or not Path(transcript_path).exists():
-                return {}
-            import shutil
-            directory = dehydrated_dir(self.workspace_dir)
-            directory.mkdir(parents=True, exist_ok=True)
-            archive_path = str(directory / f"{uuid_mod.uuid4()}.txt")
-            shutil.copyfile(transcript_path, archive_path)
-            save_tab_continuity_archive(self.workspace_dir, self.tab_id, archive_path)
-            log_event("engine", "pre_compact_archived", tab_id=self.tab_id, archive_path=archive_path, trigger=trigger)
-        except Exception as exc:
-            log_event("engine", "pre_compact_hook_failed", tab_id=self.tab_id, error=str(exc))
+        live-confirmed).
+
+        Bug fix (2026-09-20), confirmed live: this used to copy the ENTIRE
+        transcript into workspace/dehydrated/ on every compaction and point
+        the tab's continuity pointer at the copy. Compaction never touches
+        the live transcript, though -- it is append-only, and after 10 days
+        of hourly compactions tab 1's still held every record back to its
+        first day (1,325 compact_boundary markers inside it), and the newest
+        archive was a byte-for-byte prefix of it. So the copies preserved
+        nothing the live file didn't already have, while costing a
+        hundreds-of-MB copy each time: 4,484 of them, 892 GB, mostly from a
+        compaction loop (see _note_compaction_hit_limit). The continuity
+        pointer they set was wrong too -- it tells the model "an earlier
+        session was abandoned after an internal error", which is simply
+        false after an ordinary compaction. Nothing is copied now; the
+        24h-dialogue file (recent_dialogue_history_instruction) is the
+        recall path, and it reads the live file's tail. Observation only."""
+        trigger = hook_input.get("trigger") if isinstance(hook_input, dict) else None
+        log_event("engine", "pre_compact_observed", tab_id=self.tab_id, trigger=trigger)
         return {}
 
     def _handle_balance_exhausted(self) -> str:
@@ -2475,6 +2575,7 @@ class ChatSession:
                     self._check_user_wait_nudge()
                     await self._check_progress_narration()
                     self._check_forced_compaction()
+                    self._check_deferred_engine_switch()
                     self._check_funds_exhaustion_status()
                 except asyncio.CancelledError:
                     raise
@@ -2855,6 +2956,8 @@ class ChatSession:
         last forced compaction. Never runs while a real turn is in flight or the
         connection isn't fully settled -- this is maintenance, not
         something to inject into or race with actual work."""
+        if self.engine_kind != "claude":
+            return  # Codex owns its own compaction; this machinery edits Claude transcripts
         if self.ended or self.turn_pending or self.forced_compaction_result_pending:
             return
         if self.conn_state.get("kind") != "connected":
@@ -2862,6 +2965,14 @@ class ChatSession:
         if not self.last_saved_session_id:
             return
         now = time.monotonic()
+        # Right after a compaction that itself hit the usage cap: wait, no
+        # matter which trigger is armed -- INCLUDING needs_post_limit_
+        # compaction_check, which used to bypass every gate and is exactly
+        # what turned one failed compaction into thousands (see
+        # FORCED_COMPACTION_LIMIT_PAUSE_MS). The armed flag simply stays
+        # armed until the pause ends.
+        if now < self.forced_compaction_blocked_until:
+            return
 
         if self.needs_post_limit_compaction_check:
             self.needs_post_limit_compaction_check = False
@@ -2882,6 +2993,36 @@ class ChatSession:
         if reason is None:
             return
 
+        # Nothing to compact -> don't (except "growth", which by definition
+        # already measured real growth). Measured live: every hourly/startup
+        # compaction on an idle tab ran with 3.5K-7K tokens in context and
+        # came out the same size, yet each one still cost a full transcript
+        # scan/copy. The size comes from the live turns' own usage reports
+        # when this process has seen any, otherwise from the END of the
+        # transcript itself (read_last_context_tokens) -- a fresh process
+        # has no usage report yet, which is precisely when the startup
+        # compaction fires. Unknown (None) keeps the old behavior: compact.
+        if reason != "growth":
+            context_tokens = self.last_known_context_tokens
+            if context_tokens is None:
+                try:
+                    path = claude_project_dir(self.workspace_dir) / f"{self.last_saved_session_id}.jsonl"
+                    context_tokens = read_last_context_tokens(path)
+                    if context_tokens is not None:
+                        self.last_known_context_tokens = context_tokens
+                except Exception as exc:
+                    log_event("engine", "forced_compaction_context_probe_failed", tab_id=self.tab_id, error=str(exc))
+            if context_tokens is not None and context_tokens < FORCED_COMPACTION_MIN_CONTEXT_TOKENS:
+                log_event(
+                    "engine", "forced_compaction_skipped_small_context", tab_id=self.tab_id, reason=reason,
+                    context_tokens=context_tokens, threshold=FORCED_COMPACTION_MIN_CONTEXT_TOKENS,
+                )
+                # Treated as "checked": no re-evaluation until the next
+                # hourly slot (or real growth), not on every 5 s tick.
+                self.needs_startup_compaction = False
+                self.last_forced_compaction_at = now
+                return
+
         self.needs_startup_compaction = False
         self.last_forced_compaction_at = now
         self.size_at_last_forced_compaction = self._current_session_file_size() or 0
@@ -2899,6 +3040,28 @@ class ChatSession:
         # (whose own setter is the usual auto-publish trigger).
         asyncio.create_task(self._publish_status())
         self._push_internal_command("/compact")
+
+    def _note_compaction_hit_limit(self, limit_text: str) -> None:
+        """A forced compaction just failed because the usage cap is in force.
+        Per explicit instruction (2026-09-20), after a real outage: this used
+        to be handled like a real turn hitting the cap -- the tab went
+        "limited", and the error's own trailing ResultMessage flipped it back
+        to "connected" within a millisecond, which is the exact edge that
+        arms needs_post_limit_compaction_check (retry what the cap
+        interrupted, no cooldown) -- so the next 5 s watchdog tick compacted
+        again, failed again, and so on for as long as the cap lasted (1,464
+        times in one hour), each attempt copying the whole transcript.
+        Maintenance failing against a cap isn't a tab-level event at all: no
+        state change, just a flat pause before the next attempt (see
+        FORCED_COMPACTION_LIMIT_PAUSE_MS). The trailing ResultMessage is
+        consumed by the normal forced-compaction path (forced_compaction_
+        result_pending is still True) exactly as any other compaction
+        result."""
+        self.forced_compaction_blocked_until = time.monotonic() + FORCED_COMPACTION_LIMIT_PAUSE_MS / 1000
+        log_event(
+            "engine", "forced_compaction_hit_limit", tab_id=self.tab_id,
+            pause_s=FORCED_COMPACTION_LIMIT_PAUSE_MS // 1000, message=limit_text[:200],
+        )
 
     def _drain_compaction_queue(self) -> None:
         """Called right after forced_compaction_result_pending flips back
@@ -3238,9 +3401,13 @@ class ChatSession:
                 self.last_visible_output_at = time.monotonic()
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
+                self.engine_kind = (
+                    "openai" if load_chat_mode(self.workspace_dir, self.tab_id) == "openai" and openai_available(self.workspace_dir)
+                    else "claude"
+                )
                 mode = await resolve_mode(self.workspace_dir, self.tab_id)
-                self.current_chat_source = mode.chat_source
-                if mode.chat_source == "none":
+                self.current_chat_source = "openai" if self.engine_kind == "openai" else mode.chat_source
+                if mode.chat_source == "none" and self.engine_kind == "claude":
                     # query() is about to fail on its very first real request no
                     # matter what -- there's no chat source to even try. Checked
                     # here, before query() creation, so opening the login window
@@ -3259,6 +3426,16 @@ class ChatSession:
                 resume_session_id = self._resolve_resume_session_id()
                 if resume_session_id:
                     self.last_saved_session_id = resume_session_id
+                if resume_session_id and self.engine_kind == "claude":
+                    # No CLI process has this transcript open right now (a
+                    # fresh query() is about to be built), so it is safe to
+                    # move a huge already-compacted prefix out of the file
+                    # the CLI has to read on every resume.
+                    await asyncio.to_thread(
+                        rotate_transcript,
+                        claude_project_dir(self.workspace_dir) / f"{resume_session_id}.jsonl",
+                        self.workspace_dir,
+                    )
                     # Bug fix (2026-09-18), confirmed live: _recent_24h_
                     # dialogue_file_path used to only ever get (re)written
                     # inside submit()'s real-user branch -- meaning the
@@ -3350,13 +3527,18 @@ class ChatSession:
                     options_kwargs["env"] = anthropic_env
                 if resume_session_id:
                     options_kwargs["resume"] = resume_session_id
+                claude_model = get_model_override(self.workspace_dir, "claude")
+                if claude_model:
+                    options_kwargs["model"] = claude_model
                 if system_prompt_append:
                     options_kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code", "append": system_prompt_append}
-                options = ClaudeAgentOptions(**options_kwargs)
-
                 query_started_at = time.monotonic()
-                log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=mode.chat_source)
-                self.client = ClaudeSDKClient(options=options)
+                log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=self.current_chat_source, engine=self.engine_kind)
+                if self.engine_kind == "openai":
+                    self.client = CodexEngine(build_codex_options(self.workspace_dir, system_prompt_append, mcp_servers, resume_session_id))
+                else:
+                    options = ClaudeAgentOptions(**options_kwargs)
+                    self.client = ClaudeEngine(options)
                 self._cli_process_pid = None
                 self._process_activity_monitor = None
                 await self.client.connect(self._input_stream())
@@ -3466,6 +3648,14 @@ class ChatSession:
                         limit_text = next((t for t in text_blocks if CC_CLI_LIMIT_PATTERN.search(t)), None)
                         if limit_text:
                             log_event("engine", "cc_cli_limit_message", tab_id=self.tab_id)
+                            # The limit message is OUR forced compaction's own
+                            # failure ("Error during compaction: You've hit your
+                            # session limit"), not a real turn hitting the cap --
+                            # maintenance, so it must not flip the whole tab
+                            # limited/connected. See _note_compaction_hit_limit.
+                            if self.forced_compaction_result_pending:
+                                self._note_compaction_hit_limit(limit_text)
+                                continue
                             # Bug fix (2026-09-11), per explicit instruction: this is
                             # NOT the same shape as a rate-limit REJECTION (no
                             # arm_ignore_next_result here, deliberately) -- a real
@@ -3576,7 +3766,7 @@ class ChatSession:
                     sid = getattr(message, "session_id", None)
                     if sid and sid != self.last_saved_session_id and not self.restart_for_unrecoverable_session:
                         self.last_saved_session_id = sid
-                        save_tab_session_id(self.workspace_dir, self.tab_id, sid)
+                        save_tab_session_id(self.workspace_dir, self.tab_id, sid, self.engine_kind)
 
                     if isinstance(message, ResultMessage):
                         # Bug fix (2026-09-15): the live "how much is

@@ -24,7 +24,6 @@
   <div class="header">
     <div class="header-title">Caroline</div>
     <div class="header-right">
-      <button id="clearChatBtn" class="icon-btn" title="Clear conversation">🗑</button>
       <button id="settingsBtn" class="icon-btn" title="Settings">⚙</button>
     </div>
   </div>
@@ -168,14 +167,41 @@
           <button id="swTopUpBtn" class="secondary">Top up</button>
         </div>
 
-        <div id="chatModeField" class="settings-field" style="display:none">
-          <label>This tab answers via</label>
-          <select id="chatModeSelect">
-            <option value="claude">Claude (your Anthropic subscription)</option>
-            <option value="sw">SquirrelWisdom (cheaper, metered)</option>
-          </select>
+      </section>
+
+      <section class="settings-section">
+        <h4>Models</h4>
+        <p class="settings-hint">Automatic uses each provider's own default. A choice applies to conversations started after you change it.</p>
+        <div class="settings-field">
+          <label>Claude model</label>
+          <select id="claudeModelSelect"><option value="">Automatic</option></select>
         </div>
-        <p id="chatModeHint" class="settings-hint" style="display:none">Requires both a Claude subscription and a paid SquirrelWisdom balance -- available once both are set up above.</p>
+        <div class="settings-field">
+          <label>OpenAI model</label>
+          <select id="openaiModelSelect"><option value="">Automatic</option></select>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h4>OpenAI</h4>
+        <p class="settings-hint">Lets a tab answer through OpenAI instead of Claude, then pick OpenAI in the tab's header. Sign in with your ChatGPT subscription, or use your own API key below -- independent of each other, same as Claude's own login vs. API key.</p>
+        <div id="openaiStatusText" class="settings-status">Checking…</div>
+        <div class="settings-row">
+          <button id="openaiChatgptBtn">Sign in with ChatGPT</button>
+          <button id="openaiDeviceBtn" class="secondary">Sign in with a code</button>
+          <button id="openaiLogoutBtn" class="secondary" style="display:none">Log out</button>
+        </div>
+        <div id="openaiPendingBox" class="settings-hint" style="display:none"></div>
+
+        <div class="settings-field">
+          <label>Own OpenAI API key (optional)</label>
+          <input id="openaiKeyInput" type="password" placeholder="sk-..." />
+        </div>
+        <div class="settings-row">
+          <button id="openaiKeySaveBtn">Save key</button>
+          <button id="openaiKeyClearBtn" class="secondary">Clear</button>
+        </div>
+        <div id="openaiKeyStatus" class="settings-status"></div>
       </section>
 
       <section class="settings-section">

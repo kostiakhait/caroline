@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from app.durability import claude_project_dir
+from app.durability import claude_project_dir, session_transcript_path
 from app.logging_setup import log_event
 
 _ATTACHMENT_NOTE_PREFIXES = [
@@ -235,7 +235,31 @@ _RAW_TS_TAIL_BYTES = 4096
 _STALE_LINES_BEFORE_STOP = 8
 
 
-def iter_lines_reversed(path: str | Path, initial_chunk_bytes: int = _REVERSE_READ_INITIAL_CHUNK_BYTES) -> Iterator[bytes]:
+def iter_lines_reversed(
+    path: str | Path, initial_chunk_bytes: int = _REVERSE_READ_INITIAL_CHUNK_BYTES, cold: bool = True
+) -> Iterator[bytes]:
+    """Yields the transcript's lines newest first; once the live file is
+    exhausted, continues into its cold prefix (transcript_rotate) if one
+    exists, so a rotated transcript still reads as one continuous history.
+    cold=False reads only the live file. See _iter_file_lines_reversed."""
+    yield from _iter_file_lines_reversed(path, initial_chunk_bytes)
+    if cold:
+        from app.transcript_rotate import cold_path_for
+        cold_file = cold_path_for(path)
+        if cold_file.exists():
+            # The cold file ends with a newline, so its reverse walk opens with
+            # an empty piece that is NOT a record -- drop it so the joined
+            # stream is exactly the original file's line sequence.
+            first = True
+            for piece in _iter_file_lines_reversed(cold_file, initial_chunk_bytes):
+                if first and not piece:
+                    first = False
+                    continue
+                first = False
+                yield piece
+
+
+def _iter_file_lines_reversed(path: str | Path, initial_chunk_bytes: int) -> Iterator[bytes]:
     """Yields the file's lines (as raw bytes, no trailing newline), NEWEST
     first, reading backwards in chunks -- never more of the file in memory
     than the chunk plus whatever single line straddles a chunk boundary. A
@@ -315,6 +339,46 @@ def read_recent_entries(path: str | Path, limit: int, source_label: str | None =
     return out
 
 
+_CONTEXT_TOKEN_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+_COMPACT_BOUNDARY_RE = re.compile(rb'"subtype"\s*:\s*"compact_boundary"')
+
+
+def read_last_context_tokens(path: str | Path, max_lines: int = 5000) -> int | None:
+    """How big the model's context was at the END of this transcript, in
+    tokens -- what the last assistant message's usage reports (input + cache
+    read + cache creation, the same sum chat_session.py already uses for
+    live turns). Returns 0 when a compaction is the newest thing in the
+    file (context is just the summary right now, whatever the older usage
+    records say), and None when nothing usable is found within max_lines.
+    Read from the END of the file (iter_lines_reversed) -- cheap however big
+    the transcript is. Exists so a fresh process can tell whether a session
+    actually NEEDS compacting without a live turn having reported usage yet
+    (see ChatSession._check_forced_compaction)."""
+    scanned = 0
+    for raw in iter_lines_reversed(path):
+        if not raw.strip():
+            continue
+        scanned += 1
+        if scanned > max_lines:
+            return None
+        if _COMPACT_BOUNDARY_RE.search(raw[:4000]):
+            return 0
+        if b'"usage"' not in raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        usage = (obj.get("message") or {}).get("usage")
+        if isinstance(usage, dict):
+            total = sum(v for k, v in usage.items() if k in _CONTEXT_TOKEN_USAGE_KEYS and isinstance(v, int))
+            if total:
+                return total
+    return None
+
+
 def read_recent_history(workspace_dir: str, limit: int = 200) -> list[dict[str, Any]]:
     file = _latest_session_file(workspace_dir)
     if not file:
@@ -332,7 +396,7 @@ def read_recent_history_for_session(workspace_dir: str, session_id: str, limit: 
     way. This reads the EXACT session file for the tab whose session_id
     the caller already resolved (durability.py's load_tab_session_id) --
     no "most recent" guessing."""
-    file = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+    file = session_transcript_path(workspace_dir, session_id)
     if not file.exists():
         return []
     return read_recent_entries(file, limit)

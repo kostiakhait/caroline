@@ -36,10 +36,22 @@ public sealed class UpdateChecker
 
     private static readonly TimeSpan InitialDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan CheckInterval = TimeSpan.FromMinutes(30);
+    // Flat, never growing (standing rule: no exponential backoff anywhere) -- how often a FAILED
+    // update is re-examined in the background. Cheap: it only costs two tiny requests unless the
+    // server has actually changed since the last failure (see InstallerFetcher.GetFingerprintAsync).
+    private static readonly TimeSpan FailedUpdateRetryInterval = TimeSpan.FromMinutes(5);
 
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(30) };
+    private readonly InstallerFetcher _fetcher;
     private readonly DispatcherTimer _timer;
+    private readonly DispatcherTimer _retryTimer;
     private bool _promptedThisSession;
+    // Set when an installer has been downloaded AND verified but not yet launched (the user said
+    // "later", or it was fetched by a background retry) -- UpdateNowAsync uses it instead of
+    // downloading 216 MB again.
+    private string? _verifiedInstallerPath;
+    private string? _lastFailedFingerprint;
+    private bool _retryRunning;
 
     /// <summary>Fired as soon as a newer build is found, independent of the once-per-launch
     /// MessageBox prompt below -- lets the tray icon show "Update to {version}" even after the
@@ -56,8 +68,11 @@ public sealed class UpdateChecker
 
     public UpdateChecker()
     {
+        _fetcher = new InstallerFetcher(_http, InstallerUrl, InstallerSha256Url, Path.Combine(Path.GetTempPath(), "Caroline"), DownloadMaxAttempts);
         _timer = new DispatcherTimer { Interval = CheckInterval };
         _timer.Tick += async (_, _) => await CheckAsync();
+        _retryTimer = new DispatcherTimer { Interval = FailedUpdateRetryInterval };
+        _retryTimer.Tick += async (_, _) => await RetryFailedUpdateAsync();
     }
 
     public void Start()
@@ -134,19 +149,127 @@ public sealed class UpdateChecker
         string installerPath;
         try
         {
-            installerPath = await DownloadInstallerAsync();
+            if (_verifiedInstallerPath is not null && File.Exists(_verifiedInstallerPath))
+            {
+                Logger.Log($"[UpdateChecker] UpdateNowAsync: reusing the already-verified installer {_verifiedInstallerPath}");
+                installerPath = _verifiedInstallerPath;
+            }
+            else
+            {
+                var result = await FetchInstallerAsync();
+                if (result.Status == InstallerFetchStatus.Mismatch)
+                {
+                    NotifyUpdateFailed(result, userInitiated: true);
+                    return;
+                }
+                installerPath = result.Path!;
+            }
         }
         catch (Exception ex)
         {
+            // Network trouble, a full disk, etc. -- not a verdict on the server. Same treatment: say so,
+            // and keep trying in the background rather than leaving the user with a dead end.
             Logger.Log($"[UpdateChecker] failed to download installer: {ex}");
-            System.Windows.MessageBox.Show($"Couldn't download the update: {ex.Message}", "Caroline Update",
-                System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
+            StartBackgroundRetry(fingerprint: null);
+            System.Windows.MessageBox.Show(
+                $"The update couldn't be downloaded right now ({ex.Message}).\n\nNothing on your computer was changed. " +
+                "Caroline will keep trying automatically every 5 minutes and offer the update again as soon as it works.",
+                "Caroline Update", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
             return;
         }
 
+        _retryTimer.Stop();
         Logger.Log($"[UpdateChecker] launching {installerPath} (manual, via tray)");
         Process.Start(new ProcessStartInfo(installerPath) { UseShellExecute = true });
         System.Windows.Application.Current.Shutdown();
+    }
+
+    /// <summary>Downloads and verifies the installer (see InstallerFetcher), publishing progress to
+    /// StatusChanged. A bad hash comes back as a Mismatch result, not an exception.</summary>
+    private async Task<InstallerFetchResult> FetchInstallerAsync()
+    {
+        Logger.Log("[UpdateChecker] FetchInstallerAsync: starting download");
+        StatusChanged?.Invoke("Caroline: Update ongoing...");
+        // Best-effort cleanup of earlier attempts' leftovers -- unique filenames mean nothing else ever
+        // deletes these; a still-running installer holding one open is skipped, not fatal.
+        try
+        {
+            foreach (var old in Directory.EnumerateFiles(Path.Combine(Path.GetTempPath(), "Caroline"), "CarolineInstaller-update-*.exe"))
+            {
+                if (old == _verifiedInstallerPath) continue;
+                try { File.Delete(old); }
+                catch (Exception ex) { Logger.Log($"[UpdateChecker] cleanup delete of {old} failed, leaving it (not fatal): {ex.Message}"); }
+            }
+        }
+        catch (Exception ex) { Logger.Log($"[UpdateChecker] leftover-cleanup enumeration failed (not fatal): {ex.Message}"); }
+
+        var result = await _fetcher.FetchAsync(percent => StatusChanged?.Invoke($"Caroline: Update ongoing... {percent}%"));
+        Logger.Log($"[UpdateChecker] FetchInstallerAsync: {result.Status}" +
+            (result.Status == InstallerFetchStatus.Mismatch
+                ? $" (expected {result.ExpectedSha256}, got {result.ActualSha256}, stable={result.StableMismatch})"
+                : $", path={result.Path}"));
+        if (result.Status != InstallerFetchStatus.Mismatch) _verifiedInstallerPath = result.Path;
+        return result;
+    }
+
+    /// <summary>The server's installer doesn't match its own published checksum. Not the user's problem and
+    /// not the end of the road: say what actually happened, then keep re-examining in the background (see
+    /// StartBackgroundRetry) until the server has a valid file.</summary>
+    private void NotifyUpdateFailed(InstallerFetchResult result, bool userInitiated)
+    {
+        StartBackgroundRetry(result.Fingerprint);
+        StatusChanged?.Invoke("Caroline: Update waiting for the server -- retrying every 5 minutes");
+        if (!userInitiated) return;
+        var why = result.StableMismatch
+            ? "The download server is offering a file that doesn't match its own published checksum. That's a problem on the server, not with your connection or this computer."
+            : "The download kept arriving damaged, so it couldn't be verified.";
+        System.Windows.MessageBox.Show(
+            why + "\n\nNothing on your computer was changed. Caroline will keep checking every 5 minutes and offer the update again as soon as a valid one is available.",
+            "Caroline Update", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
+    }
+
+    private void StartBackgroundRetry(string? fingerprint)
+    {
+        _lastFailedFingerprint = fingerprint;
+        if (!_retryTimer.IsEnabled)
+        {
+            Logger.Log($"[UpdateChecker] a failed update will be re-examined every {FailedUpdateRetryInterval.TotalMinutes:F0} min until it works");
+            _retryTimer.Start();
+        }
+    }
+
+    /// <summary>Background retry tick after a failed update. Never shows a dialog while it's still failing.
+    /// If the server looks exactly as it did at the last failure (same file identity, same published checksum)
+    /// there is nothing new to try and no 216 MB download is made; otherwise it downloads, and on success stops
+    /// retrying and offers the update again.</summary>
+    private async Task RetryFailedUpdateAsync()
+    {
+        if (_retryRunning) return;
+        _retryRunning = true;
+        try
+        {
+            var fingerprint = await _fetcher.GetFingerprintAsync();
+            if (_lastFailedFingerprint is not null && fingerprint == _lastFailedFingerprint)
+            {
+                Logger.Log("[UpdateChecker] retry: the server looks the same as at the last failure -- nothing new to try");
+                return;
+            }
+            var result = await FetchInstallerAsync();
+            if (result.Status == InstallerFetchStatus.Mismatch)
+            {
+                _lastFailedFingerprint = result.Fingerprint;
+                return;
+            }
+            _retryTimer.Stop();
+            _lastFailedFingerprint = null;
+            StatusChanged?.Invoke("Caroline: Update ready");
+            await OfferUpdateAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"[UpdateChecker] retry attempt failed (will try again in {FailedUpdateRetryInterval.TotalMinutes:F0} min): {ex.Message}");
+        }
+        finally { _retryRunning = false; }
     }
 
     private async Task<string?> FetchRemoteSha256Async() => await FetchSha256Async(ZipSha256Url);
@@ -175,114 +298,5 @@ public sealed class UpdateChecker
         Logger.Log($"[UpdateChecker] update-available MessageBox result: {result}");
         if (result != System.Windows.MessageBoxResult.Yes) return;
         await UpdateNowAsync();
-    }
-
-    /// <summary>
-    /// Downloads CarolineInstaller-update.exe and verifies it against the
-    /// published SHA-256 before returning, retrying on mismatch -- confirmed
-    /// live (2026-09-03) as the actual cause of a self-update silently never
-    /// relaunching Caroline: the previous version of this method had NO
-    /// integrity check at all (unlike CarolineInstaller's own Downloader.cs,
-    /// which always verifies Caroline.zip/model downloads), so a truncated
-    /// download produced a corrupt single-file self-contained exe that threw
-    /// System.IO.FileNotFoundException for WindowsBase.dll (a bundled managed
-    /// assembly cut off mid-file) and crashed before writing even its own
-    /// first log line -- invisible to the user beyond "nothing happened".
-    /// </summary>
-    private async Task<string> DownloadInstallerAsync()
-    {
-        Logger.Log("[UpdateChecker] DownloadInstallerAsync: starting download");
-        StatusChanged?.Invoke("Caroline: Update ongoing...");
-        var expectedSha256 = await FetchSha256Async(InstallerSha256Url);
-
-        var tempDir = Path.Combine(Path.GetTempPath(), "Caroline");
-        Directory.CreateDirectory(tempDir);
-        // Best-effort cleanup of earlier attempts' leftovers -- unique filenames (below)
-        // mean nothing else ever deletes these. Failures here (a still-running installer
-        // holding one open) are exactly what this whole fix is about and are silently
-        // skipped, not fatal.
-        try
-        {
-            foreach (var old in Directory.EnumerateFiles(tempDir, "CarolineInstaller-update-*.exe"))
-            {
-                try { File.Delete(old); }
-                catch (Exception ex) { Logger.Log($"[UpdateChecker] DownloadInstallerAsync: cleanup delete of {old} failed, leaving it (not fatal): {ex.Message}"); }
-            }
-        }
-        catch (Exception ex) { Logger.Log($"[UpdateChecker] DownloadInstallerAsync: leftover-cleanup enumeration of {tempDir} failed (not fatal): {ex.Message}"); }
-        // Unique per attempt (was a fixed "CarolineInstaller-update.exe") -- confirmed live
-        // (2026-09-03) as a real collision: this process shuts down right after launching
-        // the downloaded installer, but that installer itself keeps running for a few
-        // minutes (stop old client, extract, relaunch). If the NEW Caroline instance it
-        // launches checks for updates again (its own 1-minute initial-delay check) and
-        // finds a still-newer build already published in that window -- easy to hit during
-        // a burst of same-day deploys -- its own download landed on the exact same fixed
-        // path the still-running installer's own exe was executing from, which Windows
-        // locks against write access: "Couldn't download the update: ... being used by
-        // another process." A unique name per attempt makes that collision impossible
-        // regardless of how many overlapping update attempts are in flight at once.
-        var path = Path.Combine(tempDir, $"CarolineInstaller-update-{Guid.NewGuid():N}.exe");
-
-        for (var attempt = 1; ; attempt++)
-        {
-            using var sha256 = SHA256.Create();
-            using (var response = await _http.GetAsync(InstallerUrl, HttpCompletionOption.ResponseHeadersRead))
-            {
-                response.EnsureSuccessStatusCode();
-                var totalBytes = response.Content.Headers.ContentLength;
-                await using (var fileStream = new FileStream(path, FileMode.Create, FileAccess.Write))
-                await using (var httpStream = await response.Content.ReadAsStreamAsync())
-                {
-                    var buffer = new byte[81920];
-                    long downloaded = 0;
-                    var lastReported = -1;
-                    int read;
-                    while ((read = await httpStream.ReadAsync(buffer)) != 0)
-                    {
-                        await fileStream.WriteAsync(buffer.AsMemory(0, read));
-                        sha256.TransformBlock(buffer, 0, read, null, 0);
-                        downloaded += read;
-                        // Reported by percent-changed, not by time/chunk count -- naturally
-                        // throttles itself to ~100 updates over the whole download regardless
-                        // of file size or connection speed, instead of flooding every tab's
-                        // status bar (and the WebView2 IPC channel) once per 80KB chunk.
-                        if (totalBytes is > 0)
-                        {
-                            var percent = (int)(downloaded * 100 / totalBytes.Value);
-                            if (percent != lastReported)
-                            {
-                                lastReported = percent;
-                                StatusChanged?.Invoke($"Caroline: Update ongoing... {percent}%");
-                            }
-                        }
-                    }
-                    sha256.TransformFinalBlock([], 0, 0);
-                }
-            }
-
-            if (expectedSha256 is null)
-            {
-                // No checksum published (shouldn't normally happen once the deploy
-                // target is updated to publish one) -- log it but don't block the
-                // update entirely on that alone.
-                Logger.Log("[UpdateChecker] WARNING: no published sha256 for the installer, skipping verification");
-                return path;
-            }
-
-            var actualSha256 = Convert.ToHexString(sha256.Hash!).ToLowerInvariant();
-            if (string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
-            {
-                Logger.Log($"[UpdateChecker] DownloadInstallerAsync: download verified ok (attempt {attempt}), path={path}");
-                return path;
-            }
-
-            Logger.Log($"[UpdateChecker] DownloadInstallerAsync: attempt {attempt}/{DownloadMaxAttempts} hash mismatch " +
-                $"(expected {expectedSha256}, got {actualSha256})");
-            if (attempt >= DownloadMaxAttempts)
-            {
-                File.Delete(path);
-                throw new InvalidDataException($"Downloaded installer failed hash verification after {DownloadMaxAttempts} attempts.");
-            }
-        }
     }
 }

@@ -87,6 +87,9 @@ public sealed class BackendProcess : IDisposable
         // own local_tts_launcher.py reads this exact env var to spawn the separate local
         // edge-tts server subprocess, matching the original's own convention rather than
         // hardcoding sys.executable there.
+        // Codex app-server (OpenAI support): installed by CodexInstaller, may be absent
+        // (an optional dependency) -- the backend checks the file exists before using it.
+        psi.Environment["CAROLINE_CODEX_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "codex", "codex-app-server.exe");
         psi.Environment["CAROLINE_PYTHON_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "python.exe");
 
         // Per explicit instruction (2026-09-13): Port above is the ONE place
