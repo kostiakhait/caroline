@@ -306,7 +306,10 @@ def recent_dialogue_history_instruction(file_path: str | None) -> str:
         "Additional material, on top of your own memory of this conversation: the real back-and-forth between "
         f"you and this specific user over the last 24 hours (their words and yours, internal/service messages "
         f"already filtered out) is kept at {file_path}, refreshed right before every message they send you. "
-        "This is MANDATORY, not optional, and applies with extra force right after any restart/reconnect, when "
+        "(The last hour specifically is ALSO inlined directly into every real message you receive, right above "
+        "the message itself, per explicit instruction (2026-09-22) after confirmed live incidents of not "
+        "checking even that recent a window -- this file is for anything OLDER than that inlined hour, up to "
+        "24h back.) This is MANDATORY, not optional, and applies with extra force right after any restart/reconnect, when "
         "the conversation can look deceptively like it just started even though it didn't: before EVER asking "
         "the user to re-explain a task, re-state context, remind you what \"it\"/\"the task\"/\"the thing we "
         "discussed\" refers to, or clarify something you feel unsure about -- read this file FIRST, every "
@@ -360,6 +363,44 @@ def language_hint_instruction(lang: str) -> str:
     return (
         f"The user's conversation has most recently been in {lang}. Default to replying in {lang} unless the "
         "user's own message is clearly in a different language, in which case follow their lead instead."
+    )
+
+
+def owner_profile_instruction(profile_text: str) -> str:
+    """Per explicit instruction (2026-09-22): Caroline should durably know
+    her owner/boss's own facts -- bio, requisites, key details -- rather
+    than re-deriving or re-asking for them, and this must be synced with
+    Notes (the user's own words: "все это должно синхронизироваться с
+    заметками"), not a separate local copy. Source of truth is the
+    "Caroline:Profile" Notes folder itself (see notes_plugin.py's
+    read_owner_profile_text and OWNER_PROFILE_FOLDER); this instruction
+    just inlines whatever it currently holds directly into the system
+    prompt (chat_session.py's own connection-build code), refreshed at
+    every fresh connection -- cheap and stable, unlike the fast-changing
+    dialogue window recent_dialogue_history_instruction covers, so a
+    pointer she'd have to choose to open isn't needed here the way it
+    wasn't reliable for that other case either. Distinct from
+    vault_security_instruction (secrets specifically, never inlined) and
+    task_completion_memory_instruction (a log of past tasks, not standing
+    facts about a person) -- this is neither: durable facts ABOUT the
+    owner, always current, always visible. Absent (returns "") when
+    nothing has ever been fetched yet, so a fresh install or an
+    unavailable Notes connection adds no noise."""
+    if not profile_text:
+        return ""
+    return (
+        'Standing facts about your owner, from the "Caroline:Profile" Notes folder -- their own biography, '
+        "requisites, and other durable details you should already know rather than asking about or guessing "
+        "at again:\n\n"
+        f"{profile_text}\n\n"
+        'This is the ONE canonical place for this kind of information -- distinct from "Caroline:Vault" '
+        '(secrets/passwords only) and "Caroline:Memory" (a log of past tasks, not standing facts about a '
+        "person). Whenever you learn a new durable fact about your owner worth remembering long-term (not a "
+        "one-off detail only relevant to the current task), or an existing one turns out to be wrong or "
+        'outdated, update it there yourself (notes_update on the relevant note, or notes_create in "Caroline:'
+        'Profile" for something genuinely new) -- keep it current, don\'t let it silently drift out of date. '
+        "What's shown above reflects this Notes folder as of this connection, not necessarily this exact "
+        "second -- if you just updated it yourself this same turn, trust your own edit over this text."
     )
 
 

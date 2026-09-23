@@ -111,10 +111,11 @@ from app.failure_classification import (
 from app.logging_setup import log_event
 from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
+from app.plugins.notes_plugin import read_owner_profile_text
 from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
-from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction
+from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, owner_profile_instruction, recent_dialogue_history_instruction
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
@@ -505,6 +506,19 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
 # somewhere unfiltered.
 _SYNTHETIC_TURN_MARKER = "⁣[[caroline-internal-turn]]⁣"
 
+# Strips the RECENT_HOUR_INLINE_WINDOW_HOURS context block submit() prepends
+# to a real user message's own wire_text -- same STRIP shape as
+# _HISTORY_STAMP_PATTERN (removes a prefix, keeps the real text after it),
+# not the whole-message-exclude shape _SYNTHETIC_HISTORY_TEXT_PATTERNS uses:
+# the user's own real words follow this block on the same turn, and must
+# stay in every future dialogue window, not get dropped along with it. Without
+# this, each inlined block would itself become part of a LATER window's own
+# "last hour" read, nesting a growing copy of itself into every message sent
+# during a busy hour.
+_INLINE_HOUR_CONTEXT_BLOCK_PATTERN = re.compile(
+    r"^\[Context -- the real conversation between you and this user over the last hour,.*?\n\]\n\n", re.DOTALL,
+)
+
 
 def _is_synthetic_history_text(raw_text: str) -> bool:
     text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
@@ -733,7 +747,12 @@ def _usable_dialogue_lines(entries: list[dict[str, Any]], min_ts_ms: float | Non
         if min_ts_ms is not None and entry.get("ts", float("inf")) < min_ts_ms:
             continue
         raw_text = str(entry.get("text") or "")
-        clean_text = _HISTORY_STAMP_PATTERN.sub("", raw_text).strip()
+        # Strip the "[Sent: ...]" stamp, then (see its own comment) the
+        # RECENT_HOUR_INLINE_WINDOW_HOURS context block submit() may have
+        # prepended -- a real user turn's OWN words always follow either,
+        # never something to lose, just not something to re-inline into a
+        # LATER window's own read of this same turn.
+        clean_text = _INLINE_HOUR_CONTEXT_BLOCK_PATTERN.sub("", _HISTORY_STAMP_PATTERN.sub("", raw_text)).strip()
         if not clean_text or _is_synthetic_history_text(raw_text):
             continue
         if clean_text.startswith("[") and clean_text.endswith("]") and "\n" not in clean_text:
@@ -864,6 +883,65 @@ def _read_recent_user_lines(session_id: str | None, tab_id: str, workspace_dir: 
     return user_lines[-count:]
 
 
+def _gather_recent_usable_lines(session_id: str | None, tab_id: str, workspace_dir: str, cutoff_ms: float) -> list[str]:
+    """Shared by _write_recent_24h_dialogue_file and
+    _compute_recent_hour_inline_text -- only the window differs (24h vs
+    1h), the actual gathering (every engine this tab has used, not just
+    the current one, plus the tab's own continuity archive for anything a
+    compaction already aged out of the live file within the window) is
+    identical. See _write_recent_24h_dialogue_file's own docstring for why
+    switching a tab between Claude and OpenAI must not make the new engine
+    start blind."""
+    lines: list[str] = []
+    session_ids = [session_id, *(load_tab_session_id(workspace_dir, tab_id, kind) for kind in ("claude", "openai"))]
+    paths: list[Path] = []
+    for sid in dict.fromkeys(i for i in session_ids if i):
+        path = session_transcript_path(workspace_dir, sid)
+        if path.exists() and path not in paths:
+            paths.append(path)
+    try:
+        lines = _recent_usable_lines_across_sessions(paths, cutoff_ms)
+    except Exception as exc:
+        log_event("engine", "recent_lines_read_failed", tab_id=tab_id, error=str(exc))
+    archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
+    if archive_path:
+        try:
+            lines = _recent_usable_lines(Path(archive_path), min_ts_ms=cutoff_ms) + lines
+        except Exception as exc:
+            log_event("engine", "recent_lines_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
+    return lines
+
+
+# Per explicit instruction (2026-09-22), after a real incident ("она не
+# смотрит в реальности даже на час назад"): confirmed the EXISTING safety
+# net (recent_dialogue_history_instruction, below) wasn't reliable enough
+# on its own -- it's a POINTER the model has to actively choose to go
+# read, and evidently often doesn't, even when the conversation clearly
+# needed it. This window is deliberately much smaller (1h, not 24h) for a
+# DIFFERENT delivery mechanism: inlined directly into every real message's
+# own wire text (see submit()'s real-user branch), not a file she has to
+# decide to open. No choice required means no reliance on her choosing
+# well -- see this constant's own use site for why 24h's own file-pointer
+# approach couldn't just be reused for this (system_prompt_append is fixed
+# for the whole life of a connection, not refreshed per turn; a real
+# per-turn refresh has to ride the turn's own message content instead).
+RECENT_HOUR_INLINE_WINDOW_HOURS = 1.0
+
+
+def _compute_recent_hour_inline_text(session_id: str | None, tab_id: str, workspace_dir: str) -> str:
+    """Companion to _write_recent_24h_dialogue_file, for inlining rather
+    than pointing -- see RECENT_HOUR_INLINE_WINDOW_HOURS' own comment for
+    why this needs to be a separate delivery mechanism, not just a shorter
+    version of the same file. Meant to be called OFF the event loop, same
+    as its sibling (see ChatSession._schedule_recent_hour_inline_refresh).
+    Returns "" (never a placeholder sentence) when there's nothing to
+    report, so the caller can just skip the block entirely rather than
+    inlining a content-free note into every single message."""
+    cutoff_ms = (time.time() - RECENT_HOUR_INLINE_WINDOW_HOURS * 3600) * 1000
+    lines = _gather_recent_usable_lines(session_id, tab_id, workspace_dir, cutoff_ms)
+    return "\n".join(lines)
+
+
 def _recent_24h_dialogue_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"recent-24h-dialogue-{_sanitize_tab_id(tab_id)}.txt"
 
@@ -894,25 +972,7 @@ def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspa
     model can never read a half-written one while a refresh is in flight."""
     out_path = _recent_24h_dialogue_path(workspace_dir, tab_id)
     cutoff_ms = (time.time() - RECENT_HISTORY_FILE_WINDOW_HOURS * 3600) * 1000
-    lines: list[str] = []
-    # Every engine this tab has used, not just the current one: switching a tab
-    # between Claude and OpenAI must not make the new engine start blind.
-    session_ids = [session_id, *(load_tab_session_id(workspace_dir, tab_id, kind) for kind in ("claude", "openai"))]
-    paths: list[Path] = []
-    for sid in dict.fromkeys(i for i in session_ids if i):
-        path = session_transcript_path(workspace_dir, sid)
-        if path.exists() and path not in paths:
-            paths.append(path)
-    try:
-        lines = _recent_usable_lines_across_sessions(paths, cutoff_ms)
-    except Exception as exc:
-        log_event("engine", "recent_24h_dialogue_read_failed", tab_id=tab_id, error=str(exc))
-    archive_path = load_tab_continuity_archive(workspace_dir, tab_id)
-    if archive_path:
-        try:
-            lines = _recent_usable_lines(Path(archive_path), min_ts_ms=cutoff_ms) + lines
-        except Exception as exc:
-            log_event("engine", "recent_24h_dialogue_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
+    lines = _gather_recent_usable_lines(session_id, tab_id, workspace_dir, cutoff_ms)
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         body = "\n".join(lines) if lines else "(No real messages between you and this user in the last 24 hours.)"
@@ -1448,6 +1508,26 @@ class ChatSession:
         # more pass runs afterward, instead of piling up N parallel readers.
         self._recent_24h_refresh_task: "asyncio.Task[None] | None" = None
         self._recent_24h_refresh_dirty = False
+        # See RECENT_HOUR_INLINE_WINDOW_HOURS' own comment: a much shorter
+        # window than the 24h file above, kept in memory (not written to
+        # disk -- nothing ever needs to point at it, it's inlined directly
+        # into each real message) and refreshed the same single-flight,
+        # worker-thread way. "" until the first refresh completes or when
+        # there's genuinely nothing to report.
+        self._recent_hour_inline_text: str = ""
+        self._recent_hour_refresh_task: "asyncio.Task[None] | None" = None
+        self._recent_hour_refresh_dirty = False
+        # Per explicit instruction (2026-09-22): owner-profile data (bio,
+        # requisites, ...) read from the "Caroline:Profile" Notes folder --
+        # see owner_profile_instruction's own docstring (policies.py) and
+        # notes_plugin.py's read_owner_profile_text. Refreshed with a plain
+        # await at connection-build time (a Notes API call is already
+        # async/non-blocking, unlike the local-file reads above -- no
+        # worker-thread/single-flight machinery needed). Kept on a
+        # failure (not logged in, network error, ...) rather than reset to
+        # "" -- stale-but-real data is more useful than silently dropping
+        # it for one connection.
+        self._owner_profile_text: str = ""
         # The language hint baked into the CURRENT query()'s system prompt.
         # A long-lived client doesn't re-read it every turn anymore, so a
         # real user turn that finds the persisted language has changed
@@ -1714,6 +1794,40 @@ class ChatSession:
             if not self._recent_24h_refresh_dirty:
                 return
 
+    def _schedule_recent_hour_inline_refresh(self) -> None:
+        """Same single-flight, worker-thread shape as
+        _schedule_recent_24h_dialogue_refresh (see its own docstring) --
+        the only difference is WHERE the result lands: an in-memory string
+        (self._recent_hour_inline_text) instead of a file, since this is
+        inlined directly into each real message rather than pointed at
+        (see RECENT_HOUR_INLINE_WINDOW_HOURS' own comment for why)."""
+        if self._recent_hour_refresh_task is not None and not self._recent_hour_refresh_task.done():
+            self._recent_hour_refresh_dirty = True
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self._recent_hour_inline_text = _compute_recent_hour_inline_text(self.last_saved_session_id, self.tab_id, self.workspace_dir)
+            except Exception as exc:
+                log_event("engine", "recent_hour_inline_refresh_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        self._recent_hour_refresh_task = loop.create_task(self._refresh_recent_hour_inline_async())
+
+    async def _refresh_recent_hour_inline_async(self) -> None:
+        while True:
+            self._recent_hour_refresh_dirty = False
+            started = time.monotonic()
+            try:
+                self._recent_hour_inline_text = await asyncio.to_thread(
+                    _compute_recent_hour_inline_text, self.last_saved_session_id, self.tab_id, self.workspace_dir,
+                )
+                log_event("engine", "recent_hour_inline_refreshed", tab_id=self.tab_id, ms=round((time.monotonic() - started) * 1000), has_content=bool(self._recent_hour_inline_text))
+            except Exception as exc:
+                log_event("engine", "recent_hour_inline_refresh_failed", tab_id=self.tab_id, error=str(exc))
+            if not self._recent_hour_refresh_dirty:
+                return
+
     def _check_funds_exhaustion_status(self) -> None:
         """Per explicit instruction (2026-09-16): sw_api.py's exhaustion
         flag is set/cleared as a side effect of whatever REAL call
@@ -1905,6 +2019,12 @@ class ChatSession:
             # worker thread within a moment, long before the model reads it.
             self._recent_24h_dialogue_file_path = str(_recent_24h_dialogue_path(self.workspace_dir, self.tab_id))
             self._schedule_recent_24h_dialogue_refresh()
+            # See RECENT_HOUR_INLINE_WINDOW_HOURS' own comment. Scheduled
+            # here (fire-and-forget, same shape as the 24h refresh right
+            # above) so it's warm for the FOLLOWING real turn; this turn's
+            # own wire_text below uses whatever the last refresh already
+            # computed.
+            self._schedule_recent_hour_inline_refresh()
         save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
         # last_real_user_question/the saved pending-turn file above -- those
@@ -1914,6 +2034,23 @@ class ChatSession:
         # a real one structurally, without guessing from its wording -- see
         # _SYNTHETIC_TURN_MARKER's own docstring.
         wire_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
+        # Per explicit instruction (2026-09-22), after a real incident: this
+        # is the actual delivery half of RECENT_HOUR_INLINE_WINDOW_HOURS --
+        # inlined into the real user's OWN message (not the system prompt,
+        # which is fixed for the whole life of a connection, not refreshed
+        # per turn -- see that constant's own comment) so there's no choice
+        # to read it or not; she already sees it. Real user turns only --
+        # an internal nudge/check inlining the same thing right back at her
+        # would just be noise. Skipped entirely (not even an empty-content
+        # marker) when there's genuinely nothing in the window, same
+        # "don't inline a content-free note" principle as the function
+        # itself.
+        if is_real_user and self._recent_hour_inline_text:
+            wire_text = (
+                "[Context -- the real conversation between you and this user over the last hour, included "
+                "automatically so you don't need to go look it up or ask them to repeat anything already here:\n"
+                f"{self._recent_hour_inline_text}\n]\n\n{wire_text}"
+            )
         self._push_message(wire_text, attachments, is_voice)
 
     def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False) -> None:
@@ -3718,6 +3855,23 @@ class ChatSession:
                     # continuity archive, exactly when this file matters.
                 self._recent_24h_dialogue_file_path = str(_recent_24h_dialogue_path(self.workspace_dir, self.tab_id))
                 self._schedule_recent_24h_dialogue_refresh()
+                # Same reasoning as the 24h refresh right above -- warms
+                # the inline-hour cache (see RECENT_HOUR_INLINE_WINDOW_HOURS)
+                # before the first real message of a fresh connection needs
+                # it, not just from submit()'s own real-user branch.
+                self._schedule_recent_hour_inline_refresh()
+                # See _owner_profile_text's own __init__ comment -- a plain
+                # await (already async/non-blocking), not fire-and-forget:
+                # this is small and cheap, and we want THIS connection's
+                # own system prompt to reflect it (not just eventually
+                # catch up like the file-based caches above, which have no
+                # analogous "bake once per connection" moment to matter for).
+                try:
+                    fetched_profile = await read_owner_profile_text()
+                    if fetched_profile:
+                        self._owner_profile_text = fetched_profile
+                except Exception as exc:
+                    log_event("engine", "owner_profile_fetch_failed", tab_id=self.tab_id, error=str(exc))
 
                 mcp_servers = build_mcp_servers()
                 # Dynamic backstop (2026-09-22), zero hardcoded names or
@@ -3735,6 +3889,7 @@ class ChatSession:
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
+                    owner_profile_instruction(self._owner_profile_text),
                     language_hint_instruction(self._system_prompt_language),
                     OPENAI_TOOL_HONESTY_INSTRUCTION if self.engine_kind == "openai" else None,
                 ]
