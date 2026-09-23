@@ -90,11 +90,9 @@ from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.policies import (
     continuity_pointer_instruction,
     learn_from_mistakes_instruction,
-    no_alarming_internal_recovery_instruction,
-    no_full_filesystem_search_instruction,
     no_internal_mechanics_to_user_instruction,
-    no_remote_filesystem_scans_instruction,
     no_unauthorized_secret_changes_instruction,
+    no_unbounded_filesystem_scans_instruction,
     prefer_own_backend_tools_instruction,
     proactive_context_recovery_instruction,
     self_sufficiency_instruction,
@@ -115,10 +113,8 @@ from app.policies import (
 # this engine doesn't have, so a future addition to that list is included
 # here automatically unless it hits the same structural limit.
 _SHARED_ALWAYS_ON_INSTRUCTIONS = (
-    no_full_filesystem_search_instruction,
-    no_remote_filesystem_scans_instruction,
+    no_unbounded_filesystem_scans_instruction,
     timestamp_awareness_instruction,
-    no_alarming_internal_recovery_instruction,
     no_internal_mechanics_to_user_instruction,
     proactive_context_recovery_instruction,
     task_completion_memory_instruction,

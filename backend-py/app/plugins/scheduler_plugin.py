@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
+from app.policies import follow_explicit_parameters_instruction
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -203,7 +204,7 @@ def ensure_recurring_backup(note: str, interval_s: float = 60 * 60) -> None:
 
 
 def _usage_instructions() -> str:
-    return (
+    return "\n\n".join((
         "For ANY periodic/recurring task (checking something on a schedule, a daily/weekly routine) or a task "
         "tied to a recurring real-world date (a birthday, an anniversary), ALWAYS use schedule_reminder's own "
         "`recurring` (calendar-anchored: daily/weekly) or `recurring_every_minutes` (plain interval) "
@@ -211,8 +212,9 @@ def _usage_instructions() -> str:
         'yourself for N from now" into the note text and relying on yourself to actually do that every time it '
         "fires -- confirmed in practice this silently stops forever the first time a turn fails, gets "
         "interrupted, or you simply don't follow through, with nothing to notice or recover it. A backend-"
-        "scheduled recurrence cannot be skipped this way."
-    )
+        "scheduled recurrence cannot be skipped this way.",
+        follow_explicit_parameters_instruction(),
+    ))
 
 
 PLUGIN = Plugin(

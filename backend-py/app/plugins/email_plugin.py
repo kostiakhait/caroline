@@ -47,7 +47,7 @@ from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, call_v2
-from app.policies import read_content_not_headers_instruction
+from app.policies import follow_explicit_parameters_instruction, notes_folder_fallback_instruction, read_content_not_headers_instruction
 
 _sessions = SessionManager()
 
@@ -227,9 +227,9 @@ def _credentials_convention_instruction() -> str:
         '"vault:email:kostia.khait@gmail.com"), with the rest of the note\'s text being a single-line JSON '
         'object: {"password": "...", "imapHost": "...", "imapPort": 993, "smtpHost": "...", "smtpPort": 587}. '
         "Before calling ANY other tool in this plugin for a given address, you MUST look up that note first "
-        "(notes_search or notes_list on that folder). If it's genuinely not there, see "
-        "notes_folder_fallback_instruction before concluding no credentials exist -- an OLDER note for the "
-        "same mailbox can still be sitting in a since-renamed folder.\n\n"
+        "(notes_search or notes_list on that folder). If it's genuinely not there, see the note below on "
+        "searching every folder before concluding no credentials exist -- an OLDER note for the same mailbox "
+        "can still be sitting in a since-renamed folder.\n\n"
         "Fill in EVERY field this tool asks for -- match a saved note's (or the user's own) fields to this "
         "tool's parameters BY MEANING, not by requiring an identical spelling: \"imapHost\"/\"imap_host\"/\"IMAP "
         "server\" are all the same thing as this tool's imapHost parameter, and likewise for smtpHost. Never "
@@ -268,9 +268,11 @@ def _mark_discussed_emails_read_instruction() -> str:
 def _usage_instructions() -> str:
     return "\n\n".join((
         _credentials_convention_instruction(),
+        notes_folder_fallback_instruction(),
         read_content_not_headers_instruction(),
         _check_sent_mail_too_instruction(),
         _mark_discussed_emails_read_instruction(),
+        follow_explicit_parameters_instruction(),
     ))
 
 

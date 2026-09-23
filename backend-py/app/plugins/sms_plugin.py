@@ -8,6 +8,7 @@ from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, call_v2
+from app.policies import follow_explicit_parameters_instruction
 
 SMS_SERVICE_KEY = "sms_zB7vIlt7R_ethw1JCp6IT0cXd3UZsaWf2UGiwoci6FY"
 
@@ -72,6 +73,7 @@ async def sms_view_received(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 PLUGIN = Plugin(
     name="sms",
+    usage_instructions=follow_explicit_parameters_instruction(),
     tools=[
         PluginTool(
             "sms_login",

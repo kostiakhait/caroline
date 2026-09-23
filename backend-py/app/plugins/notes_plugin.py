@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.plugins.loader import Plugin, PluginTool
+from app.policies import (
+    notes_folder_fallback_instruction,
+    owner_profile_instruction,
+    task_completion_memory_instruction,
+    vault_security_instruction,
+)
 from app.plugins.notes_api import (
     MAX_ATTACHMENT_BYTES,
     NotesApiError,
@@ -351,39 +357,25 @@ async def notes_remove_attachment(args: dict[str, Any], _rp: Any) -> dict[str, A
     return {"text": f'Removed attachment "{args["filename"]}" from note "{args["noteId"]}" and deleted the file.'}
 
 
-# --- owner-profile inline cache (chat_session.py) --------------------------
-
-OWNER_PROFILE_FOLDER = "Caroline:Profile"
-
-
-async def read_owner_profile_text() -> str:
-    """Per explicit instruction (2026-09-22): the whole OWNER_PROFILE_FOLDER,
-    concatenated -- source of truth is Notes itself (per that same
-    instruction, "все это должно синхронизироваться с заметками"), this
-    just reads it fresh for inlining into the system prompt (see
-    chat_session.py's own owner-profile cache/refresh for why inline, not
-    a pointer like recent_dialogue_history_instruction: this data is
-    small and stable, so the per-connection cost of always including it is
-    cheap, and unlike a fast-changing dialogue window there's no per-turn
-    freshness need to weigh against that). list_notes' own entries already
-    carry `text` -- no extra per-note fetch needed. Reuses THIS module's
-    own shared SessionManager (_sessions) rather than a second one, so
-    this never causes a redundant, independent login round-trip.
-
-    Raises whatever the underlying call raises (NotesApiError if not
-    logged in, a network error, ...) -- the caller decides what "no
-    profile available right now" should look like; this function's own
-    job is just the fetch, not degrading gracefully."""
-    entries = await _sessions.with_session(lambda session: list_notes(session, folder=OWNER_PROFILE_FOLDER))
-    if not entries:
-        return ""
-    entries.sort(key=lambda e: e.get("updatedAt", 0))
-    parts = [e.get("text", "").strip() for e in entries if (e.get("text") or "").strip()]
-    return "\n\n---\n\n".join(parts)
+# Per explicit instruction (2026-09-23), after a live incident traced to
+# ALWAYS_ON_INSTRUCTIONS' own total size (a real, measurable contributor to
+# --append-system-prompt overflowing Windows' CreateProcess command-line
+# limit): these four used to be unconditionally injected into every
+# connection's system prompt; now fetched on demand instead, exactly like
+# any other plugin's own usage guidance, whenever the model actually looks
+# up a notes_* tool. See each function's own docstring (policies.py) for
+# why it belongs here.
+_USAGE_INSTRUCTIONS = "\n\n".join((
+    vault_security_instruction(),
+    notes_folder_fallback_instruction(),
+    task_completion_memory_instruction(),
+    owner_profile_instruction(),
+))
 
 
 PLUGIN = Plugin(
     name="notes",
+    usage_instructions=_USAGE_INSTRUCTIONS,
     tools=[
         PluginTool(
             "notes_login",
