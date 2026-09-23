@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
@@ -34,6 +35,14 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, DocumentViewerWindow> _viewerWindows = new(StringComparer.OrdinalIgnoreCase);
     private readonly AppBrowserHost _appBrowserHost = new();
     private readonly VisualModeManager _visualMode = new();
+    // Guards against launching a second concurrent download for the same
+    // purchased model -- can genuinely happen (an immediate trigger right
+    // after purchase, plus main.py's own startup flush for anything still
+    // pending, could both fire close together). VisualModelDownloader.
+    // DownloadAsync itself resumes cleanly, so a second call isn't
+    // DESTRUCTIVE, just wasteful (two readers on the same .downloading
+    // temp file racing each other) -- this avoids that entirely.
+    private readonly HashSet<string> _activeModelDownloads = new(StringComparer.OrdinalIgnoreCase);
 
     public event EventHandler? ExitRequested;
 
@@ -1125,6 +1134,25 @@ public partial class MainWindow : Window
                 return;
             }
 
+            if (type == "visual_model_download_start")
+            {
+                // Sent right after a real purchase (app/plugins/visual_models_plugin.py),
+                // or flushed at startup for one that couldn't start immediately (main.py's
+                // own pending-downloads flush) -- see VisualModelDownloader's own doc
+                // comment. Fire-and-forget: OnWebMessageReceived stays synchronous, matches
+                // every other case here.
+                var dlModelName = root.GetProperty("modelName").GetString()!;
+                var dlUrl = root.GetProperty("url").GetString()!;
+                var dlShaUrl = root.GetProperty("shaUrl").GetString()!;
+                if (!_activeModelDownloads.Add(dlModelName))
+                {
+                    Logger.Log($"MainWindow: visual_model_download_start for {dlModelName} ignored -- already downloading.");
+                    return;
+                }
+                _ = RunVisualModelDownloadAsync(webView, dlModelName, dlUrl, dlShaUrl);
+                return;
+            }
+
             if (type == "visual_speech_start")
             {
                 // Wire key is "requestId" -- matches what chat.js actually sends (see
@@ -1246,6 +1274,57 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Logger.Log($"VisualModeManager: {label} failed: {ex}");
+        }
+    }
+
+    /// <summary>Downloads one purchased Visual Mode model in the background (see
+    /// VisualModelDownloader's own doc comment) and reports progress/completion back
+    /// to chat.js, which relays the terminal outcome on to the Python backend (see
+    /// chat.js's own window.chrome.webview message listener,
+    /// visual_model_download_done). Progress is throttled to whole-percent-point
+    /// changes -- a multi-GB file reads in ~80KB chunks, so reporting every chunk
+    /// would be tens of thousands of postMessage calls for one download.</summary>
+    private async Task RunVisualModelDownloadAsync(WebView2 webView, string modelName, string url, string shaUrl)
+    {
+        try
+        {
+            Logger.Log($"MainWindow: visual_model_download_start {modelName} url={url}");
+            var expectedSha = await VisualModelDownloader.FetchSha256Async(shaUrl, CancellationToken.None);
+            if (expectedSha is null)
+            {
+                Logger.Log($"MainWindow: visual_model_download {modelName} -- no .sha256 published yet at {shaUrl}, downloading unverified.");
+            }
+            var destPath = VisualModelDownloader.DestPathFor(modelName);
+            var lastReportedPercent = -1;
+            await VisualModelDownloader.DownloadAsync(url, destPath, expectedSha, progress =>
+            {
+                if (progress.Percent == lastReportedPercent) return;
+                lastReportedPercent = progress.Percent;
+                Dispatcher.BeginInvoke(() =>
+                {
+                    var payload = JsonSerializer.Serialize(new { type = "visual_model_download_progress", modelName, percent = progress.Percent });
+                    webView.CoreWebView2?.PostWebMessageAsJson(payload);
+                });
+            }, CancellationToken.None);
+            Logger.Log($"MainWindow: visual_model_download {modelName} finished and verified.");
+            await Dispatcher.BeginInvoke(() =>
+            {
+                var payload = JsonSerializer.Serialize(new { type = "visual_model_download_done", modelName, ok = true, error = (string?)null });
+                webView.CoreWebView2?.PostWebMessageAsJson(payload);
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"MainWindow: visual_model_download {modelName} failed: {ex}");
+            await Dispatcher.BeginInvoke(() =>
+            {
+                var payload = JsonSerializer.Serialize(new { type = "visual_model_download_done", modelName, ok = false, error = ex.Message });
+                webView.CoreWebView2?.PostWebMessageAsJson(payload);
+            });
+        }
+        finally
+        {
+            _activeModelDownloads.Remove(modelName);
         }
     }
 

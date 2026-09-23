@@ -4349,6 +4349,23 @@ class ChatSession:
                             # below), so chat.js can speak/animate each visible
                             # reply as it actually arrives.
                             envelope: dict[str, Any] = {"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice}
+                            if wire.get("type") == "result":
+                                # Distinguishes a genuine turn's settlement from
+                                # OUR OWN internal post-turn completion check
+                                # re-asking itself (was_awaiting_post_turn_check_
+                                # reply, captured above -- see
+                                # _fire_post_turn_completion_check). A caller
+                                # that cares whether a settlement represents a
+                                # real externally-triggered turn (e.g. the
+                                # Ratatosk owner-channel's "did this actually
+                                # get replied to" fallback, app/main.py's
+                                # _ratatosk_session_send) needs this signal --
+                                # without it, a legitimately-silent internal
+                                # check-reply (a bare [[NO_UPDATE]] answering
+                                # our own nudge, not the owner) looks identical
+                                # to a real turn that genuinely never got
+                                # replied to. Nothing else currently reads it.
+                                envelope["wasInternalCheckReply"] = was_awaiting_post_turn_check_reply
                             await self.send(envelope)
                             if wire.get("type") in ("assistant", "result"):
                                 if not self.real_user_turn_answered:

@@ -130,6 +130,7 @@
 
   const ratatoskStatusText = document.getElementById("ratatoskStatusText");
   const ratatoskRegisterBtn = document.getElementById("ratatoskRegisterBtn");
+  const ratatoskStopBtn = document.getElementById("ratatoskStopBtn");
 
   const attachBtn = document.getElementById("attachBtn");
   const fileInput = document.getElementById("fileInput");
@@ -1446,6 +1447,16 @@
       return;
     }
 
+    if (evt.type === "visual_model_download_start") {
+      // Pushed right after a purchase (or flushed at startup for one that
+      // couldn't start immediately -- see main.py's own pending-downloads
+      // flush) -- just relayed to the native host, which owns the actual
+      // multi-GB resumable download. Progress/completion come back the
+      // other way via the window.chrome.webview message listener below.
+      if (window.chrome?.webview) window.chrome.webview.postMessage(evt);
+      return;
+    }
+
     if (evt.type === "proactive_turn_queued") {
       // A turn this page never called send() for (reminder, ratatosk nudge, startup
       // greeting, etc.) is about to produce its own "result" -- push a placeholder so
@@ -1735,6 +1746,15 @@
     } else if (evt.op === "ratatosk_own_account_register") {
       if (!evt.ok) addBanner(`Could not register Caroline's Ratatosk account: ${evt.stderr || "unknown error"}`);
       sendControl("ratatosk_status_get");
+    } else if (evt.op === "ratatosk_stop_session") {
+      ratatoskStopBtn.disabled = false;
+      ratatoskStopBtn.textContent = "Stop current Ratatosk turn";
+      try {
+        const s = JSON.parse(evt.stdout || "{}");
+        setStatusBarText(s.stopped ? "Stopped the current Ratatosk turn." : "Nothing was running on Ratatosk to stop.", 3000);
+      } catch {
+        setStatusBarText("Ratatosk stop request sent.", 3000);
+      }
     } else if (evt.op === "ratatosk_channel_status") {
       try {
         updateChannelLamp(evt.ok ? JSON.parse(evt.stdout || "{}") : null);
@@ -1984,6 +2004,12 @@
     ratatoskRegisterBtn.disabled = true;
     ratatoskRegisterBtn.textContent = "Registering…";
     sendControl("ratatosk_own_account_register");
+  });
+
+  ratatoskStopBtn.addEventListener("click", () => {
+    ratatoskStopBtn.disabled = true;
+    ratatoskStopBtn.textContent = "Stopping…";
+    sendControl("ratatosk_stop_session");
   });
 
   ownAnthropicKeySaveBtn.addEventListener("click", () => {
@@ -2467,6 +2493,20 @@
         // "done browsing the checkout", so refresh the displayed balance.
         sendControl("sw_status");
         sendControl("chat_mode_get");
+      } else if (data && data.type === "visual_model_download_progress") {
+        // Native-only status text, same treatment as update_status just
+        // below -- no need to round-trip every percent tick to the backend,
+        // only the terminal outcome (visual_model_download_done) matters
+        // there.
+        const pct = typeof data.percent === "number" ? ` ${data.percent}%` : "";
+        setStatusBarText(`Downloading ${data.modelName}...${pct}`);
+      } else if (data && data.type === "visual_model_download_done") {
+        // Terminal outcome of a visual_model_download_start this page
+        // relayed earlier -- forwarded to the backend so it can clear the
+        // pending marker and tell the user proactively (see main.py's
+        // visual_model_download_done control op).
+        sendControl("visual_model_download_done", { modelName: data.modelName, ok: data.ok, error: data.error });
+        setStatusBarText(data.ok ? `${data.modelName} finished downloading.` : `${data.modelName} download failed.`, 5000);
       } else if (data && data.type === "update_status") {
         // The WPF shell's own self-updater downloading a new build -- purely
         // native, has nothing to do with any backend/query() turn. Per

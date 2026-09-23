@@ -48,7 +48,12 @@ from app.subscription_mode import (
     invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
     CLAUDE_MODEL_ALIASES, get_model_override, set_model_override,
 )
-from app.visual_mode import is_visual_mode_enabled, resolve_visual_model, set_visual_mode_enabled
+from app.plugins.visual_models_plugin import (
+    FACE_ANIMATION_BASE_URL,
+    load_pending_visual_model_downloads,
+    remove_pending_visual_model_download,
+)
+from app.visual_mode import is_visual_mode_enabled, models_dir, resolve_visual_model, set_visual_mode_enabled
 from app.window_registry import unregister_window
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -82,10 +87,38 @@ _ratatosk_session: ChatSession | None = None
 # calling ratatosk_send_message (a hung tool call plus a rate limit can
 # produce a synthetic reply that never reaches Ratatosk at all, leaving the
 # owner with no idea anything happened). Tracked per-turn: reset right
-# before injecting an owner message, set True the moment a
-# ratatosk_send_message tool_use is observed, checked when that turn's
-# "result" arrives -- if still False, send a fallback notice ourselves.
-_ratatosk_turn_got_reply = False
+# before injecting an owner message(s), populated as ratatosk_send_message
+# tool_use calls are observed, checked when that turn's "result" arrives.
+#
+# Bug fix (2026-09-23), per explicit instruction ("Там ответы идут в одну
+# группу, а служебные... в другую" / "Кэролайн... невозможно остановить"):
+# two real, previously-unfixed bugs in this owner-channel:
+#
+# 1. The old design was a single bool ("did SOME ratatosk_send_message
+#    happen this turn") and the fallback notice always went to the DM --
+#    if the owner's message came in a GROUP (not the DM they may never
+#    check) and Caroline replied there successfully, the bool was still
+#    True so no false notice fired; but if she genuinely failed to reply,
+#    the notice landed in the DM instead of the group the owner was
+#    actually watching. Now tracked as the actual SET of groupIds a
+#    ratatosk_send_message call targeted, compared against the actual set
+#    of groupIds that had new messages THIS turn (_ratatosk_turn_origin_
+#    group_ids) -- the fallback notice goes to each origin group that
+#    didn't get a reply, not blindly to the DM. DM stays as the last-resort
+#    target only when no origin group is known at all (should not happen
+#    for a genuine owner-channel turn, but is the honest fallback if it
+#    ever does).
+# 2. Every "result" on this session used to trigger the check, including
+#    this SAME session's own internal post-turn completion check re-asking
+#    itself "did you actually finish?" -- a turn that legitimately answers
+#    that with a bare [[NO_UPDATE]] (nothing more to say, the real work was
+#    already done and sent in the PRIOR turn) looked identical to a genuine
+#    turn that got no reply at all, so it falsely told the owner "sorry,
+#    couldn't reply" after turns that had, in fact, already replied.
+#    ChatSession now tags exactly this case (wasInternalCheckReply, see
+#    chat_session.py's own "result" envelope) so it can be skipped here.
+_ratatosk_turn_origin_group_ids: list[str] = []
+_ratatosk_turn_replied_group_ids: set[str] = set()
 
 # Guards the startup greeting to exactly once per backend-process lifetime
 # -- a full app relaunch gets a fresh process (and so a fresh greeting),
@@ -230,7 +263,7 @@ async def _start_ratatosk_background_loops() -> None:
     # its own. See app/account_state.py.
     asyncio.create_task(run_account_state_refresher())
     asyncio.create_task(_prune_redundant_archives_in_background())
-    start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner)
+    start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Checked every 20s (plus once immediately, catching anything that came
     # due while the app was closed); a reminder is only marked fired once
@@ -426,7 +459,14 @@ async def _sw_session_or_none() -> str | None:
         return None
 
 
-async def _notify_owner_ratatosk_turn_had_no_reply() -> None:
+async def _notify_owner_ratatosk_turn_had_no_reply(missing_group_ids: list[str]) -> None:
+    """Sends the "couldn't reply" fallback notice to each group that had a
+    new message this turn but never got a ratatosk_send_message reply --
+    NOT unconditionally to the owner's DM (see this module's own top-of-file
+    comment on _ratatosk_turn_origin_group_ids for why). Falls back to the
+    DM only when no origin group is known at all (shouldn't happen for a
+    genuine owner-channel turn, but is the honest fallback if it ever
+    does -- better than staying silent)."""
     try:
         if not has_own_ratatosk_account(WORKSPACE_DIR) or not is_logged_in():
             return
@@ -435,13 +475,14 @@ async def _notify_owner_ratatosk_turn_had_no_reply() -> None:
         if not caroline_email or not owner_email:
             return
         session = await get_own_v2_session(WORKSPACE_DIR)
-        group_id = await find_or_create_dm(session, caroline_email, owner_email)
-        await send_message(
-            session, group_id, caroline_email,
+        notice = (
             "⚠️ Не смогла нормально ответить на предыдущее сообщение (сбой или лимит) -- напишите ещё раз, если "
-            "это всё ещё актуально.",
+            "это всё ещё актуально."
         )
-        log_event("engine", "ratatosk_no_reply_notice_sent")
+        targets = missing_group_ids or [await find_or_create_dm(session, caroline_email, owner_email)]
+        for group_id in targets:
+            await send_message(session, group_id, caroline_email, notice)
+        log_event("engine", "ratatosk_no_reply_notice_sent", group_ids=targets)
     except Exception as exc:
         log_event("engine", "notify_owner_ratatosk_turn_had_no_reply_failed", error=str(exc))
 
@@ -449,9 +490,8 @@ async def _notify_owner_ratatosk_turn_had_no_reply() -> None:
 async def _ratatosk_session_send(event: dict[str, Any]) -> None:
     """`send` for the headless ratatosk session -- there's no chat window to
     render this conversation in (deliberately headless, not a 6th tab), so
-    this just logs, plus watches for whether ratatosk_send_message actually
-    got called this turn."""
-    global _ratatosk_turn_got_reply
+    this just logs, plus tracks which groupIds actually got a
+    ratatosk_send_message reply this turn."""
     log_event("engine", "ratatosk_session_event", event_type=event.get("type"))
     if event.get("type") != "sdk_message":
         return
@@ -459,10 +499,19 @@ async def _ratatosk_session_send(event: dict[str, Any]) -> None:
     if message.get("type") == "assistant":
         for block in (message.get("message") or {}).get("content") or []:
             if block.get("type") == "tool_use" and block.get("name") == "mcp__caroline-ratatosk__ratatosk_send_message":
-                _ratatosk_turn_got_reply = True
+                group_id = (block.get("input") or {}).get("groupId")
+                if group_id:
+                    _ratatosk_turn_replied_group_ids.add(group_id)
     elif message.get("type") == "result":
-        if not _ratatosk_turn_got_reply:
-            asyncio.create_task(_notify_owner_ratatosk_turn_had_no_reply())
+        # A reply to our OWN internal post-turn completion check (not a
+        # genuine externally-triggered turn) legitimately doesn't call
+        # ratatosk_send_message -- see this module's top-of-file comment,
+        # bug 2. Skip the check entirely for that case.
+        if event.get("wasInternalCheckReply"):
+            return
+        missing = [gid for gid in _ratatosk_turn_origin_group_ids if gid not in _ratatosk_turn_replied_group_ids]
+        if missing or not _ratatosk_turn_origin_group_ids:
+            asyncio.create_task(_notify_owner_ratatosk_turn_had_no_reply(missing))
 
 
 async def get_or_create_ratatosk_session() -> ChatSession:
@@ -476,13 +525,35 @@ async def get_or_create_ratatosk_session() -> ChatSession:
     return session
 
 
-def _inject_from_ratatosk_owner(text: str) -> None:
-    global _ratatosk_turn_got_reply
-    _ratatosk_turn_got_reply = False
+def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
+    _ratatosk_turn_origin_group_ids.clear()
+    _ratatosk_turn_origin_group_ids.extend(origin_group_ids)
+    _ratatosk_turn_replied_group_ids.clear()
 
     async def _do() -> None:
         session = await get_or_create_ratatosk_session()
         session.inject_proactive(text)
+
+    asyncio.create_task(_do())
+
+
+def _ratatosk_stop_session() -> bool:
+    """Stops whatever the headless Ratatosk session is currently doing.
+    ChatSession.stop() itself has no WS dependency at all (see its own
+    implementation) -- the actual bug (2026-09-23, per explicit
+    instruction: "Кэролайн, запущенную через рататоск, невозможно
+    остановить") was that nothing reachable from OUTSIDE a live desktop-app
+    WS connection ever called it for this specific session. Two reachable
+    triggers now share this one function: the Settings-UI "Stop" button
+    (ratatosk_stop_session control op, over the SAME WS a desktop tab
+    already has open) and the "/stop" chat-command (ratatosk_channel.py),
+    reachable from wherever Ratatosk itself is reachable -- e.g. the
+    owner's phone, with no desktop app or WS connection needed at all.
+    Returns whether there was actually anything running to stop."""
+    if _ratatosk_session is None or not _ratatosk_session.turn_pending:
+        return False
+    _ratatosk_session.stop()
+    return True
 
     asyncio.create_task(_do())
 
@@ -614,6 +685,47 @@ async def handle_control_request(
             "stderr": None if result.get("ok") else result.get("error"),
             "requestId": request_id,
         }
+    if op == "ratatosk_stop_session":
+        # Settings-UI half of the "can't stop a Ratatosk-launched session"
+        # fix (2026-09-23) -- the other half is the "/stop" chat-command in
+        # ratatosk_channel.py, reachable without any desktop app/WS
+        # connection at all. Both share _ratatosk_stop_session().
+        stopped = _ratatosk_stop_session()
+        log_event("engine", "ratatosk_stop_session_control", stopped=stopped)
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps({"stopped": stopped}), "requestId": request_id}
+    if op == "visual_model_download_done":
+        # Reported by the native WPF host (via chat.js's relay -- see
+        # chat.js's own window.chrome.webview message listener) once a
+        # visual_model_download_start it was sent (main.py's flush loop
+        # above, or visual_models_plugin.py's immediate trigger) actually
+        # finishes, one way or the other. On success, removes the pending
+        # marker and tells the user proactively -- purchase_visual_model's
+        # own result text explicitly warns the model isn't usable yet, so
+        # this is the other half of that promise: an actual "it's ready"
+        # follow-up, not silence. On failure, LEAVES the pending marker (a
+        # future flush -- next app launch -- retries it automatically,
+        # same flat-retry-forever shape every other self-healing mechanism
+        # in this codebase already uses) but still tells the user now
+        # rather than only ever finding out by asking.
+        model_name = parsed.get("modelName")
+        ok = bool(parsed.get("ok"))
+        error = parsed.get("error")
+        log_event("engine", "visual_model_download_done", model_name=model_name, ok=ok, error=error)
+        if model_name:
+            primary = primary_session()
+            if ok:
+                remove_pending_visual_model_download(model_name)
+                if primary is not None:
+                    primary.inject_proactive(
+                        f'[Visual Mode model "{model_name}" finished downloading and is ready -- you can now offer '
+                        f"to activate it with activate_visual_model if the user wants to use it.]"
+                    )
+            elif primary is not None:
+                primary.inject_proactive(
+                    f'[Visual Mode model "{model_name}" failed to download: {error or "unknown error"}. It will '
+                    "retry automatically next time the app starts -- let the user know if they ask.]"
+                )
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "open_login_from_settings":
         # Same native login form ensure_squirrelwisdom_login opens (also
         # covers "Register"), triggered directly from Settings' button
@@ -1048,6 +1160,26 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         vm_model = resolve_visual_model(WORKSPACE_DIR)
         log_event("engine", "visual_mode_config_sent", enabled=vm_enabled, model_path=(vm_model or {}).get("modelPath"))
         await websocket.send_json({"type": "visual_mode_config", "enabled": vm_enabled, "modelPath": (vm_model or {}).get("modelPath")})
+
+        # Flush any purchased-model download that couldn't be started
+        # immediately at purchase time (no real desktop connection then --
+        # e.g. bought via the headless Ratatosk owner-channel, or the app
+        # was closed) -- same "once per backend-process lifetime, primary
+        # tab" moment as visual_mode_config just above, since a fresh
+        # process is exactly a fresh chance to deliver it. Skips (and
+        # cleans up) any entry that already finished downloading since it
+        # was queued.
+        for pending_name in list(load_pending_visual_model_downloads()):
+            if (Path(models_dir()) / f"{pending_name}.xcfa").exists():
+                remove_pending_visual_model_download(pending_name)
+                continue
+            log_event("engine", "visual_model_download_flush", model_name=pending_name)
+            await websocket.send_json({
+                "type": "visual_model_download_start",
+                "modelName": pending_name,
+                "url": f"{FACE_ANIMATION_BASE_URL}{pending_name}.xcfa",
+                "shaUrl": f"{FACE_ANIMATION_BASE_URL}{pending_name}.xcfa.sha256",
+            })
 
     # Per explicit instruction: Caroline must never come back up silently.
     # Fires once per backend-process lifetime, tied to the primary tab.

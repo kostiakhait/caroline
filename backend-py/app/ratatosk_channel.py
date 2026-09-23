@@ -18,9 +18,19 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
-from app.plugins.ratatosk_api import get_recent_messages, get_server_now, list_conversations, send_presence_heartbeat
+from app.plugins.ratatosk_api import get_recent_messages, get_server_now, list_conversations, send_message, send_presence_heartbeat
 from app.plugins.ratatosk_own_account import get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
 from app.task_supervisor import supervise
+
+# A direct command, not something for the model to reply to -- handled here,
+# immediately, without ever reaching inject_from_owner. Per explicit
+# instruction: a headless session (no WS/Settings UI connection reachable at
+# all) still needs to be stoppable from wherever Ratatosk itself is
+# reachable, e.g. the owner's phone, not only from the desktop app that
+# happens to be open. Case-insensitive, exact match after stripping -- never
+# a substring match, so it can't misfire on a real sentence that happens to
+# contain the word.
+STOP_COMMAND_TEXT = "/stop"
 
 # No push from Ratatosk -- its own UI polls every 4-5s; this owner-DM
 # control channel is far less latency-sensitive (it's "give Caroline an
@@ -83,7 +93,11 @@ def get_ratatosk_channel_status() -> dict[str, Any]:
     return asdict(_status)
 
 
-async def _owner_channel_tick(workspace_dir: str, inject_from_owner: Callable[[str], None]) -> None:
+async def _owner_channel_tick(
+    workspace_dir: str,
+    inject_from_owner: Callable[[str, list[str]], None],
+    stop_session: Callable[[], bool],
+) -> None:
     _status.tick_count += 1
     _status.last_tick_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     tick_label = f"tick #{_status.tick_count}"
@@ -130,6 +144,22 @@ async def _owner_channel_tick(workspace_dir: str, inject_from_owner: Callable[[s
             ]
             if not new_messages:
                 continue
+
+            command_messages = [m for m in new_messages if (m.get("text") or "").strip().lower() == STOP_COMMAND_TEXT]
+            if command_messages:
+                stopped = stop_session()
+                log_event("plugin:ratatosk-channel", "stop_command_received", label=tick_label, group_id=group_id, stopped=stopped)
+                try:
+                    await send_message(
+                        session, group_id, caroline_email,
+                        "Stopped." if stopped else "Nothing was running to stop.",
+                    )
+                except Exception as exc:
+                    log_event("plugin:ratatosk-channel", "stop_command_reply_failed", error=str(exc))
+                new_messages = [m for m in new_messages if m not in command_messages]
+                if not new_messages:
+                    continue
+
             texts = [f"{m.get('from') or 'unknown'}: {m.get('text') or ''}" for m in new_messages]
             texts = [t for t in texts if t.strip()]
             if not texts:
@@ -161,7 +191,8 @@ async def _owner_channel_tick(workspace_dir: str, inject_from_owner: Callable[[s
         ]
         inject_from_owner(
             f"[New Ratatosk message(s) since you last checked, across {len(per_group_new)} group(s) -- reply to "
-            f"each using its OWN groupId shown below, not in any chat window:\n\n" + "\n\n".join(sections) + "]"
+            f"each using its OWN groupId shown below, not in any chat window:\n\n" + "\n\n".join(sections) + "]",
+            [group["groupId"] for group, _texts in per_group_new],
         )
     except Exception as exc:
         _status.last_error = str(exc)
@@ -170,13 +201,17 @@ async def _owner_channel_tick(workspace_dir: str, inject_from_owner: Callable[[s
         log_event("plugin:ratatosk-channel", "tick_failed", label=tick_label, error=_status.last_error)
 
 
-def start_ratatosk_owner_channel(workspace_dir: str, inject_from_owner: Callable[[str], None]) -> asyncio.Task[None]:
+def start_ratatosk_owner_channel(
+    workspace_dir: str,
+    inject_from_owner: Callable[[str, list[str]], None],
+    stop_session: Callable[[], bool],
+) -> asyncio.Task[None]:
     log_event("plugin:ratatosk-channel", "starting_poll_loop", interval_ms=POLL_INTERVAL_MS)
 
     async def _loop() -> None:
         while True:
             await asyncio.sleep(POLL_INTERVAL_MS / 1000)
-            await _owner_channel_tick(workspace_dir, inject_from_owner)
+            await _owner_channel_tick(workspace_dir, inject_from_owner, stop_session)
 
     return supervise("ratatosk_owner_channel", _loop)
 
