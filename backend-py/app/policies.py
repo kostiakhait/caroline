@@ -412,6 +412,33 @@ def vault_security_instruction() -> str:
     )
 
 
+def notes_folder_fallback_instruction() -> str:
+    """Per explicit instruction (2026-09-22), after a real, concrete
+    incident: told to reconnect a mailbox, Caroline checked only
+    "Caroline:Vault" for that mailbox's saved credentials, didn't find
+    them, and told the user they didn't exist -- they did, just still
+    sitting in "Claude Credentials", an OLDER folder name from before the
+    current convention (see _credentials_convention_instruction's own
+    2026-09-22 fix for the specific contradiction that caused this one).
+    That specific contradiction is now fixed, but the general failure mode
+    -- a naming/folder convention has changed at least once already and
+    will again, and an item saved under an older one doesn't relocate
+    itself -- isn't specific to credentials or to that one incident, so
+    this is deliberately general rather than folded into just the
+    credentials instruction."""
+    return (
+        'When you look for something in Notes that should exist -- credentials, a memory entry, a reference -- '
+        'in whatever folder your own current convention says (e.g. "Caroline:Vault", "Caroline:Memory", '
+        '"Caroline:Profile") and it genuinely is not there, do NOT conclude it does not exist and tell the user '
+        "so. Your own naming/folder conventions have changed before and will again -- an older item can still be "
+        "sitting under a now-outdated folder or title you no longer check by default. Before reporting something "
+        "as missing, run notes_search with NO folder restriction (searches every folder) for the item's likely "
+        "name/content, and check the results even if the title doesn't exactly match your current convention's "
+        "naming pattern. Only tell the user something is genuinely not stored anywhere after that broader search "
+        "also comes up empty."
+    )
+
+
 def no_unauthorized_secret_changes_instruction() -> str:
     """Standing rule (2026-09-09), stated by the user as hard and categorical
     after a real incident: a password Caroline set for someone else's
@@ -592,6 +619,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     no_internal_mechanics_to_user_instruction,
     no_alarming_internal_recovery_instruction,
     vault_security_instruction,
+    notes_folder_fallback_instruction,
     no_unauthorized_secret_changes_instruction,
     follow_explicit_parameters_instruction,
     prefer_own_backend_tools_instruction,

@@ -220,11 +220,16 @@ def _credentials_convention_instruction() -> str:
         "This plugin has no credential storage or \"login\" tool of its own, deliberately -- every mailbox's "
         "IMAP/SMTP credentials MUST be found and saved through the SAME general-purpose notes_* tools you "
         'already use for everything else, never through an email-specific adapter. The convention: one note '
-        'per mailbox, in folder "Claude Credentials", titled exactly "vault:email:<address>" (e.g. '
+        'per mailbox, in folder "Caroline:Vault" (see vault_security_instruction -- this used to say "Claude '
+        'Credentials", a stale, pre-2026-09-14 folder name that directly contradicted the general vault '
+        "convention; confirmed live, 2026-09-22, that this exact contradiction caused a real mailbox's "
+        'credentials to go unfound), titled exactly "vault:email:<address>" (e.g. '
         '"vault:email:kostia.khait@gmail.com"), with the rest of the note\'s text being a single-line JSON '
         'object: {"password": "...", "imapHost": "...", "imapPort": 993, "smtpHost": "...", "smtpPort": 587}. '
         "Before calling ANY other tool in this plugin for a given address, you MUST look up that note first "
-        "(notes_search or notes_list on that folder).\n\n"
+        "(notes_search or notes_list on that folder). If it's genuinely not there, see "
+        "notes_folder_fallback_instruction before concluding no credentials exist -- an OLDER note for the "
+        "same mailbox can still be sitting in a since-renamed folder.\n\n"
         "Fill in EVERY field this tool asks for -- match a saved note's (or the user's own) fields to this "
         "tool's parameters BY MEANING, not by requiring an identical spelling: \"imapHost\"/\"imap_host\"/\"IMAP "
         "server\" are all the same thing as this tool's imapHost parameter, and likewise for smtpHost. Never "
