@@ -55,6 +55,10 @@ from claude_agent_sdk import (
     RateLimitEvent,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+    TERMINAL_TASK_STATUSES,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -115,7 +119,12 @@ from app.plugins.loader import build_mcp_servers
 from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
 from app.persona import get_persona, persona_system_prompt_append
-from app.policies import ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction
+from app import agent_registry
+from app.agent_definitions import caroline_agents
+from app.policies import (
+    ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction,
+    running_agents_pointer_instruction,
+)
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
@@ -3108,6 +3117,31 @@ class ChatSession:
             [], False, False,
         )
 
+    def _track_background_tasks(self, message: Any) -> None:
+        """Feeds agent_registry from the SDK's typed task lifecycle events (see that module's docstring for
+        why). A background task can end with a TaskNotificationMessage OR only a TaskUpdatedMessage whose
+        status is terminal (e.g. a stopped task) -- either one clears it."""
+        try:
+            if isinstance(message, TaskStartedMessage):
+                agent_registry.register(self.workspace_dir, self.tab_id, message.task_id, message.description, message.task_type, message.tool_use_id)
+            elif isinstance(message, TaskNotificationMessage):
+                agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status)
+            elif isinstance(message, TaskUpdatedMessage) and (message.status or (message.patch or {}).get("status")) in TERMINAL_TASK_STATUSES:
+                agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status or (message.patch or {}).get("status"))
+        except Exception as exc:
+            log_event("engine", "track_background_tasks_failed", tab_id=self.tab_id, error=str(exc))
+
+    def _tell_model_agents_were_lost(self, lost: list[dict[str, Any]]) -> None:
+        listing = "; ".join(f"agentId {e['task_id']}: {e.get('description') or '?'}" for e in lost)
+        log_event("engine", "agents_lost_note_injected", tab_id=self.tab_id, count=len(lost))
+        self.inject_proactive(
+            "[The app restarted while these agents/background tasks you had launched were still running, and a "
+            f"restart kills them -- they are GONE and will never report back: {listing}. If the work is still "
+            "needed, launch it again (check first what they may already have produced, e.g. files on disk). Never "
+            "mention the restart to the user. If nothing here needs doing, reply exactly [[NO_UPDATE]].]"
+        )
+        agent_registry.clear_lost(self.workspace_dir, self.tab_id)
+
     def _track_tool_outcomes(self, message: Any) -> None:
         """Ground-truth tool-outcome tracking (see ToolOutcome's own
         docstring and the field comments in __init__): every ToolUseBlock is
@@ -3859,6 +3893,7 @@ class ChatSession:
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
+                    running_agents_pointer_instruction(agent_registry.ensure_status_file(self.workspace_dir, self.tab_id)),
                     language_hint_instruction(self._system_prompt_language),
                     OPENAI_TOOL_HONESTY_INSTRUCTION if self.engine_kind == "openai" else None,
                 ]
@@ -3875,6 +3910,16 @@ class ChatSession:
                     "permission_mode": "bypassPermissions",
                     "mcp_servers": mcp_servers,
                     "disallowed_tools": ["mcp__caroline-notes__notes_login", *dynamic_disallowed_tools],
+                    # Only Caroline's OWN in-process MCP servers -- ignore every other MCP configuration (user/
+                    # project scope in ~/.claude.json, claude.ai connectors). Confirmed live (2026-09-24): those
+                    # belong to whoever's dev setup shares that file, come and go with their connection state,
+                    # and agents reached for them (an external email MCP) instead of Caroline's own tools. A
+                    # structural fix with no names or lists in it; applies to subagents too. Verified with a real
+                    # probe that the Claude login is unaffected.
+                    "extra_args": {"strict-mcp-config": None},
+                    # Caroline's own definition of the default agent -- carries her rules, which a subagent does
+                    # NOT inherit from --append-system-prompt. See agent_definitions.py.
+                    "agents": caroline_agents(),
                     "stderr": _stderr_handler,
                     # Claude's own native auto-compaction handles context
                     # ageing now -- explicitly on, and one long-lived client
@@ -3925,7 +3970,11 @@ class ChatSession:
                     self.client = ClaudeEngine(options)
                 self._cli_process_pid = None
                 self._process_activity_monitor = None
+                # A fresh CLI process: every agent the previous one had running died with it, silently.
+                lost_agents = agent_registry.mark_running_as_lost(self.workspace_dir, self.tab_id)
                 await self.client.connect(self._input_stream())
+                if lost_agents:
+                    self._tell_model_agents_were_lost(lost_agents)
 
                 async for raw_message in self.client.receive_messages():
                     self.last_activity = time.monotonic()
@@ -3949,6 +3998,7 @@ class ChatSession:
                     # Ground-truth tool-outcome tracking -- see
                     # _track_tool_outcomes' own docstring.
                     self._track_tool_outcomes(message)
+                    self._track_background_tasks(message)
 
                     # --- classifier refusal ---
                     if isinstance(message, AssistantMessage):
@@ -4112,6 +4162,16 @@ class ChatSession:
                             # last_known_context_tokens against the brand
                             # new baseline on its very next check.
                             self.last_known_context_tokens = post_tokens
+                        # Compaction can summarize away who was launched -- say so again, from ground truth.
+                        still_running = agent_registry.running(self.workspace_dir, self.tab_id)
+                        if still_running:
+                            listing = "; ".join(f"agentId {i}: {e.get('description') or '?'}" for i, e in still_running.items())
+                            self.inject_proactive(
+                                "[Your context was just compacted. Agents/background tasks you launched that are STILL "
+                                f"RUNNING and will report back on their own: {listing}. Do not re-launch them and do not "
+                                "assume they are done; the full, current list is in the file named in your instructions. "
+                                "If this changes nothing for the user, reply exactly [[NO_UPDATE]].]"
+                            )
 
                     # --- system/api_retry ---
                     if isinstance(message, SystemMessage) and message.subtype == "api_retry":

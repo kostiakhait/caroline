@@ -279,6 +279,24 @@ def continuity_pointer_instruction(archive_path: str | None) -> str:
     )
 
 
+def running_agents_pointer_instruction(file_path: str | None) -> str:
+    """Per explicit instruction (2026-09-24): Caroline launched agents and, after a compaction or a
+    restart, forgot she had -- an agent's only trace in the conversation is a one-line "launched"
+    tool result, which compaction can summarize away, and a restart silently kills every agent
+    while the history still says it is running. app/agent_registry.py keeps the ground truth in a
+    file that is always current; this is the pointer (a path, not the content -- same shape as
+    recent_dialogue_history_instruction)."""
+    if not file_path:
+        return ""
+    return (
+        f"Agents and background tasks you launch are tracked in {file_path} -- always current, unlike your memory of "
+        "the conversation (compaction can drop who you launched, and an app restart silently kills every running "
+        "agent). Read it before you launch another agent for the same job, after a compaction or restart, and whenever "
+        "the user asks what you have running; anything it lists as LOST IN A RESTART is gone and must be re-launched if "
+        "still needed. Give each agent a self-contained brief: it does not see this conversation."
+    )
+
+
 def recent_dialogue_history_instruction(file_path: str | None) -> str:
     """Per explicit instruction (2026-09-14): dehydration strips old
     thinking/tool content and Claude's own native auto-compaction summarizes
