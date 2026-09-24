@@ -306,6 +306,9 @@ RECENT_HISTORY_FILE_WINDOW_HOURS = 24
 # otherwise re-parse the same transcript once per restart per tab. The hard
 # timeout only exists so a wedged worker process can never linger forever.
 RECENT_24H_REFRESH_MIN_AGE_S = 120
+# A resumed real user question must end with a VISIBLE answer; a silent [[NO_UPDATE]] is re-asked
+# at most this many times (flat, then stops -- see the result handler).
+RESUMED_ANSWER_MAX_NUDGES = 3
 RECENT_24H_REFRESH_TIMEOUT_S = 600
 # At most one refresh worker process at a time across every tab.
 _RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
@@ -1473,6 +1476,11 @@ class ChatSession:
         # extra 60s on top of the one that already produced nothing.
         self.last_narration_failed_at: float | None = None
         self.last_real_user_question: str | None = None
+        # Set by main.py when it resumes a turn a restart interrupted: the user's ORIGINAL words. While set,
+        # a resumed turn that ends without any visible text (a silent [[NO_UPDATE]]) is re-asked --
+        # see the result handler and RESUMED_ANSWER_MAX_NUDGES.
+        self.resumed_unanswered_question: str | None = None
+        self.resumed_answer_nudges: int = 0
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -1886,7 +1894,7 @@ class ChatSession:
 
     # --------------------------------------------------------------- submit --
 
-    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False) -> None:
+    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None) -> None:
         # Per standing instruction ("ВЕЗДЕ логируем и ВСЁ"): this is the
         # single choke point EVERY turn goes through -- real user messages,
         # every proactive/internal nudge (inject_proactive already logs
@@ -1910,7 +1918,7 @@ class ChatSession:
                 "engine", "submit_queued_during_compaction", tab_id=self.tab_id, is_real_user=is_real_user,
                 is_voice=is_voice, text_len=len(text), attachment_count=len(attachments),
             )
-            self.compaction_queued_turns.append({"text": text, "attachments": attachments, "is_real_user": is_real_user, "is_voice": is_voice})
+            self.compaction_queued_turns.append({"text": text, "attachments": attachments, "is_real_user": is_real_user, "is_voice": is_voice, "pending_text": pending_text})
             asyncio.create_task(self._publish_status())
             return
         log_event(
@@ -2007,7 +2015,10 @@ class ChatSession:
             # worker thread within a moment, long before the model reads it.
             self._recent_24h_dialogue_file_path = str(_recent_24h_dialogue_path(self.workspace_dir, self.tab_id))
             self._schedule_recent_24h_dialogue_refresh()
-        save_pending_turn(self.workspace_dir, self.tab_id, text, attachments)
+        # pending_text: what a restart should resume FROM -- the user's own words, not this
+        # call's (possibly wrapped) wire text. See durability.unwrap_resume_note for the
+        # nested-wrapper incident this prevents.
+        save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
         # last_real_user_question/the saved pending-turn file above -- those
         # all need to stay the real, clean text for their own consumers,
@@ -2209,7 +2220,7 @@ class ChatSession:
         # That check now lives entirely inside run_small_model_turn() itself
         # (small_model_engine.py), using Camerlengo/OpenRouter models only.
 
-    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False) -> bool:
+    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
         showing is now decided ENTIRELY by the model's own reply content
@@ -2227,7 +2238,7 @@ class ChatSession:
         attachments = attachments or []
         log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
-        self.submit(text, attachments, False, is_voice)
+        self.submit(text, attachments, False, is_voice, pending_text=pending_text)
         return True
 
     def stop(self) -> None:
@@ -2235,6 +2246,9 @@ class ChatSession:
             return
         log_event("engine", "user_stop", tab_id=self.tab_id)
         self.user_stop_requested = True
+        # An explicit Stop must also cancel any pending "resumed question needs a visible answer" re-ask,
+        # or the abandoned turn would start again on its own.
+        self.resumed_unanswered_question = None
         if self.small_model_active:
             # No SDK client/query() is involved in this path at all -- the
             # only thing to stop is the background task running
@@ -3386,7 +3400,7 @@ class ChatSession:
         log_event("engine", "compaction_queue_drained", tab_id=self.tab_id, count=len(queued))
         had_real_user_turn = any(item["is_real_user"] for item in queued)
         for item in queued:
-            self.submit(item["text"], item["attachments"], item["is_real_user"], item["is_voice"])
+            self.submit(item["text"], item["attachments"], item["is_real_user"], item["is_voice"], pending_text=item.get("pending_text"))
         if had_real_user_turn:
             # Per explicit instruction (2026-09-18), after a real incident:
             # a real user message got queued behind compaction and the
@@ -4252,7 +4266,35 @@ class ChatSession:
                             # was_real_user_turn; still suppressed for a
                             # check-reply that came back with nothing at all
                             # (the elif below, unchanged for that case).
-                            if was_real_user_turn or (was_awaiting_post_turn_check_reply and self.turn_saw_any_visible_text):
+                            # A resumed real question must not end in silence (2026-09-23, live: a
+                            # restart-interrupted question was "answered" with a bare [[NO_UPDATE]] the user
+                            # never saw, so the tab looked idle until they typed "continue").
+                            resumed_nudged = False
+                            if self.resumed_unanswered_question is not None:
+                                if self.turn_saw_any_visible_text:
+                                    self.resumed_unanswered_question = None
+                                    self.resumed_answer_nudges = 0
+                                elif self.resumed_answer_nudges < RESUMED_ANSWER_MAX_NUDGES:
+                                    self.resumed_answer_nudges += 1
+                                    resumed_nudged = True
+                                    log_event("engine", "resumed_question_silent_reply_renudged", tab_id=self.tab_id, attempt=self.resumed_answer_nudges)
+                                    self.inject_proactive(
+                                        "[The user's message below was interrupted by a restart and you have NOT yet shown them any "
+                                        "visible answer to it -- they are waiting and currently see nothing. A reply of [[NO_UPDATE]] "
+                                        "is not allowed here. Answer it now, in "
+                                        f"{current_language_name(self.tab_id)}: if the work was already completed, say what was done and "
+                                        "where the result is (check first if you're unsure); if it still needs doing, do it. Never "
+                                        "mention the restart itself.\n\nThe user's original message:\n"
+                                        f'"{self.resumed_unanswered_question}"]',
+                                        pending_text=self.resumed_unanswered_question,
+                                    )
+                                else:
+                                    log_event("engine", "resumed_question_renudge_exhausted", tab_id=self.tab_id)
+                                    self.resumed_unanswered_question = None
+                                    self.resumed_answer_nudges = 0
+                            if resumed_nudged:
+                                pass
+                            elif was_real_user_turn or (was_awaiting_post_turn_check_reply and self.turn_saw_any_visible_text):
                                 self._fire_post_turn_completion_check()
                             elif not was_awaiting_post_turn_check_reply and not self.turn_saw_any_visible_text:
                                 # Per explicit instruction (2026-09-13), after a

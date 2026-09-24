@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
-from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode
+from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
@@ -1255,11 +1255,16 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             # previously this stayed None all process lifetime and a
             # long-running resumed task (e.g. regenerating a presentation)
             # got no narration at all.
-            session.last_real_user_question = unfinished_turn.text
+            # The user's own words, with any earlier restart's wrapper layers stripped (see
+            # durability.unwrap_resume_note) -- what gets re-wrapped below AND what stays saved as the
+            # pending turn, so N restarts never nest N wrappers.
+            original_text = unwrap_resume_note(unfinished_turn.text)
+            session.last_real_user_question = original_text
+            session.resumed_unanswered_question = original_text
             resume_lang = current_language_name(tab_id)
             session.inject_proactive(
                 "[Caroline was restarted (app closed or crashed) while still working on this, and it was never "
-                f'finished or answered:\n\n"{unfinished_turn.text}"\n\nResume it now and answer the user -- but '
+                f'finished or answered:\n\n"{original_text}"\n\nResume it now and answer the user -- but '
                 "this is internal machinery (the same as any other restart/recovery), so it falls under your "
                 "standing instruction to never expose it: do NOT mention that you were restarted, interrupted, "
                 "or that anything technical happened behind the scenes, and do not apologize for a delay -- "
@@ -1272,6 +1277,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "partially finished, or is still running -- treat it as if it never happened, and if it still "
                 "needs doing, start it again from scratch (checking first, per above, whether it actually needs "
                 f"redoing). Reply in {resume_lang}.]",
+                pending_text=original_text,
             )
             # Bug fix (2026-09-15), root-caused live: inject_proactive()
             # (called just above) always passes is_real_user=False to

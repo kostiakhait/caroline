@@ -88,6 +88,28 @@ def save_pending_turn(workspace_dir: str, tab_id: str, text: str, attachments: l
         log_event("engine", "save_pending_turn_failed", tab_id=tab_id, error=str(exc))
 
 
+_RESUME_NOTE_PREFIX = "[Caroline was restarted (app closed or crashed) while still working on this, and it was never finished or answered:"
+_RESUME_NOTE_SUFFIX = '"\n\nResume it now and answer the user'
+
+
+def unwrap_resume_note(text: str) -> str:
+    """Strips main.py's "[Caroline was restarted ... never finished or answered:
+    "<the real text>" ... Resume it now ...]" wrapper -- as many layers deep as
+    there are (2026-09-23, live incident: every restart used to re-save the
+    already-wrapped text as the pending turn, so N restarts produced N nested
+    wrappers burying the user's actual words at the bottom, and the model
+    mistook the whole thing for internal machinery and answered a silent
+    [[NO_UPDATE]]). Returns the innermost real text; a text with no wrapper is
+    returned unchanged."""
+    while text.startswith(_RESUME_NOTE_PREFIX):
+        start = text.find('"', len(_RESUME_NOTE_PREFIX))
+        end = text.rfind(_RESUME_NOTE_SUFFIX)
+        if start == -1 or end <= start:
+            break
+        text = text[start + 1:end]
+    return text
+
+
 def clear_pending_turn(workspace_dir: str, tab_id: str) -> None:
     try:
         _pending_turn_path(workspace_dir, tab_id).unlink(missing_ok=True)
