@@ -415,6 +415,31 @@ def vault_security_instruction() -> str:
     )
 
 
+def credentials_check_notes_first_instruction() -> str:
+    """Per explicit instruction (2026-09-24): "она все время забывает" --
+    vault_security_instruction/notes_folder_fallback_instruction (just
+    above) only reach the model once it's ALREADY reaching for a notes
+    tool, since they're notes_plugin.py's own usage_instructions, fetched
+    on demand via get_tool_instructions (this file's own module docstring
+    explains why detailed tool guidance stays off the always-on prompt).
+    That's the wrong shape for THIS habit specifically: the failure isn't
+    "used a notes tool incorrectly", it's forgetting to even THINK of
+    Notes when some OTHER task (logging into a site, reconnecting a
+    mailbox, calling an API) needs a credential -- asking the user or
+    giving up instead. Deliberately just the trigger, short and always-on;
+    the actual mechanics (which folder, notes_search-with-no-folder-
+    restriction as a fallback, the vault-backups skill) stay on-demand via
+    get_tool_instructions once a notes tool call is actually in play, so
+    this doesn't re-duplicate content already covered there."""
+    return (
+        "Whenever a task needs a login, password, API key, or other credential and Notes is available, check "
+        'there FIRST -- the "Caroline:Vault" folder, or notes_search if you\'re not sure where -- before asking '
+        "the user for it or saying you don't have it (call get_tool_instructions on a notes tool for the exact "
+        "mechanics if you need them). When you obtain or generate a NEW credential worth keeping, save it there "
+        "yourself the same way -- don't just use it once and let it evaporate."
+    )
+
+
 def notes_folder_fallback_instruction() -> str:
     """Per explicit instruction (2026-09-22), after a real, concrete
     incident: told to reconnect a mailbox, Caroline checked only
@@ -608,6 +633,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     prefer_command_line_and_scripting_instruction,
+    credentials_check_notes_first_instruction,
 )
 
 
