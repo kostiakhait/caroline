@@ -17,6 +17,11 @@ internal sealed class InstallState
     public string? InstalledSha256 { get; set; }
     public string ActiveAppDir { get; set; } = "app";
     public List<string> PendingDeletion { get; set; } = new();
+
+    // Never used by Caroline itself -- carried here ONLY so that a Save() from this side
+    // (StaleInstallCleanup rewrites the whole file) doesn't silently drop the installer's
+    // recorded Defender-exclusion outcome and make it re-prompt for UAC next run.
+    public string? DefenderExclusion { get; set; }
 }
 
 internal static class InstallStateStore

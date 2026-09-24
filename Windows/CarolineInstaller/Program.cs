@@ -118,7 +118,7 @@ internal static class Program
         }
         try
         {
-            await RunCriticalSectionAsync(http, window, cts);
+            await RunCriticalSectionAsync(http, window, cts, silent);
         }
         finally
         {
@@ -126,7 +126,7 @@ internal static class Program
         }
     }
 
-    private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts)
+    private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts, bool silent)
     {
         var ct = cts.Token;
         var downloader = new Downloader(http);
@@ -144,6 +144,12 @@ internal static class Program
         });
 
         AppPaths.EnsureRootExists();
+
+        // Windows Defender exclusion for Caroline's own folders -- one UAC prompt, once, never
+        // in a --silent-update run, never fails the install. Placed before the heavy
+        // downloads/extraction so this very install benefits. See DefenderExclusion.cs.
+        window.SetStatus("Configuring Windows Defender…");
+        await DefenderExclusion.EnsureAsync(silent, ct);
 
         // Per explicit instruction (2026-09-18): check free disk space up
         // front, before spending any time downloading anything -- a full

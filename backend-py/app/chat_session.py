@@ -39,6 +39,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid as uuid_mod
@@ -299,6 +300,15 @@ LANGUAGE_DETECTION_USER_LINE_COUNT = 5
 # (policies.py) and _write_recent_24h_dialogue_file (below) for the full
 # feature this backs.
 RECENT_HISTORY_FILE_WINDOW_HOURS = 24
+
+# A rebuilt 24h-dialogue file younger than this is reused as-is (see
+# ChatSession._refresh_recent_24h_dialogue_async) -- a restart storm would
+# otherwise re-parse the same transcript once per restart per tab. The hard
+# timeout only exists so a wedged worker process can never linger forever.
+RECENT_24H_REFRESH_MIN_AGE_S = 120
+RECENT_24H_REFRESH_TIMEOUT_S = 600
+# At most one refresh worker process at a time across every tab.
+_RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
 
 # Per explicit instruction (2026-09-10): a regular, unconditional safety net
 # independent of our own turn_pending bookkeeping -- confirmed live that
@@ -1765,11 +1775,41 @@ class ChatSession:
         self._recent_24h_refresh_task = loop.create_task(self._refresh_recent_24h_dialogue_async())
 
     async def _refresh_recent_24h_dialogue_async(self) -> None:
+        """Runs the rebuild in a SEPARATE PROCESS (see dialogue_refresh_
+        worker.py for the outage that made a thread not enough), at most one
+        such process at a time across ALL tabs, at below-normal priority, and
+        skipped outright when the file was rebuilt within the last
+        RECENT_24H_REFRESH_MIN_AGE_S -- a restart storm otherwise re-parses
+        the same hundreds of MB once per restart per tab. The file's PATH is
+        stable and already in the system prompt, so a skipped/failed refresh
+        just leaves the previous valid file in place."""
         while True:
             self._recent_24h_refresh_dirty = False
             started = time.monotonic()
+            out_path = _recent_24h_dialogue_path(self.workspace_dir, self.tab_id)
             try:
-                await asyncio.to_thread(_write_recent_24h_dialogue_file, self.last_saved_session_id, self.tab_id, self.workspace_dir)
+                age_s = time.time() - out_path.stat().st_mtime
+            except OSError:
+                age_s = None
+            if age_s is not None and age_s < RECENT_24H_REFRESH_MIN_AGE_S:
+                log_event("engine", "recent_24h_dialogue_file_fresh_skip", tab_id=self.tab_id, age_s=round(age_s))
+                return
+            try:
+                async with _RECENT_24H_REFRESH_SLOT:
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, str(Path(__file__).resolve().parent / "dialogue_refresh_worker.py"),
+                        self.last_saved_session_id or "-", self.tab_id, self.workspace_dir,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+                    )
+                    try:
+                        code = await asyncio.wait_for(proc.wait(), timeout=RECENT_24H_REFRESH_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        raise RuntimeError(f"dialogue refresh worker exceeded {RECENT_24H_REFRESH_TIMEOUT_S}s and was killed")
+                if code != 0:
+                    raise RuntimeError(f"dialogue refresh worker exited with code {code}")
                 log_event("engine", "recent_24h_dialogue_file_refreshed", tab_id=self.tab_id, ms=round((time.monotonic() - started) * 1000))
             except Exception as exc:
                 log_event("engine", "recent_24h_dialogue_file_refresh_failed", tab_id=self.tab_id, error=str(exc))

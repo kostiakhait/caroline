@@ -24,6 +24,11 @@ internal sealed class InstallState
     /// guess. Both this installer (a quick best-effort pass on every run) and the running
     /// Caroline app itself (which can retry for as long as it's alive) consume this list.</summary>
     public List<string> PendingDeletion { get; set; } = new();
+
+    /// <summary>Outcome of the one-time Windows Defender exclusion step (see
+    /// DefenderExclusion.cs): "added", "declined", "unavailable" or "failed"; null = never
+    /// attempted. Only "added"/"declined" stop the installer from trying again.</summary>
+    public string? DefenderExclusion { get; set; }
 }
 
 internal static class InstallStateStore
