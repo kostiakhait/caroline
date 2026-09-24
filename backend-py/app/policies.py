@@ -46,6 +46,23 @@ its own seedSkills() port).
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+
+def bundled_python_exe() -> str:
+    """Full path of the Python interpreter this very backend is running on
+    -- i.e. Caroline's own installer-bundled runtime, wherever it was
+    installed (sys.executable is its pythonw.exe; the console-capable
+    sibling python.exe is what a Bash tool call needs). Computed, never
+    hardcoded: the install location is per-user/per-machine."""
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        sibling = exe.with_name("python.exe")
+        if sibling.exists():
+            return str(sibling)
+    return str(exe)
+
 
 def no_unbounded_filesystem_scans_instruction() -> str:
     """Merged (2026-09-23) from what used to be two separate, largely
@@ -500,8 +517,20 @@ def prefer_command_line_and_scripting_instruction() -> str:
         "Example: to download a file, use curl/Invoke-WebRequest or a short script, not opening a browser and "
         "clicking through a download flow by hand. Reach for GUI automation only when the task is genuinely "
         "GUI-only -- no CLI/API/scriptable equivalent exists for it (driving a specific app's own UI, say).\n"
-        "When a task calls for writing a script to get it done, use the Python already available to you. Every "
-        "script you write must log its own progress AS IT RUNS, with output flushed immediately as each line is "
+        "When a task calls for writing a script to get it done, write it in Python and ALWAYS run it with "
+        f"Caroline's own bundled interpreter, by its full path: {bundled_python_exe()} -- never bare `python`, "
+        "`python3`, `py`, or any other Python that happens to be installed on this machine (its packages and "
+        "certificate trust store are not what Caroline was built and tested against, and on a user's machine "
+        "there may be no other Python at all). Install any extra package into THAT interpreter, not another one.\n"
+        "TLS/certificate errors (CERTIFICATE_VERIFY_FAILED, \"certificate has expired\", and the like) from a "
+        "Python script: NEVER disable verification (no verify=False, CERT_NONE, or unverified context) and never "
+        "tell the user a server's certificate is bad based on that message alone. Python on Windows reads the "
+        "machine's own certificate store, and a stale/expired intermediate there produces exactly this error "
+        "against a perfectly valid server. First retry with an explicit certifi context "
+        "(ssl.create_default_context(cafile=certifi.where())) and check the server independently "
+        "(`openssl s_client -connect host:port -servername host`, look at the dates and \"Verify return code\"). "
+        "Only if it still fails that way, report the actual error to the user -- don't route around it.\n"
+        "Every script you write must log its own progress AS IT RUNS, with output flushed immediately as each line is "
         "written (e.g. print(..., flush=True), not the default buffered-until-exit behavior) -- so a hang or "
         "stall partway through is visible in real time, not only discoverable after the fact once nothing came "
         "back. Writing and launching the script is not the end of the task: you must actually watch it run -- "
