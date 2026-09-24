@@ -239,7 +239,13 @@ async def attach_file(session: str, note_id: str, local_file_path: str, original
 
 
 async def list_attachments(session: str, note_id: str | None = None) -> list[dict[str, Any]]:
-    result = await call_plugin("listAttachments", session)
+    # noteId is filtered server-side (not just below): the server decrypts
+    # every returned row's full blob to read its metadata, so an unfiltered
+    # call scales with ALL of the account's attachments and can run for
+    # minutes. The client-side filter stays as a safety net for an older
+    # server that ignores the parameter.
+    extra = {"noteId": note_id} if note_id else {}
+    result = await call_plugin("listAttachments", session, **extra)
     attachments: list[dict[str, Any]] = (result or {}).get("attachments") or []
     return [a for a in attachments if a.get("noteId") == note_id] if note_id else attachments
 
@@ -460,7 +466,10 @@ PLUGIN = Plugin(
             "notes_list_attachments",
             "Lists attachments, optionally filtered to a single note. There is no downloadable URL for any of "
             "them -- fetch bytes with notes_download_attachment.",
-            {"noteId": str | None}, notes_list_attachments,
+            # Full JSON schema, not the {name: type} shorthand: the SDK turns
+            # every key of the shorthand into a REQUIRED property regardless
+            # of `| None`, so noteId could never actually be omitted.
+            {"type": "object", "properties": {"noteId": {"type": "string"}}, "required": []}, notes_list_attachments,
         ),
         PluginTool(
             "notes_download_attachment",
