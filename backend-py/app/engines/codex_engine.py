@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -169,6 +170,30 @@ def _block_dict(block: Any) -> dict[str, Any]:
     if isinstance(block, ThinkingBlock):
         return {"type": "thinking", "thinking": block.thinking}
     return {"type": "unknown"}
+
+
+_HTTP_STATUS_RE = re.compile(r"\b(?:status|http)\s*:?\s*(\d{3})\b", re.IGNORECASE)
+
+
+def _typed_error(message: str, error_name: str) -> str:
+    """Maps a Codex failure onto the SDK's own AssistantMessageError vocabulary
+    (claude_agent_sdk.types.AssistantMessageError) -- by HTTP status class, which is
+    protocol knowledge, not a list of provider strings. ChatSession keys off this typed
+    field to keep a raw provider error (URLs, request ids, a masked API key) out of the
+    chat: an untyped failure text used to look exactly like a normal assistant reply, was
+    shown as a bubble, counted as "visible output", and re-armed the post-turn completion
+    check forever (2026-09-25, a bad OpenAI key: one identical 401 bubble every ~25 s)."""
+    if error_name.lower() == "usagelimitexceeded":
+        return "rate_limit"
+    m = _HTTP_STATUS_RE.search(message or "")
+    status = int(m.group(1)) if m else 0
+    if status in (401, 403):
+        return "authentication_failed"
+    if status == 429:
+        return "rate_limit"
+    if 500 <= status <= 599:
+        return "server_error"
+    return "unknown"
 
 
 def _error_name(error: Any) -> str:
@@ -500,7 +525,7 @@ class CodexEngine:
         # bare error result would otherwise be invisible to the user.
         self._emit(AssistantMessage(
             content=[TextBlock(text=message)], model=self._model or "openai", session_id=self._thread_id,
-            error="rate_limit" if error_name.lower() == "usagelimitexceeded" else None,
+            error=_typed_error(message, error_name),
         ))
         self._emit(ResultMessage(
             subtype="error_during_execution",

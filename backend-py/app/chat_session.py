@@ -318,6 +318,12 @@ RECENT_24H_REFRESH_MIN_AGE_S = 120
 # A resumed real user question must end with a VISIBLE answer; a silent [[NO_UPDATE]] is re-asked
 # at most this many times (flat, then stops -- see the result handler).
 RESUMED_ANSWER_MAX_NUDGES = 3
+# AssistantMessage.error kinds that are NEVER shown as a chat bubble -- the raw provider
+# text stays in the log, the user gets a short status instead (see the branch in
+# _run_loop). billing_error/rate_limit have their own handling; invalid_request is left
+# alone deliberately: the classifier-refusal explanation and prompt-too-long recovery
+# key off that text.
+ENGINE_ERROR_SUPPRESSED_KINDS = ("authentication_failed", "server_error", "unknown")
 RECENT_24H_REFRESH_TIMEOUT_S = 600
 # At most one refresh worker process at a time across every tab.
 _RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
@@ -1670,6 +1676,11 @@ class ChatSession:
         wanted = "openai" if load_chat_mode(self.workspace_dir, self.tab_id) == "openai" and openai_available(self.workspace_dir) else "claude"
         if wanted == self.engine_kind or self.client is None:
             return "unchanged"
+        # The mode changed: a retry armed against the OLD engine's failure (bad key, outage)
+        # must not fire into the new one -- cancelled here, before the busy check, so it
+        # can't slip in while the switch waits for the running turn.
+        self._clear_api_retry_timer()
+        self._clear_one_shot_followup_timer()
         if self.turn_pending:
             log_event("engine", "engine_switch_deferred_turn_pending", tab_id=self.tab_id, wanted=wanted)
             self.engine_switch_pending = True
@@ -1850,9 +1861,9 @@ class ChatSession:
     def _compute_public_status(self) -> tuple[str, str]:
         kind = self.conn_state.get("kind")
         reason = self.conn_state.get("reason") or ""
-        if kind in ("billing_blocked", "not_logged_in"):
+        if kind in ("billing_blocked", "not_logged_in", "auth_failed"):
             return "error", reason
-        if kind in ("restarting", "restart_backoff", "limited"):
+        if kind in ("restarting", "restart_backoff", "limited", "engine_error"):
             return "recovering", reason
         # Bug fix (2026-09-16), per explicit instruction: "при исчерпании
         # баланса на клоде или опенроутере эта информация явно
@@ -4080,6 +4091,25 @@ class ChatSession:
                             )
                             continue
 
+                    # --- typed engine error: never a chat bubble ---
+                    if isinstance(message, AssistantMessage) and message.error in ENGINE_ERROR_SUPPRESSED_KINDS:
+                        raw_error_text = " ".join(b.text for b in message.content if isinstance(b, TextBlock))
+                        log_event("engine", "engine_error_suppressed", tab_id=self.tab_id, error_kind=message.error, text=raw_error_text[:500])
+                        if message.error == "authentication_failed":
+                            self._set_conn_state("auth_failed", "The AI provider rejected the credentials -- check the login/API key in Settings.")
+                        else:
+                            self._set_conn_state("engine_error", "The AI provider returned an error. Try again in a moment.")
+                        # The trailing ResultMessage is a REAL completion (clears turn_pending) but must
+                        # not flip this status straight back to "connected" -- same flag the usage-cap
+                        # branch below uses. The flat retry stays ON for every kind, auth included,
+                        # per explicit instruction: credentials/tokens can be fixed at any moment (a
+                        # refreshed login, a new key) and the session must pick that up by itself.
+                        # What changed is only that the failure is silent in the chat, and that the
+                        # retry is cancelled on an engine/mode switch (switch_engine_if_needed).
+                        self.suppress_next_conn_state_reset = True
+                        self._schedule_api_retry(f"engine_error:{message.error}", self.turn_is_voice)
+                        continue
+
                     # --- CC CLI usage-cap message ---
                     if isinstance(message, AssistantMessage):
                         text_blocks = [b.text for b in message.content if isinstance(b, TextBlock)]
@@ -4329,8 +4359,12 @@ class ChatSession:
                             # A resumed real question must not end in silence (2026-09-23, live: a
                             # restart-interrupted question was "answered" with a bare [[NO_UPDATE]] the user
                             # never saw, so the tab looked idle until they typed "continue").
+                            # A provider-rejected turn is not "finished but silent": re-asking "did you
+                            # actually finish?" (or re-nudging a resumed question) against a request the
+                            # provider keeps rejecting is what looped forever on a bad API key.
+                            error_result = bool(getattr(message, "is_error", False))
                             resumed_nudged = False
-                            if self.resumed_unanswered_question is not None:
+                            if self.resumed_unanswered_question is not None and not error_result:
                                 if self.turn_saw_any_visible_text:
                                     self.resumed_unanswered_question = None
                                     self.resumed_answer_nudges = 0
@@ -4354,6 +4388,8 @@ class ChatSession:
                                     self.resumed_answer_nudges = 0
                             if resumed_nudged:
                                 pass
+                            elif error_result:
+                                log_event("engine", "post_turn_completion_check_skipped_error_result", tab_id=self.tab_id)
                             elif was_real_user_turn or (was_awaiting_post_turn_check_reply and self.turn_saw_any_visible_text):
                                 self._fire_post_turn_completion_check()
                             elif not was_awaiting_post_turn_check_reply and not self.turn_saw_any_visible_text:
