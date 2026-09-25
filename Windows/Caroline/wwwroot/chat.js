@@ -1457,6 +1457,15 @@
       return;
     }
 
+    if (evt.type === "user_message_echo") {
+      // A user message that did NOT originate in this page (sent from the
+      // phone companion app): draw it as a normal user bubble and keep
+      // turnQueue aligned with the backend's turn count, exactly like send().
+      turnQueue.push({ isVoice: false, assistantText: "", spoken: false });
+      addBubble("user", evt.text || "", evt.attachments || []);
+      return;
+    }
+
     if (evt.type === "proactive_turn_queued") {
       // A turn this page never called send() for (reminder, ratatosk nudge, startup
       // greeting, etc.) is about to produce its own "result" -- push a placeholder so

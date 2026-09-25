@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import time
@@ -524,7 +525,7 @@ def _history_cursor_path(workspace_dir: str) -> Path:
     return Path(workspace_dir) / "companion-history-cursor.json"
 
 
-def _load_history_cursor(workspace_dir: str) -> dict[str, int]:
+def _load_history_cursor(workspace_dir: str) -> dict[str, Any]:
     """Per-tab count of how many history entries have already been pushed
     to the phone -- lets the sync send only NEW entries each tick instead
     of re-transferring the whole transcript. Mirrors
@@ -539,7 +540,7 @@ def _load_history_cursor(workspace_dir: str) -> dict[str, int]:
         return {}
 
 
-def _save_history_cursor(workspace_dir: str, cursors: dict[str, int]) -> None:
+def _save_history_cursor(workspace_dir: str, cursors: dict[str, Any]) -> None:
     try:
         _history_cursor_path(workspace_dir).write_text(json.dumps(cursors, indent=2) + "\n", encoding="utf-8")
     except Exception as exc:
@@ -593,29 +594,80 @@ def _entry_with_embedded_attachments(entry: dict[str, Any]) -> dict[str, Any]:
     return {**entry, "attachments": [_embed_attachment_bytes(a) for a in attachments]}
 
 
+def _entry_fingerprint(entry: dict[str, Any]) -> str:
+    """Stable identity of one history entry, independent of its position --
+    role/text/ts plus attachment names (never their bytes, which are only
+    embedded at write time)."""
+    atts = [a.get("name") for a in (entry.get("attachments") or []) if isinstance(a, dict)]
+    raw = json.dumps([entry.get("role"), entry.get("text"), entry.get("ts"), atts], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _plan_history_sync(state: dict[str, Any], new_fps: list[str]) -> dict[str, Any]:
+    """Pure planning step (unit-testable): given what the phone currently
+    has -- remote indices state["lo"] .. lo+len(fps)-1, holding entries whose
+    fingerprints are state["fps"] -- and the desktop's current window
+    `new_fps`, decide what to delete and write.
+
+    The desktop hands over a SLIDING window of its latest ~200 entries, so
+    a positional cursor ("I already sent the first N") stalls forever once
+    the window is full (confirmed live: every tab stuck at 200 since
+    2026-09-22). Instead, find how much of the old window is still the
+    head of the new one and only append what's after it; indices keep
+    growing (the phone sorts by index, so gaps at the low end are fine).
+
+    Returns {"delete": [indices], "write_from": first new position in
+    new_fps, "write_at": remote index of that first write, "lo": new low
+    index}."""
+    old = state["fps"]
+    lo = state["lo"]
+    hi = lo + len(old)
+    for k in range(len(old) + 1):
+        tail = old[k:]
+        if len(tail) <= len(new_fps) and new_fps[: len(tail)] == tail and (tail or not old):
+            return {
+                "delete": list(range(lo, lo + k)), "write_from": len(tail), "write_at": hi, "lo": lo + k,
+            }
+    # No overlap at all (history was rewritten/compacted): replace wholesale,
+    # continuing the index sequence so the phone never sees an index reused.
+    return {"delete": list(range(lo, hi)), "write_from": 0, "write_at": hi, "lo": hi}
+
+
+def _normalize_history_state(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict) and isinstance(raw.get("fps"), list) and isinstance(raw.get("lo"), int):
+        return raw
+    if isinstance(raw, int):  # legacy positional cursor: remote holds indices 0..raw-1, content unknown
+        return {"lo": 0, "fps": [""] * raw}
+    return {"lo": 0, "fps": []}
+
+
 async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds, history_snapshot: HistorySnapshot) -> None:
-    """Pushes only the entries the phone hasn't received yet, one per key
-    under tabs/<tabId>/history/<index> (not one overwritten blob) -- for
-    EVERY currently-open tab, not just the primary one. Bug fix
-    (2026-09-10): confirmed live -- the previous "primary tab only, whatever
-    session file was most recently modified" approach could sync a
-    DIFFERENT tab's conversation under tabs/1/history, mislabeling it.
-    history_snapshot(tab_id) now reads that exact tab's own session file
+    """Mirrors each open tab's visible transcript window to the phone under
+    tabs/<tabId>/history/<index>, EXACTLY (same entries the desktop has),
+    by content rather than position -- see _plan_history_sync for why.
+    history_snapshot(tab_id) reads that exact tab's own session file
     (history.read_recent_history_for_session), never a guess."""
     try:
         cursors = _load_history_cursor(workspace_dir)
         changed = False
         for tab_id in get_active_tab_ids():
             entries = history_snapshot(tab_id)
-            already_sent = cursors.get(tab_id, 0)
-            new_entries = entries[already_sent:]
-            if not new_entries:
+            new_fps = [_entry_fingerprint(e) for e in entries]
+            state = _normalize_history_state(cursors.get(tab_id))
+            if new_fps == state["fps"]:
                 continue
-            for i, entry in enumerate(new_entries, start=already_sent):
-                await set_mine(f"tabs/{tab_id}/history/{i}", _entry_with_embedded_attachments(entry))
-            cursors[tab_id] = len(entries)
+            plan = _plan_history_sync(state, new_fps)
+            for index in plan["delete"]:
+                await delete_mine(f"tabs/{tab_id}/history/{index}")
+            for offset, entry in enumerate(entries[plan["write_from"]:]):
+                await set_mine(f"tabs/{tab_id}/history/{plan['write_at'] + offset}", _entry_with_embedded_attachments(entry))
+            cursors[tab_id] = {"lo": plan["lo"], "fps": new_fps}
             changed = True
-            log_event("plugin:companion", "history_synced", tab_id=tab_id, new_entries=len(new_entries), total=len(entries))
+            _save_history_cursor(workspace_dir, cursors)  # per tab: a later tab failing must not redo this one
+            log_event(
+                "plugin:companion", "history_synced", tab_id=tab_id, written=len(entries) - plan["write_from"],
+                deleted=len(plan["delete"]), total=len(entries),
+            )
         if changed:
             _save_history_cursor(workspace_dir, cursors)
     except Exception as exc:  # noqa: BLE001 -- best effort, never break the loop

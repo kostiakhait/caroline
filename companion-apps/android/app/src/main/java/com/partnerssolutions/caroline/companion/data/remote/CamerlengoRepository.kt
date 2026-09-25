@@ -20,7 +20,14 @@ class CamerlengoRepository(private val api: CamerlengoApi = CamerlengoModule.api
     class CamerlengoException(message: String) : Exception(message)
     class NotLoggedInException : Exception("Not logged in.")
 
-    suspend fun login(email: String, password: String): String {
+    suspend fun login(rawEmail: String, password: String): String {
+        // Camerlengo namespaces everything by the exact login string
+        // (caroline/<login>/...), so "Kostia@X.com" and "kostia@x.com" are
+        // two different, empty-looking accounts. Always lowercase (and trim)
+        // here -- the one place every login, including the automatic
+        // re-login from stored credentials, goes through -- so the phone
+        // always lands in the same namespace the desktop writes to.
+        val email = rawEmail.trim().lowercase()
         val response = api.call(
             VarCommandRequest(
                 command = "user:verify",

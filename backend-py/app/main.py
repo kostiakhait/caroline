@@ -194,12 +194,15 @@ def _inject_companion_message(tab_id: str, text: str, attachments: list[dict[str
     session = sessions.get(tab_id)
     if session is None:
         return False
-    label = (
-        f"[The user sent this from their phone via the Caroline companion app]: {text}"
-        if text else
-        "[The user sent an attachment from their phone via the Caroline companion app.]"
-    )
-    return session.inject_proactive(label, attachments)
+    # Exact mirror (explicit instruction, 2026-09-26): a phone message is an
+    # ordinary user message -- no "[sent from their phone]" prefix, always
+    # answered (is_real_user), and drawn as a normal user bubble on the
+    # desktop too (chat.js's user_message_echo handler), so both screens show
+    # the same conversation.
+    atts = attachments or []
+    asyncio.create_task(session.send({"type": "user_message_echo", "text": text, "attachments": atts}))
+    session.submit_or_try_small_model(text, atts, False)
+    return True
 
 
 def _active_tab_ids() -> list[str]:

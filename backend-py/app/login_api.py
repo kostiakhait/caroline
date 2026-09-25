@@ -77,7 +77,16 @@ def logged_in_email() -> str | None:
     return creds["email"] if creds else None
 
 
+def _normalize_email(email: str) -> str:
+    """Camerlengo namespaces everything by the exact login string, so the
+    same address in a different case is a different (empty) account --
+    always store and use it trimmed and lowercased, matching the Android
+    companion app's own login."""
+    return email.strip().lower()
+
+
 async def verify_and_save_login(email: str, password: str) -> LoginResult:
+    email = _normalize_email(email)
     log_event("engine", "login_attempt", email=email)
     try:
         await notes_api.verify_password(email, password)
@@ -91,6 +100,7 @@ async def verify_and_save_login(email: str, password: str) -> LoginResult:
 
 
 async def register_account_only(email: str, password: str) -> LoginResult:
+    email = _normalize_email(email)
     """Self-service registration via the v2 "user:add" command (auth=public,
     no key/session needed) -- same underlying account store as
     verify_and_save_login's legacy verifyPassword (Auth.Authorizer, shared
@@ -110,6 +120,7 @@ async def register_account_only(email: str, password: str) -> LoginResult:
 
 
 async def register_and_save_login(email: str, password: str) -> LoginResult:
+    email = _normalize_email(email)
     result = await register_account_only(email, password)
     if result.ok:
         save_credentials(email, password)
