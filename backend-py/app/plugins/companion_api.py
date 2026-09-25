@@ -83,7 +83,7 @@ import asyncio
 import base64
 import hashlib
 import json
-import mimetypes
+import re
 import time
 import uuid
 from pathlib import Path
@@ -174,16 +174,26 @@ class NoPairedDeviceError(Exception):
 
 # --- raw var:*Mine client ----------------------------------------------------
 
+# A v2 session is reused across calls until the server says it expired: minting
+# one per call cost ~3s each (a full user:verify round trip), which made any
+# multi-write sync (a whole history window) take minutes. The one automatic
+# retry on SessionExpiredError below re-mints, so a stale cached token can
+# only ever cost one extra call.
+_cached_session: str | None = None
+
+
 async def _call(command: str, **extra: Any) -> dict[str, Any]:
-    """One var:*Mine call with a fresh v2 session, retried once on an
-    expired session."""
-    session = await get_v2_session()
+    """One var:*Mine call, reusing the cached v2 session and retried once
+    with a fresh one on an expired session."""
+    global _cached_session
+    if _cached_session is None:
+        _cached_session = await get_v2_session()
     try:
-        return await call_v2(command, session=session, **extra)
+        return await call_v2(command, session=_cached_session, **extra)
     except SessionExpiredError:
         log_event("plugin:companion", "v2_session_expired_retrying", command=command)
-        session = await get_v2_session()
-        return await call_v2(command, session=session, **extra)
+        _cached_session = await get_v2_session()
+        return await call_v2(command, session=_cached_session, **extra)
 
 
 async def get_mine(path: str) -> Any | None:
@@ -508,7 +518,7 @@ async def _resume_one(workspace_dir: str, op_id: str, entry: dict[str, Any], inj
 # --- engine-level tab wiring (started from main.py, next to the scheduler
 #     due-check loop -- see companion_plugin.py's docstring) -------------------
 
-HistorySnapshot = Callable[[str], list[dict[str, Any]]]
+HistorySnapshot = Callable[[str], "list[dict[str, Any]] | None"]
 GetActiveTabIds = Callable[[], list[str]]
 # Per-tab lamp/status-bar source, matching chat_session.py's own
 # _compute_public_status() exactly: {"state": "ready"|"working"|
@@ -559,117 +569,62 @@ def _save_history_cursor(workspace_dir: str, cursors: dict[str, Any]) -> None:
 MAX_EMBEDDED_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 
-def _embed_attachment_bytes(attachment: dict[str, Any]) -> dict[str, Any]:
-    """Reads the real file history.py pointed at (chat_session.py's own
-    workspace/uploads/<uuid>-<name>, always on disk for as long as the
-    entry itself exists) and folds its bytes in as dataBase64/mimeType --
-    same shape chat_session.py's _attachment_to_blocks already expects
-    coming the other way, so the phone's own outgoing attachments (see
-    _drain_inbox below) and these incoming ones share one wire format.
-    Best-effort: a missing file or an over-cap file falls back to the
-    previous name-only shape (the Android app already renders that as a
-    plain chip), never raises."""
-    path = attachment.get("path")
-    name = attachment.get("name", "attachment")
-    if not path:
-        return {"name": name}
-    try:
-        file_path = Path(path)
-        size = file_path.stat().st_size
-        if size > MAX_EMBEDDED_ATTACHMENT_BYTES:
-            log_event("plugin:companion", "attachment_too_large_to_embed", path=path, bytes=size)
-            return {"name": name, "tooLarge": True}
-        data = file_path.read_bytes()
-        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        return {"name": name, "mimeType": mime_type, "dataBase64": base64.b64encode(data).decode("ascii")}
-    except Exception as exc:  # noqa: BLE001 -- best effort, never break the sync
-        log_event("plugin:companion", "attachment_embed_failed", path=path, error=str(exc))
-        return {"name": name}
+_ATT_ID_OK = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
 
 
-def _entry_with_embedded_attachments(entry: dict[str, Any]) -> dict[str, Any]:
-    attachments = entry.get("attachments")
-    if not attachments:
-        return entry
-    return {**entry, "attachments": [_embed_attachment_bytes(a) for a in attachments]}
+def _attachment_dir(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / "companion-att" / tab_id
 
 
-def _entry_fingerprint(entry: dict[str, Any]) -> str:
-    """Stable identity of one history entry, independent of its position --
-    role/text/ts plus attachment names (never their bytes, which are only
-    embedded at write time)."""
-    atts = [a.get("name") for a in (entry.get("attachments") or []) if isinstance(a, dict)]
-    raw = json.dumps([entry.get("role"), entry.get("text"), entry.get("ts"), atts], ensure_ascii=False, sort_keys=True)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _plan_history_sync(state: dict[str, Any], new_fps: list[str]) -> dict[str, Any]:
-    """Pure planning step (unit-testable): given what the phone currently
-    has -- remote indices state["lo"] .. lo+len(fps)-1, holding entries whose
-    fingerprints are state["fps"] -- and the desktop's current window
-    `new_fps`, decide what to delete and write.
-
-    The desktop hands over a SLIDING window of its latest ~200 entries, so
-    a positional cursor ("I already sent the first N") stalls forever once
-    the window is full (confirmed live: every tab stuck at 200 since
-    2026-09-22). Instead, find how much of the old window is still the
-    head of the new one and only append what's after it; indices keep
-    growing (the phone sorts by index, so gaps at the low end are fine).
-
-    Returns {"delete": [indices], "write_from": first new position in
-    new_fps, "write_at": remote index of that first write, "lo": new low
-    index}."""
-    old = state["fps"]
-    lo = state["lo"]
-    hi = lo + len(old)
-    for k in range(len(old) + 1):
-        tail = old[k:]
-        if len(tail) <= len(new_fps) and new_fps[: len(tail)] == tail and (tail or not old):
-            return {
-                "delete": list(range(lo, lo + k)), "write_from": len(tail), "write_at": hi, "lo": lo + k,
-            }
-    # No overlap at all (history was rewritten/compacted): replace wholesale,
-    # continuing the index sequence so the phone never sees an index reused.
-    return {"delete": list(range(lo, hi)), "write_from": 0, "write_at": hi, "lo": hi}
-
-
-def _normalize_history_state(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict) and isinstance(raw.get("fps"), list) and isinstance(raw.get("lo"), int):
-        return raw
-    if isinstance(raw, int):  # legacy positional cursor: remote holds indices 0..raw-1, content unknown
-        return {"lo": 0, "fps": [""] * raw}
-    return {"lo": 0, "fps": []}
+def _history_state(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict) and isinstance(raw.get("hash"), str):
+        return {"hash": raw["hash"], "uploaded": list(raw.get("uploaded") or [])}
+    return {"hash": "", "uploaded": []}  # anything older (positional cursors) = never synced
 
 
 async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds, history_snapshot: HistorySnapshot) -> None:
-    """Mirrors each open tab's visible transcript window to the phone under
-    tabs/<tabId>/history/<index>, EXACTLY (same entries the desktop has),
-    by content rather than position -- see _plan_history_sync for why.
-    history_snapshot(tab_id) reads that exact tab's own session file
-    (history.read_recent_history_for_session), never a guess."""
+    """Mirrors what each tab's desktop chat window SHOWS to the phone, as one
+    value per tab (tabs/<id>/history_v2 = {"v": 2, "entries": [...]}) plus one
+    key per attachment (tabs/<id>/att/<attId>, written once). One value per
+    tab, not one key per message: every Camerlengo write costs ~1s, so a
+    200-message window written key by key took minutes (confirmed live),
+    while one value takes seconds regardless of window size. Only rewritten
+    when the visible content actually changed."""
     try:
         cursors = _load_history_cursor(workspace_dir)
-        changed = False
         for tab_id in get_active_tab_ids():
             entries = history_snapshot(tab_id)
-            new_fps = [_entry_fingerprint(e) for e in entries]
-            state = _normalize_history_state(cursors.get(tab_id))
-            if new_fps == state["fps"]:
+            if entries is None:
+                continue  # the desktop hasn't reported what it shows for this tab yet
+            state = _history_state(cursors.get(tab_id))
+            digest = hashlib.sha1(json.dumps(entries, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            if digest == state["hash"]:
                 continue
-            plan = _plan_history_sync(state, new_fps)
-            for index in plan["delete"]:
-                await delete_mine(f"tabs/{tab_id}/history/{index}")
-            for offset, entry in enumerate(entries[plan["write_from"]:]):
-                await set_mine(f"tabs/{tab_id}/history/{plan['write_at'] + offset}", _entry_with_embedded_attachments(entry))
-            cursors[tab_id] = {"lo": plan["lo"], "fps": new_fps}
-            changed = True
+            uploaded = set(state["uploaded"])
+            wire_entries: list[dict[str, Any]] = []
+            for entry in entries:
+                wire_atts = []
+                for att in entry.get("attachments") or []:
+                    if not isinstance(att, dict):
+                        continue
+                    wire: dict[str, Any] = {"name": att.get("name", "attachment"), "mimeType": att.get("mimeType")}
+                    att_id = att.get("attId")
+                    if att.get("tooLarge"):
+                        wire["tooLarge"] = True
+                    elif isinstance(att_id, str) and _ATT_ID_OK.match(att_id):
+                        if att_id not in uploaded:
+                            saved = _attachment_dir(workspace_dir, tab_id) / f"{att_id}.json"
+                            if saved.exists():
+                                await set_mine(f"tabs/{tab_id}/att/{att_id}", json.loads(saved.read_text(encoding="utf-8")))
+                                uploaded.add(att_id)
+                        if att_id in uploaded:
+                            wire["attId"] = att_id
+                    wire_atts.append(wire)
+                wire_entries.append({"role": entry.get("role"), "text": entry.get("text", ""), "ts": entry.get("ts"), "attachments": wire_atts})
+            await set_mine(f"tabs/{tab_id}/history_v2", {"v": 2, "entries": wire_entries})
+            cursors[tab_id] = {"hash": digest, "uploaded": sorted(uploaded)}
             _save_history_cursor(workspace_dir, cursors)  # per tab: a later tab failing must not redo this one
-            log_event(
-                "plugin:companion", "history_synced", tab_id=tab_id, written=len(entries) - plan["write_from"],
-                deleted=len(plan["delete"]), total=len(entries),
-            )
-        if changed:
-            _save_history_cursor(workspace_dir, cursors)
+            log_event("plugin:companion", "history_synced", tab_id=tab_id, total=len(wire_entries), attachments=len(uploaded))
     except Exception as exc:  # noqa: BLE001 -- best effort, never break the loop
         log_event("plugin:companion", "history_sync_failed", error=str(exc))
 
@@ -729,8 +684,83 @@ def request_tab_list_publish(workspace_dir: str, tabs: "list[Any]") -> None:
         log_event("plugin:companion", "tab_list_persist_failed", error=str(exc))
 
 
+def _visible_transcript_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"companion-visible-{tab_id}.json"
+
+
+def save_visible_transcript(workspace_dir: str, tab_id: str, entries: "list[Any]") -> None:
+    """Stores what the desktop chat window says it is SHOWING for this tab
+    (chat.js's visible_transcript_set) -- the single source the phone
+    mirrors (explicit instruction, 2026-09-26: what the desktop doesn't
+    show must not be synced)."""
+    try:
+        clean = []
+        att_dir = _attachment_dir(workspace_dir, tab_id)
+        for e in entries:
+            if not (isinstance(e, dict) and e.get("role") in ("user", "assistant")):
+                continue
+            light_atts = []
+            for att in e.get("attachments") or []:
+                if not isinstance(att, dict):
+                    continue
+                att_id = att.get("attId")
+                data = att.get("dataBase64")
+                if isinstance(att_id, str) and _ATT_ID_OK.match(att_id) and isinstance(data, str) and data:
+                    target = att_dir / f"{att_id}.json"
+                    if not target.exists():
+                        att_dir.mkdir(parents=True, exist_ok=True)
+                        target.write_text(json.dumps({"name": att.get("name"), "mimeType": att.get("mimeType"), "dataBase64": data}), encoding="utf-8")
+                light_atts.append({k: att.get(k) for k in ("name", "mimeType", "attId", "tooLarge") if att.get(k) is not None})
+            clean.append({**{k: v for k, v in e.items() if k != "attachments"}, "attachments": light_atts})
+        path = _visible_transcript_path(workspace_dir, tab_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:  # noqa: BLE001
+        log_event("plugin:companion", "visible_transcript_save_failed", tab_id=tab_id, error=str(exc))
+
+
+def load_visible_transcript(workspace_dir: str, tab_id: str) -> "list[dict[str, Any]] | None":
+    """None until the desktop window has reported once for this tab -- the
+    caller must then skip syncing that tab rather than mirror a guess."""
+    path = _visible_transcript_path(workspace_dir, tab_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        log_event("plugin:companion", "visible_transcript_load_failed", tab_id=tab_id, error=str(exc))
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _desktop_settings_tab_list() -> "list[dict[str, str]] | None":
+    """The desktop app's own open tabs, read from its settings.json
+    (AppSettings.OpenTabIds/TabNames under %APPDATA%/Caroline). The WPF
+    window only pushes tab_list_set on add/close/rename, so a tab list
+    missed while SW was down would never be re-sent; the file is always
+    current."""
+    import os
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    try:
+        data = json.loads((Path(appdata) / "Caroline" / "settings.json").read_text(encoding="utf-8"))
+        ids = data.get("OpenTabIds")
+        names = data.get("TabNames") or {}
+        if not isinstance(ids, list) or not ids:
+            return None
+        return [{"id": str(i), "name": str(names.get(str(i)) or f"Tab {i}")} for i in ids]
+    except Exception:  # noqa: BLE001 -- best effort, the WS op path still works
+        return None
+
+
 async def _sync_tab_list(workspace_dir: str) -> None:
     global _tab_list_desired, _tab_list_published_at
+    from_settings = _desktop_settings_tab_list()
+    if from_settings is not None and from_settings != _tab_list_desired:
+        _tab_list_desired = from_settings
+        _tab_list_published_at = None
     if _tab_list_desired is None:
         path = _tab_list_path(workspace_dir)
         if not path.exists():

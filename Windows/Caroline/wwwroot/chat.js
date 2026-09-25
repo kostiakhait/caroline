@@ -394,6 +394,51 @@
   // this every tab would read/overwrite the exact same localStorage entry.
   const TRANSCRIPT_KEY = `caroline:transcript:${tabId}`;
   const TRANSCRIPT_MAX = 300;
+  // Exact-mirror source for the phone companion app (explicit instruction,
+  // 2026-09-26: "what the desktop doesn't show, don't sync"): this page's own
+  // visible transcript is the only thing that knows what the user actually
+  // sees, so it reports its latest entries to the backend (debounced), which
+  // mirrors exactly those to the phone.
+  const VISIBLE_SYNC_MAX = 200;
+  const VISIBLE_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+  // attIds whose bytes this page already handed to the backend (it keeps them
+  // on disk, so they only need to travel once per page session).
+  const sentAttachmentIds = new Set();
+  let visibleSyncTimer = null;
+  function scheduleVisibleTranscriptSync() {
+    if (visibleSyncTimer) clearTimeout(visibleSyncTimer);
+    visibleSyncTimer = setTimeout(() => {
+      visibleSyncTimer = null;
+      void reportVisibleTranscript();
+    }, 800);
+  }
+  async function reportVisibleTranscript() {
+    try {
+      if (typeof ws === "undefined" || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const entries = [];
+      for (const e of loadTranscript().slice(-VISIBLE_SYNC_MAX)) {
+        const attachments = [];
+        for (const a of e.attachments || []) {
+          const out = { name: a.name, mimeType: a.mimeType };
+          if (a.attId) {
+            out.attId = a.attId;
+            if (!sentAttachmentIds.has(a.attId)) {
+              sentAttachmentIds.add(a.attId);
+              const blob = await loadAttachmentBlob(a.attId);
+              if (blob && blob.dataBase64) {
+                // base64 length * 3/4 ~= real bytes
+                if (blob.dataBase64.length * 0.75 <= VISIBLE_ATTACHMENT_MAX_BYTES) out.dataBase64 = blob.dataBase64;
+                else out.tooLarge = true;
+              }
+            }
+          }
+          attachments.push(out);
+        }
+        entries.push({ role: e.role, text: e.text, ts: e.ts, attachments });
+      }
+      sendControl("visible_transcript_set", { entries });
+    } catch { /* best effort -- the phone mirror must never break the chat */ }
+  }
 
   // IndexedDB-backed attachment blob store. Bug fix (2026-09-09): localStorage's
   // own ~5-10MB quota can't hold real image/video bytes across many messages,
@@ -481,6 +526,7 @@
       list.push({ role, text, attachments: lightAttachments, ts });
       while (list.length > TRANSCRIPT_MAX) list.shift();
       localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(list));
+      scheduleVisibleTranscriptSync();
     } catch { /* private-browsing/quota -- transcript just won't survive a restart */ }
   }
 
@@ -1350,6 +1396,7 @@
         historyRequested = true;
         if (loadTranscript().length === 0) sendControl("get_history", {});
       }
+      scheduleVisibleTranscriptSync();
     });
     ws.addEventListener("close", () => {
       wsConnected = false;

@@ -36,7 +36,7 @@ from app.plugins.notes_api import load_credentials
 from app.plugins.office_editor import finish_office_edit_session
 from app.plugins.ratatosk_api import find_or_create_dm, send_message
 from app.plugins.ratatosk_own_account import ensure_own_ratatosk_account, get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
-from app.plugins.companion_api import resume_companion_operations, request_tab_list_publish as companion_request_tab_list, start_companion_inbox_loop, start_sms_sync_loop
+from app.plugins.companion_api import resume_companion_operations, request_tab_list_publish as companion_request_tab_list, load_visible_transcript, save_visible_transcript, start_companion_inbox_loop, start_sms_sync_loop
 from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -226,17 +226,15 @@ def _companion_tab_status(tab_id: str) -> dict[str, str] | None:
     return {"state": state, "reason": reason}
 
 
-def _companion_history_snapshot(tab_id: str) -> list[dict[str, Any]]:
-    """Callback for the same loop: THIS tab's own recent visible
-    transcript to mirror to the phone. Bug fix (2026-09-10): confirmed
-    live -- this used to ignore tab_id and call read_recent_history()
-    (whichever session file was most recently modified anywhere in the
-    workspace), which could mislabel one tab's conversation as another's.
-    Now resolves this exact tab's own session id first."""
-    session_id = load_tab_session_id(WORKSPACE_DIR, tab_id)
-    if not session_id:
-        return []
-    return read_recent_history_for_session(WORKSPACE_DIR, session_id)
+def _companion_history_snapshot(tab_id: str) -> list[dict[str, Any]] | None:
+    """Callback for the same loop: exactly what THIS tab's desktop chat
+    window is showing (reported by chat.js via visible_transcript_set), or
+    None if it hasn't reported yet (that tab is then not synced at all).
+    Explicit instruction (2026-09-26): what the desktop doesn't show must
+    not be mirrored to the phone -- so this no longer reads the raw model
+    session file, which contains internal/synthetic turns and errors the
+    UI deliberately never renders."""
+    return load_visible_transcript(WORKSPACE_DIR, tab_id)
 
 
 async def _prune_redundant_archives_in_background() -> None:
@@ -597,6 +595,11 @@ async def handle_control_request(
     request_id = parsed.get("requestId")
     if op == "client_diag":
         log_event("engine", "client_diag", **{k: v for k, v in parsed.items() if k not in ("op", "requestId")})
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "visible_transcript_set":
+        entries = parsed.get("entries")
+        if isinstance(entries, list) and session is not None:
+            save_visible_transcript(WORKSPACE_DIR, session.tab_id, entries)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "tab_list_set":
         # WPF's MainWindow.xaml.cs's own SyncTabListToBackend() -- tab id +

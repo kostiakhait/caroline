@@ -88,41 +88,87 @@ class ChatViewModel(
         viewModelScope.launch { refreshOnce() }
     }
 
+    // Attachment bytes already fetched (tabs/<tabId>/att/<attId>), so each
+    // image is downloaded once per app run, not on every 3s refresh.
+    private val attachmentCache = mutableMapOf<String, Attachment>()
+
+    /**
+     * Current format (backend companion_api.py _sync_history, 2026-09-26):
+     * ONE value per tab, tabs/<tabId>/history_v2 = {"v":2,"entries":[...]},
+     * holding exactly what the desktop chat window shows -- already filtered
+     * for display, so nothing is filtered or re-stamped here. Attachment
+     * bytes live in their own keys (tabs/<tabId>/att/<attId>), fetched
+     * lazily and cached, so a big image never rides along with every
+     * history refresh.
+     */
+    private suspend fun loadV2(v2: Map<*, *>): List<ChatMessage>? {
+        val entries = v2["entries"] as? List<*> ?: return null
+        return entries.mapIndexedNotNull { index, rawEntry ->
+            val entry = rawEntry as? Map<*, *> ?: return@mapIndexedNotNull null
+            val attachments = (entry["attachments"] as? List<*>).orEmpty().mapNotNull { rawAtt ->
+                val a = rawAtt as? Map<*, *> ?: return@mapNotNull null
+                val name = a["name"] as? String ?: return@mapNotNull null
+                val attId = a["attId"] as? String
+                val mimeType = a["mimeType"] as? String
+                val tooLarge = a["tooLarge"] as? Boolean ?: false
+                when {
+                    attId == null -> Attachment(name = name, mimeType = mimeType, tooLarge = tooLarge)
+                    else -> attachmentCache[attId] ?: run {
+                        val data = repository.getMine("tabs/$tabId/att/$attId") as? Map<*, *>
+                        val base64 = data?.get("dataBase64") as? String
+                        val att = Attachment(name = name, mimeType = mimeType, dataBase64 = base64)
+                        // Only cache a real hit -- a miss (not uploaded yet) must be retried next refresh.
+                        if (base64 != null) attachmentCache[attId] = att
+                        att
+                    }
+                }
+            }
+            ChatMessage(
+                index = index,
+                role = entry["role"] as? String ?: "user",
+                text = entry["text"] as? String ?: "",
+                ts = (entry["ts"] as? Number)?.toLong() ?: 0L,
+                attachments = attachments,
+            )
+        }
+    }
+
+    /** Old per-key format (tabs/<tabId>/history/<index>) -- only used when a
+     * desktop that predates history_v2 is on the other end. */
+    private suspend fun loadLegacy(): List<ChatMessage> {
+        val raw = repository.getAllMine("tabs/$tabId/history")
+        return raw.entries
+            .mapNotNull { (key, value) ->
+                val index = (key as? String)?.toIntOrNull() ?: return@mapNotNull null
+                val entry = value as? Map<*, *> ?: return@mapNotNull null
+                val rawText = entry["text"] as? String ?: ""
+                if (TextFiltering.isSyntheticText(rawText)) return@mapNotNull null
+                @Suppress("UNCHECKED_CAST")
+                val rawAttachments = entry["attachments"] as? List<Map<*, *>>
+                val attachments = rawAttachments?.mapNotNull { a ->
+                    val name = a["name"] as? String ?: return@mapNotNull null
+                    Attachment(
+                        name = name,
+                        mimeType = a["mimeType"] as? String,
+                        dataBase64 = a["dataBase64"] as? String,
+                        tooLarge = a["tooLarge"] as? Boolean ?: false,
+                    )
+                } ?: emptyList()
+                ChatMessage(
+                    index = index,
+                    role = entry["role"] as? String ?: "user",
+                    text = TextFiltering.stripStamp(rawText),
+                    ts = (entry["ts"] as? Double)?.toLong() ?: 0L,
+                    attachments = attachments,
+                )
+            }
+            .sortedBy { it.index }
+    }
+
     private suspend fun refreshOnce() {
         try {
-            val raw = repository.getAllMine("tabs/$tabId/history")
-            val synced = raw.entries
-                .mapNotNull { (key, value) ->
-                    val index = (key as? String)?.toIntOrNull() ?: return@mapNotNull null
-                    val entry = value as? Map<*, *> ?: return@mapNotNull null
-                    val rawText = entry["text"] as? String ?: ""
-                    // Client-side only, per explicit instruction (2026-09-11)
-                    // -- the backend hands over the SAME raw text its own
-                    // model-facing session sees (a "[Sent: ...]" stamp, and
-                    // occasionally a whole synthetic/internal turn); this
-                    // app decides what a human should actually see, same as
-                    // the desktop's own chat.js does for its live rendering.
-                    if (TextFiltering.isSyntheticText(rawText)) return@mapNotNull null
-                    @Suppress("UNCHECKED_CAST")
-                    val rawAttachments = entry["attachments"] as? List<Map<*, *>>
-                    val attachments = rawAttachments?.mapNotNull { a ->
-                        val name = a["name"] as? String ?: return@mapNotNull null
-                        Attachment(
-                            name = name,
-                            mimeType = a["mimeType"] as? String,
-                            dataBase64 = a["dataBase64"] as? String,
-                            tooLarge = a["tooLarge"] as? Boolean ?: false,
-                        )
-                    } ?: emptyList()
-                    ChatMessage(
-                        index = index,
-                        role = entry["role"] as? String ?: "user",
-                        text = TextFiltering.stripStamp(rawText),
-                        ts = (entry["ts"] as? Double)?.toLong() ?: 0L,
-                        attachments = attachments,
-                    )
-                }
-                .sortedBy { it.index }
+            val v2 = repository.getMine("tabs/$tabId/history_v2") as? Map<*, *>
+            val synced = (v2?.let { loadV2(it) }) ?: loadLegacy()
             // Drop any optimistic echo whose text now has a real synced
             // counterpart -- the backend round-trip caught up.
             val syncedTexts = synced.map { it.text }.toSet()
