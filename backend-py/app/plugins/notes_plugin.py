@@ -17,6 +17,7 @@ from app.policies import (
     notes_folder_fallback_instruction,
     owner_profile_instruction,
     task_completion_memory_instruction,
+    thematic_memory_convention_instruction,
     vault_security_instruction,
 )
 from app.plugins.notes_api import (
@@ -31,7 +32,7 @@ from app.plugins.notes_api import (
 _sessions = SessionManager()
 
 FOLDER_MEMORY_NOTE = (
-    ' For Claude\'s own long-term memory (not asked for by the user), use folder "Claude Memory" '
+    ' For Claude\'s own long-term memory (not asked for by the user), use folder "Caroline:Memory" '
     "unless the user directs otherwise. This tool works with any note/folder the user names, too."
 )
 
@@ -376,6 +377,7 @@ _USAGE_INSTRUCTIONS = "\n\n".join((
     notes_folder_fallback_instruction(),
     task_completion_memory_instruction(),
     owner_profile_instruction(),
+    thematic_memory_convention_instruction(),
 ))
 
 

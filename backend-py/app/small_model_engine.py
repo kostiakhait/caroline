@@ -89,17 +89,17 @@ from app.persona import Persona
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.policies import (
     continuity_pointer_instruction,
+    credentials_check_notes_first_instruction,
     learn_from_mistakes_instruction,
     no_internal_mechanics_to_user_instruction,
     no_unauthorized_secret_changes_instruction,
     no_unbounded_filesystem_scans_instruction,
     prefer_own_backend_tools_instruction,
     proactive_context_recovery_instruction,
+    recall_memory_check_first_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
-    task_completion_memory_instruction,
     timestamp_awareness_instruction,
-    vault_security_instruction,
 )
 
 # Per explicit instruction (2026-09-13), after a real capability audit
@@ -117,13 +117,13 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     timestamp_awareness_instruction,
     no_internal_mechanics_to_user_instruction,
     proactive_context_recovery_instruction,
-    task_completion_memory_instruction,
-    vault_security_instruction,
     no_unauthorized_secret_changes_instruction,
     prefer_own_backend_tools_instruction,
     learn_from_mistakes_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
+    credentials_check_notes_first_instruction,
+    recall_memory_check_first_instruction,
 )
 
 # Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__

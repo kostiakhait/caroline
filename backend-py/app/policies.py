@@ -433,6 +433,28 @@ def vault_security_instruction() -> str:
     )
 
 
+def thematic_memory_convention_instruction() -> str:
+    """Per the three-tier-memory design (2026-09-24): the mechanics behind
+    recall_memory_check_first_instruction's short always-on trigger (just
+    below in ALWAYS_ON_INSTRUCTIONS) -- fetched on demand via
+    get_tool_instructions, shared by notes_plugin.py (saving side) and
+    memory_search_plugin.py (recall_memory's own usage_instructions,
+    retrieval side), since it genuinely spans both."""
+    return (
+        'The "Caroline:Topics" Notes folder is for durable facts worth recalling later by topic/keyword -- '
+        'distinct from "Caroline:Profile" (standing facts about your owner specifically), "Caroline:Memory" (a '
+        'log of past completed tasks), and "Caroline:Vault" (secrets). Save a new fact with notes_create in a '
+        "fitting subfolder under it (create one if none fits yet -- e.g. \"Caroline:Topics/Grants/NLnet\" for a "
+        'grant-specific detail); group related topics under a shared subfolder as they accumulate rather than '
+        "leaving everything flat. To find something later, prefer the recall_memory tool over browsing this (or "
+        "any other Notes folder) yourself -- it searches in its own separate call, so it never costs your own "
+        "context/turns the way reading through folders and notes one by one would. recall_memory searches your "
+        "entire Notes account, not just this folder, so it's also the right first move for anything that might "
+        'be in "Caroline:Vault"/"Caroline:Profile"/"Caroline:Memory" instead -- your other notes_* tools remain '
+        "fully available too, for direct/addressed lookups where you already know exactly where something is."
+    )
+
+
 def credentials_check_notes_first_instruction() -> str:
     """Per explicit instruction (2026-09-24): "она все время забывает" --
     vault_security_instruction/notes_folder_fallback_instruction (just
@@ -455,6 +477,29 @@ def credentials_check_notes_first_instruction() -> str:
         "the user for it or saying you don't have it (call get_tool_instructions on a notes tool for the exact "
         "mechanics if you need them). When you obtain or generate a NEW credential worth keeping, save it there "
         "yourself the same way -- don't just use it once and let it evaporate."
+    )
+
+
+def recall_memory_check_first_instruction() -> str:
+    """Per explicit instruction (2026-09-24), the three-tier-memory design:
+    the actual bottleneck isn't that Caroline doesn't know Notes exists --
+    it's that browsing/searching it inline, in her own turn, spends context
+    and attention she doesn't reliably have to spare. recall_memory (see
+    memory_search_plugin.py) factors that search out into its own separate
+    call so it never costs the main conversation anything but the answer.
+    Same shape as credentials_check_notes_first_instruction just above:
+    a short trigger only, always-on so it's never forgotten; the actual
+    mechanics (the "Caroline:Topics" folder convention, when to save vs.
+    search) stay on-demand via get_tool_instructions, fetched once a notes
+    tool is actually in play (notes_plugin.py's own usage_instructions)."""
+    return (
+        "When a topic/keyword comes up that you might already know something about, call recall_memory first "
+        "instead of re-deriving, re-asking, or trying to recall it from your own context -- it searches all of "
+        "your Notes (not just the current conversation) in its own separate call, so it costs nothing but the "
+        "answer. When you learn something durable worth recalling by topic later, save it yourself as a note in "
+        'the "Caroline:Topics" folder (create a fitting subfolder if none exists yet) -- this is in addition to, '
+        "not instead of, your other notes_* tools and folders (Caroline:Vault/Profile/Memory), which you still "
+        "use directly as before."
     )
 
 
@@ -652,6 +697,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     system_temp_dir_instruction,
     prefer_command_line_and_scripting_instruction,
     credentials_check_notes_first_instruction,
+    recall_memory_check_first_instruction,
 )
 
 
