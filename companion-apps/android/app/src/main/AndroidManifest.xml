@@ -16,6 +16,11 @@
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- Multi-phone support (2026-09-26): best-effort auto-detect of this
+         phone's own number, to prefill (never silently trust) the setup
+         screen's confirmation field; see CompanionPrefs.bestEffort
+         DetectedNumber. -->
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
 
     <!-- Same artwork as the Windows app's own icon (Windows/Caroline/
          Resources/app.ico), sourced from the marketing site's higher-res

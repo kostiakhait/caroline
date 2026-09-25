@@ -58,6 +58,23 @@ REGISTRY.cancel_for_tab(), or a resumed operation's own cancel path) must
 also reach the phone -- the corresponding Camerlengo path is deleted so
 the phone doesn't act on a cancelled request or write a result into the
 void, and the journal entry is removed.
+
+=== Multi-phone support (explicit instruction, 2026-09-26) =================
+
+More than one phone can be paired to the same SquirrelWisdom account at
+once. Every path a phone touches (SMS outbox, SMS sync, contacts requests)
+is namespaced under `devices/<deviceId>/...` -- deviceId is a random UUID
+the phone generates once on first setup and persists forever (NOT the
+phone number: Android frequently can't report a real number at all, so it
+can't be a stable key). Each phone also writes a periodic heartbeat to
+`devices/<deviceId>/info = {"phoneNumber", "lastSeenAt", "model"}`, which
+is the single source of truth this module reads to answer "what phones
+are paired and what are their numbers" (list_devices/resolve_device
+below). Because every phone only ever reads/writes its OWN devices/<id>/
+subtree, two phones on one account never race on the same path -- the
+race that existed before this namespacing (both phones seeing the same
+flat sms/outbox/<opId> and potentially both sending) is now structurally
+impossible, not just guarded against.
 """
 
 from __future__ import annotations
@@ -76,6 +93,13 @@ from app.logging_setup import log_event
 from app.plugins.companion_sms_store import load_store, merge_messages, save_store, since_cursor
 from app.plugins.sw_api import SessionExpiredError, SwApiError, call_v2
 from app.task_supervisor import supervise
+
+# --- multi-phone support (explicit instruction, 2026-09-26) -----------------
+# Multiple phones can now be paired to one account. Every wire path a phone
+# touches (sms outbox, sms sync, contacts requests) lives under
+# devices/<deviceId>/... -- see list_devices/resolve_device below and this
+# module's own docstring for the paths a device registers itself at.
+DEVICE_STALE_AFTER_S = 300.0  # no heartbeat in 5 minutes -> reported offline (still a known/addressable device)
 
 # --- tunables (explicit instruction, 2026-09-10) ---------------------------
 PHASE1_POLL_INTERVAL_S = 60.0  # accept-wait cadence -- forever, never gives up
@@ -124,6 +148,27 @@ ReportProgress = Callable[[Any], None] | None
 class PhoneUnreachableError(Exception):
     """Phase 2's budget elapsed with no result -- the phone accepted the
     request but never finished it in time."""
+
+
+class UnknownDeviceError(Exception):
+    """A `fromNumber` argument didn't match any paired device."""
+
+    def __init__(self, phone_number: str, devices: "list[dict[str, Any]]"):
+        self.phone_number = phone_number
+        self.devices = devices
+        super().__init__(f"No paired phone matches '{phone_number}'.")
+
+
+class AmbiguousDeviceError(Exception):
+    """No phone number was given and more than one device is paired."""
+
+    def __init__(self, devices: "list[dict[str, Any]]"):
+        self.devices = devices
+        super().__init__("More than one phone is paired; a phone number is required to pick one.")
+
+
+class NoPairedDeviceError(Exception):
+    """No phone number was given and zero devices are paired at all."""
 
 
 # --- raw var:*Mine client ----------------------------------------------------
@@ -180,6 +225,59 @@ async def _safe_delete(path: str) -> None:
         await delete_mine(path)
     except Exception as exc:  # noqa: BLE001 -- best effort, cleanup must never throw
         log_event("plugin:companion", "cleanup_delete_failed", path=path, error=str(exc))
+
+
+# --- device registry (multi-phone support) -----------------------------------
+
+def _digits_only(number: str) -> str:
+    return "".join(ch for ch in number if ch.isdigit())
+
+
+async def list_devices() -> list[dict[str, Any]]:
+    """Every paired phone, read live from the device registry (no local
+    caching -- this is cheap, and staleness would only ever be wrong in
+    the direction of hiding a phone that just paired). `online` is a
+    best-effort hint from heartbeat recency, not a guarantee."""
+    raw = await get_all_mine("devices")
+    now_ms = time.time() * 1000
+    devices = []
+    for device_id, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        last_seen = info.get("lastSeenAt")
+        online = isinstance(last_seen, (int, float)) and (now_ms - last_seen) / 1000.0 < DEVICE_STALE_AFTER_S
+        devices.append({
+            "deviceId": device_id,
+            "phoneNumber": info.get("phoneNumber"),
+            "model": info.get("model"),
+            "lastSeenAt": last_seen,
+            "online": online,
+        })
+    devices.sort(key=lambda d: d.get("phoneNumber") or "")
+    return devices
+
+
+async def resolve_device(phone_number: str | None) -> dict[str, Any]:
+    """Resolves a `fromNumber` tool argument to one paired device, matched
+    on the last 10 digits (tolerant of +country-code/spacing/formatting
+    differences between however the model or a saved contact wrote the
+    number and however the phone reported its own).
+
+    No phone_number given: the only paired device if there's exactly one
+    (AmbiguousDeviceError if there's more than one, NoPairedDeviceError if
+    there are none)."""
+    devices = await list_devices()
+    if phone_number is None:
+        if len(devices) == 1:
+            return devices[0]
+        if not devices:
+            raise NoPairedDeviceError()
+        raise AmbiguousDeviceError(devices)
+    wanted = _digits_only(phone_number)[-10:]
+    matches = [d for d in devices if d.get("phoneNumber") and _digits_only(d["phoneNumber"])[-10:] == wanted] if wanted else []
+    if not matches:
+        raise UnknownDeviceError(phone_number, devices)
+    return matches[0]
 
 
 # --- local operations journal (explicit instruction, 2026-09-10: LOCAL file,
@@ -332,10 +430,12 @@ async def _finish_and_cleanup(workspace_dir: str, op_id: str, request_path: str,
 
 # --- model-facing operation constructors -------------------------------------
 
-async def send_sms(workspace_dir: str, tab_id: str, to: str, text: str, report_progress: ReportProgress) -> dict[str, Any]:
+async def send_sms(
+    workspace_dir: str, tab_id: str, device_id: str, to: str, text: str, report_progress: ReportProgress,
+) -> dict[str, Any]:
     op_id = uuid.uuid4().hex
-    request_path = f"sms/outbox/{op_id}"
-    result_path = f"sms/outbox_result/{op_id}"
+    request_path = f"devices/{device_id}/sms/outbox/{op_id}"
+    result_path = f"devices/{device_id}/sms/outbox_result/{op_id}"
     result = await run_operation(
         workspace_dir, tab_id, request_path, result_path,
         {"to": to, "text": text}, f"SMS to {to}", report_progress, op_id,
@@ -345,11 +445,11 @@ async def send_sms(workspace_dir: str, tab_id: str, to: str, text: str, report_p
 
 
 async def request_response(
-    workspace_dir: str, tab_id: str, family: str, payload: dict[str, Any], report_progress: ReportProgress,
+    workspace_dir: str, tab_id: str, device_id: str, family: str, payload: dict[str, Any], report_progress: ReportProgress,
 ) -> Any:
     op_id = uuid.uuid4().hex
-    request_path = f"{family}/requests/{op_id}"
-    result_path = f"{family}/responses/{op_id}"
+    request_path = f"devices/{device_id}/{family}/requests/{op_id}"
+    result_path = f"devices/{device_id}/{family}/responses/{op_id}"
     label = f"{family} {payload.get('op', 'request')}"
     result = await run_operation(workspace_dir, tab_id, request_path, result_path, payload, label, report_progress, op_id)
     await _finish_and_cleanup(workspace_dir, op_id, request_path, result_path)
@@ -608,41 +708,65 @@ def start_companion_inbox_loop(
 # --- SMS local-copy sync loop -------------------------------------------------
 
 async def _sms_sync_tick(workspace_dir: str) -> None:
-    """One attempt: ask the phone for everything since the last successful
-    sync, wait a bounded window, merge whatever comes back. Silent no-op
-    (not an error) if the phone never answers -- see this module's own
-    "SMS local-copy sync" header comment for why that's the correct,
-    deliberate behavior here, not a failure to surface."""
+    """One attempt PER paired device: ask that phone for everything since
+    the last successful sync of ITS OWN bucket, wait a bounded window,
+    merge whatever comes back. Devices are synced one at a time
+    (sequentially, not concurrently) -- simplest correct thing, and with a
+    handful of phones the worst case (every phone timing out its own
+    SMS_SYNC_RESPONSE_WAIT_S) is still comfortably under SMS_SYNC_INTERVAL_S.
+    Silent no-op (not an error) for any device that never answers -- see
+    this module's own "SMS local-copy sync" header comment for why that's
+    the correct, deliberate behavior here, not a failure to surface."""
     if not is_logged_in():
         return
+    try:
+        devices = await list_devices()
+    except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
+        log_event("plugin:companion", "sms_sync_device_list_failed", error=str(exc))
+        return
+    if not devices:
+        return
     store = load_store(workspace_dir)
-    since = since_cursor(store)
+    changed = False
+    for device in devices:
+        if await _sms_sync_one_device(store, device["deviceId"], device.get("phoneNumber")):
+            changed = True
+    if changed:
+        save_store(workspace_dir, store)
+
+
+async def _sms_sync_one_device(store: dict[str, Any], device_id: str, phone_number: str | None) -> bool:
+    """Returns True if a response was received (and merged into `store` in
+    place) -- False means the phone didn't answer in time this attempt,
+    nothing to persist."""
+    since = since_cursor(store, device_id)
+    request_path = f"devices/{device_id}/sms/sync_request"
+    response_path = f"devices/{device_id}/sms/sync_response"
     # Clear any stale response from a PREVIOUS abandoned attempt first --
     # otherwise a late answer to an attempt we already gave up on could be
-    # mistaken for the answer to THIS one (see the module docstring: no
-    # ts/request-id correlation is kept, so staleness is prevented instead
-    # by always starting from a clean slate).
-    await _safe_delete("sms/sync_response")
-    await set_mine("sms/sync_request", {"since": since, "ts": int(time.time() * 1000)})
+    # mistaken for the answer to THIS one (no ts/request-id correlation is
+    # kept, so staleness is prevented instead by always starting clean).
+    await _safe_delete(response_path)
+    await set_mine(request_path, {"since": since, "ts": int(time.time() * 1000)})
     deadline = time.monotonic() + SMS_SYNC_RESPONSE_WAIT_S
     response: Any = None
     while time.monotonic() < deadline:
-        response = await get_mine("sms/sync_response")
+        response = await get_mine(response_path)
         if response is not None:
             break
         await asyncio.sleep(SMS_SYNC_POLL_INTERVAL_S)
-    await _safe_delete("sms/sync_request")
-    await _safe_delete("sms/sync_response")
+    await _safe_delete(request_path)
+    await _safe_delete(response_path)
     if response is None:
-        log_event("plugin:companion", "sms_sync_no_response", since=since)
-        return
+        log_event("plugin:companion", "sms_sync_no_response", device_id=device_id, since=since)
+        return False
     messages = response.get("messages") if isinstance(response, dict) else None
     if not isinstance(messages, list):
-        log_event("plugin:companion", "sms_sync_malformed_response")
-        return
-    added = merge_messages(store, messages)
-    save_store(workspace_dir, store)
-    log_event("plugin:companion", "sms_sync_ok", received=len(messages), added=added, total=len(store["messages"]))
+        log_event("plugin:companion", "sms_sync_malformed_response", device_id=device_id)
+        return False
+    added = merge_messages(store, device_id, phone_number, messages)
+    log_event("plugin:companion", "sms_sync_ok", device_id=device_id, received=len(messages), added=added)
+    return True
 
 
 def start_sms_sync_loop(workspace_dir: str, interval_s: float = SMS_SYNC_INTERVAL_S) -> "asyncio.Task[None]":

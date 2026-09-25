@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.partnerssolutions.caroline.companion.data.companion.CompanionPrefs
 import com.partnerssolutions.caroline.companion.data.contacts.ContactsRepository
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.data.sms.SmsRepository
@@ -37,6 +38,15 @@ import kotlinx.coroutines.launch
  * already finished it, so it's skipped rather than redone (critical for
  * companion_sms_send specifically -- redoing it would send a duplicate
  * real text message). No local "already handled" tracking needed at all.
+ *
+ * Multi-phone support (explicit instruction, 2026-09-26): every path this
+ * service reads/writes lives under devices/<deviceId>/... (CompanionPrefs.
+ * deviceId, a random UUID generated once per install) instead of a flat
+ * shared path -- so a second phone paired to the same account watches its
+ * OWN subtree and never races this one on the same request. This service
+ * also periodically writes its own devices/<deviceId>/info heartbeat
+ * (phone number + last-seen time) -- companion_api.py's device registry
+ * on the backend reads that to know what's paired and how to address it.
  */
 class CompanionOpsService : Service() {
 
@@ -44,6 +54,7 @@ class CompanionOpsService : Service() {
     private val repository = CamerlengoRepository()
     private lateinit var smsRepository: SmsRepository
     private lateinit var contactsRepository: ContactsRepository
+    private var lastHeartbeatAt = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -54,7 +65,7 @@ class CompanionOpsService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
-        Logger.i("CompanionOpsService started")
+        Logger.i("CompanionOpsService started (deviceId=${CompanionPrefs.deviceId})")
         scope.launch { pollLoop() }
         return START_STICKY
     }
@@ -70,6 +81,7 @@ class CompanionOpsService : Service() {
     private suspend fun pollLoop() {
         while (scope.isActive) {
             try {
+                handleHeartbeat()
                 handleOutbox()
                 handleSmsSync()
                 handleRequestFamily("contacts")
@@ -84,16 +96,32 @@ class CompanionOpsService : Service() {
         }
     }
 
-    // --- sms/outbox: companion_sms_send ------------------------------------
+    // --- devices/<deviceId>/info: presence + number announcement -----------
+    // Throttled to HEARTBEAT_INTERVAL_MS, not written on every 5s poll tick
+    // -- the backend's own staleness check (DEVICE_STALE_AFTER_S=300s,
+    // companion_api.py) has plenty of margin over this cadence.
+
+    private suspend fun handleHeartbeat() {
+        val now = System.currentTimeMillis()
+        if (now - lastHeartbeatAt < HEARTBEAT_INTERVAL_MS) return
+        repository.setMine(
+            "devices/${CompanionPrefs.deviceId}/info",
+            mapOf("phoneNumber" to CompanionPrefs.phoneNumber, "model" to Build.MODEL, "lastSeenAt" to now),
+        )
+        lastHeartbeatAt = now
+    }
+
+    // --- devices/<deviceId>/sms/outbox: companion_sms_send -----------------
 
     private suspend fun handleOutbox() {
-        val entries = repository.getAllMine("sms/outbox")
+        val base = "devices/${CompanionPrefs.deviceId}/sms/outbox"
+        val entries = repository.getAllMine(base)
         for ((rawId, rawValue) in entries) {
             val opId = rawId as? String ?: continue
             val payload = rawValue as? Map<*, *> ?: continue
-            val resultPath = "sms/outbox_result/$opId"
+            val resultPath = "devices/${CompanionPrefs.deviceId}/sms/outbox_result/$opId"
             if (repository.getMine(resultPath) != null) continue // already done, backend hasn't cleaned up yet
-            val requestPath = "sms/outbox/$opId"
+            val requestPath = "$base/$opId"
             if (payload["status"] != "accepted") {
                 repository.setMine(requestPath, withAcceptedStatus(payload))
             }
@@ -109,35 +137,38 @@ class CompanionOpsService : Service() {
         }
     }
 
-    // --- sms/sync_request -> sms/sync_response: local-copy sync -----------
-    // Per explicit instruction (2026-09-25): companion_list_sms_threads/
-    // companion_read_sms_thread no longer talk to the phone live at all --
-    // Caroline's backend keeps its OWN local copy, refreshed by this
-    // exchange every ~3 minutes (companion_api.py's start_sms_sync_loop).
-    // Single leaf paths (not a per-opId family like the others below):
-    // only one sync is ever in flight at a time. Same idempotency
+    // --- devices/<deviceId>/sms/sync_request -> sync_response: local-copy
+    // sync. Per explicit instruction (2026-09-25): companion_list_sms_
+    // threads/companion_read_sms_thread no longer talk to a phone live at
+    // all -- Caroline's backend keeps its OWN local copy, refreshed by this
+    // exchange every ~3 minutes (companion_api.py's start_sms_sync_loop),
+    // separately per paired device. Single leaf paths under this device's
+    // own subtree (not a per-opId family like the others below): only one
+    // sync is ever in flight per device at a time. Same idempotency
     // principle as everywhere else -- skip if we've already answered the
     // current request.
 
     private suspend fun handleSmsSync() {
-        val request = repository.getMine("sms/sync_request") as? Map<*, *> ?: return
-        if (repository.getMine("sms/sync_response") != null) return // already answered, backend hasn't cleaned up yet
+        val base = "devices/${CompanionPrefs.deviceId}/sms"
+        val request = repository.getMine("$base/sync_request") as? Map<*, *> ?: return
+        if (repository.getMine("$base/sync_response") != null) return // already answered, backend hasn't cleaned up yet
         val since = (request["since"] as? Number)?.toLong()
         Logger.i("companion: syncing SMS since=$since")
         val messages = smsRepository.dumpMessages(since)
-        repository.setMine("sms/sync_response", mapOf("messages" to messages))
+        repository.setMine("$base/sync_response", mapOf("messages" to messages))
     }
 
-    // --- {family}/requests -> {family}/responses: contacts lookups --------
+    // --- devices/<deviceId>/{family}/requests -> responses: contacts lookups
 
     private suspend fun handleRequestFamily(family: String) {
-        val entries = repository.getAllMine("$family/requests")
+        val base = "devices/${CompanionPrefs.deviceId}/$family"
+        val entries = repository.getAllMine("$base/requests")
         for ((rawId, rawValue) in entries) {
             val opId = rawId as? String ?: continue
             val payload = rawValue as? Map<*, *> ?: continue
-            val responsePath = "$family/responses/$opId"
+            val responsePath = "$base/responses/$opId"
             if (repository.getMine(responsePath) != null) continue
-            val requestPath = "$family/requests/$opId"
+            val requestPath = "$base/requests/$opId"
             if (payload["status"] != "accepted") {
                 repository.setMine(requestPath, withAcceptedStatus(payload))
             }
@@ -205,6 +236,11 @@ class CompanionOpsService : Service() {
         // dominates end-to-end latency either way, this just avoids being
         // an ADDITIONAL bottleneck.
         private const val POLL_INTERVAL_MS = 5_000L
+
+        // Comfortably under companion_api.py's DEVICE_STALE_AFTER_S=300s,
+        // and no reason to write it on every 5s poll tick -- a device's
+        // number/model essentially never changes between heartbeats.
+        private const val HEARTBEAT_INTERVAL_MS = 60_000L
 
         fun start(context: Context) {
             val intent = Intent(context, CompanionOpsService::class.java)
