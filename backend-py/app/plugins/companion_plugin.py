@@ -4,18 +4,28 @@ paired phone's own SIM, read that phone's SMS threads, and read its
 contacts. All traffic goes through Camerlengo's session-scoped variable
 store (companion_api.py) -- there is never a direct phone<->PC connection.
 
-Every companion operation is transactional and two-phase (accept, then
-result -- see companion_api.py's own module docstring for the full
-protocol) and NEVER gives up on its own; only an explicit cancel
-(Stop / stop_operation) ends one early. Because that can take a while,
-these run through app/operations.py's start/status/stop contract exactly
-like every other tool -- a slow one returns an operation_id the model
-polls via check_operation_status, and report_progress feeds that poll a
-human-readable "still waiting" line; app/operations.py's own REGISTRY is
-what ChatSession.stop() reaches via cancel_for_tab() to actually cancel
-one. Companion operations are ALSO journaled locally (see
-companion_api.run_operation) so they survive a backend restart -- that
-part is transparent to these tool handlers.
+companion_sms_send and the contacts lookups are transactional and
+two-phase (accept, then result -- see companion_api.py's own module
+docstring for the full protocol) and NEVER give up on their own; only an
+explicit cancel (Stop / stop_operation) ends one early. Because that can
+take a while, these run through app/operations.py's start/status/stop
+contract exactly like every other tool -- a slow one returns an
+operation_id the model polls via check_operation_status, and
+report_progress feeds that poll a human-readable "still waiting" line;
+app/operations.py's own REGISTRY is what ChatSession.stop() reaches via
+cancel_for_tab() to actually cancel one. These operations are ALSO
+journaled locally (see companion_api.run_operation) so they survive a
+backend restart -- that part is transparent to these tool handlers.
+
+companion_list_sms_threads/companion_read_sms_thread are DIFFERENT (per
+explicit instruction, 2026-09-25): a phone is not reliably reachable the
+way an IMAP server is, so these never talk to the phone live at all --
+they read Caroline's own local copy (companion_sms_store.py), kept fresh
+by a separate background sync loop (companion_api.start_sms_sync_loop,
+every 3 minutes, best-effort -- silently skips a cycle if the phone
+doesn't answer in time). Instant, and correct as of the last successful
+sync regardless of whether the phone happens to be reachable right this
+moment.
 
 SW-login-gated (needs the user's own SquirrelWisdom account -- the same
 one paired to the Android app). Uses sw_gate.py's shared
@@ -40,6 +50,7 @@ from app.plugins.companion_api import (
     request_response,
     send_sms,
 )
+from app.plugins.companion_sms_store import last_synced_at, list_messages, list_threads, load_store
 from app.plugins.loader import Plugin, PluginTool
 from app.session_context import get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
@@ -80,11 +91,17 @@ async def companion_list_sms_threads(args: dict[str, Any], report_progress: Any)
     gate_msg = await _gate()
     if gate_msg:
         return {"text": gate_msg, "is_error": True}
-    try:
-        threads = await request_response(WORKSPACE_DIR, _current_tab_id(), "sms", {"op": "list_threads"}, report_progress)
-    except PhoneUnreachableError as exc:
-        return {"text": str(exc), "is_error": True}
-    return {"text": _json(threads)}
+    # Reads the LOCAL copy (companion_sms_store.py) -- never talks to the
+    # phone live, see this module's own header comment for why. Mirrors
+    # email_list_messages' own unseenOnly: set up a schedule_reminder
+    # ("every 15 minutes check my SMS") the same way you would for email,
+    # calling this with unreadOnly=true each time and [[NO_UPDATE]] when
+    # there's genuinely nothing new -- the periodic BACKGROUND sync that
+    # keeps the local copy fresh is a separate, independent mechanism
+    # (companion_api.start_sms_sync_loop), not triggered by this call.
+    store = load_store(WORKSPACE_DIR)
+    threads = list_threads(store, unread_only=bool(args.get("unreadOnly")))
+    return {"text": _json({"lastSyncedAt": last_synced_at(store), "threads": threads})}
 
 
 async def companion_read_sms_thread(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -94,13 +111,10 @@ async def companion_read_sms_thread(args: dict[str, Any], report_progress: Any) 
     thread_id = str(args["thread_id"]).strip()
     if not thread_id:
         return {"text": "'thread_id' is required (get one from companion_list_sms_threads).", "is_error": True}
-    try:
-        messages = await request_response(
-            WORKSPACE_DIR, _current_tab_id(), "sms", {"op": "read_thread", "threadId": thread_id}, report_progress,
-        )
-    except PhoneUnreachableError as exc:
-        return {"text": str(exc), "is_error": True}
-    return {"text": _json(messages)}
+    # Also reads the local copy -- see companion_list_sms_threads above.
+    store = load_store(WORKSPACE_DIR)
+    messages = list_messages(store, thread_id)
+    return {"text": _json({"lastSyncedAt": last_synced_at(store), "messages": messages})}
 
 
 async def companion_list_contacts(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -149,10 +163,19 @@ def _usage_instructions() -> str:
         "or on a vague instruction; only send when the user has clearly asked you to send a specific message to "
         "a specific person/number, and quote back the exact recipient and text you're about to send if there's "
         "any ambiguity.\n\n"
-        "companion_list_sms_threads / companion_read_sms_thread and companion_list_contacts / "
-        "companion_search_contacts are read-only lookups on the phone. Contacts and SMS content are personal "
-        "data: use what you read to do what the user asked, don't volunteer or repeat more of it than the task "
-        "needs."
+        "companion_list_contacts / companion_search_contacts are read-only phone lookups (two-phase, may take a "
+        "while -- same timing note as above). Contacts and SMS content are personal data: use what you read to "
+        "do what the user asked, don't volunteer or repeat more of it than the task needs.\n\n"
+        "companion_list_sms_threads / companion_read_sms_thread are DIFFERENT from every other companion_* tool: "
+        "they never talk to the phone live, they read Caroline's own local copy of the SMS, kept fresh "
+        "automatically in the background every ~3 minutes -- always instant, no waiting, no 'phone unreachable' "
+        "possible. Because the sync is automatic, YOU still have to actually call companion_list_sms_threads "
+        "(unreadOnly=true) to notice anything new -- the sync itself never tells you or the user about new "
+        "messages, it only keeps the data ready for when you check. If the user wants to be told about new "
+        "texts periodically (\"let me know when I get a new SMS\", \"check my texts every 15 minutes\"), set "
+        "that up with schedule_reminder the same way you would for \"check my email every morning\" -- on each "
+        "firing, call companion_list_sms_threads(unreadOnly=true) and reply with exactly [[NO_UPDATE]] if "
+        "there's genuinely nothing new."
     )
 
 
@@ -172,14 +195,24 @@ PLUGIN = Plugin(
         PluginTool(
             "companion_list_sms_threads",
             "List the SMS conversation threads on the user's paired Android phone (recent threads, each with a "
-            "thread id, the other party, and a snippet). May take a while -- see get_tool_instructions.",
-            {},
+            "thread id, the other party, a snippet, and an unread count), plus lastSyncedAt. Reads Caroline's "
+            "own local copy -- instant, no waiting, works even if the phone is offline right now (may just be "
+            "slightly stale). Pass unreadOnly=true to check for new messages only, and see "
+            "get_tool_instructions for how to check periodically via schedule_reminder.",
+            # Full JSON schema, not the {name: type} shorthand: that shorthand
+            # makes every key required regardless of `| None`, which would
+            # force unreadOnly on every call.
+            {
+                "type": "object",
+                "properties": {"unreadOnly": {"type": "boolean", "description": "Only return threads with unread messages. Defaults to false (all recent threads)."}},
+                "required": [],
+            },
             companion_list_sms_threads,
         ),
         PluginTool(
             "companion_read_sms_thread",
             "Read the messages in one SMS thread on the paired Android phone, by its thread id (from "
-            "companion_list_sms_threads). May take a while -- see get_tool_instructions.",
+            "companion_list_sms_threads). Reads Caroline's own local copy -- instant, no waiting.",
             {"thread_id": str},
             companion_read_sms_thread,
         ),

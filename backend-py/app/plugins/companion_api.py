@@ -73,6 +73,7 @@ from typing import Any, Callable
 
 from app.login_api import get_v2_session, is_logged_in
 from app.logging_setup import log_event
+from app.plugins.companion_sms_store import load_store, merge_messages, save_store, since_cursor
 from app.plugins.sw_api import SessionExpiredError, SwApiError, call_v2
 from app.task_supervisor import supervise
 
@@ -89,6 +90,21 @@ def _phase2_backoff_delays():
     yield 20.0
     while True:
         yield 60.0
+
+
+# --- SMS local-copy sync (explicit instruction, 2026-09-25) -----------------
+# Deliberately NOT the phase1/phase2 protocol above -- that's built for a
+# model tool call the caller keeps checking on indefinitely (Phase 1 never
+# times out on purpose). This is an unattended BACKGROUND job with no one
+# waiting on it: if the phone doesn't answer within a bounded window, this
+# attempt just gives up and tries again next interval -- never piles up an
+# indefinite wait, never needs the operations-journal/restart-resume
+# machinery request_response() has (nothing is lost by abandoning one
+# attempt; the next one re-asks for everything since the last SUCCESSFUL
+# sync, not since this attempt started).
+SMS_SYNC_INTERVAL_S = 180.0  # how often a sync is attempted
+SMS_SYNC_RESPONSE_WAIT_S = 45.0  # how long one attempt waits for the phone to answer before giving up
+SMS_SYNC_POLL_INTERVAL_S = 5.0  # matches the Android service's own poll tick -- no point checking faster
 
 
 # The tabs/<tabId>/inbox drain + tabs/<tabId>/history sync loop cadence --
@@ -587,3 +603,61 @@ def start_companion_inbox_loop(
                 log_event("plugin:companion", "inbox_loop_tick_failed", error=str(exc))
 
     return supervise("companion_inbox", _loop)
+
+
+# --- SMS local-copy sync loop -------------------------------------------------
+
+async def _sms_sync_tick(workspace_dir: str) -> None:
+    """One attempt: ask the phone for everything since the last successful
+    sync, wait a bounded window, merge whatever comes back. Silent no-op
+    (not an error) if the phone never answers -- see this module's own
+    "SMS local-copy sync" header comment for why that's the correct,
+    deliberate behavior here, not a failure to surface."""
+    if not is_logged_in():
+        return
+    store = load_store(workspace_dir)
+    since = since_cursor(store)
+    # Clear any stale response from a PREVIOUS abandoned attempt first --
+    # otherwise a late answer to an attempt we already gave up on could be
+    # mistaken for the answer to THIS one (see the module docstring: no
+    # ts/request-id correlation is kept, so staleness is prevented instead
+    # by always starting from a clean slate).
+    await _safe_delete("sms/sync_response")
+    await set_mine("sms/sync_request", {"since": since, "ts": int(time.time() * 1000)})
+    deadline = time.monotonic() + SMS_SYNC_RESPONSE_WAIT_S
+    response: Any = None
+    while time.monotonic() < deadline:
+        response = await get_mine("sms/sync_response")
+        if response is not None:
+            break
+        await asyncio.sleep(SMS_SYNC_POLL_INTERVAL_S)
+    await _safe_delete("sms/sync_request")
+    await _safe_delete("sms/sync_response")
+    if response is None:
+        log_event("plugin:companion", "sms_sync_no_response", since=since)
+        return
+    messages = response.get("messages") if isinstance(response, dict) else None
+    if not isinstance(messages, list):
+        log_event("plugin:companion", "sms_sync_malformed_response")
+        return
+    added = merge_messages(store, messages)
+    save_store(workspace_dir, store)
+    log_event("plugin:companion", "sms_sync_ok", received=len(messages), added=added, total=len(store["messages"]))
+
+
+def start_sms_sync_loop(workspace_dir: str, interval_s: float = SMS_SYNC_INTERVAL_S) -> "asyncio.Task[None]":
+    """Started once from main.py's startup hook, independent of
+    start_companion_inbox_loop -- a stalled/slow sync attempt (bounded at
+    SMS_SYNC_RESPONSE_WAIT_S, but still real wall-clock time) must never
+    delay that loop's own 3s history/status/inbox cadence."""
+    log_event("plugin:companion", "sms_sync_loop_starting", interval_s=interval_s)
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await _sms_sync_tick(workspace_dir)
+            except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
+                log_event("plugin:companion", "sms_sync_tick_failed", error=str(exc))
+
+    return supervise("companion_sms_sync", _loop)

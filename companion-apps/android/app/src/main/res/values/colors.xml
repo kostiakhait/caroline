@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sampled directly from the brand icon's own flat backdrop
+         (caroline-site/assets/img/brand/icon-512.webp) so the adaptive
+         icon's background layer seams invisibly into the foreground
+         image's own rounded-corner fill, regardless of which mask shape
+         a launcher applies. -->
+    <color name="ic_launcher_background">#5067CA</color>
+
+    <!-- Same brand palette as ui/theme/Color.kt (Compose owns the real
+         theme; this is just the pre-Compose window background, see
+         themes.xml). caroline-site/assets/css/style.css's own bg token. -->
+    <color name="brand_bg">#05070C</color>
+</resources>

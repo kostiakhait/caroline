@@ -36,7 +36,7 @@ from app.plugins.notes_api import load_credentials
 from app.plugins.office_editor import finish_office_edit_session
 from app.plugins.ratatosk_api import find_or_create_dm, send_message
 from app.plugins.ratatosk_own_account import ensure_own_ratatosk_account, get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
-from app.plugins.companion_api import resume_companion_operations, set_mine as companion_set_mine, start_companion_inbox_loop
+from app.plugins.companion_api import resume_companion_operations, set_mine as companion_set_mine, start_companion_inbox_loop, start_sms_sync_loop
 from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -276,6 +276,15 @@ async def _start_ratatosk_background_loops() -> None:
         WORKSPACE_DIR, _active_tab_ids, _inject_companion_message, _companion_history_snapshot,
         _companion_tab_status, get_ratatosk_channel_status,
     )
+    # Independent background loop keeping Caroline's own local copy of the
+    # phone's SMS fresh (companion_sms_store.py) -- per explicit
+    # instruction (2026-09-25), a phone isn't reliably reachable the way an
+    # IMAP server is, so companion_list_sms_threads/companion_read_sms_
+    # thread never talk to the phone live; this is what actually keeps
+    # their data current. Separate loop, separate cadence (3 minutes, not
+    # 3 seconds) -- see companion_api.py's own SMS-sync header comment for
+    # why it must not share the inbox loop's tick.
+    start_sms_sync_loop(WORKSPACE_DIR)
     # Resume any companion operation (SMS send, sms/contacts lookup) that
     # was still in flight when the backend last went down -- see
     # companion_api.py's own module docstring for the never-gives-up

@@ -43,7 +43,7 @@ import com.partnerssolutions.caroline.companion.util.Logger
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CompanionTabsScreen(onLogout: () -> Unit, viewModel: TabsViewModel = viewModel()) {
+fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, viewModel: TabsViewModel = viewModel()) {
     var selectedIndex by remember { mutableIntStateOf(0) }
     var menuOpen by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -57,6 +57,13 @@ fun CompanionTabsScreen(onLogout: () -> Unit, viewModel: TabsViewModel = viewMod
                         Icon(Icons.Filled.MoreVert, contentDescription = "Menu")
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Phone companion (SMS/contacts)") },
+                            onClick = {
+                                menuOpen = false
+                                onOpenCompanionSetup()
+                            },
+                        )
                         DropdownMenuItem(
                             text = { Text("Share logs") },
                             onClick = {

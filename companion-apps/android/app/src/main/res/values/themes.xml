@@ -6,8 +6,10 @@
          Material Components concept, not a raw android: framework
          resource, and this project pulls in neither library). Compose
          fully repaints over this at runtime via CarolineCompanionTheme;
-         this only has to be valid, not final. -->
-    <style name="Theme.CarolineCompanion" parent="android:Theme.Material.Light.NoActionBar">
-        <item name="android:windowBackground">@android:color/white</item>
+         this only has to be valid, not final, but the background is set
+         to the real brand dark (see ui/theme/Color.kt) so the pre-Compose
+         frame doesn't flash white against an otherwise dark-only brand. -->
+    <style name="Theme.CarolineCompanion" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/brand_bg</item>
     </style>
 </resources>

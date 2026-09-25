@@ -18,6 +18,7 @@ import androidx.navigation.compose.rememberNavController
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.data.remote.CredentialsStore
 import com.partnerssolutions.caroline.companion.data.remote.SessionHolder
+import com.partnerssolutions.caroline.companion.ui.companion.CompanionSetupScreen
 import com.partnerssolutions.caroline.companion.ui.login.LoginScreen
 import com.partnerssolutions.caroline.companion.ui.tabs.CompanionTabsScreen
 import com.partnerssolutions.caroline.companion.util.Logger
@@ -78,7 +79,11 @@ fun NavGraph(navController: NavHostController = rememberNavController()) {
                                 popUpTo(0) { inclusive = true }
                             }
                         },
+                        onOpenCompanionSetup = { navController.navigate(Screen.CompanionSetup.route) },
                     )
+                }
+                composable(Screen.CompanionSetup.route) {
+                    CompanionSetupScreen(onBack = { navController.popBackStack() })
                 }
             }
         }

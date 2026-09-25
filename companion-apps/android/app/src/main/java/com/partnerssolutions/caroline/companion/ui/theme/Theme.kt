@@ -1,31 +1,36 @@
 package com.partnerssolutions.caroline.companion.ui.theme
 
-import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalContext
 
-private val DarkColors = darkColorScheme(primary = CarolineBlue80, secondary = CarolineAccent40)
-private val LightColors = lightColorScheme(primary = CarolineBlue40, secondary = CarolineBlueGrey40)
+/**
+ * The real Caroline brand palette (Color.kt, taken directly from the
+ * marketing site's CSS), forced on unconditionally -- no dynamic Material
+ * You color (that would replace it with whatever's in the user's
+ * wallpaper, defeating the point of having a brand at all) and no light
+ * variant (the site itself has none; this is a dark-only HUD identity by
+ * design, not an oversight).
+ */
+private val CarolineColors = darkColorScheme(
+    primary = CarolineCyan,
+    onPrimary = CarolineOnCyan,
+    primaryContainer = CarolineCyanDim,
+    onPrimaryContainer = CarolineCyanSoft,
+    secondary = CarolineGold,
+    onSecondary = CarolineOnCyan,
+    error = CarolineRed,
+    onError = CarolineText,
+    background = CarolineBg,
+    onBackground = CarolineText,
+    surface = CarolineBgPanel,
+    onSurface = CarolineText,
+    surfaceVariant = CarolineBgPanel2,
+    onSurfaceVariant = CarolineTextDim,
+    outline = CarolineBorder,
+)
 
 @Composable
-fun CarolineCompanionTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
-    content: @Composable () -> Unit,
-) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        darkTheme -> DarkColors
-        else -> LightColors
-    }
-    MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
+fun CarolineCompanionTheme(content: @Composable () -> Unit) {
+    MaterialTheme(colorScheme = CarolineColors, typography = Typography, content = content)
 }

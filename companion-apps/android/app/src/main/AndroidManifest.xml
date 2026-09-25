@@ -17,13 +17,17 @@
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
 
-    <!-- TODO: real launcher icon; @android:drawable/sym_def_app_icon below is
-         a system placeholder; the real Caroline art lives in the main repo's
-         art/ directory. -->
+    <!-- Same artwork as the Windows app's own icon (Windows/Caroline/
+         Resources/app.ico), sourced from the marketing site's higher-res
+         copy (caroline-site/assets/img/brand/icon-512.webp, same image) for
+         better downscaling quality. mipmap-anydpi-v26/ic_launcher(_round).xml
+         supplies the adaptive-icon version; the mipmap-*dpi PNGs are the
+         legacy fallback for API <26. -->
     <application
         android:name=".CompanionApplication"
         android:allowBackup="false"
-        android:icon="@android:drawable/sym_def_app_icon"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:theme="@style/Theme.CarolineCompanion"
         android:usesCleartextTraffic="false">
@@ -48,9 +52,14 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
-        <!-- Phase 3 TODO (not wired yet, see companion-apps/android/README.md):
-             SmsReceiver (SMS_RECEIVED broadcast, new incoming mail) and the
-             foreground polling Service belong here once built. -->
+        <!-- Opt-in only (CompanionSetupScreen); see its own doc comment for
+             why this isn't auto-started. No SmsReceiver: every companion_*
+             tool is a pull (Caroline asks, phone answers from the current
+             content://sms state), nothing needs a push on new-incoming-SMS. -->
+        <service
+            android:name=".service.CompanionOpsService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
     </application>
 
