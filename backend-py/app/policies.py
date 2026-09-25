@@ -258,6 +258,39 @@ def proactive_context_recovery_instruction() -> str:
     )
 
 
+def usage_cap_self_awareness_instruction() -> str:
+    """Per explicit instruction (2026-09-26): confirmed live -- the CC CLI's
+    own usage-cap report ("You've hit your session limit" / "monthly spend
+    limit", chat_session.py's CC_CLI_LIMIT_PATTERN) gets retried
+    automatically and forever (_schedule_one_shot_followup_check) until a
+    real reply comes through, which can mean the SAME cap notice repeats
+    several times over the following stretch while it's still active. Once
+    it lifts, Caroline resumes normally -- but with that whole stretch of
+    repeated cap notices sitting in her own recent history, she has reason
+    to keep treating the cap as a live, current fact and to keep bringing
+    it up even in a turn she is only now, actually, able to answer.
+
+    The fix isn't a retry-count change (the forever-retry is deliberate and
+    already correct, see _schedule_one_shot_followup_check's own docstring)
+    -- it's giving her the one fact that resolves the ambiguity on her own:
+    a session that is truly still capped cannot produce ANY reply at all,
+    so the mere fact that she is generating this response is, by itself,
+    conclusive proof the cap has already cleared. No need to check, ask, or
+    hedge."""
+    return (
+        "Claude Code's own usage cap (\"You've hit your session limit\", \"monthly spend limit\") clears itself "
+        "automatically at the time it states -- no action from you or the user fixes it any faster, and none is "
+        "needed. If you can see this instruction and are producing a reply at all, the cap is NOT currently "
+        "active on you right now -- a genuinely capped session produces no output whatsoever, so your own live "
+        "response is proof enough that it already lifted, even if your recent history shows the same cap notice "
+        "repeating several times while it was still active (that repetition is an automatic retry, not a sign it's "
+        "still in effect now). Don't re-check, re-state, apologize for, or hedge about a past cap hit once you're "
+        "actually replying -- just answer normally, the same as any other turn. This is about your own reasoning, "
+        "not something to explain to the user either way -- see the instruction on never exposing internal "
+        "machinery in conversation."
+    )
+
+
 def continuity_pointer_instruction(archive_path: str | None) -> str:
     """Only present at all when there's an actual archive path for this
     tab; absent (returns "") the rest of the time, so a tab with no such
@@ -689,6 +722,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     timestamp_awareness_instruction,
     complex_task_execution_instruction,
     learn_from_mistakes_instruction,
+    usage_cap_self_awareness_instruction,
     proactive_context_recovery_instruction,
     no_internal_mechanics_to_user_instruction,
     no_unauthorized_secret_changes_instruction,
