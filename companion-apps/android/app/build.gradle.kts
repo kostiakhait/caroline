@@ -15,14 +15,30 @@ android {
         // provider are all available from 26 on; no reason to support lower.
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-skeleton"
+        // Set by build.bat (-PappVersion=<yyyyMMddHHmm>, -PappVersionCode=<minutes
+        // since the epoch>) so every published build is a real, monotonically
+        // increasing upgrade over the last one; plain ad-hoc gradlew runs fall
+        // back to the skeleton defaults.
+        versionCode = project.findProperty("appVersionCode")?.toString()?.toIntOrNull() ?: 1
+        versionName = project.findProperty("appVersion")?.toString() ?: "0.1.0-skeleton"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // Same signing key as Ratatosk/ShortNerdCat (d:\REPO\tf38key.jks, alias
+    // tf38key); the password only ever comes from the environment, never the repo.
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getenv("SNC_KEYSTORE") ?: "D:\\REPO\\tf38key.jks")
+            storePassword = System.getenv("SNC_SIGN_PASSWORD") ?: ""
+            keyAlias = "tf38key"
+            keyPassword = System.getenv("SNC_SIGN_PASSWORD") ?: ""
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
