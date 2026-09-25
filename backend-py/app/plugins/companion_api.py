@@ -642,6 +642,67 @@ async def _sync_status(
         log_event("plugin:companion", "status_sync_failed", error=str(exc))
 
 
+# --- tabs_list: desired-state publishing (explicit instruction, 2026-09-26) --
+# The desktop (WPF) sends its tab list only when tabs are added/closed/renamed
+# (and at startup). Publishing it to Camerlengo used to happen inline in that
+# one request, best-effort -- if SquirrelWisdom was down or not yet logged in
+# at that moment (confirmed: 502s on user:verify), the phone's tab bar stayed
+# empty ("No Tabs Yet") until the next tab change, because nothing retried.
+# Now the request only records the DESIRED list (persisted, so a backend
+# restart before the desktop resends still has it) and the inbox loop
+# reconciles it: published on the next tick once SW is reachable, retried
+# every tick while it fails, and refreshed every TAB_LIST_REFRESH_S so an
+# account switch or a wiped remote value also heals on its own.
+TAB_LIST_REFRESH_S = 300.0
+
+_tab_list_desired: "list[Any] | None" = None
+_tab_list_published_at: float | None = None  # monotonic; None = desired list not yet published
+
+
+def _tab_list_path(workspace_dir: str) -> Path:
+    return Path(workspace_dir) / "companion-tab-list.json"
+
+
+def request_tab_list_publish(workspace_dir: str, tabs: "list[Any]") -> None:
+    """Records the desktop's current tab list as the desired remote state.
+    Never talks to the network itself -- _sync_tab_list does that."""
+    global _tab_list_desired, _tab_list_published_at
+    if tabs == _tab_list_desired:
+        return  # unchanged resend; keep the existing published/refresh state
+    _tab_list_desired = tabs
+    _tab_list_published_at = None
+    try:
+        _tab_list_path(workspace_dir).write_text(json.dumps(tabs, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 -- persistence is a bonus, never fail the request
+        log_event("plugin:companion", "tab_list_persist_failed", error=str(exc))
+
+
+async def _sync_tab_list(workspace_dir: str) -> None:
+    global _tab_list_desired, _tab_list_published_at
+    if _tab_list_desired is None:
+        path = _tab_list_path(workspace_dir)
+        if not path.exists():
+            return
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log_event("plugin:companion", "tab_list_load_failed", error=str(exc))
+            return
+        if not isinstance(loaded, list):
+            return
+        _tab_list_desired = loaded
+    if _tab_list_published_at is not None and time.monotonic() - _tab_list_published_at < TAB_LIST_REFRESH_S:
+        return
+    try:
+        await set_mine("tabs_list", _tab_list_desired)
+    except Exception as exc:  # noqa: BLE001 -- retried on the next tick
+        log_event("plugin:companion", "tab_list_sync_failed", error=str(exc))
+        return
+    if _tab_list_published_at is None:
+        log_event("plugin:companion", "tab_list_published", tabs=len(_tab_list_desired))
+    _tab_list_published_at = time.monotonic()
+
+
 async def _drain_inbox(inject_to_tab: InjectToTab) -> None:
     try:
         tabs = await get_all_mine("tabs")
@@ -676,6 +737,7 @@ async def _inbox_loop_tick(
 ) -> None:
     if not is_logged_in():
         return  # not paired to any SW account yet -- nothing to sync
+    await _sync_tab_list(workspace_dir)
     await _sync_history(workspace_dir, get_active_tab_ids, history_snapshot)
     await _sync_status(get_active_tab_ids, tab_status_snapshot, channel_status_snapshot)
     await _drain_inbox(inject_to_tab)

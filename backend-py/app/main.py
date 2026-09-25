@@ -36,7 +36,7 @@ from app.plugins.notes_api import load_credentials
 from app.plugins.office_editor import finish_office_edit_session
 from app.plugins.ratatosk_api import find_or_create_dm, send_message
 from app.plugins.ratatosk_own_account import ensure_own_ratatosk_account, get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
-from app.plugins.companion_api import resume_companion_operations, set_mine as companion_set_mine, start_companion_inbox_loop, start_sms_sync_loop
+from app.plugins.companion_api import resume_companion_operations, request_tab_list_publish as companion_request_tab_list, start_companion_inbox_loop, start_sms_sync_loop
 from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -606,11 +606,10 @@ async def handle_control_request(
         # into SquirrelWisdom, same as every other companion-app sync;
         # WPF doesn't block its own tab strip on this either way.
         tabs = parsed.get("tabs")
-        if isinstance(tabs, list) and is_logged_in():
-            try:
-                await companion_set_mine("tabs_list", tabs)
-            except Exception as exc:
-                log_event("engine", "tab_list_sync_failed", error=str(exc))
+        if isinstance(tabs, list):
+            # Only records the desired list; companion_api's inbox loop
+            # publishes it and keeps retrying until SW is reachable.
+            companion_request_tab_list(WORKSPACE_DIR, tabs)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "stt":
         audio_b64 = parsed.get("audioBase64")
