@@ -22,6 +22,10 @@ private const val CAMERLENGO_BASE_URL = "https://www.squirrelwisdom.com/"
  * tradeoff PRIMARY_TAB_ID makes on the backend, see companion_api.py's own
  * comment on it).
  */
+// Caroline's own general-purpose SquirrelWisdom service key for ai:stt/ai:tts --
+// the same one the desktop backend uses (backend-py/app/plugins/sw_api.py's
+// CAROLINE_SW_KEY); a service key, not a user secret.
+const val CAROLINE_AI_SERVICE_KEY = "QvR-sujLOgpKWZ-yhSOK5ZNgEe4sgF0EUU7GexQqr4M"
 const val CAMERLENGO_LOGIN_SERVICE_KEY = "fytZDwOTaBo8I173IS2DaY_qgzm0IFvqvnxJGvC5QrE"
 
 object CamerlengoModule {

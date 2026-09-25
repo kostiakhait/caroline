@@ -12,6 +12,8 @@ import com.partnerssolutions.caroline.companion.data.model.TabStatus
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.util.Logger
 import com.partnerssolutions.caroline.companion.util.TextFiltering
+import com.partnerssolutions.caroline.companion.util.VoicePlayer
+import android.content.Context
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -69,6 +71,67 @@ class ChatViewModel(
         private set
     var channelStatus by mutableStateOf(ChannelStatus.UNKNOWN)
         private set
+
+    // --- voice (ported from Ratatosk's pattern: tap mic -> record -> STT into the
+    // input box; replies can be spoken via a speaker button, and automatically
+    // when the message was sent by voice, like the desktop's voice turns) ---
+    var isRecording by mutableStateOf(false)
+        private set
+    var isTranscribing by mutableStateOf(false)
+        private set
+    var speakingIndex by mutableStateOf<Int?>(null)
+        private set
+    var voiceError by mutableStateOf<String?>(null)
+        private set
+    private var voicePlayer: VoicePlayer? = null
+    // Set when a voice-originated message was sent: speak the reply once the turn is finished.
+    private var voiceReplySentAt: Long? = null
+
+    fun markRecording(value: Boolean) { isRecording = value }
+
+    fun transcribe(base64Audio: String, format: String, onText: (String) -> Unit) {
+        isTranscribing = true
+        voiceError = null
+        viewModelScope.launch {
+            try {
+                val text = repository.speechToText(base64Audio, format)
+                if (text == null) voiceError = "Didn't catch that." else onText(text)
+            } catch (exc: Exception) {
+                Logger.e("speech to text failed", exc)
+                voiceError = exc.message ?: "Speech recognition failed."
+            } finally {
+                isTranscribing = false
+            }
+        }
+    }
+
+    fun speak(context: Context, index: Int, text: String) {
+        if (speakingIndex == index) { stopSpeaking(); return }
+        stopSpeaking()
+        speakingIndex = index
+        voiceError = null
+        viewModelScope.launch {
+            try {
+                val audio = repository.textToSpeech(text)
+                val player = voicePlayer ?: VoicePlayer(context.applicationContext).also { voicePlayer = it }
+                player.play(audio) { if (speakingIndex == index) speakingIndex = null }
+            } catch (exc: Exception) {
+                Logger.e("text to speech failed", exc)
+                voiceError = exc.message ?: "Speech synthesis failed."
+                if (speakingIndex == index) speakingIndex = null
+            }
+        }
+    }
+
+    fun stopSpeaking() {
+        voicePlayer?.stop()
+        speakingIndex = null
+    }
+
+    override fun onCleared() {
+        voicePlayer?.stop()
+        super.onCleared()
+    }
 
     // Highest real (synced) index seen, so an optimistic local echo (see
     // sendMessage) can be told apart from and cleanly dropped once the
@@ -175,6 +238,7 @@ class ChatViewModel(
             optimisticMessages = optimisticMessages.filterNot { it.text in syncedTexts }
             messages = synced + optimisticMessages
             refreshStatus()
+            maybeSpeakVoiceReply(synced)
             error = null
         } catch (exc: Exception) {
             Logger.e("ChatViewModel refresh failed for tab $tabId", exc)
@@ -183,6 +247,18 @@ class ChatViewModel(
             isLoading = false
         }
     }
+
+    private fun maybeSpeakVoiceReply(synced: List<ChatMessage>) {
+        val sentAt = voiceReplySentAt ?: return
+        if (tabStatus.state != "ready") return
+        val reply = synced.filter { it.role == "assistant" && it.ts >= sentAt && it.text.isNotBlank() }
+        if (reply.isEmpty()) return
+        voiceReplySentAt = null
+        appContext?.let { speak(it, reply.last().index, reply.joinToString("\n\n") { it.text }) }
+    }
+
+    private var appContext: Context? = null
+    fun bindContext(context: Context) { appContext = context.applicationContext }
 
     /**
      * Pulls this tab's own lamp-1/status-bar source plus the one global
@@ -227,9 +303,10 @@ class ChatViewModel(
      * up to ~2x AUTO_REFRESH_INTERVAL_MS later) -- otherwise sending felt
      * like it did nothing.
      */
-    fun sendMessage(text: String, attachment: PendingAttachment?, onSent: () -> Unit) {
+    fun sendMessage(text: String, attachment: PendingAttachment?, voiceOrigin: Boolean = false, onSent: () -> Unit) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() && attachment == null) return
+        if (voiceOrigin) voiceReplySentAt = System.currentTimeMillis()
         isSending = true
         sendError = null
         viewModelScope.launch {

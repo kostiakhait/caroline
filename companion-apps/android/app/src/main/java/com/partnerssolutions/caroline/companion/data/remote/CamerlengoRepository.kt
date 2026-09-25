@@ -75,6 +75,24 @@ class CamerlengoRepository(private val api: CamerlengoApi = CamerlengoModule.api
         }
     }
 
+    /** Speech to text through Caroline's `ai:stt` -- same call the desktop makes. Null if nothing was recognized. */
+    suspend fun speechToText(base64Audio: String, format: String): String? = withSession { session ->
+        val response = api.call(
+            VarCommandRequest(command = "ai:stt", key = CAROLINE_AI_SERVICE_KEY, session = session, audio = base64Audio, format = format),
+        )
+        if (!response.ok) throw CamerlengoException(response.reason ?: "ai:stt failed")
+        response.result?.takeIf { it.isNotBlank() }
+    }
+
+    /** Text to speech through `ai:tts`; returns base64 MP3. */
+    suspend fun textToSpeech(text: String, voice: String = "Nova"): String = withSession { session ->
+        val response = api.call(
+            VarCommandRequest(command = "ai:tts", key = CAROLINE_AI_SERVICE_KEY, session = session, text = text, voice = voice),
+        )
+        if (!response.ok) throw CamerlengoException(response.reason ?: "ai:tts failed")
+        response.result ?: throw CamerlengoException("ai:tts returned no audio")
+    }
+
     suspend fun getMine(path: String): Any? = withSession { session ->
         val response = api.call(VarCommandRequest(command = "var:getMine", session = session, path = path))
         if (!response.ok) {

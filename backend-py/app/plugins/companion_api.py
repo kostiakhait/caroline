@@ -785,15 +785,18 @@ async def _sync_tab_list(workspace_dir: str) -> None:
     _tab_list_published_at = time.monotonic()
 
 
-async def _drain_inbox(inject_to_tab: InjectToTab) -> None:
-    try:
-        tabs = await get_all_mine("tabs")
-    except Exception as exc:  # noqa: BLE001
-        log_event("plugin:companion", "inbox_read_failed", error=str(exc))
-        return
-    for tab_id, tab_data in (tabs.items() if isinstance(tabs, dict) else []):
-        inbox = tab_data.get("inbox") if isinstance(tab_data, dict) else None
-        if not isinstance(inbox, dict):
+async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None:
+    # One read per tab's own inbox. Reading the whole `tabs` subtree in one
+    # call stopped working once tabs/<id>/history_v2 and tabs/<id>/att/* got
+    # big (Camerlengo answers "nothing" for it -- confirmed live: phone
+    # messages sat unread in Camerlengo and never reached the desktop).
+    for tab_id in tab_ids:
+        try:
+            inbox = await get_all_mine(f"tabs/{tab_id}/inbox")
+        except Exception as exc:  # noqa: BLE001
+            log_event("plugin:companion", "inbox_read_failed", tab_id=tab_id, error=str(exc))
+            continue
+        if not isinstance(inbox, dict) or not inbox:
             continue
         for msg_id, msg in list(inbox.items()):
             text = msg.get("text") if isinstance(msg, dict) else None
@@ -819,10 +822,13 @@ async def _inbox_loop_tick(
 ) -> None:
     if not is_logged_in():
         return  # not paired to any SW account yet -- nothing to sync
+    # Phone -> desktop first: a message the user just sent must not wait
+    # behind the (slower) desktop -> phone syncs.
+    tab_ids = list(dict.fromkeys(list(get_active_tab_ids()) + [t["id"] for t in (_desktop_settings_tab_list() or [])]))
+    await _drain_inbox(inject_to_tab, tab_ids)
     await _sync_tab_list(workspace_dir)
     await _sync_history(workspace_dir, get_active_tab_ids, history_snapshot)
     await _sync_status(get_active_tab_ids, tab_status_snapshot, channel_status_snapshot)
-    await _drain_inbox(inject_to_tab)
 
 
 def start_companion_inbox_loop(

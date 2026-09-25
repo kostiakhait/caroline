@@ -36,6 +36,11 @@ data class VarCommandRequest(
     val user: String? = null,
     val password: String? = null,
     val value: Any? = null,
+    // ai:stt / ai:tts (Caroline's general-purpose SW service key + a session).
+    val audio: String? = null,
+    val format: String? = null,
+    val text: String? = null,
+    val voice: String? = null,
 )
 
 @JsonClass(generateAdapter = true)
@@ -44,6 +49,7 @@ data class VarCommandResponse(
     @Json(name = ".reason") val reason: String? = null,
     @Json(name = ".errcode") val errcode: String? = null,
     @Json(name = ".value") val value: Any? = null,
+    val result: String? = null,
     val session: String? = null,
 ) {
     val ok: Boolean get() = status == "ok"

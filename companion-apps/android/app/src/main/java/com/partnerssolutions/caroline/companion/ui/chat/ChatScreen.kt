@@ -36,6 +36,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import kotlinx.coroutines.launch
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material3.CircularProgressIndicator
@@ -98,6 +102,39 @@ fun ChatScreen(tabId: String) {
     val context = LocalContext.current
     var input by remember { mutableStateOf("") }
     var pendingAttachment by remember { mutableStateOf<PendingAttachment?>(null) }
+    // True once the input text came from speech, so the reply is spoken back.
+    var voiceOrigin by remember { mutableStateOf(false) }
+    val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+    val voiceRecorder = remember(context) { com.partnerssolutions.caroline.companion.util.VoiceRecorder(context) }
+    var recordJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var manualStop by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { viewModel.bindContext(context) }
+
+    fun startRecording() {
+        manualStop = false
+        recordJob = coroutineScope.launch {
+            viewModel.markRecording(true)
+            val audio = voiceRecorder.recordUntilStop { manualStop }
+            viewModel.markRecording(false)
+            recordJob = null
+            if (audio != null) {
+                viewModel.transcribe(audio, com.partnerssolutions.caroline.companion.util.VoiceRecorder.FORMAT) { text ->
+                    input = if (input.isBlank()) text else "$input $text"
+                    voiceOrigin = true
+                }
+            }
+        }
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startRecording()
+    }
+    fun toggleRecording() {
+        if (recordJob != null) { manualStop = true; return }
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            context, android.Manifest.permission.RECORD_AUDIO,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) startRecording() else micPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+    }
 
     // Per explicit instruction (2026-09-15): the phone must be able to send
     // real attachment bytes to the desktop too, not just receive them --
@@ -155,7 +192,13 @@ fun ChatScreen(tabId: String) {
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                     contentPadding = PaddingValues(vertical = 12.dp),
                 ) {
-                    items(viewModel.messages, key = { it.index }) { message -> MessageBubble(message) }
+                    items(viewModel.messages, key = { it.index }) { message ->
+                        MessageBubble(
+                            message,
+                            speaking = viewModel.speakingIndex == message.index,
+                            onSpeak = { viewModel.speak(context, message.index, message.text) },
+                        )
+                    }
                 }
             }
         }
@@ -163,15 +206,19 @@ fun ChatScreen(tabId: String) {
             value = input,
             onValueChange = { input = it },
             sending = viewModel.isSending,
-            error = viewModel.sendError,
+            error = viewModel.sendError ?: viewModel.voiceError,
+            recording = viewModel.isRecording,
+            transcribing = viewModel.isTranscribing,
+            onMic = ::toggleRecording,
             pendingAttachment = pendingAttachment,
             onAttach = { attachmentPicker.launch("*/*") },
             onRemoveAttachment = { pendingAttachment = null },
             onSend = {
                 val attachment = pendingAttachment
-                viewModel.sendMessage(input, attachment) {
+                viewModel.sendMessage(input, attachment, voiceOrigin) {
                     input = ""
                     pendingAttachment = null
+                    voiceOrigin = false
                 }
             },
         )
@@ -279,6 +326,9 @@ private fun InputBar(
     onValueChange: (String) -> Unit,
     sending: Boolean,
     error: String?,
+    recording: Boolean,
+    transcribing: Boolean,
+    onMic: () -> Unit,
     pendingAttachment: PendingAttachment?,
     onAttach: () -> Unit,
     onRemoveAttachment: () -> Unit,
@@ -327,6 +377,13 @@ private fun InputBar(
                 modifier = Modifier.weight(1f),
                 maxLines = 4,
             )
+            IconButton(onClick = onMic, enabled = !sending && !transcribing) {
+                when {
+                    transcribing -> CircularProgressIndicator(modifier = Modifier.padding(4.dp), strokeWidth = 2.dp)
+                    recording -> Icon(Icons.Filled.Stop, contentDescription = "Stop recording", tint = MaterialTheme.colorScheme.error)
+                    else -> Icon(Icons.Filled.Mic, contentDescription = "Voice input")
+                }
+            }
             IconButton(onClick = onSend, enabled = (value.isNotBlank() || pendingAttachment != null) && !sending) {
                 if (sending) {
                     CircularProgressIndicator(modifier = Modifier.padding(4.dp), strokeWidth = 2.dp)
@@ -339,7 +396,7 @@ private fun InputBar(
 }
 
 @Composable
-private fun MessageBubble(message: ChatMessage) {
+private fun MessageBubble(message: ChatMessage, speaking: Boolean, onSpeak: () -> Unit) {
     val isOwn = message.role == "user"
     val bubbleColor = if (isOwn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
     val textColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
@@ -380,13 +437,25 @@ private fun MessageBubble(message: ChatMessage) {
                 )
             }
         }
-        if (message.ts > 0) {
-            Text(
-                formatBubbleTimestamp(message.ts),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                modifier = Modifier.padding(top = 2.dp, start = 4.dp, end = 4.dp),
-            )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (!isOwn && message.text.isNotBlank()) {
+                IconButton(onClick = onSpeak, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        if (speaking) Icons.Filled.Stop else Icons.AutoMirrored.Filled.VolumeUp,
+                        contentDescription = if (speaking) "Stop speaking" else "Speak",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    )
+                }
+            }
+            if (message.ts > 0) {
+                Text(
+                    formatBubbleTimestamp(message.ts),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    modifier = Modifier.padding(top = 2.dp, start = 4.dp, end = 4.dp),
+                )
+            }
         }
     }
 }
