@@ -101,7 +101,7 @@ from app.engines.claude_engine import ClaudeEngine
 from app.engines.codex_engine import CodexEngine
 from app.openai_mode import build_codex_options, openai_available
 from app.transcript_rotate import rotate_transcript
-from app.history import _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
+from app.history import _ATTACHMENT_NOTE_PREFIXES, _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -515,6 +515,18 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     re.compile(r"^This session is being continued from a previous conversation", re.IGNORECASE),
 ]
 
+# Bug fix (2026-09-25), confirmed live: Caroline's own auto-generated attachment
+# note ("[This image is also saved at <path> -- use that path...]", always English --
+# see chat_session.py's _save_attachment_to_uploads) is already recognized as
+# not-the-user's-own-words by history.py's _extract_attachment_note (used to keep it
+# out of the rendered chat transcript), but this module's OWN "is this real user
+# text" check never knew about it -- so it sailed straight into
+# refresh_language_in_background's sample as if Konstantin had typed it, and a
+# Russian tab's most recent "real" user line turned out to be this English
+# boilerplate, contributing to persisting the wrong language for the whole tab.
+# Same list, same judgment, both places now.
+_ATTACHMENT_NOTE_PREFIX_TUPLE = tuple(_ATTACHMENT_NOTE_PREFIXES)
+
 
 # Bug fix (2026-09-10): the patterns below are a blocklist of specific known
 # nudge wordings -- confirmed live tonight this keeps missing new synthetic
@@ -568,6 +580,8 @@ def _is_synthetic_history_text(raw_text: str) -> bool:
     if not text:
         return True
     if text.startswith(_SYNTHETIC_TURN_MARKER):
+        return True
+    if text.startswith(_ATTACHMENT_NOTE_PREFIX_TUPLE):
         return True
     return any(p.match(text) for p in _SYNTHETIC_HISTORY_TEXT_PATTERNS)
 

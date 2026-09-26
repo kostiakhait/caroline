@@ -82,6 +82,31 @@ async def detect_language(text: str) -> str | None:
     return iso if iso and iso != "unknown" else None
 
 
+# Bug fix (2026-09-25), confirmed live: a bare-name reply is only a prompt
+# ASK, not a guarantee -- caught two real corruptions this let through
+# unfiltered: one tab's persisted language was the model's whole chain of
+# reasoning ("To determine the language, let's analyze the given user
+# message: \"...\"\n\nThe language is English"), and a SEPARATE tab flipped
+# to a flatly wrong "English" with no way to tell whether that was a genuine
+# (if mistaken) one-word verdict or the same kind of leak by coincidence.
+# Both values get fed straight into live prompts as {language} (see
+# chat_session.py's STARTUP_GREETING_NUDGE_TEMPLATE/translate_text), so
+# saving anything but a short bare name poisons real conversation turns, not
+# just this cache. Per explicit instruction (2026-09-25): the prompt above now
+# demands exactly ONE capitalized English word ("Russian", "English",
+# "Spanish", ...), matching the same single-token discipline detect_language()
+# above already gets for free from Camerlengo's own ai:detectLanguage (a
+# dedicated, narrowly-scoped command) -- ai:resolve is the general-purpose one
+# and has no such built-in contract, so it has to be enforced here instead.
+# A prompt instruction is still only an ASK, not a guarantee -- reject
+# anything that isn't literally that one word instead of trusting compliance.
+_LANGUAGE_NAME_WORD = re.compile(r"^[A-Z][A-Za-z'-]{1,29}$")
+
+
+def _looks_like_a_language_name(name: str) -> bool:
+    return bool(_LANGUAGE_NAME_WORD.match(name))
+
+
 async def resolve_user_language(recent_text: str, session: str | None = None) -> str | None:
     """Redesign (2026-09-09, see the resolve-based-language-detection plan):
     determines what language the USER (not Caroline) is writing in, via
@@ -93,9 +118,15 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     refresh_language_in_background, never awaited synchronously in a
     user-facing path."""
     prompt = (
-        "Determine what language the USER is writing in, based on their most recent messages below (ignore any "
-        "assistant/system text mixed in -- focus only on the user's own words). Reply with ONLY the language's "
-        'English name (e.g. "Russian", "Spanish", "English") and nothing else -- no punctuation, no explanation.\n\n'
+        "Below are the user's most recent messages (ignore any assistant/system text mixed in -- focus only on "
+        "the user's own words). These messages can be a mix of languages, including short fragments or stray "
+        "boilerplate in a different language than the user actually speaks -- determine which language is "
+        "PREDOMINANTLY used, i.e. which language makes up the MAJORITY of this text overall, not just whichever "
+        "language the last fragment happens to be in. Your ENTIRE reply must be a SINGLE WORD: that predominant "
+        "language's own English name, capitalized, e.g. \"Russian\", \"English\", \"Spanish\", \"German\", "
+        "\"French\", \"Ukrainian\" -- nothing before or after it: no punctuation, no quotes, no sentence, no "
+        "explanation, no reasoning. Not a full name like \"Brazilian Portuguese\" -- the single base word "
+        '("Portuguese") is enough.\n\n'
         f"{recent_text}"
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
@@ -110,7 +141,12 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
         log_event("plugin:voice", "resolve_user_language_bad_response", status=data.get(".status"), reason=data.get(".reason"))
         return None
     name = data["result"].strip()
-    return name or None
+    if not name:
+        return None
+    if not _looks_like_a_language_name(name):
+        log_event("plugin:voice", "resolve_user_language_implausible_result", raw_len=len(name), raw_preview=name[:120])
+        return None
+    return name
 
 
 def _gender_agreement_clause(gender: str | None) -> str:
