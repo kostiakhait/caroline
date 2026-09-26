@@ -3676,6 +3676,26 @@ class ChatSession:
             "engine", "handle_failure_entered", tab_id=self.tab_id, hang_count=self.hang_count,
             turn_pending=self.turn_pending, error=str(exc), error_chain=_format_exception_chain(exc),
         )
+        # Bug fix (2026-09-26), per explicit instruction ("Таймер надо сбрасывать каждый
+        # раз. Никогда не сдаваться" -- reset the ceiling's clock on every reconnect,
+        # never give up outright): turn_pending_since (see its own property-setter
+        # comment) only used to reset on a fresh USER turn, never across a reconnect
+        # WITHIN the same still-pending turn -- so once HANG_ABSOLUTE_CEILING_MS tripped
+        # once, turn_elapsed_s could only keep growing from then on, past_absolute_ceiling
+        # stayed permanently true for the rest of that turn, and _check_hang force-closed
+        # every subsequent reconnect again within seconds of it starting, before it ever
+        # got a real chance -- confirmed live, 2026-09-26: two tabs stuck in exactly this
+        # loop for 34+ minutes straight, hang_count climbing every ~5s, neither one able
+        # to reconnect at all. Resetting here -- right where every restart, of every
+        # cause, actually begins (see this method's own docstring note above) -- gives
+        # each fresh attempt the FULL ceiling window to prove itself stuck or not, instead
+        # of inheriting a clock that was already expired before it even started. This does
+        # NOT weaken the ceiling as a per-attempt circuit breaker (a connection that is
+        # ITSELF stuck for a full effective_timeout_s still gets force-closed, same as
+        # before) -- it only stops a series of otherwise-healthy reconnects from being
+        # punished for a stale clock from an earlier, unrelated stall.
+        if self.turn_pending:
+            self.turn_pending_since = time.monotonic()
         # See restart_engine_switch's own __init__ comment. Consumed once,
         # right here, since switch_engine_if_needed()'s force_restart() ends
         # the stream the exact same way any other disconnect does -- this is
