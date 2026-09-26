@@ -34,6 +34,19 @@ class TabsViewModel(private val repository: CamerlengoRepository = CamerlengoRep
     var error by mutableStateOf<String?>(null)
         private set
 
+    // Per explicit instruction (2026-09-26), after a real glitch: the very
+    // FIRST poll on cold start can lose a one-off race against the process's
+    // own network/DNS warmup (UnknownHostException, message like "Unable to
+    // resolve host ...") and fail on its own -- before the 2026-09-16 fix
+    // below even applies, since tabs is still empty at that point. That
+    // surfaced a scary full-screen error for ~3s, immediately followed by
+    // normal content once the next poll succeeded. One early failure while
+    // tabs is still empty is now tolerated silently (falls through to the
+    // plain "No tabs yet" branch instead) -- only two in a row surfaces the
+    // real error screen, same "don't tear down the UI over one flaky tick"
+    // reasoning as below, just extended to the empty-list case too.
+    private var consecutiveEmptyLoadFailures = 0
+
     init {
         viewModelScope.launch {
             while (isActive) {
@@ -57,6 +70,7 @@ class TabsViewModel(private val repository: CamerlengoRepository = CamerlengoRep
                 TabInfo(id, name)
             } ?: emptyList()
             error = null
+            consecutiveEmptyLoadFailures = 0
         } catch (exc: Exception) {
             Logger.e("TabsViewModel refresh failed", exc)
             // Bug fix (2026-09-16), confirmed live: this used to
@@ -78,7 +92,10 @@ class TabsViewModel(private val repository: CamerlengoRepository = CamerlengoRep
             // Only surface the error screen when there's nothing to fall
             // back to yet (the very first load).
             if (tabs.isEmpty()) {
-                error = exc.message ?: "Couldn't load tabs."
+                consecutiveEmptyLoadFailures++
+                if (consecutiveEmptyLoadFailures >= 2) {
+                    error = exc.message ?: "Couldn't load tabs."
+                }
             }
         } finally {
             isLoading = false
