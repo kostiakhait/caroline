@@ -22,7 +22,6 @@ from app.plugins.loader import Plugin, PluginTool
 from app.plugins.office_editor import OfficeEditorError, prepare_office_edit_session
 from app.policies import close_windows_after_task_instruction, read_content_not_headers_instruction
 from app.session_context import get_send, get_tab_id
-from app.sw_gate import require_sw_or_prompt
 from app.window_registry import register_window, unregister_window
 
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -54,9 +53,13 @@ async def open_in_viewer(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     send = get_send()
 
     if kind == "document":
-        gate = await require_sw_or_prompt(send)
-        if not gate.ok:
-            return {"text": gate.message, "is_error": True}
+        # Per explicit instruction (2026-09-26): this used to gate on
+        # require_sw_or_prompt (SquirrelWisdom login) before even trying --
+        # removed once tracing prepare_office_edit_session down into
+        # reforce's own source (see that function's docstring) confirmed
+        # none of the calls it makes actually require a logged-in session
+        # server-side. OfficeEditorError below still surfaces a real
+        # failure (e.g. reforce itself unreachable) plainly to the model.
         try:
             config, remote_path = await prepare_office_edit_session(path)
         except OfficeEditorError as exc:
@@ -90,9 +93,9 @@ PLUGIN = Plugin(
             "open_in_viewer",
             "Open a local image, video, or document in Caroline's own floating viewer window (separate from "
             "the chat). Images/video just display; documents (docx/xlsx/pptx/pdf) open for real editing via "
-            "an embedded OnlyOffice editor -- this requires the user to be logged into SquirrelWisdom and a "
-            "working internet connection, since the document is briefly uploaded there to be edited and "
-            "synced back. Returns immediately -- it does not wait for them to finish, since that could take "
+            "an embedded OnlyOffice editor -- this requires a working internet connection, since the document "
+            "is briefly uploaded to a throwaway temp path to be edited and synced back (no SquirrelWisdom "
+            "login needed). Returns immediately -- it does not wait for them to finish, since that could take "
             "a while. purpose is a short note on why you're opening it (e.g. \"showing the user the generated "
             "invoice\") -- recorded so list_my_windows can later tell you (or the user) what this window is "
             "for and why it's still open.",

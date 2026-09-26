@@ -21,7 +21,7 @@ from typing import Any
 
 from app.logging_setup import log_event
 from app.plugins.notes_api import APP_KEY as SQUIRRELWISDOM_APP_KEY
-from app.plugins.notes_api import _post_json, load_credentials, verify_password
+from app.plugins.notes_api import _post_json
 
 V2_DOCUMENT_KEY = "m83G0G1mvtfT8gIMecDJY8oUaisIMiyfcgH2gvbDvzU"
 SQUIRRELWISDOM_ORIGIN = "https://www.squirrelwisdom.com"
@@ -33,15 +33,25 @@ class OfficeEditorError(Exception):
     pass
 
 
-async def _get_session() -> str:
-    creds = load_credentials()
-    if not creds:
-        raise OfficeEditorError("Not logged in to SquirrelWisdom.")
-    return await verify_password(creds["email"], creds["password"])
-
-
 async def prepare_office_edit_session(local_path: str) -> tuple[dict[str, Any], str]:
-    session = await _get_session()
+    """Per explicit instruction (2026-09-26), after tracing why open_in_viewer
+    required a SquirrelWisdom login at all: it never actually needed one.
+    This used to call a _get_session() helper that raised OfficeEditorError
+    ("Not logged in to SquirrelWisdom") when no local credentials existed,
+    then attached the resulting session to every request below. Read
+    against reforce's own source (d:\\REPO\\reforce): the legacy "write"/
+    "read"/"delete" commands are authorized by `checkAPIKey` alone
+    (Commands.py:507) -- `session` is logged (Commands.py:499-501) but
+    never validated, and `_check_chat_membership` (FileCommands.py) only
+    even looks at session for chats/{group_id}/... paths, never
+    caroline_docs/... ones. The v2 "document:openForEdit" command is
+    registered `auth="scope"` (Api2DocumentCommands.py + Api2Dispatcher.py
+    process()), which checks only the `key` field via Api2Auth.resolve_key
+    -- `session` isn't read at all in that code path either. So the login
+    requirement was a Caroline-side habit, not a server-side boundary: the
+    real (and only) access control on these temp copies is the long random
+    path component below, same model Notes' own short-lived preview temp
+    files already use. Session removed from all four calls in this module."""
     path = Path(local_path)
     ext = path.suffix.lstrip(".").lower()
     # Long random component is the only access control on this temp copy,
@@ -52,7 +62,7 @@ async def prepare_office_edit_session(local_path: str) -> tuple[dict[str, Any], 
     log_event("plugin:office-editor", "prepare_edit_session_start", local_path=local_path, remote_path=remote_path)
 
     content_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    write_res = await _post_json({".command": "write", "key": SQUIRRELWISDOM_APP_KEY, "session": session, "path": remote_path, "content": content_b64})
+    write_res = await _post_json({".command": "write", "key": SQUIRRELWISDOM_APP_KEY, "path": remote_path, "content": content_b64})
     if write_res.get(".status") != "ok":
         reason = str(write_res.get(".reason") or "Upload to SquirrelWisdom failed.")
         log_event("plugin:office-editor", "upload_failed", local_path=local_path, remote_path=remote_path, error=reason)
@@ -60,7 +70,7 @@ async def prepare_office_edit_session(local_path: str) -> tuple[dict[str, Any], 
     log_event("plugin:office-editor", "upload_done", remote_path=remote_path, bytes=len(content_b64))
 
     edit_res = await _post_json({
-        "command": "document:openForEdit", "key": V2_DOCUMENT_KEY, "session": session,
+        "command": "document:openForEdit", "key": V2_DOCUMENT_KEY,
         "path": remote_path, "title": path.name, "origin": SQUIRRELWISDOM_ORIGIN,
     })
     if edit_res.get(".status") != "ok":
@@ -85,8 +95,7 @@ _READ_STATUS_RE = re.compile(r"^ok\n=====\n([\s\S]*?)\n=====\n([\s\S]*?)\n======
 
 async def finish_office_edit_session(remote_path: str, local_path: str) -> None:
     log_event("plugin:office-editor", "finish_edit_session_start", remote_path=remote_path, local_path=local_path)
-    session = await _get_session()
-    read_res = await _post_json({".command": "read", "key": SQUIRRELWISDOM_APP_KEY, "session": session, "path": remote_path})
+    read_res = await _post_json({".command": "read", "key": SQUIRRELWISDOM_APP_KEY, "path": remote_path})
     status = read_res.get(".status")
     match = _READ_STATUS_RE.match(status) if isinstance(status, str) else None
     if match:
@@ -96,7 +105,7 @@ async def finish_office_edit_session(remote_path: str, local_path: str) -> None:
     else:
         log_event("plugin:office-editor", "read_back_unexpected_status", remote_path=remote_path, status=str(status)[:200])
     try:
-        await _post_json({".command": "delete", "key": SQUIRRELWISDOM_APP_KEY, "session": session, "path": remote_path})
+        await _post_json({".command": "delete", "key": SQUIRRELWISDOM_APP_KEY, "path": remote_path})
         log_event("plugin:office-editor", "temp_copy_deleted", remote_path=remote_path)
     except Exception as exc:
         log_event("plugin:office-editor", "temp_copy_delete_failed", remote_path=remote_path, error=str(exc))
