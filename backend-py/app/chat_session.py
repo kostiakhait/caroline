@@ -118,7 +118,7 @@ from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
 from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
-from app.persona import get_persona, persona_system_prompt_append
+from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app import agent_registry
 from app.agent_definitions import caroline_agents
 from app.policies import (
@@ -2191,7 +2191,7 @@ class ChatSession:
         from app.plugins.voice_api import translate_text
 
         try:
-            translated = await translate_text(text, current_language_name(self.tab_id))
+            translated = await translate_text(text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir))
         except Exception as exc:
             log_event("engine", "small_model_translate_failed", tab_id=self.tab_id, error=str(exc))
             translated = None
@@ -2960,7 +2960,7 @@ class ChatSession:
             if not text.strip():
                 continue
             try:
-                translated = await translate_text(text, language)
+                translated = await translate_text(text, language, gender=get_persona_gender(self.workspace_dir))
             except Exception as exc:
                 log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
                 continue
@@ -3079,6 +3079,7 @@ class ChatSession:
             try:
                 comment = await generate_progress_comment(
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
+                    gender=get_persona_gender(self.workspace_dir),
                 )
             except Exception as exc:
                 log_event("engine", "progress_narration_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))

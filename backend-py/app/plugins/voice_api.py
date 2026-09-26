@@ -113,7 +113,34 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name or None
 
 
-async def translate_text(text: str, language: str, session: str | None = None, timeout: float = 30.0) -> str | None:
+def _gender_agreement_clause(gender: str | None) -> str:
+    """Same grammatical-gender-agreement rule persona.py's own system-prompt
+    block states for the main session (persona_system_prompt_append) --
+    duplicated here (not imported/shared) because this module's callers are
+    a completely separate, small-model side channel (narration drafting,
+    forced translation) that never sees that system prompt at all. Without
+    this, a translated/drafted first-person line has no idea which
+    grammatical gender to use and defaults inconsistently -- confirmed live
+    (2026-09-26): the narrator kept coming out masculine in Russian despite
+    Caroline's persona being female. Returns "" (no clause at all) when
+    gender is unknown, rather than guessing."""
+    if not gender:
+        return ""
+    gender_lower = gender.lower()
+    if "female" in gender_lower:
+        examples = '"поняла" not "понял", "сказала" not "сказал", "сделала" not "сделал"'
+    elif "male" in gender_lower:
+        examples = '"понял" not "поняла", "сказал" not "сказала", "сделал" not "сделала"'
+    else:
+        return ""
+    return (
+        f" The speaker is {gender} -- in every language where verbs/adjectives inflect for the speaker's "
+        f"grammatical gender (e.g. Russian past tense), use that gender's forms consistently, e.g. {examples} "
+        "-- never mix or default to the other gender."
+    )
+
+
+async def translate_text(text: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None) -> str | None:
     """Per explicit instruction (2026-09-13): the target language for a
     generated piece of text (progress narration, today) must come from
     Caroline's own DEDICATED, already-continuously-refreshed language
@@ -161,7 +188,7 @@ async def translate_text(text: str, language: str, session: str | None = None, t
     sites (chat_session.py) -- narration passes a much shorter value, see
     generate_progress_comment's own doc comment for why."""
     prompt = (
-        f"Translate the following text into {language}. If the text is already in that language, respond with "
+        f"Translate the following text into {language}." + _gender_agreement_clause(gender) + " If the text is already in that language, respond with "
         "it unchanged (or only lightly cleaned up) -- do not refuse or explain, translation into the SAME "
         "language it's already in is a normal, valid case, not an error. Leave code blocks/inline code, file "
         "paths, URLs, and other literal technical identifiers exactly as they are -- translate only the "
@@ -506,7 +533,7 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
 
 
 async def generate_progress_comment(
-    recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0,
+    recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
@@ -643,7 +670,7 @@ async def generate_progress_comment(
     # report a language mismatch, so a forced pass is the only guarantee.
     # Falls back to the untranslated text on any failure -- a narration
     # comment in the wrong language is still better than none at all.
-    translated = await translate_text(text, language, session=session, timeout=timeout)
+    translated = await translate_text(text, language, session=session, timeout=timeout, gender=gender)
     final_text = translated or text
     if translated is None:
         log_event("plugin:voice", "generate_progress_comment_translate_failed_using_original", text=text[:300])
