@@ -54,6 +54,7 @@ from app.plugins.visual_models_plugin import (
     remove_pending_visual_model_download,
 )
 from app.visual_mode import is_visual_mode_enabled, models_dir, resolve_visual_model, set_visual_mode_enabled
+from app.local_stt import is_local_stt_available, is_local_stt_enabled, set_local_stt_enabled, transcribe_local
 from app.window_registry import unregister_window
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -623,13 +624,30 @@ async def handle_control_request(
         if not audio_b64 or not fmt:
             return {"type": "control_response", "op": op, "ok": False, "stderr": "stt requires audioBase64 and format", "requestId": request_id}
         log_event("engine", "stt_requested", request_id=request_id, format=fmt, audio_bytes=len(audio_b64))
-        try:
-            text = await transcribe_audio(audio_b64, fmt, await _sw_session_or_none())
-        except Exception as exc:
-            log_event("engine", "stt_failed", request_id=request_id, error=str(exc))
-            return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
+        text = None
+        if is_local_stt_enabled(WORKSPACE_DIR) and is_local_stt_available():
+            try:
+                text = await transcribe_local(audio_b64, fmt)
+                log_event("engine", "local_stt_used", request_id=request_id)
+            except Exception as exc:
+                log_event("engine", "local_stt_failed_falling_back_to_cloud", request_id=request_id, error=str(exc))
+        if text is None:
+            try:
+                text = await transcribe_audio(audio_b64, fmt, await _sw_session_or_none())
+            except Exception as exc:
+                log_event("engine", "stt_failed", request_id=request_id, error=str(exc))
+                return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
         log_event("engine", "stt_done", request_id=request_id, text_len=len(text))
         return {"type": "control_response", "op": op, "ok": True, "stdout": text, "requestId": request_id}
+    if op == "local_stt_get":
+        stdout = json.dumps({"enabled": is_local_stt_enabled(WORKSPACE_DIR), "available": is_local_stt_available()})
+        return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}
+    if op == "local_stt_set":
+        if not isinstance(parsed.get("enabled"), bool):
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "local_stt_set requires a boolean 'enabled'", "requestId": request_id}
+        log_event("engine", "local_stt_set", enabled=parsed["enabled"])
+        set_local_stt_enabled(WORKSPACE_DIR, parsed["enabled"])
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "tts":
         text = parsed.get("text")
         if not text:

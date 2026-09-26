@@ -135,6 +135,16 @@
       </section>
 
       <section class="settings-section">
+        <h4>Speech recognition</h4>
+        <p class="settings-hint">Voice messages are transcribed in the cloud by default. Turning this on transcribes them on this computer instead -- slightly less accurate, but works without a network round trip and keeps the audio itself local.</p>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="localSttEnabled" />
+          Transcribe voice messages locally
+        </label>
+        <div id="localSttUnavailableHint" class="settings-hint" style="display:none">Unavailable -- the local speech model wasn't installed (or was skipped, e.g. for low disk space). Voice messages still work via the cloud.</div>
+      </section>
+
+      <section class="settings-section">
         <h4>Claude account</h4>
         <p class="settings-hint">Caroline uses your own Claude subscription — no separate API key.</p>
         <div id="authStatusText" class="settings-status">Checking…</div>

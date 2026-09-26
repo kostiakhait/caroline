@@ -290,6 +290,15 @@ internal static class Program
             p => window.SetDownloadProgress("Downloading talking-head models…", p),
             ct));
 
+        // Step 4b: local speech-recognition model (~1.5GB, best-effort, unconditional --
+        // explicit instruction, 2026-09-26: ships with every install regardless of the
+        // Settings toggle, which stays off by default. See WhisperModelInstaller's own
+        // doc comment.
+        await WithStepAsync(ErrorCodes.WhisperModelInstall, "Downloading local speech-recognition model", () => WhisperModelInstaller.InstallAsync(downloader, http,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading local speech-recognition model…", p),
+            ct));
+
         window.SetStatus("Creating shortcut…");
         await WithStepAsync(ErrorCodes.ShortcutOrAutostart, "Creating the desktop shortcut", () => Task.Run(ShortcutManager.CreateDesktopShortcut, ct));
 

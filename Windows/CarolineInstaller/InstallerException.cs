@@ -48,6 +48,7 @@ internal static class ErrorCodes
     public const string Launch = "E13";
     public const string LaunchCrashed = "E14";
     public const string CodexInstall = "E16";
+    public const string WhisperModelInstall = "E17";
     /// <summary>Anything not wrapped by a specific step -- a bug, not a foreseen failure mode.</summary>
     public const string Unexpected = "E99";
 }

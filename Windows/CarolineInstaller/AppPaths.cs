@@ -62,6 +62,16 @@ internal static class AppPaths
     /// </summary>
     public static string ModelsDir => Path.Combine(Root, "art", "models");
 
+    /// <summary>
+    /// The local speech-recognition model (faster-whisper/CTranslate2,
+    /// distil-large-v3) -- same "survive AppDir's full delete+recreate on
+    /// every update" reasoning as ModelsDir above, and downloaded the same
+    /// unconditional way (see WhisperModelInstaller.cs), not gated behind
+    /// the Settings toggle that turns local STT ON: explicit instruction
+    /// (2026-09-26), "зашита в инсталлятор сразу".
+    /// </summary>
+    public static string WhisperModelDir => Path.Combine(Root, "art", "whisper-model");
+
     public static string RuntimeDir => Path.Combine(Root, "runtime");
     public static string NodeDir => Path.Combine(RuntimeDir, "node");
     public static string NodeExe => Path.Combine(NodeDir, "node.exe");

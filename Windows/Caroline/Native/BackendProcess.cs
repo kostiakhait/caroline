@@ -71,6 +71,15 @@ public sealed class BackendProcess : IDisposable
         // to a dev-relative guess only kicks in when this path doesn't actually resolve.
         psi.Environment["CAROLINE_MODELS_DIR"] = Path.Combine(AppContext.BaseDirectory, "..", "art", "models");
 
+        // Same sibling-of-AppDir reasoning again -- the optional local speech-recognition
+        // model (CarolineInstaller.AppPaths.WhisperModelDir, ~1.5GB, downloaded
+        // unconditionally at install time but only actually USED once the Settings toggle
+        // turns it on) lives at Root\art\whisper-model\. Read by app/local_stt.py; always
+        // set even if the directory/model.bin doesn't exist (dev tree, or a download that
+        // was skipped for low disk space) -- is_local_stt_available() checks for the real
+        // file, this only points at where it would be.
+        psi.Environment["CAROLINE_WHISPER_MODEL_PATH"] = Path.Combine(AppContext.BaseDirectory, "..", "art", "whisper-model");
+
         // Same sibling-of-AppDir reasoning as CAROLINE_MODELS_DIR just above -- the bundled
         // ffmpeg.exe lives at Root\runtime\ffmpeg\ffmpeg.exe (CarolineInstaller.AppPaths.FfmpegExe),
         // a fixed location regardless of which app-<hash> directory is currently active (see

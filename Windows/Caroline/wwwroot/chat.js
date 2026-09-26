@@ -172,6 +172,12 @@
     sendControl("visual_mode_set", { enabled: visualModeEnabled.checked });
   });
 
+  const localSttEnabled = document.getElementById("localSttEnabled");
+  const localSttUnavailableHint = document.getElementById("localSttUnavailableHint");
+  localSttEnabled.addEventListener("change", () => {
+    sendControl("local_stt_set", { enabled: localSttEnabled.checked });
+  });
+
   // Populated from "visual_mode_get" (settings check + startup fetch below) and
   // kept live by the "visual_mode_config" push the backend sends once at Caroline's
   // own startup (see server.ts's OutEvent doc comment) -- playOneSpeech reads this
@@ -1899,6 +1905,17 @@
         visualModeEnabled.disabled = !v.available;
         visualModeUnavailableHint.style.display = v.available ? "none" : "block";
       } catch { /* leave as-is */ }
+    } else if (evt.op === "local_stt_get") {
+      try {
+        const v = JSON.parse(evt.stdout || "{}");
+        localSttEnabled.checked = !!v.enabled;
+        // Visible but disabled when the model wasn't installed, same
+        // pattern as visual_mode_get's own available/enabled split.
+        localSttEnabled.disabled = !v.available;
+        localSttUnavailableHint.style.display = v.available ? "none" : "block";
+      } catch { /* leave as-is */ }
+    } else if (evt.op === "local_stt_set") {
+      if (!evt.ok) addBanner(`Could not change speech recognition setting: ${evt.stderr || "unknown error"}`);
     } else if (evt.op === "tts") {
       const cb = pendingTtsRequests.get(evt.requestId);
       pendingTtsRequests.delete(evt.requestId);
@@ -1971,6 +1988,7 @@
     sendControl("mcp_list");
     sendControl("persona_get");
     sendControl("visual_mode_get");
+    sendControl("local_stt_get");
     sendControl("mode_get");
     sendControl("sw_status");
     sendControl("chat_mode_get");

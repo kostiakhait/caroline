@@ -79,7 +79,20 @@ internal static class PythonInstaller
          // ничего не происходит: процессы не потребляют процессор и не
          // меняется загрузка памяти") -- the only practical way to read
          // another process's CPU/memory usage from Python on Windows.
-         "psutil"];
+         "psutil",
+         // Optional local speech-to-text (app/local_stt.py, off by default --
+         // Settings toggle), ported from d:/REPO/transcribe's own model-loading
+         // approach. faster-whisper pulls in ctranslate2/tokenizers/huggingface-hub/
+         // onnxruntime/av as its own dependencies -- not listed separately here,
+         // same as edge-tts's own transitive deps aren't. The model file itself
+         // does NOT come from here -- see WhisperModelInstaller.cs.
+         "faster-whisper",
+         // GPU acceleration for the above, auto-detected by ctranslate2 at
+         // runtime (device="auto") -- harmless, unused site-packages on a
+         // machine with no CUDA GPU, exactly like transcribe's own requirements.txt.
+         // Pinned cudnn version: ctranslate2 is built against the cuDNN 8 ABI,
+         // and cudnn 9.x on Windows hangs on the first GPU call.
+         "nvidia-cublas-cu12", "nvidia-cudnn-cu12==8.9.7.29", "nvidia-cuda-runtime-cu12"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 
@@ -108,7 +121,12 @@ internal static class PythonInstaller
     private static bool IsPackageImportable(string sitePackagesDir, string package)
     {
         if (!Directory.Exists(sitePackagesDir)) return false;
-        var normalizedPrefix = package.Replace('-', '_');
+        // Strip a "==version" pin (e.g. "nvidia-cudnn-cu12==8.9.7.29") -- dist-info
+        // directory names carry the version pip actually resolved, which isn't
+        // necessarily an exact byte-match of the pin string (pip may add local/build
+        // metadata), so this only needs the bare distribution name to glob on.
+        var bareName = package.Split("==", 2)[0];
+        var normalizedPrefix = bareName.Replace('-', '_');
         foreach (var distInfoDir in Directory.GetDirectories(sitePackagesDir, $"{normalizedPrefix}-*.dist-info"))
         {
             var topLevelPath = Path.Combine(distInfoDir, "top_level.txt");
