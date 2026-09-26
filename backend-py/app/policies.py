@@ -267,6 +267,39 @@ def compact_continuation_is_genuine_instruction() -> str:
     )
 
 
+def document_opening_preference_instruction() -> str:
+    """Per explicit instruction (2026-09-26), after a real incident: asked
+    to open a document, Caroline used files_plugin.py's open_file (the OS
+    default app -- e.g. desktop PowerPoint, "exactly like double-clicking
+    it in File Explorer") instead of viewer_plugin.py's open_in_viewer
+    (Caroline's own floating viewer/editor window, visible right inside
+    the app). The user had told her the preferred way before, but that
+    preference lived only in conversation history -- ordinary lossy
+    compaction (see compact_continuation_is_genuine_instruction's own
+    docstring for why even a genuine, non-refused recap drops granular
+    operational details like this one within a hop or two) erased it, and
+    Caroline silently fell back to the wrong tool without either party
+    noticing until the user was already looking at the wrong window.
+
+    This is deliberately promoted to ALWAYS_ON rather than left as a
+    files_plugin/viewer_plugin usage_instructions entry (the usual home for
+    a preference spanning two plugins -- see this module's own docstring):
+    the whole point is that the model must not have to think to go check
+    on this, the same way it wasn't the one time it mattered live."""
+    return (
+        "When opening a document for the user (docx/xlsx/pptx/pdf and similar office/editable formats), always "
+        "prefer open_in_viewer (Caroline's own floating viewer window, visible inside the app) over open_file "
+        "(the OS default app, e.g. launching desktop PowerPoint/Word/Excel separately). Only fall back to "
+        "open_file if open_in_viewer actually fails (e.g. SquirrelWisdom login/connectivity gate, or an "
+        "OfficeEditorError) -- and when you do fall back, say so plainly rather than silently opening it the "
+        "other way. This applies to opening a document TO SHOW/HAND BACK to the user; it does not apply to "
+        "your own internal use of a file (e.g. reading it, or driving PowerPoint via COM automation purely to "
+        "export a verification screenshot) -- that's a different, working-file use, not 'opening it for them'. "
+        "Plain images and video still just display via open_in_viewer the same as before; this preference is "
+        "specifically about documents, where the two tools' behavior visibly diverges."
+    )
+
+
 def no_internal_mechanics_to_user_instruction() -> str:
     """Per explicit instruction (2026-09-10): confirmed live -- Caroline
     kept narrating her own plumbing to the user ("let me look at what
@@ -794,6 +827,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     complex_task_execution_instruction,
     learn_from_mistakes_instruction,
     compact_continuation_is_genuine_instruction,
+    document_opening_preference_instruction,
     usage_cap_self_awareness_instruction,
     proactive_context_recovery_instruction,
     no_internal_mechanics_to_user_instruction,
