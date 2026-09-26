@@ -977,6 +977,20 @@ def _recent_24h_dialogue_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"recent-24h-dialogue-{_sanitize_tab_id(tab_id)}.txt"
 
 
+def _write_system_prompt_file(workspace_dir: str, tab_id: str, text: str) -> str:
+    """Writes this tab's composed system-prompt append to a file the CLI reads via
+    --append-system-prompt-file (see the call site for why it is not on the command line).
+    Rewritten on every query() build -- the text carries per-query parts (language hint,
+    continuity pointer). Written atomically (temp file + replace): a restart storm can start
+    a new CLI while an older build of the file is still being read."""
+    path = Path(workspace_dir) / f"system-prompt-{_sanitize_tab_id(tab_id)}.md"
+    tmp = path.with_suffix(f".md.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8", newline="")
+    os.replace(tmp, path)
+    log_event("engine", "system_prompt_file_written", tab_id=tab_id, chars=len(text))
+    return str(path)
+
+
 def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspace_dir: str) -> str:
     """Per explicit instruction (2026-09-14): see recent_dialogue_history_
     instruction's own docstring (policies.py) for the full feature this
@@ -3654,8 +3668,17 @@ class ChatSession:
         try:
             if self.client:
                 await self.client.interrupt()
+            else:
+                self.hang_interrupt_result_pending = False
         except Exception as exc:
             log_event("engine", "hang_soft_interrupt_failed", tab_id=self.tab_id, error=str(exc))
+            # Bug fix (2026-09-26): the flag above is set BEFORE the await on purpose (the aborted turn's
+            # courtesy ResultMessage can arrive before interrupt() itself returns), but when the interrupt
+            # never reached the CLI (confirmed live: "Not connected. Call connect() first." while the
+            # session was mid-restart) no courtesy result is coming -- leaving the flag set would make the
+            # NEXT real answer look like one and get silently swallowed, the exact failure the comment
+            # above describes. Undo it.
+            self.hang_interrupt_result_pending = False
         # Same reasoning as stop()'s own fix -- a hang is plausibly caused
         # by exactly a detached background operation that never completes/
         # never gets polled again, so cancel this tab's in-flight
@@ -4023,8 +4046,20 @@ class ChatSession:
                 claude_model = get_model_override(self.workspace_dir, "claude")
                 if claude_model:
                     options_kwargs["model"] = claude_model
-                if system_prompt_append:
-                    options_kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code", "append": system_prompt_append}
+                if system_prompt_append and self.engine_kind != "openai":
+                    # Bug fix (2026-09-26), per explicit decision: the composed prompt used to go on the
+                    # claude.exe COMMAND LINE (--append-system-prompt <text>). Windows caps a command line at
+                    # 32767 chars; with ALWAYS_ON at ~19.7K the tabs that carry a continuity pointer (2 and 4)
+                    # reached 33115 -> CreateProcess failed with WinError 206, which the SDK misreports as
+                    # "Claude Code not found at ...claude.exe" (the file was there the whole time) -- both tabs
+                    # sat in "Trouble reconnecting" and never started (confirmed live, 2026-09-26), and tabs 1/3
+                    # were 716 chars from the same fate. A FILE has no such limit, and the CLI reads the same
+                    # text from it (--append-system-prompt-file), so nothing in the prompt is trimmed or
+                    # changed. system_prompt stays the bare claude_code preset (NOT None: the SDK turns None
+                    # into --system-prompt "", which would blank the base prompt).
+                    prompt_file = _write_system_prompt_file(self.workspace_dir, self.tab_id, system_prompt_append)
+                    options_kwargs["extra_args"] = {**options_kwargs["extra_args"], "append-system-prompt-file": prompt_file}
+                    options_kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code"}
                 query_started_at = time.monotonic()
                 log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=self.current_chat_source, engine=self.engine_kind)
                 if self.engine_kind == "openai":
