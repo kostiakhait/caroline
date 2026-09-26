@@ -31,6 +31,10 @@ from claude_agent_sdk import (
 
 from app.engines.codex_rpc import CodexRpcClient, CodexRpcError, build_env, codex_argv
 from app.logging_setup import log_event
+from app.session_context import (
+    get_cli_pid_sink, get_inject_proactive, get_send, get_tab_id,
+    set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id,
+)
 
 _END = object()
 INIT_TIMEOUT_S = 60.0
@@ -95,8 +99,34 @@ class ToolBridge:
         self._close_requested = asyncio.Event()
         self._closed = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # Captured by open() -- see its own comment -- and re-applied by call() on
+        # every dispatch, instead of trusting whatever the caller's ambient context
+        # happens to be at that moment.
+        self._send: Any = None
+        self._tab_id: str | None = None
+        self._inject_proactive: Any = None
+        self._cli_pid_sink: Any = None
 
     async def open(self) -> None:
+        # Bug fix (2026-09-26), confirmed live: open_in_viewer failed mid-session with
+        # "No active session send() context -- this tool must be called from within a
+        # live ChatSession turn", even though this same tool had worked moments earlier
+        # on the Claude engine in the SAME tab. Confirmed by a real in-process test
+        # (test_codex_toolbridge_context.py): an in-process mcp Client/server session's
+        # tool handler actually runs on whatever task calls session.call_tool() --
+        # i.e. on call()'s OWN caller, not on _run()'s persistent task -- so this class
+        # cannot rely on _run() alone to fix a handler's ambient contextvars, and
+        # equally cannot rely on whatever the CALLER's context happens to be at call()
+        # time, since that's exactly what a Codex reconnect mid-session can leave
+        # broken. Capture send/tab_id/etc. explicitly here -- this call site (open(),
+        # awaited straight from CodexEngine.connect(), itself awaited straight from
+        # chat_session.py's _run_loop) is always correct at the moment it runs -- and
+        # have call() re-assert them on ITS OWN context right before every dispatch,
+        # instead of depending on however the ambient context happened to get there.
+        self._send = get_send()
+        self._tab_id = get_tab_id()
+        self._inject_proactive = get_inject_proactive()
+        self._cli_pid_sink = get_cli_pid_sink()
         ready = asyncio.Event()
         error: list[BaseException] = []
         self._task = asyncio.ensure_future(self._run(ready, error))
@@ -138,6 +168,14 @@ class ToolBridge:
         if route is None:
             return {"success": False, "contentItems": [{"type": "inputText", "text": f"Unknown tool: {dynamic_name}"}]}
         server_name, tool_name = route
+        # See open()'s own comment -- re-assert the values captured there on THIS
+        # task (whichever one is actually calling right now) rather than trusting
+        # whatever this task's ambient context happens to already hold, since the
+        # in-process handler runs inline on this same call, not on _run()'s task.
+        set_send(self._send)
+        set_tab_id(self._tab_id)
+        set_inject_proactive(self._inject_proactive)
+        set_cli_pid_sink(self._cli_pid_sink)
         result = await self._sessions[server_name].call_tool(tool_name, arguments if isinstance(arguments, dict) else {})
         items: list[dict[str, Any]] = []
         for block in result.content:

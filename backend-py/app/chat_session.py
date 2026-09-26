@@ -513,6 +513,17 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     # how many real Russian messages the user actually sent, since this
     # gets re-added on every single resume.
     re.compile(r"^This session is being continued from a previous conversation", re.IGNORECASE),
+    # Bug fix (2026-09-26), confirmed live: same shape as the auto-compaction preamble
+    # above -- the underlying Claude Code CLI's own native `/loop` autonomous-check
+    # feature resubmits this fixed English instructional prompt as a genuine role="user"
+    # turn every time a scheduled wakeup fires, completely independent of Caroline's own
+    # submit()/inject_proactive() (so _SYNTHETIC_TURN_MARKER never tags it either).
+    # Confirmed live as the actual cause of a real incident: tab 1's last-5-real-user-
+    # lines sample held two 7822-char copies of this English prompt against 185 total
+    # characters of the user's own (furious) Russian messages, and the "majority
+    # language" resolver correctly, faithfully picked English -- the sample itself was
+    # the bug, not the resolver.
+    re.compile(r"^# /loop — autonomous default with dynamic pacing", re.IGNORECASE),
 ]
 
 # Bug fix (2026-09-25), confirmed live: Caroline's own auto-generated attachment

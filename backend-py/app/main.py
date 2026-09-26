@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import webbrowser
 import mimetypes
 import os
@@ -298,25 +299,38 @@ def primary_session() -> ChatSession | None:
     return sessions.get(PRIMARY_TAB_ID)
 
 
+# Bug fix (2026-09-26), per explicit instruction ("категорически хардкод
+# любых списков" -- a standing, repeated instruction): the original recovery
+# below only tried a fixed list of four well-known folder names (Downloads/
+# Desktop/Documents/Pictures) and silently failed for anything else --
+# confirmed live as a real, recurring incident: a generated logo the model
+# referenced as "assets/../../../../AppData/Local/Temp/otf_rfp_shots/icons/
+# tf38_logo_carrier.png" rendered as a broken-image placeholder because
+# "AppData" isn't Downloads/Desktop/Documents/Pictures. This never needed a
+# list at all: every real case (confirmed both live incidents) is the SAME
+# shape -- the model tries to fake a relative assets/ reference and prefixes
+# the real path with "assets/" plus enough "../" to walk back up to some
+# ancestor, but the file was always really a descendant of the user's own
+# home directory. Strip that "assets/(../)+" prefix and resolve the
+# remainder against Path.home() directly -- covers Downloads/Desktop/
+# Documents/Pictures/AppData/anything else under the user's profile, with
+# nothing to keep adding to as new cases turn up.
+_MANGLED_ASSETS_PREFIX_RE = re.compile(r"^assets/(?:\.\./)+")
+
+
 def _recover_mangled_local_path(path: str) -> Path | None:
     """Best-effort recovery for a path the model garbled while trying to
     fake an assets/ reference (see chat.js's own doc comment on this exact
     live incident: "assets/../../../../Downloads/fig3_coaxial.png") -- a
-    string like that never resolves as a literal relative OR absolute
-    path from any base, but the real file (confirmed live) was sitting
-    exactly where the trailing segment says: the user's own Downloads
-    folder. If a well-known Windows user folder name appears anywhere in
-    the string, retry using everything from that folder name onward,
-    resolved against the current user's home directory."""
+    string like that never resolves as a literal relative OR absolute path
+    from any base, but the real file (confirmed live, twice now) was always
+    really sitting under the user's own home directory."""
     normalized = path.replace("\\", "/")
-    for folder in ("Downloads", "Desktop", "Documents", "Pictures"):
-        idx = normalized.find(f"{folder}/")
-        if idx == -1:
-            continue
-        candidate = Path.home() / normalized[idx:]
-        if candidate.is_file():
-            return candidate
-    return None
+    remainder = _MANGLED_ASSETS_PREFIX_RE.sub("", normalized)
+    if remainder == normalized:
+        return None
+    candidate = Path.home() / remainder
+    return candidate if candidate.is_file() else None
 
 
 @app.get("/api/local-file")
