@@ -101,7 +101,7 @@ from app.engines.claude_engine import ClaudeEngine
 from app.engines.codex_engine import CodexEngine
 from app.openai_mode import build_codex_options, openai_available
 from app.transcript_rotate import rotate_transcript
-from app.history import _ATTACHMENT_NOTE_PREFIXES, _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
+from app.history import ATTACHMENT_NOTE_MARKER, _ATTACHMENT_NOTE_PREFIXES, _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -536,7 +536,14 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
 # Russian tab's most recent "real" user line turned out to be this English
 # boilerplate, contributing to persisting the wrong language for the whole tab.
 # Same list, same judgment, both places now.
-_ATTACHMENT_NOTE_PREFIX_TUPLE = tuple(_ATTACHMENT_NOTE_PREFIXES)
+_ATTACHMENT_NOTE_PREFIX_TUPLE = tuple(_ATTACHMENT_NOTE_PREFIXES) + (
+    # Bridge only (2026-09-26), same convention as the "Reminder due" pair above: the
+    # extracted-PDF-text note wasn't in history.py's list, and entries already on disk
+    # from before history.ATTACHMENT_NOTE_MARKER existed carry no marker (confirmed live: a
+    # 22K-char one sat in a Russian tab's language sample). New notes are covered
+    # structurally by the marker; delete this once no such entry is recent enough to matter.
+    "[Attached PDF",
+)
 
 
 # Bug fix (2026-09-10): the patterns below are a blocklist of specific known
@@ -735,7 +742,7 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
             {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": attachment["dataBase64"]}},
             {
                 "type": "text",
-                "text": f"[This image is also saved at {saved_path} -- use that path (e.g. to copy/move it somewhere "
+                "text": f"{ATTACHMENT_NOTE_MARKER}[This image is also saved at {saved_path} -- use that path (e.g. to copy/move it somewhere "
                 "permanent) instead of reading backend-internal files like pending-turn-*.json for attachment "
                 "bytes; those are ephemeral crash-recovery state, get overwritten by the next message, and are "
                 "not a reliable way to retrieve what you were just sent.]",
@@ -760,7 +767,7 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
         except Exception as exc:
             return [{
                 "type": "text",
-                "text": f"[Attached PDF saved to {saved_path} -- could not extract its page text ({exc}); "
+                "text": f"{ATTACHMENT_NOTE_MARKER}[Attached PDF saved to {saved_path} -- could not extract its page text ({exc}); "
                 f"use read_document_pages(path=\"{saved_path}\") if you need its content.]",
             }]
         included: list[str] = []
@@ -772,7 +779,7 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
             included.append(block)
             included_chars += len(block)
         header = (
-            f"[Attached PDF, {total_pages} page(s), also saved at {saved_path} -- parsed page-by-page, "
+            f"{ATTACHMENT_NOTE_MARKER}[Attached PDF, {total_pages} page(s), also saved at {saved_path} -- parsed page-by-page, "
             "text only, never sent to you as raw document bytes.]"
         )
         if len(included) < total_pages:
@@ -784,7 +791,7 @@ def _attachment_to_blocks(attachment: dict[str, Any]) -> list[dict[str, Any]]:
             )
         return [{"type": "text", "text": header + "\n\n" + "\n\n".join(included)}]
     saved_path = _save_attachment_to_uploads(attachment)
-    return [{"type": "text", "text": f"[Attached file saved to {saved_path} -- read it if relevant to the request.]"}]
+    return [{"type": "text", "text": f"{ATTACHMENT_NOTE_MARKER}[Attached file saved to {saved_path} -- read it if relevant to the request.]"}]
 
 
 def _usable_dialogue_lines(entries: list[dict[str, Any]], min_ts_ms: float | None = None) -> list[str]:

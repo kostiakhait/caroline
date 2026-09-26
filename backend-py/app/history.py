@@ -23,6 +23,20 @@ _ATTACHMENT_NOTE_PREFIXES = [
     "[Attached file saved to ",
 ]
 
+# Bug fix (2026-09-26), confirmed live: Caroline's own auto-generated attachment notes
+# ("[Attached PDF, 6 page(s)... <22K chars of extracted text>", "[This image is also saved
+# at ...]", ...) were read back as if the user had typed them, and one English 22K-char
+# PDF dump outweighed ~300 chars of the user's real Russian in language detection. A
+# prefix list per note shape kept missing the next shape, so chat_session.py's
+# _attachment_to_blocks now tags EVERY note block it generates with this marker at the
+# single place that creates them, and _extract_text_and_attachments -- the one choke point
+# every history/dialogue reader goes through -- drops any marked block from the user's
+# text. A note shape added later is covered automatically. U+2063 (invisible separator),
+# same convention as chat_session.py's _SYNTHETIC_TURN_MARKER.
+ATTACHMENT_NOTE_MARKER = "\u2063[[caroline-attachment-note]]\u2063"
+
+_SAVED_PATH_RE = re.compile(r"saved (?:to|at) (.+?)(?: -- |\]|$)")
+
 _UUID_PREFIX_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-", re.IGNORECASE,
 )
@@ -40,6 +54,7 @@ def _sanitize_project_dir_name(path: str) -> str:
 
 
 def _extract_attachment_note(block_text: str) -> dict[str, str] | None:
+    block_text = block_text.removeprefix(ATTACHMENT_NOTE_MARKER)
     for prefix in _ATTACHMENT_NOTE_PREFIXES:
         if not block_text.startswith(prefix):
             continue
@@ -82,6 +97,15 @@ def _extract_text_and_attachments(content: Any) -> tuple[str, list[dict[str, str
         note = _extract_attachment_note(b["text"])
         if note:
             attachments.append(note)
+        elif b["text"].startswith(ATTACHMENT_NOTE_MARKER):
+            # A marked note whose shape has no entry in _ATTACHMENT_NOTE_PREFIXES (e.g. the
+            # extracted-PDF-text note): never the user's own words, so never text -- keep
+            # the file itself as an attachment when its saved path can be read out of it.
+            m = _SAVED_PATH_RE.search(b["text"][:600])
+            if m:
+                saved_path = m.group(1).strip()
+                base = re.split(r"[\\/]", saved_path)[-1] or saved_path
+                attachments.append({"name": _UUID_PREFIX_RE.sub("", base), "path": saved_path})
         else:
             text_parts.append(b["text"])
     return "\n\n".join(text_parts), attachments
