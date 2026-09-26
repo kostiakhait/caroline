@@ -60,6 +60,21 @@ fun CompanionSetupScreen(onBack: () -> Unit) {
         CompanionPrefs.enabled = true
         CompanionOpsService.start(context)
         enabled = true
+        // Ask the user to exempt this app from battery optimization so the
+        // service survives aggressive OEM power managers (Xiaomi/Huawei/
+        // Samsung, etc.) -- same fix Ratatosk's own always-on sync service
+        // already needed. A system dialog the user can decline; the service
+        // still runs without this, just less reliably on those ROMs (see
+        // CompanionOpsService's own onTaskRemoved/BootReceiver fallbacks).
+        val powerManager = context.getSystemService(android.os.PowerManager::class.java)
+        if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == false) {
+            context.startActivity(
+                android.content.Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:${context.packageName}"),
+                ),
+            )
+        }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->

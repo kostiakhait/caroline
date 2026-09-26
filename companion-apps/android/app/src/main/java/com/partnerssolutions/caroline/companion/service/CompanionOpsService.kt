@@ -47,6 +47,21 @@ import kotlinx.coroutines.launch
  * also periodically writes its own devices/<deviceId>/info heartbeat
  * (phone number + last-seen time) -- companion_api.py's device registry
  * on the backend reads that to know what's paired and how to address it.
+ *
+ * Resilience strategy (ported from Ratatosk's ChatSyncService, the same
+ * problem solved before -- explicit instruction, 2026-09-26: "нет
+ * постоянной иконки сервиса, следовательно нет и постоянно работающего
+ * сервиса", confirmed live -- this service WAS running, but
+ * IMPORTANCE_MIN made its notification -- and the status-bar icon that's
+ * the user's only visible proof it's running -- invisible on at least some
+ * OEM skins, which read as "the service isn't there at all"):
+ *   1. START_STICKY -- Android re-creates the service after a system-pressure kill.
+ *   2. onTaskRemoved + AlarmManager -- schedules an explicit restart 5s after
+ *      the user swipes the app away, bypassing OEM battery optimizers that
+ *      ignore START_STICKY (common on Xiaomi/Huawei/Samsung).
+ *   3. BootReceiver (separate file) -- restarts after reboot / package replace.
+ *   4. Battery-optimization exemption prompt (CompanionSetupScreen, when the
+ *      user turns the feature on) -- reduces the odds of #2 being needed at all.
  */
 class CompanionOpsService : Service() {
 
@@ -68,6 +83,27 @@ class CompanionOpsService : Service() {
         Logger.i("CompanionOpsService started (deviceId=${CompanionPrefs.deviceId})")
         scope.launch { pollLoop() }
         return START_STICKY
+    }
+
+    // Called when the user swipes the app away from recents. On many OEM ROMs
+    // START_STICKY is ignored after this event; AlarmManager provides a
+    // guaranteed fallback restart (ported from Ratatosk's own fix for the
+    // exact same problem).
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (CompanionPrefs.enabled) {
+            val restartIntent = Intent(applicationContext, ServiceRestartReceiver::class.java).apply { setPackage(packageName) }
+            val pi = PendingIntent.getBroadcast(
+                applicationContext, 1, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            getSystemService(android.app.AlarmManager::class.java).set(
+                android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                android.os.SystemClock.elapsedRealtime() + 5_000L,
+                pi,
+            )
+            Logger.i("CompanionOpsService.onTaskRemoved: restart scheduled in 5s")
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
@@ -204,9 +240,20 @@ class CompanionOpsService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        // IMPORTANCE_LOW + ongoing = persistent but silent status-bar icon (no heads-up
+        // popup, no sound) -- IMPORTANCE_MIN (the previous setting) goes further and
+        // suppresses the status-bar icon entirely on at least some OEM skins, which is
+        // indistinguishable from "the service isn't running" to the user. Channel
+        // importance is user/system-owned once created and never changes after the
+        // fact, so CHANNEL_ID also had to change (same fix Ratatosk's own
+        // chat_sync_v2 channel made) -- an install that already created the old
+        // "companion_ops" channel at MIN would otherwise stay stuck there forever.
         val channel = NotificationChannel(
-            CHANNEL_ID, "Caroline phone companion", NotificationManager.IMPORTANCE_MIN,
-        ).apply { description = "Watches for SMS/contacts requests from your desktop Caroline." }
+            CHANNEL_ID, "Caroline phone companion", NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "Watches for SMS/contacts requests from your desktop Caroline."
+            setShowBadge(false)
+        }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
@@ -222,13 +269,16 @@ class CompanionOpsService : Service() {
             // manifest's own launcher icon already uses (TODO there too).
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(openApp)
             .build()
     }
 
     companion object {
-        private const val CHANNEL_ID = "companion_ops"
+        // _v2: renamed off "companion_ops" when its importance bumped from MIN to LOW
+        // (see createNotificationChannel's own comment) -- an existing install keeps
+        // whatever importance it already created a channel at, forever.
+        private const val CHANNEL_ID = "companion_ops_v2"
         private const val NOTIFICATION_ID = 1001
 
         // Well under PHASE1_POLL_INTERVAL_S=60s (companion_api.py) so an

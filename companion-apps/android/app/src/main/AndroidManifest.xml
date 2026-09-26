@@ -7,6 +7,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Companion service resilience (2026-09-26, ported from Ratatosk's own fix for
+         the same problem): restart after reboot/update, and let the user exempt this
+         app from OEM battery optimizers that would otherwise kill the foreground
+         service despite START_STICKY. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- Requested at runtime, behind the consent screen (see the plan's own
          Phase 3 notes); declared here only. NOT the default SMS app: these
@@ -66,6 +72,22 @@
             android:name=".service.CompanionOpsService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Triggered by AlarmManager from CompanionOpsService.onTaskRemoved() to
+             restart the service after the user swipes the app away on OEM ROMs
+             that ignore START_STICKY. -->
+        <receiver
+            android:name=".service.ServiceRestartReceiver"
+            android:exported="false" />
 
     </application>
 
