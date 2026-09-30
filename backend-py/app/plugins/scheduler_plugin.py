@@ -212,7 +212,12 @@ def _usage_instructions() -> str:
         'yourself for N from now" into the note text and relying on yourself to actually do that every time it '
         "fires -- confirmed in practice this silently stops forever the first time a turn fails, gets "
         "interrupted, or you simply don't follow through, with nothing to notice or recover it. A backend-"
-        "scheduled recurrence cannot be skipped this way.",
+        "scheduled recurrence cannot be skipped this way.\n"
+        'Example -- "check my mail every 2 hours": call schedule_reminder ONCE with '
+        '`recurring_every_minutes: 120` and a note describing the check itself (e.g. "Check all 8 mailboxes '
+        'for new messages, report anything relevant"). WRONG: a note ending in something like "then '
+        're-schedule this same reminder for 2 hours later" -- that text does nothing on its own; it only works '
+        "if you personally remember and follow through on your own every single time it fires, forever.",
         follow_explicit_parameters_instruction(),
     ))
 
