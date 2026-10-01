@@ -147,6 +147,18 @@ class CompanionOpsService : Service() {
 
     private suspend fun pollLoop() {
         while (scope.isActive) {
+            // Per explicit instruction (2026-09-30), after a real incident
+            // traced live: isCompanionServiceRunning's own ActivityManager
+            // check only proves the Service OBJECT still exists -- it says
+            // nothing about whether THIS coroutine is actually still
+            // ticking. Confirmed live: a request sat unprocessed for 45+
+            // minutes while the service was nominally "running", then
+            // resolved in 9s the moment the app was genuinely reopened
+            // (a fresh pollJob). Writing this on every iteration, BEFORE
+            // the work below, is what lets restartCompanionServiceIfNeeded
+            // tell "alive and working" apart from "alive but stuck" --
+            // see CompanionPrefs.lastPollTickAt's own doc comment.
+            CompanionPrefs.lastPollTickAt = System.currentTimeMillis()
             try {
                 handleHeartbeat()
                 handleOutbox()

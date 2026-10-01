@@ -58,20 +58,53 @@ fun isCompanionServiceRunning(context: Context): Boolean {
     return am.getRunningServices(Int.MAX_VALUE).any { it.service.className == CompanionOpsService::class.java.name }
 }
 
-/** Starts CompanionOpsService if CompanionPrefs.enabled is true but the
- * service isn't actually running -- the one check that matters for both
- * "disabled by some OS timer/policy" and "user just brought Caroline back
- * to the foreground" (per explicit instruction, 2026-09-30: restart on
- * both). A no-op (returns false) when permissions aren't currently
- * granted -- nothing to restart into, same as every other call site's
- * existing permission gate. Safe to call from any context; CompanionOps
- * Service.start() itself is idempotent (CompanionOpsService.onStartCommand's
- * own pollJob guard) so calling this when the service is already healthy
- * does nothing extra. */
+// Generous over CompanionOpsService's own 5s POLL_INTERVAL_MS -- a single
+// slow tick (one real network round trip taking a few seconds longer than
+// usual) must not itself read as "stuck"; this is about catching a poll
+// coroutine that has gone silent for multiple missed intervals, not about
+// shaving the margin as tight as possible.
+private const val POLL_TICK_STALE_AFTER_MS = 30_000L
+
+/** The real health signal (per explicit instruction, 2026-09-30, after a
+ * real incident -- see CompanionOpsService.pollLoop's own call-site
+ * comment): the Service OBJECT existing (isCompanionServiceRunning) only
+ * proves Android hasn't torn the process down -- it says nothing about
+ * whether the poll coroutine inside it is still actually making progress.
+ * Confirmed live: a request sat unprocessed for 45+ minutes with the
+ * service nominally "running" the whole time, then resolved in 9s the
+ * moment the app was genuinely reopened (a fresh pollJob). This also
+ * correctly reports unhealthy when the service isn't running at all
+ * (lastPollTickAt stays 0 / old from before it stopped), so callers only
+ * need this one check, not isCompanionServiceRunning separately. */
+fun isCompanionServiceHealthy(context: Context): Boolean {
+    if (!isCompanionServiceRunning(context)) return false
+    val lastTick = CompanionPrefs.lastPollTickAt
+    return lastTick != 0L && System.currentTimeMillis() - lastTick < POLL_TICK_STALE_AFTER_MS
+}
+
+/** Restarts CompanionOpsService if CompanionPrefs.enabled is true but it
+ * isn't actually healthy right now -- the one check that matters for
+ * "disabled by some OS timer/policy", "user just brought Caroline back to
+ * the foreground", AND "the service object survived but its own poll loop
+ * silently died/stalled" (see isCompanionServiceHealthy's own doc
+ * comment -- that last case is why this stops the service first rather
+ * than just calling start(): CompanionOpsService.onStartCommand only
+ * launches a fresh pollJob when the old one has actually ENDED
+ * (pollJob?.isActive != true) -- a stuck-but-technically-still-active
+ * coroutine would make a bare start() a no-op, so a suspected-unhealthy
+ * instance gets a real stop+start, not just an idempotent nudge). A no-op
+ * (returns false) when permissions aren't currently granted -- nothing to
+ * restart into, same as every other call site's existing permission
+ * gate. */
 fun restartCompanionServiceIfNeeded(context: Context): Boolean {
     if (!CompanionPrefs.enabled) return false
-    if (isCompanionServiceRunning(context)) return false
+    if (isCompanionServiceHealthy(context)) return false
     if (!companionPermissionsGranted(context)) return false
+    if (isCompanionServiceRunning(context)) {
+        // Present but stale -- a bare start() could no-op against a
+        // stuck-not-dead pollJob (see this function's own doc comment).
+        CompanionOpsService.stop(context)
+    }
     CompanionOpsService.start(context)
     return true
 }
@@ -125,6 +158,7 @@ object CompanionPrefs {
     private const val KEY_ENABLED = "sms_contacts_enabled"
     private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_PHONE_NUMBER = "phone_number"
+    private const val KEY_LAST_POLL_TICK_AT = "last_poll_tick_at"
 
     private var prefs: SharedPreferences? = null
 
@@ -136,6 +170,23 @@ object CompanionPrefs {
         get() = prefs?.getBoolean(KEY_ENABLED, false) ?: false
         set(value) {
             prefs?.edit()?.putBoolean(KEY_ENABLED, value)?.apply()
+        }
+
+    /** Written by CompanionOpsService.pollLoop on every single iteration
+     * (System.currentTimeMillis()), BEFORE that iteration's own work --
+     * see its own call-site comment for the real incident this exists to
+     * catch: the Service object can stay alive while its poll coroutine
+     * has silently died, which isCompanionServiceRunning's ActivityManager
+     * check alone can't tell apart from "alive and working". SharedPreferences
+     * (not an in-memory field) specifically so a reader outside the
+     * service's own instance -- CompanionTabsScreen's ON_RESUME check,
+     * CompanionWatchdogWorker's periodic check -- sees the real value. 0
+     * (never ticked) is the correct default, not current time -- a
+     * service that has never started should read as stale, not healthy. */
+    var lastPollTickAt: Long
+        get() = prefs?.getLong(KEY_LAST_POLL_TICK_AT, 0L) ?: 0L
+        set(value) {
+            prefs?.edit()?.putLong(KEY_LAST_POLL_TICK_AT, value)?.apply()
         }
 
     /**

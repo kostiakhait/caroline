@@ -681,7 +681,19 @@ async def generate_progress_comment(
     if not text:
         log_event("plugin:voice", "generate_progress_comment_unextractable", raw=data["result"][:300])
         return None
-    if _looks_like_narration_garbage(text, language):
+    # Bug fix (2026-09-30), confirmed live: this draft is always written in
+    # English by this function's own prompt ("a separate step translates it
+    # into the right language afterward" -- see translate_text() below).
+    # Passing the real target `language` here makes _looks_like_narration_
+    # garbage's Cyrillic-script check (added 2026-09-28 for translate_text's
+    # OWN post-translation output) reject this pre-translation English draft
+    # on every single call for any Russian/Ukrainian/Belarusian/Bulgarian/
+    # Serbian/Macedonian conversation -- confirmed live, 100% rejection rate
+    # all day, zero narrations ever sent. Omit `language` so only the
+    # script-agnostic checks (refusals, meta-commentary, CJK) apply here;
+    # the real post-translation Cyrillic check still runs correctly inside
+    # translate_text() itself just below.
+    if _looks_like_narration_garbage(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300])
         return None
     if _is_echo_of_dialogue(text, recent_dialogue):
