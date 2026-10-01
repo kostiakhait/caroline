@@ -127,6 +127,7 @@ class SmsRepository(private val context: Context) {
      * PendingIntent callback is the authoritative signal.
      */
     suspend fun send(to: String, text: String): Result<Unit> {
+        val sendStartedAt = System.currentTimeMillis()
         val smsManager = if (Build.VERSION.SDK_INT >= 31) context.getSystemService(SmsManager::class.java)
         else @Suppress("DEPRECATION") SmsManager.getDefault()
         val parts = smsManager.divideMessage(text)
@@ -174,6 +175,31 @@ class SmsRepository(private val context: Context) {
                 }
             }
         }
-        return outcome ?: Result.failure(Exception("Timed out waiting for the SMS radio to confirm the send."))
+        if (outcome != null) return outcome
+        // Bug fix (2026-09-30), confirmed live: a real incident sent the same
+        // message to a real contact 3 times, because this broadcast-based
+        // confirmation timed out all 3 times despite every send actually
+        // reaching the phone. SmsManager's SENT PendingIntent fires via a
+        // dynamically-registered receiver, which is not reliably delivered
+        // within any fixed window on every device/ROM (Doze, aggressive
+        // battery management, a slow radio/carrier round trip) -- a timeout
+        // here does NOT mean the send failed, so reporting it as a plain
+        // error (which the caller reasonably treats as "safe to retry") is
+        // itself the bug. Before giving up, check the actual source of
+        // truth -- content://sms -- for a sent row matching this address/
+        // body that postdates when this call started.
+        return if (wasActuallySent(to, text, sendStartedAt)) Result.success(Unit)
+        else Result.failure(Exception("Timed out waiting for the SMS radio to confirm the send."))
+    }
+
+    private fun wasActuallySent(to: String, text: String, sentAfter: Long): Boolean {
+        val digits = to.filter { it.isDigit() }
+        val suffix = if (digits.length > 10) digits.takeLast(10) else digits
+        if (suffix.isEmpty()) return false
+        val projection = arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE)
+        val selection = "${Telephony.Sms.TYPE} = ? AND ${Telephony.Sms.ADDRESS} LIKE ? AND ${Telephony.Sms.BODY} = ? AND ${Telephony.Sms.DATE} > ?"
+        val args = arrayOf(Telephony.Sms.MESSAGE_TYPE_SENT.toString(), "%$suffix", text, sentAfter.toString())
+        return context.contentResolver.query(Telephony.Sms.CONTENT_URI, projection, selection, args, null)
+            ?.use { it.moveToFirst() } ?: false
     }
 }
