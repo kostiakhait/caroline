@@ -28,6 +28,9 @@ from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
 
+_CALENDAR_RECURRENCES = {"daily", "weekly"}
+
+
 def _schedule_path() -> Path:
     return Path(WORKSPACE_DIR) / "schedule.json"
 
@@ -59,7 +62,16 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "fired": False,
         "priority": args.get("priority") or "priority",
-        "recurringCalendar": recurring if recurring and recurring != "none" else None,
+        # Bug fix (2026-10-01), confirmed live: an unvalidated `recurring`
+        # value ("interval", a mix-up with recurring_every_minutes) got
+        # stored as-is and silently misread by _next_occurrence as calendar
+        # recurrence (any truthy string that isn't "weekly" -> daily, a
+        # 24h step) -- a real incident where a "every 2 hours" reminder kept
+        # drifting to 24h and self-perpetuating the corruption on every
+        # renewal. Only the two real calendar values are ever stored; any
+        # other value (including a future typo) falls back to None, which
+        # correctly defers to recurringMs below.
+        "recurringCalendar": recurring if recurring in _CALENDAR_RECURRENCES else None,
         "recurringMs": recurring_every_minutes * 60_000 if recurring_every_minutes else None,
     }
     reminders.append(reminder)
@@ -96,7 +108,15 @@ def _next_occurrence(reminder: dict[str, Any]) -> datetime:
     of catch-up reminders for every missed day/week."""
     now = datetime.now().astimezone()
     calendar = reminder.get("recurringCalendar")
-    if calendar:
+    # Bug fix (2026-10-01), confirmed live: this used to treat ANY truthy
+    # value as calendar recurrence (defaulting to a 1-day step for anything
+    # that wasn't literally "weekly") -- a reminder whose recurringCalendar
+    # was contaminated with an invalid value ("interval") kept drifting to
+    # 24h instead of honoring its real recurringMs, and every renewal below
+    # copied the same bad value forward forever. Only ever treat the two
+    # real calendar values as calendar recurrence now; anything else falls
+    # through to the plain-interval branch below, same as None always did.
+    if calendar in _CALENDAR_RECURRENCES:
         step_days = 7 if calendar == "weekly" else 1
         base = datetime.fromisoformat(reminder["dueAtIso"])
         if base.tzinfo is None:
