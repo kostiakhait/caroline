@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.database.Cursor
 import android.os.Build
 import android.provider.Telephony
 import android.telephony.SmsManager
@@ -49,29 +50,70 @@ class SmsRepository(private val context: Context) {
         val limit = if (since != null) Int.MAX_VALUE else BOOTSTRAP_LIMIT
         context.contentResolver.query(
             Telephony.Sms.CONTENT_URI, projection, selection, args, "${Telephony.Sms.DATE} DESC",
-        )?.use { c ->
-            val threadIdx = c.getColumnIndexOrThrow(Telephony.Sms.THREAD_ID)
-            val addressIdx = c.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
-            val bodyIdx = c.getColumnIndexOrThrow(Telephony.Sms.BODY)
-            val dateIdx = c.getColumnIndexOrThrow(Telephony.Sms.DATE)
-            val typeIdx = c.getColumnIndexOrThrow(Telephony.Sms.TYPE)
-            val readIdx = c.getColumnIndexOrThrow(Telephony.Sms.READ)
-            while (c.moveToNext() && out.size < limit) {
-                // TYPE 1 = inbox (received), 2 = sent -- the two that matter
-                // for a real conversation; drafts/failed/queued (3-6) are
-                // rare and not worth a richer label here.
-                val type = if (c.getInt(typeIdx) == Telephony.Sms.MESSAGE_TYPE_INBOX) "inbox" else "sent"
-                out.add(
-                    mapOf(
-                        "threadId" to (c.getString(threadIdx) ?: continue),
-                        "address" to c.getString(addressIdx),
-                        "body" to (c.getString(bodyIdx) ?: ""),
-                        "date" to c.getLong(dateIdx),
-                        "type" to type,
-                        "read" to (c.getInt(readIdx) != 0),
-                    ),
-                )
-            }
+        )?.use { c -> readRows(c, limit).forEach { out.add(it) } }
+        return out
+    }
+
+    /**
+     * companion_search_sms (2026-09-30): queries the phone's real SMS
+     * table LIVE, right now -- unlike dumpMessages (feeds the backend's
+     * own periodic local-copy sync, see this file's own header comment),
+     * this is for the case the local copy doesn't have an answer for
+     * (not yet synced, or a conversation the bootstrap's BOOTSTRAP_LIMIT
+     * cap never reached) and Caroline needs to ask the phone directly.
+     * `query` matches against the message body, `address` against the
+     * sender/recipient number -- either, both, or neither (= "most
+     * recent N messages", a reasonable live sanity check on its own).
+     * Same row shape as dumpMessages.
+     */
+    fun search(query: String?, address: String?, limit: Int): List<Map<String, Any?>> {
+        val out = mutableListOf<Map<String, Any?>>()
+        val projection = arrayOf(
+            Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
+            Telephony.Sms.DATE, Telephony.Sms.TYPE, Telephony.Sms.READ,
+        )
+        val clauses = mutableListOf<String>()
+        val args = mutableListOf<String>()
+        if (!query.isNullOrBlank()) {
+            clauses.add("${Telephony.Sms.BODY} LIKE ?")
+            args.add("%$query%")
+        }
+        if (!address.isNullOrBlank()) {
+            clauses.add("${Telephony.Sms.ADDRESS} LIKE ?")
+            args.add("%$address%")
+        }
+        val selection = if (clauses.isEmpty()) null else clauses.joinToString(" AND ")
+        context.contentResolver.query(
+            Telephony.Sms.CONTENT_URI, projection,
+            selection, if (args.isEmpty()) null else args.toTypedArray(),
+            "${Telephony.Sms.DATE} DESC",
+        )?.use { c -> readRows(c, limit).forEach { out.add(it) } }
+        return out
+    }
+
+    private fun readRows(c: Cursor, limit: Int): List<Map<String, Any?>> {
+        val out = mutableListOf<Map<String, Any?>>()
+        val threadIdx = c.getColumnIndexOrThrow(Telephony.Sms.THREAD_ID)
+        val addressIdx = c.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+        val bodyIdx = c.getColumnIndexOrThrow(Telephony.Sms.BODY)
+        val dateIdx = c.getColumnIndexOrThrow(Telephony.Sms.DATE)
+        val typeIdx = c.getColumnIndexOrThrow(Telephony.Sms.TYPE)
+        val readIdx = c.getColumnIndexOrThrow(Telephony.Sms.READ)
+        while (c.moveToNext() && out.size < limit) {
+            // TYPE 1 = inbox (received), 2 = sent -- the two that matter
+            // for a real conversation; drafts/failed/queued (3-6) are
+            // rare and not worth a richer label here.
+            val type = if (c.getInt(typeIdx) == Telephony.Sms.MESSAGE_TYPE_INBOX) "inbox" else "sent"
+            out.add(
+                mapOf(
+                    "threadId" to (c.getString(threadIdx) ?: continue),
+                    "address" to c.getString(addressIdx),
+                    "body" to (c.getString(bodyIdx) ?: ""),
+                    "date" to c.getLong(dateIdx),
+                    "type" to type,
+                    "read" to (c.getInt(readIdx) != 0),
+                ),
+            )
         }
         return out
     }

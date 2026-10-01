@@ -21,21 +21,27 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.partnerssolutions.caroline.companion.data.companion.COMPANION_REQUIRED_PERMISSIONS
 import com.partnerssolutions.caroline.companion.data.companion.CompanionPrefs
 import com.partnerssolutions.caroline.companion.data.companion.activateCompanionService
 import com.partnerssolutions.caroline.companion.data.companion.companionPermissionsGranted
+import com.partnerssolutions.caroline.companion.data.companion.restartCompanionServiceIfNeeded
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.ui.chat.ChatScreen
 import com.partnerssolutions.caroline.companion.util.Logger
@@ -80,7 +86,32 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
             } else {
                 permissionLauncher.launch(COMPANION_REQUIRED_PERMISSIONS)
             }
+        } else {
+            // Per explicit instruction (2026-09-30): CompanionPrefs.enabled
+            // staying true doesn't mean the service is actually still
+            // alive (see restartCompanionServiceIfNeeded's own doc
+            // comment) -- cold start is one of the two times this needs
+            // checking, the other being every resume (below).
+            restartCompanionServiceIfNeeded(context)
         }
+    }
+
+    // Per explicit instruction (2026-09-30): "перезапускать... каждый раз
+    // при заходе в Кэролайн" -- LaunchedEffect(Unit) above only ever runs
+    // once per composition (effectively once per cold start), so bringing
+    // the app back to the foreground after backgrounding it (no process
+    // death, so no recomposition) never re-ran that check. ON_RESUME fires
+    // every single time the user returns to this screen, cold start or not.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val currentContext = rememberUpdatedState(context)
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                restartCompanionServiceIfNeeded(currentContext.value)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(

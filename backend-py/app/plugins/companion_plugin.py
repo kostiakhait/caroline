@@ -38,6 +38,16 @@ doesn't answer in time). Instant, and correct as of the last successful
 sync regardless of whether the phone happens to be reachable right this
 moment.
 
+companion_search_sms (2026-09-30) is the deliberate THIRD option: a live,
+two-phase (same shape as the contacts tools) query straight to the
+phone's real SMS table, for exactly the case the local copy can't answer
+-- a conversation the periodic sync hasn't reached yet, or one outside
+companion_sms_store's own retained window. Slower (a real phone round
+trip, not instant) and not meant to replace companion_list_sms_threads
+as the default -- try the local copy first, fall back to this when it
+comes up empty and the user's phrasing makes clear the message should
+exist.
+
 SW-login-gated (needs the user's own SquirrelWisdom account -- the same
 one paired to the Android app). Uses sw_gate.py's shared
 require_sw_or_prompt, the plain-error-if-logged-out convention every other
@@ -209,31 +219,83 @@ async def companion_search_contacts(args: dict[str, Any], report_progress: Any) 
     return {"text": _json(contacts)}
 
 
-async def _contacts_request(from_number: Any, payload: dict[str, Any], report_progress: Any) -> Any:
-    """A named phone: that device's own contacts, as-is. No phone named:
-    every paired phone's contacts, gathered one after another and tagged
-    with sourceNumber -- a deliberate default (not just a single-phone
-    fallback), since "look this person up across all my phones" is a
-    reasonable ask on its own. Sequential, not concurrent, same reasoning
-    as _sms_sync_tick: simplest correct thing, and a handful of phones is
-    still fine against the (generous, no-timeout) two-phase protocol."""
+async def companion_create_contact(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
+    gate_msg = await _gate()
+    if gate_msg:
+        return {"text": gate_msg, "is_error": True}
+    name = str(args.get("name") or "").strip()
+    numbers_arg = args.get("numbers")
+    numbers = [str(n).strip() for n in numbers_arg if str(n).strip()] if isinstance(numbers_arg, list) else []
+    if not name or not numbers:
+        return {"text": "'name' and at least one entry in 'numbers' are required.", "is_error": True}
+    # Unlike list/search (which default to every paired phone), a save has
+    # to land on exactly ONE phone's address book -- auto-picked only when
+    # there's just one paired, same as companion_sms_send.
+    from_number = args.get("fromNumber")
+    try:
+        device = await resolve_device(str(from_number).strip() if from_number else None)
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+        return {"text": _device_error_text(exc), "is_error": True}
+    try:
+        result = await request_response(
+            WORKSPACE_DIR, _current_tab_id(), device["deviceId"], "contacts",
+            {"op": "create", "name": name, "numbers": numbers}, report_progress,
+        )
+    except PhoneUnreachableError as exc:
+        return {"text": str(exc), "is_error": True}
+    if isinstance(result, dict) and result.get("ok"):
+        return {"text": f"Saved contact '{name}' ({', '.join(numbers)}) on {device.get('phoneNumber') or 'the phone'}."}
+    error = result.get("error") if isinstance(result, dict) else str(result)
+    return {"text": f"Could not save the contact: {error or 'unknown error'}", "is_error": True}
+
+
+async def _device_request(family: str, from_number: Any, payload: dict[str, Any], report_progress: Any) -> Any:
+    """A named phone: that device's own answer, as-is. No phone named:
+    every paired phone's, gathered one after another and tagged with
+    sourceNumber -- a deliberate default (not just a single-phone
+    fallback), since "across all my phones" is a reasonable ask on its
+    own for a list-shaped result (contacts, SMS search hits). Sequential,
+    not concurrent, same reasoning as _sms_sync_tick: simplest correct
+    thing, and a handful of phones is still fine against the (generous,
+    no-timeout) two-phase protocol. Shared by contacts (list/search/
+    create) and sms_query (search) -- same fan-out shape either way."""
     tab_id = _current_tab_id()
     if from_number:
         device = await resolve_device(str(from_number).strip())
-        result = await request_response(WORKSPACE_DIR, tab_id, device["deviceId"], "contacts", payload, report_progress)
-        return result
+        return await request_response(WORKSPACE_DIR, tab_id, device["deviceId"], family, payload, report_progress)
     devices = await list_devices()
     if not devices:
         raise NoPairedDeviceError()
     if len(devices) == 1:
-        return await request_response(WORKSPACE_DIR, tab_id, devices[0]["deviceId"], "contacts", payload, report_progress)
+        return await request_response(WORKSPACE_DIR, tab_id, devices[0]["deviceId"], family, payload, report_progress)
     merged: list[dict[str, Any]] = []
     for device in devices:
-        result = await request_response(WORKSPACE_DIR, tab_id, device["deviceId"], "contacts", payload, report_progress)
+        result = await request_response(WORKSPACE_DIR, tab_id, device["deviceId"], family, payload, report_progress)
         if isinstance(result, list):
-            for contact in result:
-                merged.append({**contact, "sourceNumber": device.get("phoneNumber")} if isinstance(contact, dict) else contact)
+            for item in result:
+                merged.append({**item, "sourceNumber": device.get("phoneNumber")} if isinstance(item, dict) else item)
     return merged
+
+
+async def _contacts_request(from_number: Any, payload: dict[str, Any], report_progress: Any) -> Any:
+    return await _device_request("contacts", from_number, payload, report_progress)
+
+
+async def companion_search_sms(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
+    gate_msg = await _gate()
+    if gate_msg:
+        return {"text": gate_msg, "is_error": True}
+    query = args.get("query")
+    address = args.get("address")
+    if not query and not address:
+        return {"text": "Give at least one of 'query' (text to search for) or 'address' (a number to filter to).", "is_error": True}
+    limit = args.get("limit")
+    payload = {"op": "search", "query": query, "address": address, "limit": limit}
+    try:
+        result = await _device_request("sms_query", args.get("fromNumber"), payload, report_progress)
+    except (PhoneUnreachableError, AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+        return {"text": _device_error_text(exc) if not isinstance(exc, PhoneUnreachableError) else str(exc), "is_error": True}
+    return {"text": _json(result)}
 
 
 def _json(value: Any) -> str:
@@ -369,6 +431,47 @@ PLUGIN = Plugin(
                 "required": ["query"],
             },
             companion_search_contacts,
+        ),
+        PluginTool(
+            "companion_create_contact",
+            "Save a new contact (name + one or more phone numbers) to one of the user's paired phones -- e.g. "
+            "when a number comes up in an SMS thread or conversation and the user wants it saved. Modifies the "
+            "user's real address book; only use it when they've clearly asked you to save a specific name/number "
+            "(or confirmed one you proposed). If more than one phone is paired, pass fromNumber to say which "
+            "one's address book to save it to (otherwise this fails with the list of paired numbers to choose "
+            "from) -- unlike the list/search tools, a save always lands on exactly one phone.",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The contact's display name."},
+                    "numbers": {"type": "array", "items": {"type": "string"}, "description": "One or more phone numbers for this contact."},
+                    "fromNumber": {"type": "string", "description": "Which paired phone's address book to save to, if more than one is paired. Optional when only one phone is paired."},
+                },
+                "required": ["name", "numbers"],
+            },
+            companion_create_contact,
+        ),
+        PluginTool(
+            "companion_search_sms",
+            "Search for SMS directly ON THE PHONE, live, right now -- unlike companion_list_sms_threads/"
+            "companion_read_sms_thread (Caroline's own local copy, refreshed every ~3 minutes), this asks the "
+            "phone itself, so it finds a message even if the local copy hasn't synced it yet or never reached "
+            "it (e.g. an old conversation outside the local copy's own bootstrap window). Pass query (text to "
+            "find in the message body), address (a phone number to filter to), or both; omit both only for "
+            "'just the most recent messages, period'. Omit fromNumber to search EVERY paired phone at once "
+            "(each hit tagged with sourceNumber); pass it to search just one. May take a while -- see "
+            "get_tool_instructions.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Text to search for in the message body."},
+                    "address": {"type": "string", "description": "A phone number to filter results to."},
+                    "limit": {"type": "integer", "description": "Max messages to return (per phone). Defaults to 50, capped at 200."},
+                    "fromNumber": {"type": "string", "description": "Only search this paired phone. Defaults to every paired phone."},
+                },
+                "required": [],
+            },
+            companion_search_sms,
         ),
     ],
 )

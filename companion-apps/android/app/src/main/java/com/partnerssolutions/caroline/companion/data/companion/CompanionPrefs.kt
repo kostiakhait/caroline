@@ -1,6 +1,7 @@
 package com.partnerssolutions.caroline.companion.data.companion
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -26,6 +27,8 @@ val COMPANION_REQUIRED_PERMISSIONS: Array<String> = buildList {
     add(Manifest.permission.SEND_SMS)
     add(Manifest.permission.READ_SMS)
     add(Manifest.permission.READ_CONTACTS)
+    // companion_create_contact (2026-09-30).
+    add(Manifest.permission.WRITE_CONTACTS)
     if (Build.VERSION.SDK_INT >= 26) add(Manifest.permission.READ_PHONE_NUMBERS)
     // The persistent foreground-service notification needs this on 13+;
     // requesting it pre-33 too is a harmless no-op there.
@@ -34,6 +37,44 @@ val COMPANION_REQUIRED_PERMISSIONS: Array<String> = buildList {
 
 fun companionPermissionsGranted(context: Context): Boolean =
     COMPANION_REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+
+/**
+ * Whether CompanionOpsService is ACTUALLY alive right now, not just
+ * whether CompanionPrefs.enabled says it should be. Per explicit
+ * instruction (2026-09-30), after a real incident: the foreground service
+ * can die (OEM battery optimizer, Doze, plain system pressure despite
+ * START_STICKY/onTaskRemoved/BootReceiver) without CompanionPrefs.enabled
+ * ever getting cleared -- so every call site that only checked `enabled`
+ * before deciding "nothing to do" was silently trusting a flag that can
+ * go stale. getRunningServices is deprecated for inspecting OTHER apps'
+ * services (Android locked that down from API 26), but querying this
+ * app's OWN service by class name still works reliably -- confirmed
+ * against AOSP's own source: the restriction is about cross-app
+ * visibility, not self-visibility.
+ */
+@Suppress("DEPRECATION")
+fun isCompanionServiceRunning(context: Context): Boolean {
+    val am = context.getSystemService(ActivityManager::class.java) ?: return false
+    return am.getRunningServices(Int.MAX_VALUE).any { it.service.className == CompanionOpsService::class.java.name }
+}
+
+/** Starts CompanionOpsService if CompanionPrefs.enabled is true but the
+ * service isn't actually running -- the one check that matters for both
+ * "disabled by some OS timer/policy" and "user just brought Caroline back
+ * to the foreground" (per explicit instruction, 2026-09-30: restart on
+ * both). A no-op (returns false) when permissions aren't currently
+ * granted -- nothing to restart into, same as every other call site's
+ * existing permission gate. Safe to call from any context; CompanionOps
+ * Service.start() itself is idempotent (CompanionOpsService.onStartCommand's
+ * own pollJob guard) so calling this when the service is already healthy
+ * does nothing extra. */
+fun restartCompanionServiceIfNeeded(context: Context): Boolean {
+    if (!CompanionPrefs.enabled) return false
+    if (isCompanionServiceRunning(context)) return false
+    if (!companionPermissionsGranted(context)) return false
+    CompanionOpsService.start(context)
+    return true
+}
 
 /**
  * Turns the SMS/contacts companion on: saves [phoneNumber], marks it

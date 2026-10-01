@@ -5,6 +5,7 @@ import com.partnerssolutions.caroline.companion.data.companion.CompanionPrefs
 import com.partnerssolutions.caroline.companion.data.companion.companionPermissionsGranted
 import com.partnerssolutions.caroline.companion.data.remote.CredentialsStore
 import com.partnerssolutions.caroline.companion.service.CompanionOpsService
+import com.partnerssolutions.caroline.companion.service.CompanionWatchdogWorker
 import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
@@ -33,6 +34,13 @@ class CompanionApplication : Application() {
             Logger.w("companion was enabled but a required permission is no longer granted -- disabling")
             CompanionPrefs.enabled = false
         }
+        // Per explicit instruction (2026-09-30): a periodic backstop so a
+        // service some OS timer/battery-optimizer quietly killed gets
+        // restarted on its own schedule, not only when the user happens to
+        // open the app or the process happens to restart. A no-op (see
+        // CompanionWatchdogWorker's own doc comment) whenever the feature
+        // is off or already healthy -- safe to always schedule.
+        CompanionWatchdogWorker.schedule(this)
         Logger.i("CompanionApplication started")
     }
 }

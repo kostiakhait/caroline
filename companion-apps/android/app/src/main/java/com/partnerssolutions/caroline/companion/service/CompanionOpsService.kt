@@ -152,6 +152,7 @@ class CompanionOpsService : Service() {
                 handleOutbox()
                 handleSmsSync()
                 handleRequestFamily("contacts")
+                handleRequestFamily("sms_query")
             } catch (exc: Exception) {
                 // A single bad tick (a transient network error, say) must
                 // never kill the loop -- there's no other recovery path
@@ -242,7 +243,11 @@ class CompanionOpsService : Service() {
             val op = payload["op"] as? String
             Logger.i("companion: handling $family request op=$op (opId=$opId)")
             val result: Any = try {
-                if (family == "contacts") handleContactsOp(op, payload) else mapOf("error" to "unknown family $family")
+                when (family) {
+                    "contacts" -> handleContactsOp(op, payload)
+                    "sms_query" -> handleSmsQueryOp(op, payload)
+                    else -> mapOf("error" to "unknown family $family")
+                }
             } catch (exc: Exception) {
                 Logger.e("companion: $family op=$op failed", exc)
                 mapOf("error" to (exc.message ?: exc.toString()))
@@ -264,7 +269,32 @@ class CompanionOpsService : Service() {
             val query = (payload["query"] as? String).orEmpty()
             contactsRepository.search(query).map { mapOf("name" to it.name, "numbers" to it.numbers) }
         }
+        "create" -> {
+            val name = (payload["name"] as? String).orEmpty()
+            @Suppress("UNCHECKED_CAST")
+            val numbers = (payload["numbers"] as? List<Any?>)?.mapNotNull { it as? String } ?: emptyList()
+            if (name.isBlank() || numbers.isEmpty()) {
+                mapOf("error" to "'name' and at least one of 'numbers' are required")
+            } else {
+                val id = contactsRepository.create(name, numbers)
+                mapOf("ok" to true, "contactId" to id)
+            }
+        }
         else -> mapOf("error" to "unknown contacts op '$op'")
+    }
+
+    // companion_search_sms (2026-09-30) -- see SmsRepository.search's own
+    // doc comment for why this is a separate, LIVE path from handleSmsSync
+    // (the periodic background copy companion_list_sms_threads/
+    // companion_read_sms_thread actually read).
+    private fun handleSmsQueryOp(op: String?, payload: Map<*, *>): Any = when (op) {
+        "search" -> {
+            val query = payload["query"] as? String
+            val address = payload["address"] as? String
+            val limit = (payload["limit"] as? Number)?.toInt()?.coerceIn(1, 200) ?: 50
+            smsRepository.search(query, address, limit)
+        }
+        else -> mapOf("error" to "unknown sms_query op '$op'")
     }
 
     // --- foreground notification --------------------------------------------
