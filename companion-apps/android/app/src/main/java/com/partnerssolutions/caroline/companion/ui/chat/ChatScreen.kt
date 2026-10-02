@@ -170,6 +170,28 @@ fun ChatScreen(tabId: String) {
         }
     }
 
+    // Bug fix (2026-10-01), per explicit instruction: sendError/voiceError
+    // used to render as a permanent Text under the input bar (see
+    // InputBar's old `error` param) -- a one-off failure (e.g. a network
+    // timeout writing to the inbox) stayed on screen forever, since nothing
+    // ever cleared it except starting another send/recording. A toast is a
+    // transient notification, matching what this actually is: tell the
+    // user once, then get out of the way. Clears the ViewModel field right
+    // after showing so it doesn't re-fire on recomposition or linger as
+    // stale state.
+    LaunchedEffect(viewModel.sendError) {
+        viewModel.sendError?.let {
+            android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_LONG).show()
+            viewModel.clearSendError()
+        }
+    }
+    LaunchedEffect(viewModel.voiceError) {
+        viewModel.voiceError?.let {
+            android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_LONG).show()
+            viewModel.clearVoiceError()
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxSize().weight(1f)) {
             when {
@@ -206,7 +228,6 @@ fun ChatScreen(tabId: String) {
             value = input,
             onValueChange = { input = it },
             sending = viewModel.isSending,
-            error = viewModel.sendError ?: viewModel.voiceError,
             recording = viewModel.isRecording,
             transcribing = viewModel.isTranscribing,
             onMic = ::toggleRecording,
@@ -325,7 +346,6 @@ private fun InputBar(
     value: String,
     onValueChange: (String) -> Unit,
     sending: Boolean,
-    error: String?,
     recording: Boolean,
     transcribing: Boolean,
     onMic: () -> Unit,
@@ -335,13 +355,6 @@ private fun InputBar(
     onSend: () -> Unit,
 ) {
     Column {
-        error?.let {
-            Text(
-                it,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-            )
-        }
         pendingAttachment?.let { attachment ->
             Row(
                 modifier = Modifier

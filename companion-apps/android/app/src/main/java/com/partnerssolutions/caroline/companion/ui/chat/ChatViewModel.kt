@@ -83,6 +83,12 @@ class ChatViewModel(
         private set
     var voiceError by mutableStateOf<String?>(null)
         private set
+
+    // Lets the UI dismiss a one-off error (shown as a toast) right after
+    // displaying it, without needing write access to the backing state.
+    fun clearSendError() { sendError = null }
+    fun clearVoiceError() { voiceError = null }
+
     private var voicePlayer: VoicePlayer? = null
     // Set when a voice-originated message was sent: speak the reply once the turn is finished.
     private var voiceReplySentAt: Long? = null
