@@ -182,9 +182,7 @@ public partial class AppBrowserWindow : Window
         // Separate profile per label -- same reasoning as DocumentViewerWindow's
         // dedicated profile dirs (webview2-office, webview2-payment): distinct
         // login/cookie state per site, never sharing with the chat page's own.
-        var dataDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "Caroline", "webview2-appbrowser-" + SanitizeForPath(Label));
+        var dataDir = ProfileDataDir(Label);
         Logger.Log($"[app-browser-window:{Label}] EnsureInitializedAsync: calling CoreWebView2Environment.CreateAsync (profile dir: {dataDir}, cdpPort={CdpPort})...");
         // --remote-allow-origins=* -- required by modern Chromium's DevTools origin check,
         // otherwise a WebSocket CDP connection from playwright-core (not itself a browser tab)
@@ -274,6 +272,13 @@ public partial class AppBrowserWindow : Window
         var chars = label.ToLowerInvariant().Where(c => char.IsLetterOrDigit(c) || c == '-').ToArray();
         return chars.Length > 0 ? new string(chars) : "default";
     }
+
+    /// <summary>Factored out of EnsureInitializedAsync (2026-10-01) so OnClosing can also
+    /// name this label's profile dir, for the matching KillStaleWebView2Processes call there
+    /// -- see OnClosing's own comment for why.</summary>
+    private static string ProfileDataDir(string label) => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Caroline", "webview2-appbrowser-" + SanitizeForPath(label));
 
     public async Task NavigateAsync(string url)
     {
@@ -559,9 +564,36 @@ public partial class AppBrowserWindow : Window
 
     public event Action<AppBrowserWindow>? WindowClosed;
 
+    // Bug fix (2026-10-01), confirmed live from a real incident: this used to
+    // only raise WindowClosed, never touch _webView at all -- the WPF
+    // Window.Close() this responds to has no defined moment at which WebView2
+    // actually finishes releasing its browser process/profile lock, since
+    // disposal only ever happened implicitly (GC, eventually) if at all.
+    // AppBrowserHost.Dispatch("/close") responds {ok:true} the instant
+    // Close() returns, and the SAME close-then-immediately-reopen cycle
+    // Caroline's own hang-recovery does (close, then /open again right
+    // after) raced that still-in-flight teardown: the new
+    // CoreWebView2Environment.CreateAsync for this exact label/profile
+    // threw COMException 0x8007139F ("the group or resource is not in the
+    // correct state") because the old browser process/profile lock hadn't
+    // actually been released yet. KillStaleWebView2Processes already exists
+    // for exactly this class of problem (see its own doc comment) but was
+    // only ever called before the NEXT create, never as part of close
+    // itself -- calling it here too means by the time WindowClosed fires
+    // (and the host's /close responds), this label's profile is genuinely
+    // free, not just asked-to-close.
     private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
         Logger.Log($"[app-browser-window:{Label}] OnClosing: window closing (url={CurrentUrl})");
+        try
+        {
+            _webView?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"[app-browser-window:{Label}] OnClosing: _webView.Dispose() failed (ignored): {ex.Message}");
+        }
+        KillStaleWebView2Processes(ProfileDataDir(Label));
         WindowClosed?.Invoke(this);
     }
 }
