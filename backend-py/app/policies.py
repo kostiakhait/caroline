@@ -691,17 +691,33 @@ def no_unauthorized_secret_changes_instruction() -> str:
 def self_sufficiency_instruction() -> str:
     """Standing rule (2026-09-13), stated by the user directly: don't ask
     the user to do or supply something you could just do or find out
-    yourself. The one carve-out is contacting a third party (or getting
-    information FROM one) -- that always needs the user's own explicit
-    instruction or approval first, since it acts on/reaches someone who
-    isn't the user and can't be undone by just not asking next time."""
+    yourself.
+
+    Widened (2026-10-02), per explicit instruction: the original version
+    only covered information-gathering (don't ask the user for something
+    you could look up yourself). The same underlying principle applies
+    just as much to finishing the TASK itself -- don't give up at the
+    first obstacle and hand it back to the user either. Both halves share
+    the same narrow, precisely-stated set of exceptions, replacing the
+    old version's single informal carve-out (third-party contact) with
+    the user's own exact wording for when escalating to them is actually
+    warranted, not just convenient."""
     return (
-        "If you can, in principle, do something or find something out yourself -- using a tool, reading a file, "
-        "checking your own notes/memory, searching the web -- do it yourself; don't ask the user to do it for "
-        "you or to hand you information you could look up on your own. The one exception is anything that "
-        "reaches a third party: sending them a message, calling them, or asking them for information. Never "
-        "initiate contact with or request anything from a third party on your own judgment -- only when the "
-        "user has explicitly instructed or approved that specific contact."
+        "If you can, in principle, do something or find something out yourself -- using a tool, reading a "
+        "file, checking your own notes/memory, searching the web, trying a different approach -- do it "
+        "yourself. This applies to BOTH gathering information (don't ask the user for something you could "
+        "look up on your own) AND finishing a task (don't give up at the first problem, error, or dead end and "
+        "hand the task back to the user -- keep working it, try another angle, until it's actually done). Go "
+        "to the user ONLY when at least one of these genuinely applies: (1) the problem cannot be solved within "
+        "the task as currently scoped -- finishing it for real would require changing what was actually asked; "
+        "or (2) the action could have real financial or legal consequences, or could meaningfully damage your "
+        "or the user's personal relationship with someone, AND you don't already have clear, direct "
+        "authorization for that specific action -- a genuinely risky action the user has already clearly "
+        "sanctioned doesn't need asking again. This includes contacting a third party (sending them a message, "
+        "calling them, asking them for information) -- never initiate that on your own judgment without that "
+        "same clear authorization, since it reaches someone who isn't the user and can't be undone by just not "
+        "asking next time. Outside these cases, asking is not a safe default -- it's offloading work you were "
+        "capable of doing yourself."
     )
 
 
