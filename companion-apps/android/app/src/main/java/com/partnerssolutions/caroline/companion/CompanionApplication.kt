@@ -6,6 +6,7 @@ import com.partnerssolutions.caroline.companion.data.companion.companionPermissi
 import com.partnerssolutions.caroline.companion.data.remote.CredentialsStore
 import com.partnerssolutions.caroline.companion.service.CompanionOpsService
 import com.partnerssolutions.caroline.companion.service.CompanionWatchdogWorker
+import com.partnerssolutions.caroline.companion.update.UpdateChecker
 import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
@@ -41,6 +42,10 @@ class CompanionApplication : Application() {
         // CompanionWatchdogWorker's own doc comment) whenever the feature
         // is off or already healthy -- safe to always schedule.
         CompanionWatchdogWorker.schedule(this)
+        // OTA self-update (2026-10-01), same pattern as ShortNerdCat's own
+        // UpdateChecker -- runs for the lifetime of the process, independent
+        // of whether the optional SMS/contacts companion feature is on.
+        UpdateChecker(this).start()
         Logger.i("CompanionApplication started")
     }
 }

@@ -1,5 +1,9 @@
 package com.partnerssolutions.caroline.companion.ui.tabs
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
@@ -8,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -19,6 +24,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -34,9 +40,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.partnerssolutions.caroline.companion.BuildConfig
 import com.partnerssolutions.caroline.companion.data.companion.COMPANION_REQUIRED_PERMISSIONS
 import com.partnerssolutions.caroline.companion.data.companion.CompanionPrefs
 import com.partnerssolutions.caroline.companion.data.companion.activateCompanionService
@@ -44,6 +53,8 @@ import com.partnerssolutions.caroline.companion.data.companion.companionPermissi
 import com.partnerssolutions.caroline.companion.data.companion.restartCompanionServiceIfNeeded
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.ui.chat.ChatScreen
+import com.partnerssolutions.caroline.companion.update.ACTION_UPDATE_READY
+import com.partnerssolutions.caroline.companion.update.UpdateChecker
 import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
@@ -59,7 +70,26 @@ import com.partnerssolutions.caroline.companion.util.Logger
 fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, viewModel: TabsViewModel = viewModel()) {
     var selectedIndex by remember { mutableIntStateOf(0) }
     var menuOpen by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
+
+    // OTA self-update (2026-10-01), same pattern as ShortNerdCat's own
+    // MainActivity: starts true if UpdateChecker (running since
+    // CompanionApplication.onCreate) already had a verified APK sitting on
+    // disk before this screen was ever composed, then flips true live via
+    // ACTION_UPDATE_READY for an update that finishes downloading while
+    // the app is open.
+    var updateReady by remember { mutableStateOf(UpdateChecker.readyVersion(context) != null) }
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action == ACTION_UPDATE_READY) updateReady = true
+            }
+        }
+        val filter = IntentFilter(ACTION_UPDATE_READY)
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose { context.unregisterReceiver(receiver) }
+    }
 
     // Per explicit instruction (2026-09-27), reversing the 2026-09-24
     // opt-in decision: the SMS/contacts companion now activates itself the
@@ -123,6 +153,23 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                         Icon(Icons.Filled.MoreVert, contentDescription = "Menu")
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        if (updateReady) {
+                            val readyVersion = UpdateChecker.readyVersion(context)
+                            DropdownMenuItem(
+                                text = { Text("Update ready" + (readyVersion?.let { " ($it)" } ?: "")) },
+                                onClick = {
+                                    menuOpen = false
+                                    val apk = UpdateChecker.readyApkFile(context) ?: return@DropdownMenuItem
+                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(uri, "application/vnd.android.package-archive")
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    context.startActivity(intent)
+                                },
+                            )
+                        }
                         DropdownMenuItem(
                             text = { Text("Phone companion (SMS/contacts)") },
                             onClick = {
@@ -135,6 +182,13 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                             onClick = {
                                 menuOpen = false
                                 Logger.shareLogs(context)
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("About") },
+                            onClick = {
+                                menuOpen = false
+                                showAboutDialog = true
                             },
                         )
                         DropdownMenuItem(
@@ -181,5 +235,16 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                 }
             }
         }
+    }
+
+    if (showAboutDialog) {
+        AlertDialog(
+            onDismissRequest = { showAboutDialog = false },
+            title = { Text("About") },
+            text = { Text("Caroline Companion\nVersion ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})") },
+            confirmButton = {
+                TextButton(onClick = { showAboutDialog = false }) { Text("OK") }
+            },
+        )
     }
 }

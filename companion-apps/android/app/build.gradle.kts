@@ -54,6 +54,10 @@ android {
 
     buildFeatures {
         compose = true
+        // Needed for BuildConfig.VERSION_NAME/VERSION_CODE, which UpdateChecker
+        // and the About dialog read directly (same source build.bat already
+        // stamps versionName/versionCode from, see defaultConfig above).
+        buildConfig = true
     }
 }
 

@@ -13,6 +13,11 @@
          service despite START_STICKY. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- OTA self-update (2026-10-01, same pattern as ShortNerdCat's
+         UpdateChecker): lets the user install the silently downloaded,
+         SHA-256-verified APK via the system installer from this app's own
+         FileProvider URI, same as ShortNerdCat/Ratatosk. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Requested at runtime, behind the consent screen (see the plan's own
          Phase 3 notes); declared here only. NOT the default SMS app: these
