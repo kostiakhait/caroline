@@ -90,8 +90,24 @@ async def run_python(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": text}
 
 
+def _usage_instructions() -> str:
+    return (
+        "Before telling the user a process/application has stopped or isn't running, don't conclude that from "
+        "a single exact-name check (`tasklist /FI \"IMAGENAME eq foo.exe\"`, `taskkill /IM foo.exe`) alone. Many "
+        "Windows applications run as a thin launcher that exits almost immediately after spawning the real "
+        "worker process under a DIFFERENT name -- the process you started is not necessarily the one that keeps "
+        "running, so a negative result from an exact-name filter only means that one name isn't running right "
+        "now, not that the application itself has stopped. Before reporting it stopped, run a broader check "
+        "first -- a plain `tasklist` (or `tasklist | findstr <partial-name>`) and actually look at the full "
+        "list for anything plausibly related, not just the one name you expected. If the application has its "
+        "own status mechanism (a CLI like `adb`, a PID/lock file, a management API), prefer that over guessing "
+        "at a Windows process name."
+    )
+
+
 PLUGIN = Plugin(
     name="shell",
+    usage_instructions=_usage_instructions(),
     tools=[
         PluginTool(
             "run_command",

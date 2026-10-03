@@ -209,7 +209,7 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         # trace. Only when tab_id is actually known (a throwaway test
         # script's dispatched operation has no tab to recover for anyway).
         if op.tab_id:
-            save_pending_operation(WORKSPACE_DIR, op.tab_id, op.id, tool_name)
+            save_pending_operation(WORKSPACE_DIR, op.tab_id, op.id, tool_name, args)
         log_event(f"plugin:{plugin_name}", "operation_running", tool=tool_name, operation_id=op.id)
         return {"operation_id": op.id, "status": "running"}
     except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()

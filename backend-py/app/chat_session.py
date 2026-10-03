@@ -293,6 +293,13 @@ NARRATION_FAILURE_RETRY_S = 15.0
 # (both speakers) to have something to react to.
 RECENT_DIALOGUE_WINDOW = 12
 
+# Hard break for the post-turn completion check (2026-10-03): it re-arms itself
+# after any reply with visible text, so a check whose own replies keep producing
+# text chained forever. At most this many checks in a row, counted from the last
+# real user message; reset by a real user message, and the Stop button halts it
+# outright until the next real user message.
+POST_TURN_CHECK_MAX_ROUNDS = 5
+
 # Bug fix (2026-09-14), per explicit instruction: language detection needs
 # the user's own last N messages specifically -- "независимо от остального"
 # -- not a fixed-size window of mixed dialogue lines the way narration
@@ -1375,6 +1382,9 @@ class ChatSession:
         # empty -- fires at most once per originating turn, never an
         # infinite loop of self-nudges.
         self._awaiting_post_turn_check_reply: bool = False
+        # Loop break state for _fire_post_turn_completion_check -- see POST_TURN_CHECK_MAX_ROUNDS.
+        self._post_turn_check_rounds: int = 0
+        self._post_turn_checks_halted: bool = False
 
         # Small-model primary path (2026-09-12, see small_model_engine.py's
         # own module docstring) -- an alternative to the SDK path above for
@@ -1392,6 +1402,17 @@ class ChatSession:
         # prefer this over its usual disk read while a small-model turn is
         # active, or the narrator would see nothing happening.
         self.small_model_live_dialogue: list[str] | None = None
+        # Real activity of the running small-model turn (tiers, tool calls, verification) -- the
+        # narrator may only restate these facts. See small_model_engine's on_activity.
+        self.small_model_activity: list[str] = []
+        # True while the CURRENTLY running small-model turn is a real user turn
+        # (False for a proactive/internal one) -- see _route_sw_turn.
+        self.small_model_turn_is_real_user: bool = False
+        # Real user messages that arrived while a PROACTIVE small-model turn was
+        # running (2026-10-03): queued here instead of folded into that turn as a
+        # live comment, and started as their OWN fresh turn once it ends -- a real
+        # request must never be swallowed by unrelated internal work.
+        self.small_model_queued_real_turns: list[tuple[str, list[Any], bool]] = []
         # New user_message text that arrived WHILE a small-model turn was
         # already running -- per explicit instruction, this is live context
         # fed into the SAME turn (via get_new_user_comments, polled once per
@@ -1996,6 +2017,9 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+            self._route_sw_turn(text, attachments, is_real_user, is_voice)
+            return
         # Bug fix (2026-09-18), per explicit instruction after a real
         # incident: never push straight into the live client while a
         # forced compaction is still in flight for this tab -- confirmed
@@ -2019,6 +2043,9 @@ class ChatSession:
             "engine", "submit", tab_id=self.tab_id, is_real_user=is_real_user, is_voice=is_voice,
             text_len=len(text), attachment_count=len(attachments),
         )
+        if is_real_user:
+            self._post_turn_check_rounds = 0
+            self._post_turn_checks_halted = False
         self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
         # Reset for THIS turn -- see this flag's own __init__ comment for
@@ -2123,80 +2150,75 @@ class ChatSession:
         wire_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         self._push_message(wire_text, attachments, is_voice)
 
-    def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False) -> None:
-        """The real entry point for a REAL user_message (main.py's WS
-        "user_message" handler and POST /api/message both call this now,
-        never submit() directly) -- per explicit design (2026-09-12): try
-        answering through the small/cheap Camerlengo model FIRST when
-        eligible, falling through to the existing, completely untouched
-        Claude Agent SDK path (self.submit()) otherwise, including on the
-        small model's own escalation (self-reported sentinel or the
-        mechanical repeated-tool-call guard, see small_model_engine.py).
-        Gated per-tab now (2026-09-14) by this tab's own persisted chat
-        mode (durability.py's load_chat_mode, Settings-controlled -- see
-        chat_mode_eligible's own docstring for why "sw" can only be set
-        when both subscriptions are active) -- every real turn falls
-        through to self.submit() below unless this tab is specifically set
-        to "sw".
+    def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, is_real_user: bool = True) -> None:
+        """Compatibility entry point for existing callers. In "sw" mode submit()
+        itself routes every turn to the small-model path, so this just delegates."""
+        self.submit(text, attachments, is_real_user, is_voice)
 
-        Eligible means: this tab's chat mode is "sw", no attachments (the
-        small model never sees vision/document content here -- not a hard
-        technical limit, just out of scope for this first cut), no turn
-        already in flight, and SquirrelWisdom access is available --
-        login_api.is_logged_in(), the SAME check sw_gate.py's own
-        require_sw_or_prompt already uses at every other SW-gated call
-        site, reused rather than re-derived.
-
-        If a small-model turn is ALREADY running, a new message here is
-        live context for THAT turn, not a fresh submit -- see the
-        small_model_pending_comments docstring above."""
-        attachments = attachments or []
+    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
+        """Every turn in "sw" mode goes here, never to the Claude SDK (2026-10-03):
+        while a small-model turn runs, new input is live context for it -- UNLESS it's a
+        real user message arriving during a PROACTIVE turn, which queues as its own fresh
+        turn instead (see small_model_queued_real_turns). Otherwise a new turn starts."""
         if self.small_model_active:
-            log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text))
-            self.small_model_pending_comments.append(text)
+            if is_real_user and not self.small_model_turn_is_real_user:
+                log_event("engine", "small_model_real_turn_queued_behind_proactive", tab_id=self.tab_id, text_len=len(text))
+                self.small_model_queued_real_turns.append((text, attachments, is_voice))
+                return
+            log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
+            self.small_model_pending_comments.append(text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}")
             return
+        self._start_small_model_turn(text, attachments, is_real_user, is_voice)
 
-        if load_chat_mode(self.workspace_dir, self.tab_id) != "sw" or attachments or self.turn_pending or not is_logged_in():
-            self.submit(text, attachments, True, is_voice)
-            return
-
-        log_event("engine", "small_model_turn_attempting", tab_id=self.tab_id, text_len=len(text))
-        # Mirrors submit()'s own is_real_user=True bookkeeping exactly (see
-        # its comments for why each field exists) -- this turn is just as
-        # real a user turn as one that goes through the SDK, so every
-        # consumer of this state (narration, the silent-wait nudge, crash
-        # recovery) must see it the same way.
+    def _start_small_model_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
+        self.small_model_turn_is_real_user = is_real_user
+        log_event("engine", "small_model_turn_attempting", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
+        model_text = text
+        if attachments:
+            # The small model gets no file content in this mode; it at least learns what was attached.
+            names = ", ".join(str(a.get("name") if isinstance(a, dict) else a) for a in attachments)
+            model_text = f"{text}\n[Attachments were not delivered in this mode: {names}]"
+        # Mirrors submit()'s own is_real_user bookkeeping (see its comments for
+        # why each field exists). Real-user-only state (silent-wait nudge, crash
+        # recovery of a pending question) is skipped for internal turns.
         self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
-        self.pending_is_real_user = True
+        self.pending_is_real_user = is_real_user
         self.pending_attachments = []
         self.turn_pending = True
         self.last_activity = time.monotonic()
         self.last_user_activity = time.monotonic()
-        self.last_real_user_turn_at = time.monotonic()
-        self.last_real_user_turn_started_at_ms = time.time() * 1000
-        self.real_user_turn_answered = False
-        self.silence_nudge_sent_for_turn = False
-        # See the matching reset in submit() for why this is cleared here too.
-        self._pending_tool_calls = {}
-        self.turn_tool_outcomes = {}
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count = 0
-        self.last_real_user_question = text
-        refresh_language_in_background(self.last_saved_session_id, self.tab_id)
-        save_pending_turn(self.workspace_dir, self.tab_id, text, [])
+        self._pending_tool_calls = {}
+        self.turn_tool_outcomes = {}
+        if is_real_user:
+            self._post_turn_check_rounds = 0
+            self._post_turn_checks_halted = False
+            self.last_real_user_turn_at = time.monotonic()
+            self.last_real_user_turn_started_at_ms = time.time() * 1000
+            self.real_user_turn_answered = False
+            self.silence_nudge_sent_for_turn = False
+            self.last_real_user_question = text
+            refresh_language_in_background(self.last_saved_session_id, self.tab_id)
+            save_pending_turn(self.workspace_dir, self.tab_id, text, [])
 
         self.small_model_active = True
         self.small_model_live_dialogue = None
-        self._small_model_task = asyncio.create_task(self._run_small_model_turn(text, is_voice))
+        self.small_model_activity = []
+        self._small_model_task = asyncio.create_task(self._run_small_model_turn(model_text, is_voice, is_real_user))
 
-    def _end_small_model_turn(self) -> None:
+    def _end_small_model_turn(self, start_queued_real_turn: bool = True) -> None:
         self.small_model_active = False
         self.small_model_live_dialogue = None
         self.small_model_pending_comments = []
         self._small_model_task = None
+        if start_queued_real_turn and self.small_model_queued_real_turns:
+            text, attachments, is_voice = self.small_model_queued_real_turns.pop(0)
+            log_event("engine", "small_model_queued_real_turn_starting", tab_id=self.tab_id, text_len=len(text), remaining=len(self.small_model_queued_real_turns))
+            self._start_small_model_turn(text, attachments, True, is_voice)
 
-    async def _run_small_model_turn(self, text: str, is_voice: bool) -> None:
+    async def _run_small_model_turn(self, text: str, is_voice: bool, is_real_user: bool = True) -> None:
         persona = get_persona(self.workspace_dir)
         recent_dialogue_lines = _read_recent_dialogue_lines(
             self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW,
@@ -2213,33 +2235,31 @@ class ChatSession:
             self.small_model_pending_comments = []
             return comments
 
+        def on_activity(line: str) -> None:
+            self.small_model_activity.append(line[:300])
+            del self.small_model_activity[:-20]
+
         try:
             result = await run_small_model_turn(
                 tab_id=self.tab_id, workspace_dir=self.workspace_dir, persona=persona, user_text=text,
                 recent_dialogue_lines=recent_dialogue_lines, language=language,
                 send=self.send, on_live_dialogue_update=on_live_dialogue_update,
-                get_new_user_comments=get_new_user_comments,
+                get_new_user_comments=get_new_user_comments, on_activity=on_activity,
             )
         except asyncio.CancelledError:
-            # Stop button -- see stop()'s own small_model_active branch.
+            # Stop button -- see stop()'s own small_model_active branch. Never starts a
+            # queued real turn -- an explicit Stop means stop, not run the next thing.
             log_event("engine", "small_model_turn_cancelled", tab_id=self.tab_id)
             clear_pending_turn(self.workspace_dir, self.tab_id)
             self.turn_pending = False
-            self._end_small_model_turn()
+            self._end_small_model_turn(start_queued_real_turn=False)
             raise
         except Exception as exc:  # noqa: BLE001 -- this path must never wedge the session
             log_event("engine", "small_model_turn_unexpected_error", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
-            result = {"status": "escalate", "reason": f"unexpected error: {exc}"}
+            result = {"status": "answered", "text": "Сейчас не получается ответить на это — попробуй ещё раз чуть позже."}
 
-        if result["status"] == "answered":
-            await self._finish_small_model_turn_answered(text, result["text"], is_voice)
-        else:
-            log_event("engine", "small_model_escalating_to_sdk", tab_id=self.tab_id, reason=result.get("reason"))
-            self._end_small_model_turn()
-            # Falls through to the real, untouched SDK path with the
-            # original text -- nothing was ever shown to the user yet, so
-            # this is indistinguishable to them from a normal first submit.
-            self.submit(text, [], True, is_voice)
+        question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
+        await self._finish_small_model_turn_answered(question_text, result["text"], is_voice)
 
     async def _finish_small_model_turn_answered(self, question_text: str, text: str, is_voice: bool) -> None:
         """Synthesizes the same {assistant} + {result} wire pair a normal
@@ -2264,6 +2284,9 @@ class ChatSession:
         SDK session) should see the same thing the user actually saw."""
         from app.plugins.voice_api import translate_text
 
+        # Same rule as the SDK path (_strip_no_update_from_wire): a silent
+        # [[NO_UPDATE]] reply never reaches the visible dialog.
+        silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
         try:
             translated = await translate_text(text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir))
         except Exception as exc:
@@ -2285,18 +2308,19 @@ class ChatSession:
             "session_id": self.last_saved_session_id,
             "parent_tool_use_id": None,
         }
-        await self.send({"type": "sdk_message", "message": assistant_wire})
-        result_wire = {
-            "type": "result",
-            "subtype": "success",
-            "duration_ms": 0,
-            "is_error": False,
-            "num_turns": 1,
-            "session_id": self.last_saved_session_id,
-            "total_cost_usd": 0.0,
-            "result": text,
-        }
-        await self.send({"type": "sdk_message", "message": result_wire, "isVoice": is_voice})
+        if not silent:
+            await self.send({"type": "sdk_message", "message": assistant_wire})
+            result_wire = {
+                "type": "result",
+                "subtype": "success",
+                "duration_ms": 0,
+                "is_error": False,
+                "num_turns": 1,
+                "session_id": self.last_saved_session_id,
+                "total_cost_usd": 0.0,
+                "result": text,
+            }
+            await self.send({"type": "sdk_message", "message": result_wire, "isVoice": is_voice})
         self.real_user_turn_answered = True
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count = 0
@@ -2332,11 +2356,22 @@ class ChatSession:
         attachments = attachments or []
         log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
+        # Internal turns follow the same chat-mode gate as real ones (2026-10-03):
+        # in "sw" mode they run through the small-model cascade; everything else
+        # (other modes, attachments, pending_text replays) keeps the SDK path.
         self.submit(text, attachments, False, is_voice, pending_text=pending_text)
         return True
 
     def stop(self) -> None:
+        # Latched before the turn_pending check below: between turns nothing is
+        # pending, yet the post-turn check is what re-arms the loop, so Stop must
+        # still halt it. Cleared only by the next real user message.
+        self._post_turn_checks_halted = True
+        # A request queued behind a proactive turn (see small_model_queued_real_turns)
+        # must not run right after an explicit Stop -- that's the opposite of what Stop means.
+        self.small_model_queued_real_turns = []
         if not self.turn_pending:
+            log_event("engine", "user_stop_between_turns", tab_id=self.tab_id)
             return
         log_event("engine", "user_stop", tab_id=self.tab_id)
         self.user_stop_requested = True
@@ -3174,12 +3209,20 @@ class ChatSession:
         # budget -- see that constant's own comment for the 71s real
         # incident this fixes) so a slow/hung attempt fails fast and this
         # loop gets a real chance to try again within the SAME tick.
+        # Narrator sees only real facts about a running small-model turn. No facts -> stay silent
+        # (2026-10-03): filler without facts misleads the user.
+        activity: str | None = None
+        if self.small_model_active:
+            activity = "\n".join(self.small_model_activity[-8:]) or None
+            if activity is None:
+                log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
+                return
         comment: str | None = None
         for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
             try:
                 comment = await generate_progress_comment(
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
-                    gender=get_persona_gender(self.workspace_dir),
+                    gender=get_persona_gender(self.workspace_dir), activity=activity,
                 )
             except Exception as exc:
                 log_event("engine", "progress_narration_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))
@@ -3220,6 +3263,8 @@ class ChatSession:
         submit() sits behind the same stuck input stream as the original
         message until hang-detection's own, separate recovery runs."""
         if self.last_real_user_turn_at is None or self.real_user_turn_answered or self.silence_nudge_sent_for_turn:
+            return
+        if self._post_turn_checks_halted:
             return
         elapsed = time.monotonic() - self.last_real_user_turn_at
         if elapsed < SILENT_USER_WAIT_NUDGE_MS / 1000:
@@ -3371,6 +3416,13 @@ class ChatSession:
         driven now instead of polling on a clock."""
         if self.ended:
             return
+        if self._post_turn_checks_halted:
+            log_event("engine", "post_turn_completion_check_halted_by_stop", tab_id=self.tab_id)
+            return
+        if self._post_turn_check_rounds >= POST_TURN_CHECK_MAX_ROUNDS:
+            log_event("engine", "post_turn_completion_check_round_cap", tab_id=self.tab_id, rounds=self._post_turn_check_rounds)
+            return
+        self._post_turn_check_rounds += 1
         lang = current_language_name(self.tab_id)
         # Ground-truth cross-check (2026-09-22, see ToolOutcome's own
         # docstring): grounds this nudge in what the last turn's own tool

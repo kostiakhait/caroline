@@ -23,6 +23,7 @@ again.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 
@@ -50,15 +51,27 @@ async def get_model_provider_key() -> str | None:
     first use (or after a session change) and caching in memory only.
     Returns None if not logged into SquirrelWisdom, or the fetch/decrypt
     fails for any reason -- callers treat that as "small model unavailable
-    right now" and escalate to the full SDK, same as small_model_engine.py's
-    own "never a hard dependency" guarantee for every other failure mode
-    in that path."""
+    right now", same as small_model_engine.py's own "never a hard
+    dependency" guarantee for every other failure mode in that path.
+
+    Retries the session fetch once after a short delay (2026-10-03,
+    confirmed live: a transient SW hiccup -- not a real logout, it worked
+    seconds earlier and again seconds later -- made a real user request
+    dead-end on the generic "can't answer right now" fallback instead of
+    a real answer). Mirrors the Android companion's own retryOnce: one
+    extra try, not a general retry policy -- a real logout still fails
+    the second attempt exactly as it should."""
     global _cached_key, _cached_for_session
-    try:
-        session = await get_v2_session()
-    except Exception as exc:
-        log_event("engine", "model_key_no_session", error=str(exc))
-        return None
+    session: str | None = None
+    for attempt in (1, 2):
+        try:
+            session = await get_v2_session()
+            break
+        except Exception as exc:
+            log_event("engine", "model_key_no_session", attempt=attempt, error=str(exc))
+            if attempt == 2:
+                return None
+            await asyncio.sleep(0.8)
 
     if _cached_key and _cached_for_session == session:
         return _cached_key

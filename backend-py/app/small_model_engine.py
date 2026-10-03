@@ -417,7 +417,13 @@ def _engine_instructions(language: str) -> str:
         "If the task has more than one concrete step (going through several accounts/files/items one by one, a "
         "multi-part request), call declare_plan FIRST and list every step, then actually carry each one out and "
         "call mark_step_done right after -- this is what proves the work happened, not the words you use to "
-        "describe it. Don't declare a plan and then just describe what you're about to do instead of doing it.\n\n"
+        "describe it. Don't declare a plan and then just describe what you're about to do instead of doing it. "
+        "When a step depends on identifying or confirming something you're not already certain of (is X actually "
+        "running, does Y exist, which of several candidates is the real one), don't bake your first guess into "
+        "that step and act on it directly -- plan a broad discovery step first (list every plausible candidate, "
+        "not just the one name you expect), then a step that actually narrows it down to the real one, before "
+        "the step that acts. Skipping straight from a guess to the action step is how confident-sounding wrong "
+        "answers happen.\n\n"
         f"Reply in {language} unless the user's own message is written in a different language -- then match "
         "theirs instead.\n\n"
         "If you judge that you are NOT coping with this task -- too many tool-call failures, the task turning "
@@ -505,9 +511,8 @@ _OPERATIONS_TOOL_NAMES = {t["function"]["name"] for t in _OPERATIONS_TOOL_DEFS}
 # specially in _make_executor_fn() below, same pattern as the operations
 # trio -- these mutate a per-turn _TurnTracker rather than going through
 # dispatch(). Declaring a plan is optional (most single-step asks don't
-# need one), but ONCE declared, run_small_model_turn() checks declared vs.
-# actually-marked-done steps before accepting the turn's text as final --
-# see _TurnTracker.needs_verification().
+# need one), but ONCE declared, the verification pass in run_small_model_turn()
+# checks declared vs. actually-marked-done steps before the turn's text is shown.
 _PLAN_TOOL_DEFS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -546,15 +551,68 @@ _PLAN_TOOL_DEFS: list[dict[str, Any]] = [
 ]
 _PLAN_TOOL_NAMES = {t["function"]["name"] for t in _PLAN_TOOL_DEFS}
 
+# Per explicit instruction (2026-10-03), after a live incident where a tier
+# guessed at a fact (which Windows process name the Android emulator VM
+# actually runs under) instead of checking -- confirmed live via a standalone
+# test that camerlengo's existing AI.resolveOnline() (OpenRouter's ":online"
+# web-search mode, Exa/native-backed) correctly answers exactly this kind of
+# question with a cited source. Exposed here as a plain blocking tool (see
+# executor_fn -- it's already running on its own worker thread, so calling
+# the adapter's synchronous resolve() directly, with no main-loop hop, is
+# correct and simplest) rather than a new plugin, since it needs no
+# dispatch()/operation-registry machinery of its own and uses the SAME
+# OpenRouter key already fetched for this turn -- no new credential. NOT
+# available to the verifier (which stays tool-free by firm requirement).
+_WEB_SEARCH_TOOL_DEFS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Asks a web-search-grounded model a question and returns its answer based on live, current web "
+                "results (not just training data), with a source where possible. Use this to confirm a fact "
+                "you're genuinely NOT certain of before acting on a guess -- e.g. what name a process actually "
+                "runs under, how a specific tool/API really behaves, a current version or syntax -- rather than "
+                "assuming and finding out you were wrong after the fact. This costs real money per call -- use "
+                "it when you're actually unsure, not for things you already know or every routine step."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+            },
+        },
+    },
+]
+_WEB_SEARCH_TOOL_NAMES = {t["function"]["name"] for t in _WEB_SEARCH_TOOL_DEFS}
+
+
+def _run_web_search_tool(name: str, args: dict[str, Any], ai: Any, cfg: Any) -> str:
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return "ERROR: 'question' is required."
+    # One retry (2026-10-03, confirmed live): the FIRST resolveOnline call sometimes
+    # comes back empty while an identical immediate retry succeeds -- same ordinary
+    # intermittent-empty-result shape already retried everywhere else in this file
+    # (key fetch, verification, narration), not a sign anything is actually broken.
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            result = ai.resolveOnline(question, model=cfg.AI_MODEL_SMALL)
+        except Exception as exc:  # noqa: BLE001 -- a failed search is a tool result, not a turn-ending error
+            last_error = exc
+            continue
+        if result:
+            return str(result)
+    return f"ERROR: web_search failed: {last_error}" if last_error else "ERROR: web_search returned no answer (tried twice)."
+
 
 @dataclass
 class _TurnTracker:
     """Per-turn (not per-registry) mutable state -- one instance per
     run_small_model_turn() call, threaded through _make_executor_fn() so
-    the executor can update it as tool calls actually happen. Used
-    afterward to decide whether the turn's own text is trustworthy as a
-    final answer or needs the verification pass (see
-    needs_verification())."""
+    the executor can update it as tool calls actually happen. Read by the
+    verification pass (see _build_verification_prompt)."""
 
     tool_call_count: int = 0
     plan_steps: list[str] | None = None
@@ -590,12 +648,6 @@ class _TurnTracker:
     def touch_progress(self) -> None:
         self.last_progress_at = time.monotonic()
 
-    def needs_verification(self) -> bool:
-        if self.pending_operation_ids:
-            return True
-        if self.plan_steps is not None and len(self.plan_done) < len(self.plan_steps):
-            return True
-        return False
 
 
 def _run_plan_tool(name: str, args: dict[str, Any], tracker: _TurnTracker) -> str:
@@ -647,7 +699,7 @@ def build_tool_registry() -> ToolRegistry:
     ever learn the real result, so it had to guess or just claim success.
     Confirmed live as the actual cause of a placeholder note being left
     behind while the model told the user it was "preparing" the real one."""
-    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS)
+    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_WEB_SEARCH_TOOL_DEFS)
     lookup: dict[str, tuple[str, PluginTool]] = {}
     tool_instructions: dict[str, str] = {}
     own_plugins: list[dict[str, Any]] = []
@@ -675,7 +727,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
     since Operation.task is a live asyncio.Task; .cancel() and reading task
     state should only ever happen on the loop that owns it. Also updates
     tracker.pending_operation_ids -- an operation reaching a terminal status
-    here means it's no longer "dangling" (see _TurnTracker.needs_verification)."""
+    here means it's no longer "dangling" for the verification pass."""
     if name == "check_operation_status":
         op = OPERATIONS_REGISTRY.get(args["operation_id"])
         if op is None:
@@ -719,7 +771,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
 
 def _make_executor_fn(
     registry: ToolRegistry, tab_id: str | None, send: session_context.SendFn | None,
-    main_loop: asyncio.AbstractEventLoop, tracker: _TurnTracker,
+    main_loop: asyncio.AbstractEventLoop, tracker: _TurnTracker, ai: Any, cfg: Any,
 ) -> Callable[[str, dict[str, Any]], str]:
     """Bridges resolve_agentic()'s synchronous, worker-thread-side
     executor_fn(name, args) -> str callback into Caroline's own async
@@ -759,6 +811,13 @@ def _make_executor_fn(
 
         if name in _PLAN_TOOL_NAMES:
             return _run_plan_tool(name, args, tracker)
+
+        if name in _WEB_SEARCH_TOOL_NAMES:
+            # Already running on this turn's own worker thread (resolve_agentic calls
+            # executor_fn off the main loop) -- a plain blocking call here is correct,
+            # same as _run_plan_tool, no main-loop hop needed (unlike dispatch()'d
+            # plugin tools below, which need the main loop for session_context/Operation).
+            return _run_web_search_tool(name, args, ai, cfg)
 
         if name in _OPERATIONS_TOOL_NAMES:
             return asyncio.run_coroutine_threadsafe(
@@ -802,15 +861,20 @@ def _make_executor_fn(
     return executor_fn
 
 
-def _build_verification_prompt(tracker: _TurnTracker, final_text: str) -> str:
-    """Built fresh per verification call from tracker's own mechanical
-    state -- never guesses at WHY verification is needed from final_text's
-    wording, just states the concrete, checkable facts (which declared
-    steps are unmarked, which operations were never resolved)."""
+def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escalate: bool) -> str:
+    """Verification only (2026-10-03): the verifier has NO tools and must not do
+    any work. It checks the candidate against the mechanical facts below.
+
+    `can_escalate` (2026-10-03): True for every tier except the last -- per explicit
+    instruction ("если задача не доделана, то нужна эскалация"), finding the task
+    genuinely unfinished is itself an escalation trigger, same as a tier's own
+    ESCALATION_SENTINEL/NeedsEscalation/_TurnStalled signals -- the verifier is not
+    the end of the line while a stronger tier is still available. Only once the last
+    tier has also been verified and found wanting does the verifier write a final
+    "could not complete" message instead of escalating further."""
     parts = [
-        "The reply above is from another assistant working on the same task. Check whether the underlying "
-        "work is ACTUALLY complete -- not just whether the reply reads as complete -- and finish it for real if "
-        "it isn't, using your own tools. Do not just restate or summarize the plan; verify and act."
+        "The reply above is from another assistant that worked on the user's request. You are a verifier only: "
+        "you have no tools and must not try to do or finish any work. Check the reply against the facts below."
     ]
     if tracker.plan_steps is not None:
         undone = [s for i, s in enumerate(tracker.plan_steps) if i not in tracker.plan_done]
@@ -821,16 +885,82 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str) -> str:
             )
     if tracker.pending_operation_ids:
         parts.append(
-            "These tool operations were started and never checked through to a final result -- call "
-            "check_operation_status on each one first, before anything else: " + ", ".join(sorted(tracker.pending_operation_ids))
+            "These tool operations were started but never confirmed as finished: "
+            + ", ".join(sorted(tracker.pending_operation_ids))
         )
-    if tracker.tool_call_count == 0:
-        parts.append("No tool was called at all for this task -- if one is actually needed, call it now.")
+    if can_escalate:
+        parts.append(
+            "If, based on the reply and the facts above, the task is genuinely NOT finished yet -- real work "
+            f'still needed, not just a wording issue -- reply with EXACTLY this and nothing else: "{ESCALATION_SENTINEL} '
+            '<one short sentence saying what is still missing or wrong>". A stronger model will pick it up from '
+            "exactly that point, with the full tool-call history so far. Only do this for genuinely unfinished "
+            "work -- if it's actually done, write the final reply instead, as described below."
+        )
     parts.append(
-        "Once everything is genuinely finished (and only then), reply with the real, final answer for the user "
-        "-- the same way you'd answer them directly, not a report about the other assistant's work."
+        "Your reply is the final message the user will read. Write it fresh, clearly and to the point, directly "
+        "answering their request, even if the earlier reply was already fine. Never describe the other assistant's "
+        "work as a report. Do not claim anything is done unless the reply and facts above show it."
+        + (
+            ""
+            if can_escalate
+            else (
+                " If the task genuinely could not be completed, say so plainly -- what was done, what was not, "
+                "and why -- and stop there. Do not tell the user what to do, do not suggest steps for them to "
+                "take, and do not give any instruction, task, or advice, even phrased gently or as an offer, "
+                "unless they explicitly asked for suggestions. This was the last attempt -- there is no one left "
+                "to hand it to but the user, and piling an unrequested to-do list on them on top of an unfinished "
+                "task is not a neutral close-out, it's offloading your own unfinished work onto them."
+            )
+        )
+        + " You have no tools and this is the only message you get to send -- never promise to check, follow up, "
+        "or give it a minute: nothing will act on that promise after this reply, so it would just be a lie."
     )
     return "\n\n".join(parts)
+
+
+_UNAVAILABLE_ANSWER = "Сейчас не получается ответить на это — попробуй ещё раз чуть позже."
+
+
+def _usable(text: str) -> bool:
+    return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
+
+
+def _answer(text: str) -> dict[str, Any]:
+    return {"status": "answered", "text": text}
+
+
+def _continuation_note(tier_trace: list[str]) -> str:
+    return (
+        "[Internal: a previous attempt at this same request already ran these tool calls, with their real "
+        "results. Continue from exactly where it stopped -- do not repeat these calls, do not restart from scratch.]\n"
+        + "\n".join(tier_trace[-25:])
+    )
+
+
+COMPLEXITY_TIMEOUT_S = 12.0
+
+_COMPLEXITY_PROMPT = (
+    "Classify a request for an assistant that has tools (shell commands, files, apps, windows, email, notes). "
+    "Reply with exactly one word: COMPLEX if it needs several dependent tool steps (check, then act, then verify), "
+    "otherwise SIMPLE.\n\nRequest:\n"
+)
+
+
+async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
+    """Pre-assessment (2026-10-03): a complex multi-step tool task starts directly at
+    the second tier. AI_MODEL_SMALL is used only for this one-word service call."""
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(ai.resolve, _COMPLEXITY_PROMPT + user_text[:2000], model=cfg.AI_MODEL_SMALL, no_fallback=True),
+            timeout=COMPLEXITY_TIMEOUT_S,
+        )
+        verdict = str(raw or "").strip().upper()
+        start = 1 if verdict.startswith("COMPLEX") else 0
+    except Exception as exc:  # noqa: BLE001 -- classification must never block the turn
+        log_event("engine", "small_model_complexity_failed", error=str(exc), error_type=type(exc).__name__)
+        start = 0
+    log_event("engine", "small_model_complexity", start_tier=start)
+    return start
 
 
 async def run_small_model_turn(
@@ -843,36 +973,48 @@ async def run_small_model_turn(
     send: session_context.SendFn | None,
     on_live_dialogue_update: Callable[[list[str]], None] | None = None,
     get_new_user_comments: Callable[[], list[str]] | None = None,
+    on_activity: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Tries to answer `user_text` via the small-model primary path.
-    Returns {"status": "answered", "text": ...} or
-    {"status": "escalate", "reason": ...} -- NEVER raises: this path is
-    the primary but must never be a hard dependency, per explicit
-    instruction that the existing SDK session is always the safety net,
-    so any unexpected failure here is itself treated as an escalation
-    rather than surfaced as an error.
+    """Answers `user_text` through the OpenRouter-only path -- never hands off
+    to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
 
-    on_live_dialogue_update(lines), if given, is called every time this
-    turn's own live exchange changes (the user's question, each real
-    answer) -- lets the caller (ChatSession) feed the ACTUAL live
-    conversation to the progress narrator instead of the stale on-disk SDK
-    transcript, which this path never writes to at all.
+    Four-tier cascade (mini -> large -> codex-max -> AI_MODEL_ALTERNATE/Sonnet,
+    the last added 2026-10-03), carrying the previous tier's real tool-call trace
+    forward on every escalation. A tier escalates mechanically (ESCALATION_SENTINEL,
+    NeedsEscalation, _TurnStalled) same as before, AND a verifier (the same
+    AI_MODEL_ALTERNATE, but tool-free -- a separate role) checks every tier's
+    "done" candidate against the mechanical facts (undone plan steps, unconfirmed
+    operations): if it finds the task genuinely unfinished and a later tier still
+    exists, that is ALSO an escalation, not a final answer. Only once the last tier
+    has been tried and verified does the verifier write the actual final user-facing
+    text -- a real answer if it's done, or a plain, honest "could not complete this"
+    if it still isn't, with no unsolicited instructions/tasks for the user either way.
 
-    get_new_user_comments(), if given, is polled once per resolve_agentic()
-    iteration (see that function's own get_new_messages parameter) --
-    returns any new real user messages that arrived since the last check,
-    so a long-running turn stays responsive to what the user says WHILE
-    it's still working, without cancelling and restarting.
+    on_live_dialogue_update(lines), if given, is called every time this turn's
+    own live exchange changes -- feeds the progress narrator. get_new_user_comments(),
+    if given, is polled once per resolve_agentic() iteration so a long turn stays
+    responsive to what the user says while it runs.
     """
     log_event("engine", "small_model_turn_started", tab_id=tab_id, text_len=len(user_text))
     if camerlengo_ai is None:
         log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
-        return {"status": "escalate", "reason": "small-model engine (Camerlengo AI.py) not available on this install"}
+        return _answer(_UNAVAILABLE_ANSWER)
 
     api_key = await get_model_provider_key()
     if not api_key:
         log_event("engine", "small_model_no_key_available", tab_id=tab_id)
-        return {"status": "escalate", "reason": "no model-provider key available (not logged into SquirrelWisdom, or the fetch failed)"}
+        return _answer(_UNAVAILABLE_ANSWER)
+
+    # Explicit adapter with the freshly-fetched key -- never rely on
+    # camerlengo_ai.AI()'s own default (Config.OPENROUTER_KEY, server-only)
+    # from this process; Caroline always passes its own, per-session key.
+    # Built here (moved up 2026-10-03) rather than right before the tier loop
+    # so executor_fn (built below) can use `ai`/`cfg` directly for the
+    # web_search tool, which is a plain blocking call, not a dispatch()'d
+    # plugin operation.
+    adapter = camerlengo_ai.OpenRouterAdapter(api_key=api_key)
+    ai = camerlengo_ai.AI(adapter=adapter)
+    cfg = camerlengo_ai.Config
 
     registry = build_tool_registry()
     system = "\n\n".join([
@@ -896,11 +1038,24 @@ async def run_small_model_turn(
 
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
-    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker)
+    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker, ai, cfg)
 
     live_dialogue = [f"User: {user_text}"]
     if on_live_dialogue_update:
         on_live_dialogue_update(list(live_dialogue))
+
+    # Real tool calls of the CURRENT tier, rendered as text -- handed to the next
+    # tier on escalation so it continues instead of redoing them. Cleared after each
+    # handoff so no tier ever receives the same calls twice.
+    tier_trace: list[str] = []
+
+    def emit(line: str) -> None:
+        # Real facts for the narrator (see ChatSession.on_activity). Never lets a failure reach the turn.
+        if on_activity:
+            try:
+                on_activity(line)
+            except Exception:  # noqa: BLE001
+                pass
 
     def on_progress(evt: dict[str, Any]) -> None:
         tracker.touch_progress()
@@ -908,9 +1063,16 @@ async def run_small_model_turn(
             "engine", "small_model_progress", tab_id=tab_id, event_type=evt.get("type"),
             tool=evt.get("name"), iteration=evt.get("iteration"),
         )
+        if evt.get("type") == "tool_call":
+            log_event("engine", "small_model_tool_output", tab_id=tab_id, tool=evt.get("name"), args=evt.get("args"), result=str(evt.get("result", "")))
+            args = json.dumps(evt.get("args") or {}, ensure_ascii=False, default=str)[:300]
+            emit(f"Вызов инструмента {evt.get('name')} (аргументы: {args[:120]}); результат: {str(evt.get('result', ''))[:160]}")
+            tier_trace.append(f"- {evt.get('name')}({args}) -> {str(evt.get('result', ''))[:300]}")
         if evt.get("type") == "done" and on_live_dialogue_update:
-            live_dialogue.append(f"Caroline: {evt.get('text', '')}")
-            on_live_dialogue_update(list(live_dialogue))
+            text = evt.get("text", "")
+            if ESCALATION_SENTINEL not in text:
+                live_dialogue.append(f"Caroline: {text}")
+                on_live_dialogue_update(list(live_dialogue))
 
     def get_new_messages() -> list[dict[str, Any]] | None:
         if not get_new_user_comments:
@@ -927,97 +1089,110 @@ async def run_small_model_turn(
             on_live_dialogue_update(list(live_dialogue))
         return out
 
-    # Explicit adapter with the freshly-fetched key -- never rely on
-    # camerlengo_ai.AI()'s own default (Config.OPENROUTER_KEY, server-only)
-    # from this process; Caroline always passes its own, per-session key.
-    adapter = camerlengo_ai.OpenRouterAdapter(api_key=api_key)
-    ai = camerlengo_ai.AI(adapter=adapter)
-    model = camerlengo_ai.resolveModelCategory("LARGE")
-    log_event("engine", "small_model_resolved", tab_id=tab_id, model=model, tool_count=len(registry.tool_defs))
+    def on_usage(usage: dict[str, Any]) -> None:
+        log_event("engine", "small_model_usage", tab_id=tab_id, **usage)
 
-    try:
-        final_text = await _resolve_agentic_with_watchdog(
-            ai, tracker,
-            messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
-            model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
-            get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-            reasoning=REASONING_EFFORT,
-        )
-    except _TurnStalled as exc:
-        log_event("engine", "small_model_turn_stalled", tab_id=tab_id, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
-        return {"status": "escalate", "reason": f"no progress for {exc.elapsed_s:.0f}s ({exc.kind}) -- treating as a hang"}
-    except NeedsEscalation as exc:
-        log_event("engine", "small_model_escalation_mechanical", tab_id=tab_id, reason=exc.reason)
-        return {"status": "escalate", "reason": exc.reason}
-    except Exception as exc:  # noqa: BLE001 -- this path must never be a hard dependency
-        log_event("engine", "small_model_turn_failed", tab_id=tab_id, error=str(exc), error_type=type(exc).__name__)
-        return {"status": "escalate", "reason": f"internal error: {exc}"}
+    # 4th tier (2026-10-03, explicit instruction): AI_MODEL_ALTERNATE (Sonnet) used
+    # here WITH tools as a real escalation worker -- a distinct role from the same
+    # model's OTHER, tool-free use below as the verifier.
+    tiers = [cfg.AI_MODEL_MINI, cfg.AI_MODEL_LARGE, cfg.AI_MODEL_CODEX_MAX, cfg.AI_MODEL_ALTERNATE]
+    log_event("engine", "small_model_resolved", tab_id=tab_id, tiers=tiers, tool_count=len(registry.tool_defs))
 
-    if ESCALATION_SENTINEL in final_text:
-        log_event("engine", "small_model_escalation_self_reported", tab_id=tab_id)
-        return {"status": "escalate", "reason": "model reported NEED_ESCALATION"}
-
-    infra_failure = _is_silent_infra_failure(final_text)
-    if infra_failure is not None:
-        log_event("engine", "small_model_escalation_infra_failure", tab_id=tab_id, reason=infra_failure)
-        return {"status": "escalate", "reason": f"resolve_agentic gave up internally: {infra_failure}"}
-
-    # Per explicit instruction (2026-09-13): "Работа малой модели в
-    # отсутствие эскалации не должна требовать Claude SDK вообще" --
-    # verification of an incomplete-looking turn stays entirely inside
-    # Camerlengo/OpenRouter, using a DIFFERENT model category (ALTERNATE)
-    # rather than either re-asking the same model (which just produced the
-    # questionable answer) or routing to Claude (see chat_session.py's own
-    # _finish_small_model_turn_answered, which no longer does that). Two
-    # trigger conditions: tracker.needs_verification() (a plan was declared
-    # but not fully marked done, or a started operation was never checked
-    # through to a final status -- both mechanical, no text-pattern
-    # guessing) OR a long reply with zero tool calls and no plan at all --
-    # a pragmatic proxy (not NLP) for exactly the "wrote a paragraph plan,
-    # called nothing" pattern confirmed live in tab 1's own log; a short
-    # zero-tool reply (a quick factual answer) is left alone.
-    long_text_no_tools = tracker.tool_call_count == 0 and tracker.plan_steps is None and len(final_text) > 200
-    if tracker.needs_verification() or long_text_no_tools:
-        log_event(
-            "engine", "small_model_verification_triggered", tab_id=tab_id,
-            plan_incomplete=tracker.plan_steps is not None and len(tracker.plan_done) < len(tracker.plan_steps),
-            pending_operations=len(tracker.pending_operation_ids), long_text_no_tools=long_text_no_tools,
-        )
-        verification_model = camerlengo_ai.resolveModelCategory("ALTERNATE")
+    # Verification (AI_MODEL_ALTERNATE/Sonnet, no tools) runs after every tier that
+    # thinks it's done. Per explicit instruction (2026-10-03, "если задача не
+    # доделана, то нужна эскалация"): finding the task genuinely unfinished is
+    # itself an escalation trigger while a later tier still exists -- verification
+    # is no longer only a final polish pass tacked on after the loop.
+    async def run_verifier(candidate_text: str, can_escalate: bool) -> str:
         verification_messages = list(messages)
-        verification_messages.append({"role": "assistant", "content": final_text})
-        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, final_text)})
+        verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
+        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate)})
+        return await _resolve_agentic_with_watchdog(
+            ai, tracker,
+            messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
+            model=cfg.AI_MODEL_ALTERNATE, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+            get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
+            reasoning=REASONING_EFFORT, on_usage=on_usage,
+        )
+
+    async def verify_candidate(candidate_text: str, can_escalate: bool) -> tuple[str, bool]:
+        """Returns (text, needs_escalation). A technical verifier failure (empty
+        reply/exception on both attempts) is never treated as an escalation signal --
+        it just falls back to the candidate as-is, same as before this change."""
+        emit("Проверка результата (без инструментов).")
+        verified = ""
+        for attempt in (1, 2):
+            log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate)
+            try:
+                verified = await run_verifier(candidate_text, can_escalate)
+            except Exception as exc:  # noqa: BLE001 -- verifier failure is a retry, never silence
+                log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt=attempt, error=str(exc), error_type=type(exc).__name__)
+                verified = ""
+            if verified.strip():
+                break
+        if not verified.strip():
+            log_event("engine", "small_model_verification_fallback_candidate", tab_id=tab_id, text_len=len(candidate_text))
+            return candidate_text, False
+        if can_escalate and ESCALATION_SENTINEL in verified:
+            log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=verified.replace(ESCALATION_SENTINEL, "").strip()[:200])
+            return verified, True
+        log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
+        return verified, False
+
+    start_index = await _start_tier_index(ai, cfg, user_text)
+    final_text = ""
+    for index, model in enumerate(tiers):
+        if index < start_index:
+            continue
+        log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
+        emit(f"Работает уровень {index + 1} ({model}).")
+        candidate = ""
         try:
-            verified_text = await _resolve_agentic_with_watchdog(
+            candidate = await _resolve_agentic_with_watchdog(
                 ai, tracker,
-                messages=verification_messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
-                model=verification_model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
+                model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                reasoning=REASONING_EFFORT,
+                reasoning=REASONING_EFFORT, on_usage=on_usage,
             )
         except _TurnStalled as exc:
-            log_event("engine", "small_model_verification_stalled", tab_id=tab_id, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
-            return {"status": "escalate", "reason": f"verification pass had no progress for {exc.elapsed_s:.0f}s ({exc.kind})"}
+            # Not escalated: the stalled worker thread may still be running, and
+            # tracker.cancelled (shared with every later tier) is what keeps it from
+            # acting -- continuing here would either let it act or block the next tier.
+            log_event("engine", "small_model_tier_stalled", tab_id=tab_id, tier=index, model=model, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
+            break
         except NeedsEscalation as exc:
-            log_event("engine", "small_model_verification_escalation_mechanical", tab_id=tab_id, reason=exc.reason)
-            return {"status": "escalate", "reason": exc.reason}
-        except Exception as exc:  # noqa: BLE001 -- this path must never be a hard dependency
-            log_event("engine", "small_model_verification_failed", tab_id=tab_id, error=str(exc), error_type=type(exc).__name__)
-            return {"status": "escalate", "reason": f"verification pass internal error: {exc}"}
+            log_event("engine", "small_model_tier_escalation_mechanical", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
+        except Exception as exc:  # noqa: BLE001 -- the cascade must never raise into chat
+            log_event("engine", "small_model_tier_failed", tab_id=tab_id, tier=index, model=model, error=str(exc), error_type=type(exc).__name__)
 
-        if ESCALATION_SENTINEL in verified_text:
-            log_event("engine", "small_model_verification_escalation_self_reported", tab_id=tab_id)
-            return {"status": "escalate", "reason": "verification pass reported NEED_ESCALATION"}
-        infra_failure = _is_silent_infra_failure(verified_text)
-        if infra_failure is not None:
-            log_event("engine", "small_model_verification_infra_failure", tab_id=tab_id, reason=infra_failure)
-            return {"status": "escalate", "reason": f"verification pass gave up internally: {infra_failure}"}
+        if _usable(candidate):
+            log_event("engine", "small_model_tier_answered", tab_id=tab_id, tier=index, model=model, text_len=len(candidate), text=candidate)
+            emit(f"Уровень {index + 1} ({model}) дал ответ, переходим к проверке.")
+            can_escalate = index < len(tiers) - 1
+            verified_text, needs_escalation = await verify_candidate(candidate, can_escalate)
+            if not needs_escalation:
+                final_text = verified_text
+                break
+            emit(f"Проверка не подтвердила выполнение, эскалируем на уровень {index + 2}.")
+            if tier_trace:
+                messages.append({"role": "user", "content": _continuation_note(tier_trace)})
+                tier_trace.clear()
+            messages.append({"role": "user", "content": f"[Verifier checked the previous attempt and found it not actually finished: {verified_text.replace(ESCALATION_SENTINEL, '').strip()}]"})
+            continue
 
-        # Capped at one round -- accept the verification pass's own result
-        # regardless of tracker's state now (it had the same tools and the
-        # same chance to actually finish); not re-verifying a second time.
-        final_text = verified_text
-        log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(final_text))
+        emit(f"Уровень {index + 1} ({model}) не справился, переходим к следующему уровню.")
+        log_event("engine", "small_model_tier_escalating", tab_id=tab_id, tier=index, model=model, trace_calls=len(tier_trace))
+        if tier_trace:
+            messages.append({"role": "user", "content": _continuation_note(tier_trace)})
+            tier_trace.clear()
+
+    if not final_text:
+        # No tier ever produced a usable candidate (all stalled/errored/escalated
+        # mechanically) -- one last, non-escalating verification pass so the user
+        # still gets a real, honest answer instead of silence.
+        verified_text, _ = await verify_candidate(final_text, can_escalate=False)
+        final_text = verified_text if _usable(verified_text) else _UNAVAILABLE_ANSWER
 
     log_event("engine", "small_model_turn_answered", tab_id=tab_id, text_len=len(final_text))
-    return {"status": "answered", "text": final_text}
+    return _answer(final_text)

@@ -1373,7 +1373,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         if stale_operations:
             log_event("engine", "resuming_stale_pending_operations", tab_id=tab_id, count=len(stale_operations))
             ops_lang = current_language_name(tab_id)
-            ops_list = "\n".join(f'- {op["tool_name"]} (started {op["started_at_iso"]})' for op in stale_operations)
+            ops_list = "\n".join(f'- {op["tool_name"]}({op["args"]}) (started {op["started_at_iso"]})' for op in stale_operations)
             session.inject_proactive(
                 "[Caroline was restarted (app closed or crashed) while one or more background operations were "
                 f"still running, and they never got a chance to report back:\n\n{ops_list}\n\nThese are GONE -- "

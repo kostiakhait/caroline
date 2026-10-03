@@ -177,12 +177,16 @@ def _load_pending_operations(workspace_dir: str, tab_id: str) -> dict:
         return {}
 
 
-def save_pending_operation(workspace_dir: str, tab_id: str, operation_id: str, tool_name: str) -> None:
+def save_pending_operation(workspace_dir: str, tab_id: str, operation_id: str, tool_name: str, args: dict | None = None) -> None:
     from datetime import datetime, timezone
 
     try:
         operations = _load_pending_operations(workspace_dir, tab_id)
-        operations[operation_id] = {"toolName": tool_name, "startedAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        operations[operation_id] = {
+            "toolName": tool_name,
+            "args": args or {},
+            "startedAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
         path = _pending_operations_path(workspace_dir, tab_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(operations, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -211,10 +215,19 @@ def clear_pending_operation(workspace_dir: str, tab_id: str, operation_id: str) 
 def peek_pending_operations(workspace_dir: str, tab_id: str) -> list[dict]:
     """Read-only -- does NOT delete the file (same reasoning as
     peek_pending_turn's own docstring: deletion isn't this function's
-    job). Returns a list of {operation_id, tool_name, started_at_iso}."""
+    job). Returns a list of {operation_id, tool_name, args, started_at_iso}.
+    `args` (2026-10-03) is the actual tool-call arguments (e.g. the real
+    command for run_command) -- without it, a restart-recovery nudge could
+    only say SOME unnamed command ran, never what it actually was, which
+    confirmed live made it useless to both the model and the user."""
     operations = _load_pending_operations(workspace_dir, tab_id)
     return [
-        {"operation_id": op_id, "tool_name": entry.get("toolName", "?"), "started_at_iso": entry.get("startedAtIso", "")}
+        {
+            "operation_id": op_id,
+            "tool_name": entry.get("toolName", "?"),
+            "args": entry.get("args", {}),
+            "started_at_iso": entry.get("startedAtIso", ""),
+        }
         for op_id, entry in operations.items()
     ]
 

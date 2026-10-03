@@ -578,11 +578,24 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
         if len(candidates) == 1:
             return candidates[0]
         return ""
+    # Bug fix (2026-10-03), confirmed live: the model wrote `<narity>...
+    # </narration>` -- a misspelled/mismatched opening tag -- so the pair
+    # regex above never matched, and this fell all the way through to
+    # "plain prose" and returned the raw text WITH the broken tags still
+    # in it straight to the user. Any leftover tag-shaped fragment here
+    # (open or close, whatever its name) means the model attempted and
+    # botched the <tag> contract, not that it wrote genuine plain prose --
+    # a real remark has no reason to contain angle-bracket syntax at all.
+    # Same "never guess past a shape we don't recognize" principle as the
+    # JSON branch above -- reject rather than pass the wreckage through.
+    if re.search(r"</?[a-zA-Z][\w-]*>", stripped):
+        return ""
     return stripped
 
 
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
+    activity: str | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
@@ -696,6 +709,16 @@ async def generate_progress_comment(
     # Bug fix (2026-09-11), per explicit instruction: reverted to "SMALL"
     # (the openai/gpt5-nano bypass above is no longer needed -- see this
     # function's own docstring).
+    if activity:
+        conversation_block = f"Conversation (oldest first):\n---\n{recent_dialogue}\n---\n\n"
+        facts_block = (
+            "Facts about what the assistant is doing right now -- the ONLY source of truth for your remark:\n"
+            f"{activity}\n\n"
+            "Rules: react only to these facts. Never guess the user's mood, intentions or state; never describe "
+            "the conversation as confused or repetitive; never claim a step is done or not done unless the facts "
+            "say so; never invent next steps.\n\n"
+        )
+        prompt = prompt.replace(conversation_block, facts_block + conversation_block, 1)
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:
         body["session"] = session
