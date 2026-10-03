@@ -111,12 +111,14 @@ fun ChatScreen(tabId: String) {
     LaunchedEffect(Unit) { viewModel.bindContext(context) }
 
     fun startRecording() {
+        Logger.i("ChatScreen(tab=$tabId): startRecording")
         manualStop = false
         recordJob = coroutineScope.launch {
             viewModel.markRecording(true)
             val audio = voiceRecorder.recordUntilStop { manualStop }
             viewModel.markRecording(false)
             recordJob = null
+            Logger.i("ChatScreen(tab=$tabId): recording finished, captured=${audio != null}")
             if (audio != null) {
                 viewModel.transcribe(audio, com.partnerssolutions.caroline.companion.util.VoiceRecorder.FORMAT) { text ->
                     input = if (input.isBlank()) text else "$input $text"
@@ -157,6 +159,9 @@ fun ChatScreen(tabId: String) {
             val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
             if (bytes != null) {
                 pendingAttachment = PendingAttachment(name, mimeType, Base64.encodeToString(bytes, Base64.NO_WRAP))
+                Logger.i("ChatScreen(tab=$tabId): attachment picked, name=$name mimeType=$mimeType size=${bytes.size}")
+            } else {
+                Logger.w("ChatScreen(tab=$tabId): attachment picker returned a null input stream for $uri")
             }
         } catch (exc: Exception) {
             Logger.e("failed to read picked attachment", exc)

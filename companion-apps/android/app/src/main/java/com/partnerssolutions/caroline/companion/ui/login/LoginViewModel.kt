@@ -6,6 +6,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
+import com.partnerssolutions.caroline.companion.util.Logger
 import com.partnerssolutions.caroline.companion.util.retryOnce
 import kotlinx.coroutines.launch
 import java.io.IOException
@@ -20,9 +21,11 @@ class LoginViewModel(private val repository: CamerlengoRepository = CamerlengoRe
 
     fun login(onSuccess: () -> Unit) {
         if (email.isBlank() || password.isBlank()) {
+            Logger.w("LoginViewModel.login: rejected -- email or password blank")
             error = "Enter both your SquirrelWisdom email and password."
             return
         }
+        Logger.i("LoginViewModel.login: attempting for email=${email.trim()}")
         isLoading = true
         error = null
         viewModelScope.launch {
@@ -34,14 +37,17 @@ class LoginViewModel(private val repository: CamerlengoRepository = CamerlengoRe
                 // mistaken for a problem with what was typed rather than a
                 // one-off network stumble. See retryOnce's own doc comment.
                 retryOnce { repository.login(email.trim(), password) }
+                Logger.i("LoginViewModel.login: succeeded")
                 onSuccess()
             } catch (exc: IOException) {
                 // A real network failure (timeout, no connection, DNS) --
                 // distinct from CamerlengoException (a clean server answer
                 // like "Invalid username or password"), so say so plainly
                 // instead of showing the raw "timeout"/exception text.
+                Logger.w("LoginViewModel.login: network failure", exc)
                 error = "Network timeout -- check your connection and try again."
             } catch (exc: Exception) {
+                Logger.w("LoginViewModel.login: failed", exc)
                 error = exc.message ?: "Login failed."
             } finally {
                 isLoading = false

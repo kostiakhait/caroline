@@ -15,11 +15,14 @@ object SessionHolder {
     var session: String? = null
         private set
 
+    // Never logs the token itself -- only that a session was minted/cleared.
     fun set(value: String) {
+        com.partnerssolutions.caroline.companion.util.Logger.i("SessionHolder.set: new session minted")
         session = value
     }
 
     fun clear() {
+        com.partnerssolutions.caroline.companion.util.Logger.i("SessionHolder.clear")
         session = null
     }
 }

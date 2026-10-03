@@ -30,6 +30,7 @@ import com.partnerssolutions.caroline.companion.data.companion.CompanionPrefs
 import com.partnerssolutions.caroline.companion.data.companion.activateCompanionService
 import com.partnerssolutions.caroline.companion.data.companion.companionPermissionsGranted
 import com.partnerssolutions.caroline.companion.service.CompanionOpsService
+import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
  * Review/control screen for the SMS/contacts phone companion
@@ -53,6 +54,7 @@ fun CompanionSetupScreen(onBack: () -> Unit) {
     val numberValid = phoneNumber.trim().length >= 7
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        Logger.i("CompanionSetupScreen: permission results $results")
         if (results.values.all { it }) {
             activateCompanionService(context, phoneNumber)
             enabled = true
@@ -60,6 +62,7 @@ fun CompanionSetupScreen(onBack: () -> Unit) {
             // Partial grant is not good enough (sending needs SEND_SMS,
             // lookups need READ_SMS/READ_CONTACTS) -- leave it off rather
             // than start a service that can only half do its job.
+            Logger.w("CompanionSetupScreen: not every permission granted -- leaving feature off")
             enabled = false
         }
     }
@@ -107,14 +110,17 @@ fun CompanionSetupScreen(onBack: () -> Unit) {
                     checked = enabled,
                     enabled = enabled || numberValid,
                     onCheckedChange = { turnOn ->
+                        Logger.i("CompanionSetupScreen: switch toggled turnOn=$turnOn")
                         if (turnOn) {
                             if (companionPermissionsGranted(context)) {
                                 activateCompanionService(context, phoneNumber)
                                 enabled = true
                             } else {
+                                Logger.i("CompanionSetupScreen: requesting permissions")
                                 permissionLauncher.launch(COMPANION_REQUIRED_PERMISSIONS)
                             }
                         } else {
+                            Logger.i("CompanionSetupScreen: disabling companion service")
                             CompanionPrefs.enabled = false
                             CompanionOpsService.stop(context)
                             enabled = false

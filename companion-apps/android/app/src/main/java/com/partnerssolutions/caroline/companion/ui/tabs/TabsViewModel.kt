@@ -69,6 +69,7 @@ class TabsViewModel(private val repository: CamerlengoRepository = CamerlengoRep
                 val name = entry["name"] as? String ?: return@mapNotNull null
                 TabInfo(id, name)
             } ?: emptyList()
+            Logger.i("TabsViewModel.refreshOnce: ${tabs.size} tab(s)")
             error = null
             consecutiveEmptyLoadFailures = 0
         } catch (exc: Exception) {

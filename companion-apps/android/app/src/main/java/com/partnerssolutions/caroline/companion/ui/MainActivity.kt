@@ -9,10 +9,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import com.partnerssolutions.caroline.companion.ui.navigation.NavGraph
 import com.partnerssolutions.caroline.companion.ui.theme.CarolineCompanionTheme
+import com.partnerssolutions.caroline.companion.util.Logger
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Logger.i("MainActivity.onCreate")
         enableEdgeToEdge()
         setContent {
             CarolineCompanionTheme {

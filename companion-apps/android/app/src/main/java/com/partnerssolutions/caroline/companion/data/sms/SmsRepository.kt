@@ -40,6 +40,7 @@ class SmsRepository(private val context: Context) {
      * list_messages() expect: threadId/address/body/date/type/read.
      */
     fun dumpMessages(since: Long?): List<Map<String, Any?>> {
+        val start = System.currentTimeMillis()
         val out = mutableListOf<Map<String, Any?>>()
         val projection = arrayOf(
             Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
@@ -48,9 +49,11 @@ class SmsRepository(private val context: Context) {
         val selection = if (since != null) "${Telephony.Sms.DATE} > ?" else null
         val args = if (since != null) arrayOf(since.toString()) else null
         val limit = if (since != null) Int.MAX_VALUE else BOOTSTRAP_LIMIT
-        context.contentResolver.query(
+        val cursorFound = context.contentResolver.query(
             Telephony.Sms.CONTENT_URI, projection, selection, args, "${Telephony.Sms.DATE} DESC",
-        )?.use { c -> readRows(c, limit).forEach { out.add(it) } }
+        )?.use { c -> readRows(c, limit).forEach { out.add(it) }; true } ?: false
+        if (!cursorFound) Logger.w("SmsRepository.dumpMessages: content resolver query returned null cursor")
+        Logger.i("SmsRepository.dumpMessages(since=$since): ${out.size} row(s) in ${System.currentTimeMillis() - start}ms")
         return out
     }
 
@@ -67,6 +70,7 @@ class SmsRepository(private val context: Context) {
      * Same row shape as dumpMessages.
      */
     fun search(query: String?, address: String?, limit: Int): List<Map<String, Any?>> {
+        val start = System.currentTimeMillis()
         val out = mutableListOf<Map<String, Any?>>()
         val projection = arrayOf(
             Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
@@ -88,6 +92,7 @@ class SmsRepository(private val context: Context) {
             selection, if (args.isEmpty()) null else args.toTypedArray(),
             "${Telephony.Sms.DATE} DESC",
         )?.use { c -> readRows(c, limit).forEach { out.add(it) } }
+        Logger.i("SmsRepository.search(query=$query, address=$address, limit=$limit): ${out.size} row(s) in ${System.currentTimeMillis() - start}ms")
         return out
     }
 
@@ -131,6 +136,7 @@ class SmsRepository(private val context: Context) {
         val smsManager = if (Build.VERSION.SDK_INT >= 31) context.getSystemService(SmsManager::class.java)
         else @Suppress("DEPRECATION") SmsManager.getDefault()
         val parts = smsManager.divideMessage(text)
+        Logger.i("SmsRepository.send: to=$to textLen=${text.length} parts=${parts.size}")
         val action = "com.partnerssolutions.caroline.companion.SMS_SENT_${System.nanoTime()}"
         // One shared receiver, one callback per part (multi-part messages
         // are common past ~160 chars) -- resolves failure on the FIRST bad
@@ -141,6 +147,7 @@ class SmsRepository(private val context: Context) {
                 val receiver = object : BroadcastReceiver() {
                     override fun onReceive(ctx: Context, intent: Intent) {
                         val ok = resultCode == android.app.Activity.RESULT_OK
+                        Logger.i("SmsRepository.send: part broadcast received, resultCode=$resultCode ok=$ok remainingBefore=$remaining")
                         if (!ok) {
                             try { context.unregisterReceiver(this) } catch (_: Exception) {}
                             if (cont.isActive) cont.resume(Result.failure(Exception("SmsManager result code $resultCode")))
@@ -165,9 +172,10 @@ class SmsRepository(private val context: Context) {
                         ),
                     )
                 }
-                cont.invokeOnCancellation { try { context.unregisterReceiver(receiver) } catch (_: Exception) {} }
+                cont.invokeOnCancellation { Logger.w("SmsRepository.send: coroutine cancelled, unregistering receiver"); try { context.unregisterReceiver(receiver) } catch (_: Exception) {} }
                 try {
                     smsManager.sendMultipartTextMessage(to, null, parts, sentIntents, null)
+                    Logger.i("SmsRepository.send: sendMultipartTextMessage call returned (does not mean delivered -- awaiting broadcast)")
                 } catch (exc: Exception) {
                     Logger.e("SmsManager.sendMultipartTextMessage threw", exc)
                     try { context.unregisterReceiver(receiver) } catch (_: Exception) {}
@@ -175,7 +183,11 @@ class SmsRepository(private val context: Context) {
                 }
             }
         }
-        if (outcome != null) return outcome
+        if (outcome != null) {
+            Logger.i("SmsRepository.send: resolved via broadcast in ${System.currentTimeMillis() - sendStartedAt}ms, outcome=$outcome")
+            return outcome
+        }
+        Logger.w("SmsRepository.send: broadcast confirmation timed out after ${System.currentTimeMillis() - sendStartedAt}ms -- checking content://sms directly")
         // Bug fix (2026-09-30), confirmed live: a real incident sent the same
         // message to a real contact 3 times, because this broadcast-based
         // confirmation timed out all 3 times despite every send actually
@@ -188,18 +200,25 @@ class SmsRepository(private val context: Context) {
         // itself the bug. Before giving up, check the actual source of
         // truth -- content://sms -- for a sent row matching this address/
         // body that postdates when this call started.
-        return if (wasActuallySent(to, text, sendStartedAt)) Result.success(Unit)
+        val actuallySent = wasActuallySent(to, text, sendStartedAt)
+        Logger.i("SmsRepository.send: content://sms self-check result=$actuallySent")
+        return if (actuallySent) Result.success(Unit)
         else Result.failure(Exception("Timed out waiting for the SMS radio to confirm the send."))
     }
 
     private fun wasActuallySent(to: String, text: String, sentAfter: Long): Boolean {
         val digits = to.filter { it.isDigit() }
         val suffix = if (digits.length > 10) digits.takeLast(10) else digits
-        if (suffix.isEmpty()) return false
+        if (suffix.isEmpty()) {
+            Logger.w("SmsRepository.wasActuallySent: 'to' had no usable digits ($to) -- cannot self-check")
+            return false
+        }
         val projection = arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE)
         val selection = "${Telephony.Sms.TYPE} = ? AND ${Telephony.Sms.ADDRESS} LIKE ? AND ${Telephony.Sms.BODY} = ? AND ${Telephony.Sms.DATE} > ?"
         val args = arrayOf(Telephony.Sms.MESSAGE_TYPE_SENT.toString(), "%$suffix", text, sentAfter.toString())
-        return context.contentResolver.query(Telephony.Sms.CONTENT_URI, projection, selection, args, null)
+        val found = context.contentResolver.query(Telephony.Sms.CONTENT_URI, projection, selection, args, null)
             ?.use { it.moveToFirst() } ?: false
+        Logger.i("SmsRepository.wasActuallySent(suffix=$suffix, sentAfter=$sentAfter): found=$found")
+        return found
     }
 }

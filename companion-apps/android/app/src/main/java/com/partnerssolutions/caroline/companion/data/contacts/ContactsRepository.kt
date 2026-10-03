@@ -4,6 +4,7 @@ import android.content.ContentProviderOperation
 import android.content.ContentUris
 import android.content.Context
 import android.provider.ContactsContract
+import com.partnerssolutions.caroline.companion.util.Logger
 
 /**
  * List/search/create for companion_list_contacts/companion_search_contacts/
@@ -34,13 +35,15 @@ class ContactsRepository(private val context: Context) {
     }
 
     private fun query(selection: String?, args: Array<String>?, limit: Int): List<Contact> {
+        val start = System.currentTimeMillis()
         val byId = LinkedHashMap<String, Pair<String, MutableList<String>>>()
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
             ContactsContract.CommonDataKinds.Phone.NUMBER,
         )
-        context.contentResolver.query(
+        Logger.i("ContactsRepository.query: starting (selection=$selection, limit=$limit)")
+        val cursorFound = context.contentResolver.query(
             ContactsContract.CommonDataKinds.Phone.CONTENT_URI, projection, selection, args,
             "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC",
         )?.use { c ->
@@ -54,7 +57,10 @@ class ContactsRepository(private val context: Context) {
                 val entry = byId.getOrPut(id) { name to mutableListOf() }
                 if (number !in entry.second) entry.second.add(number)
             }
-        }
+            true
+        } ?: false
+        if (!cursorFound) Logger.w("ContactsRepository.query: content resolver query returned null cursor")
+        Logger.i("ContactsRepository.query: ${byId.size} contact(s) in ${System.currentTimeMillis() - start}ms")
         return byId.values.map { (name, numbers) -> Contact(name, numbers) }
     }
 
@@ -69,6 +75,8 @@ class ContactsRepository(private val context: Context) {
      * exception into a plain {"error": ...} response).
      */
     fun create(name: String, numbers: List<String>): String {
+        val start = System.currentTimeMillis()
+        Logger.i("ContactsRepository.create: starting (name='$name', numbers=$numbers)")
         val ops = ArrayList<ContentProviderOperation>()
         ops.add(
             ContentProviderOperation.newInsert(ContactsContract.RawContacts.CONTENT_URI)
@@ -98,6 +106,8 @@ class ContactsRepository(private val context: Context) {
         // is the new raw_contact_id, which equals the contact's own id for
         // a single-raw-contact (no account merge) insert like this one.
         val rawContactUri = results[0].uri ?: throw IllegalStateException("Contact insert returned no uri")
-        return ContentUris.parseId(rawContactUri).toString()
+        val id = ContentUris.parseId(rawContactUri).toString()
+        Logger.i("ContactsRepository.create: done in ${System.currentTimeMillis() - start}ms, id=$id")
+        return id
     }
 }

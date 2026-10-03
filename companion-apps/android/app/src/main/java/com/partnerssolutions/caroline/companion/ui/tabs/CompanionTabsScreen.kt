@@ -83,7 +83,10 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                if (intent.action == ACTION_UPDATE_READY) updateReady = true
+                if (intent.action == ACTION_UPDATE_READY) {
+                    Logger.i("CompanionTabsScreen: received ACTION_UPDATE_READY")
+                    updateReady = true
+                }
             }
         }
         val filter = IntentFilter(ACTION_UPDATE_READY)
@@ -100,11 +103,13 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
     // exactly as before (CompanionSetupScreen still lets the user turn it
     // on/off, or correct the number, at any time).
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        Logger.i("CompanionTabsScreen: permission results $results")
         if (results.values.all { it }) {
             activateCompanionService(context, CompanionPrefs.bestEffortDetectedNumber(context) ?: CompanionPrefs.phoneNumber ?: "")
         }
     }
     LaunchedEffect(Unit) {
+        Logger.i("CompanionTabsScreen: initial LaunchedEffect (cold start)")
         // Re-detect on every launch regardless of whether the feature was
         // already on (see CompanionPrefs.bestEffortDetectedNumber's own
         // doc comment) -- a null result leaves any existing saved/manual
@@ -159,7 +164,11 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                                 text = { Text("Update ready" + (readyVersion?.let { " ($it)" } ?: "")) },
                                 onClick = {
                                     menuOpen = false
-                                    val apk = UpdateChecker.readyApkFile(context) ?: return@DropdownMenuItem
+                                    Logger.i("CompanionTabsScreen: 'Update ready' tapped (version=$readyVersion)")
+                                    val apk = UpdateChecker.readyApkFile(context) ?: run {
+                                        Logger.w("CompanionTabsScreen: readyApkFile returned null despite updateReady=true")
+                                        return@DropdownMenuItem
+                                    }
                                     val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
                                     val intent = Intent(Intent.ACTION_VIEW).apply {
                                         setDataAndType(uri, "application/vnd.android.package-archive")
@@ -174,6 +183,7 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                             text = { Text("Phone companion (SMS/contacts)") },
                             onClick = {
                                 menuOpen = false
+                                Logger.i("CompanionTabsScreen: opening companion setup")
                                 onOpenCompanionSetup()
                             },
                         )
@@ -181,6 +191,7 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                             text = { Text("Share logs") },
                             onClick = {
                                 menuOpen = false
+                                Logger.i("CompanionTabsScreen: sharing logs")
                                 Logger.shareLogs(context)
                             },
                         )
@@ -188,6 +199,7 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                             text = { Text("About") },
                             onClick = {
                                 menuOpen = false
+                                Logger.i("CompanionTabsScreen: opening About dialog")
                                 showAboutDialog = true
                             },
                         )

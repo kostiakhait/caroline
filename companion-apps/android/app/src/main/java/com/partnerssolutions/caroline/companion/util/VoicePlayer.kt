@@ -12,6 +12,7 @@ class VoicePlayer(private val context: Context) {
 
     fun play(base64Mp3: String, onDone: () -> Unit) {
         stop()
+        Logger.i("VoicePlayer.play: starting (base64Len=${base64Mp3.length})")
         val f = File.createTempFile("tts_", ".mp3", context.cacheDir)
         f.writeBytes(Base64.decode(base64Mp3, Base64.DEFAULT))
         file = f
@@ -19,7 +20,7 @@ class VoicePlayer(private val context: Context) {
         player = mp
         try {
             mp.setDataSource(f.absolutePath)
-            mp.setOnCompletionListener { stop(); onDone() }
+            mp.setOnCompletionListener { Logger.i("VoicePlayer: playback completed"); stop(); onDone() }
             mp.setOnErrorListener { _, what, extra ->
                 Logger.e("VoicePlayer error what=$what extra=$extra")
                 stop(); onDone(); true

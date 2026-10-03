@@ -38,12 +38,15 @@ fun NavGraph(navController: NavHostController = rememberNavController()) {
     var autoLoginState by remember { mutableStateOf(AutoLoginState.CHECKING) }
 
     LaunchedEffect(Unit) {
+        Logger.i("NavGraph: checking auto-login")
         if (SessionHolder.session != null) {
+            Logger.i("NavGraph: live session already held, skipping auto-login")
             autoLoginState = AutoLoginState.LOGGED_IN
             return@LaunchedEffect
         }
         val creds = CredentialsStore.load()
         if (creds == null) {
+            Logger.i("NavGraph: no stored credentials, going to LoginScreen")
             autoLoginState = AutoLoginState.LOGGED_OUT
             return@LaunchedEffect
         }

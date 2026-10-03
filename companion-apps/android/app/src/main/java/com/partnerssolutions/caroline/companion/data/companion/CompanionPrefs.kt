@@ -14,6 +14,7 @@ import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import com.partnerssolutions.caroline.companion.service.CompanionOpsService
+import com.partnerssolutions.caroline.companion.util.Logger
 import java.util.UUID
 
 /** Every runtime permission CompanionOpsService needs to do its job --
@@ -55,7 +56,9 @@ fun companionPermissionsGranted(context: Context): Boolean =
 @Suppress("DEPRECATION")
 fun isCompanionServiceRunning(context: Context): Boolean {
     val am = context.getSystemService(ActivityManager::class.java) ?: return false
-    return am.getRunningServices(Int.MAX_VALUE).any { it.service.className == CompanionOpsService::class.java.name }
+    val running = am.getRunningServices(Int.MAX_VALUE).any { it.service.className == CompanionOpsService::class.java.name }
+    Logger.i("isCompanionServiceRunning: $running")
+    return running
 }
 
 // Generous over CompanionOpsService's own 5s POLL_INTERVAL_MS -- a single
@@ -77,9 +80,15 @@ private const val POLL_TICK_STALE_AFTER_MS = 30_000L
  * (lastPollTickAt stays 0 / old from before it stopped), so callers only
  * need this one check, not isCompanionServiceRunning separately. */
 fun isCompanionServiceHealthy(context: Context): Boolean {
-    if (!isCompanionServiceRunning(context)) return false
+    if (!isCompanionServiceRunning(context)) {
+        Logger.i("isCompanionServiceHealthy: false (service not running)")
+        return false
+    }
     val lastTick = CompanionPrefs.lastPollTickAt
-    return lastTick != 0L && System.currentTimeMillis() - lastTick < POLL_TICK_STALE_AFTER_MS
+    val ageMs = System.currentTimeMillis() - lastTick
+    val healthy = lastTick != 0L && ageMs < POLL_TICK_STALE_AFTER_MS
+    Logger.i("isCompanionServiceHealthy: $healthy (lastTick=$lastTick, ageMs=$ageMs)")
+    return healthy
 }
 
 /** Restarts CompanionOpsService if CompanionPrefs.enabled is true but it
@@ -97,14 +106,25 @@ fun isCompanionServiceHealthy(context: Context): Boolean {
  * restart into, same as every other call site's existing permission
  * gate. */
 fun restartCompanionServiceIfNeeded(context: Context): Boolean {
-    if (!CompanionPrefs.enabled) return false
-    if (isCompanionServiceHealthy(context)) return false
-    if (!companionPermissionsGranted(context)) return false
+    if (!CompanionPrefs.enabled) {
+        Logger.i("restartCompanionServiceIfNeeded: no-op (feature disabled)")
+        return false
+    }
+    if (isCompanionServiceHealthy(context)) {
+        Logger.i("restartCompanionServiceIfNeeded: no-op (already healthy)")
+        return false
+    }
+    if (!companionPermissionsGranted(context)) {
+        Logger.w("restartCompanionServiceIfNeeded: no-op (permissions not granted)")
+        return false
+    }
     if (isCompanionServiceRunning(context)) {
         // Present but stale -- a bare start() could no-op against a
         // stuck-not-dead pollJob (see this function's own doc comment).
+        Logger.w("restartCompanionServiceIfNeeded: service present but unhealthy -- stopping before restart")
         CompanionOpsService.stop(context)
     }
+    Logger.i("restartCompanionServiceIfNeeded: starting service")
     CompanionOpsService.start(context)
     return true
 }
@@ -125,11 +145,15 @@ fun restartCompanionServiceIfNeeded(context: Context): Boolean {
  * companionPermissionsGranted) or be inside a permission-grant callback.
  */
 fun activateCompanionService(context: Context, phoneNumber: String) {
+    Logger.i("activateCompanionService: phoneNumber=$phoneNumber")
     CompanionPrefs.phoneNumber = phoneNumber
     CompanionPrefs.enabled = true
     CompanionOpsService.start(context)
     val powerManager = context.getSystemService(PowerManager::class.java)
-    if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == false) {
+    val ignoringBatteryOpt = powerManager?.isIgnoringBatteryOptimizations(context.packageName)
+    Logger.i("activateCompanionService: isIgnoringBatteryOptimizations=$ignoringBatteryOpt")
+    if (ignoringBatteryOpt == false) {
+        Logger.i("activateCompanionService: requesting battery optimization exemption")
         context.startActivity(
             Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}")),
         )
@@ -169,6 +193,7 @@ object CompanionPrefs {
     var enabled: Boolean
         get() = prefs?.getBoolean(KEY_ENABLED, false) ?: false
         set(value) {
+            Logger.i("CompanionPrefs.enabled = $value")
             prefs?.edit()?.putBoolean(KEY_ENABLED, value)?.apply()
         }
 
@@ -201,9 +226,13 @@ object CompanionPrefs {
      */
     val deviceId: String
         get() {
-            val p = prefs ?: return UUID.randomUUID().toString() // init() not called yet -- shouldn't happen, but never crash
+            val p = prefs ?: run {
+                Logger.w("CompanionPrefs.deviceId: prefs not initialized yet -- returning a throwaway id")
+                return UUID.randomUUID().toString() // init() not called yet -- shouldn't happen, but never crash
+            }
             p.getString(KEY_DEVICE_ID, null)?.let { return it }
             val fresh = UUID.randomUUID().toString()
+            Logger.i("CompanionPrefs.deviceId: generating fresh id $fresh")
             p.edit().putString(KEY_DEVICE_ID, fresh).apply()
             return fresh
         }
@@ -219,6 +248,7 @@ object CompanionPrefs {
     var phoneNumber: String?
         get() = prefs?.getString(KEY_PHONE_NUMBER, null)
         set(value) {
+            Logger.i("CompanionPrefs.phoneNumber = $value")
             prefs?.edit()?.putString(KEY_PHONE_NUMBER, value?.trim()?.takeIf { it.isNotEmpty() })?.apply()
         }
 
@@ -242,7 +272,7 @@ object CompanionPrefs {
             return null
         }
         return try {
-            if (Build.VERSION.SDK_INT >= 33) {
+            val detected = if (Build.VERSION.SDK_INT >= 33) {
                 val subManager = context.getSystemService(SubscriptionManager::class.java)
                 val defaultSubId = SubscriptionManager.getDefaultSubscriptionId()
                 subManager?.getPhoneNumber(defaultSubId)?.takeIf { it.isNotBlank() }
@@ -251,7 +281,10 @@ object CompanionPrefs {
                 val tm = context.getSystemService(TelephonyManager::class.java)
                 tm?.line1Number?.takeIf { it.isNotBlank() }
             }
-        } catch (_: Exception) {
+            Logger.i("bestEffortDetectedNumber: $detected")
+            detected
+        } catch (exc: Exception) {
+            Logger.w("bestEffortDetectedNumber: failed", exc)
             null
         }
     }

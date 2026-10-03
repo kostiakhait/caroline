@@ -36,6 +36,7 @@ class VoiceRecorder(private val context: Context) {
         try {
             recorder.prepare()
             recorder.start()
+            Logger.i("VoiceRecorder: recording started -> ${file.absolutePath}")
         } catch (exc: Exception) {
             Logger.e("VoiceRecorder start failed", exc)
             runCatching { recorder.release() }
@@ -49,6 +50,7 @@ class VoiceRecorder(private val context: Context) {
             runCatching { recorder.release() }
         }
         val bytes = if (file.exists()) file.readBytes() else ByteArray(0)
+        Logger.i("VoiceRecorder: stopped, captured ${bytes.size} byte(s)")
         cleanup()
         return if (bytes.isEmpty()) null else Base64.encodeToString(bytes, Base64.NO_WRAP)
     }

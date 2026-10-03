@@ -96,6 +96,7 @@ class CompanionOpsService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Logger.i("CompanionOpsService.onCreate")
         smsRepository = SmsRepository(applicationContext)
         contactsRepository = ContactsRepository(applicationContext)
         createNotificationChannel()
@@ -146,7 +147,11 @@ class CompanionOpsService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private suspend fun pollLoop() {
+        var tick = 0L
+        Logger.i("CompanionOpsService.pollLoop: starting")
         while (scope.isActive) {
+            tick++
+            val tickStart = System.currentTimeMillis()
             // Per explicit instruction (2026-09-30), after a real incident
             // traced live: isCompanionServiceRunning's own ActivityManager
             // check only proves the Service OBJECT still exists -- it says
@@ -172,8 +177,15 @@ class CompanionOpsService : Service() {
                 // "running" in the user's notification shade.
                 Logger.e("CompanionOpsService poll tick failed", exc)
             }
+            // Per explicit instruction (2026-10-02): logs every tick's own
+            // wall-clock duration, not just whether it threw -- a tick that
+            // completes but took suspiciously long (one of its network
+            // calls was slow, not hung) is otherwise indistinguishable from
+            // a perfectly healthy one in the log.
+            Logger.i("CompanionOpsService.pollLoop: tick #$tick finished in ${System.currentTimeMillis() - tickStart}ms")
             delay(POLL_INTERVAL_MS)
         }
+        Logger.w("CompanionOpsService.pollLoop: exiting (scope no longer active) after $tick ticks")
     }
 
     // --- devices/<deviceId>/info: presence + number announcement -----------
@@ -184,6 +196,7 @@ class CompanionOpsService : Service() {
     private suspend fun handleHeartbeat() {
         val now = System.currentTimeMillis()
         if (now - lastHeartbeatAt < HEARTBEAT_INTERVAL_MS) return
+        Logger.i("companion: sending heartbeat (phoneNumber=${CompanionPrefs.phoneNumber}, model=${Build.MODEL})")
         repository.setMine(
             "devices/${CompanionPrefs.deviceId}/info",
             mapOf("phoneNumber" to CompanionPrefs.phoneNumber, "model" to Build.MODEL, "lastSeenAt" to now),
@@ -196,24 +209,31 @@ class CompanionOpsService : Service() {
     private suspend fun handleOutbox() {
         val base = "devices/${CompanionPrefs.deviceId}/sms/outbox"
         val entries = repository.getAllMine(base)
+        if (entries.isEmpty()) return
+        Logger.i("companion: handleOutbox sees ${entries.size} pending entr${if (entries.size == 1) "y" else "ies"}")
         for ((rawId, rawValue) in entries) {
             val opId = rawId as? String ?: continue
             val payload = rawValue as? Map<*, *> ?: continue
             val resultPath = "devices/${CompanionPrefs.deviceId}/sms/outbox_result/$opId"
-            if (repository.getMine(resultPath) != null) continue // already done, backend hasn't cleaned up yet
+            if (repository.getMine(resultPath) != null) {
+                Logger.i("companion: outbox opId=$opId already has a result -- skipping")
+                continue // already done, backend hasn't cleaned up yet
+            }
             val requestPath = "$base/$opId"
             if (payload["status"] != "accepted") {
                 repository.setMine(requestPath, withAcceptedStatus(payload))
             }
             val to = (payload["to"] as? String).orEmpty()
             val text = (payload["text"] as? String).orEmpty()
-            Logger.i("companion: sending SMS to $to (opId=$opId)")
+            Logger.i("companion: sending SMS to $to (opId=$opId, textLen=${text.length})")
             val outcome = smsRepository.send(to, text)
             val result: Map<String, Any?> = outcome.fold(
                 onSuccess = { mapOf("ok" to true) },
                 onFailure = { mapOf("ok" to false, "error" to (it.message ?: it.toString())) },
             )
+            Logger.i("companion: SMS send outcome for opId=$opId: $result -- writing result")
             repository.setMine(resultPath, result)
+            Logger.i("companion: SMS send result for opId=$opId written")
         }
     }
 
@@ -231,11 +251,16 @@ class CompanionOpsService : Service() {
     private suspend fun handleSmsSync() {
         val base = "devices/${CompanionPrefs.deviceId}/sms"
         val request = repository.getMine("$base/sync_request") as? Map<*, *> ?: return
-        if (repository.getMine("$base/sync_response") != null) return // already answered, backend hasn't cleaned up yet
+        if (repository.getMine("$base/sync_response") != null) {
+            Logger.i("companion: SMS sync already answered -- skipping")
+            return // already answered, backend hasn't cleaned up yet
+        }
         val since = (request["since"] as? Number)?.toLong()
         Logger.i("companion: syncing SMS since=$since")
         val messages = smsRepository.dumpMessages(since)
+        Logger.i("companion: SMS sync gathered ${messages.size} message(s) -- writing response")
         repository.setMine("$base/sync_response", mapOf("messages" to messages))
+        Logger.i("companion: SMS sync response written")
     }
 
     // --- devices/<deviceId>/{family}/requests -> responses: contacts lookups
@@ -243,17 +268,23 @@ class CompanionOpsService : Service() {
     private suspend fun handleRequestFamily(family: String) {
         val base = "devices/${CompanionPrefs.deviceId}/$family"
         val entries = repository.getAllMine("$base/requests")
+        if (entries.isEmpty()) return
+        Logger.i("companion: handleRequestFamily($family) sees ${entries.size} pending request(s)")
         for ((rawId, rawValue) in entries) {
             val opId = rawId as? String ?: continue
             val payload = rawValue as? Map<*, *> ?: continue
             val responsePath = "$base/responses/$opId"
-            if (repository.getMine(responsePath) != null) continue
+            if (repository.getMine(responsePath) != null) {
+                Logger.i("companion: $family opId=$opId already has a response -- skipping")
+                continue
+            }
             val requestPath = "$base/requests/$opId"
             if (payload["status"] != "accepted") {
                 repository.setMine(requestPath, withAcceptedStatus(payload))
             }
             val op = payload["op"] as? String
-            Logger.i("companion: handling $family request op=$op (opId=$opId)")
+            Logger.i("companion: handling $family request op=$op (opId=$opId, payload=$payload)")
+            val opStart = System.currentTimeMillis()
             val result: Any = try {
                 when (family) {
                     "contacts" -> handleContactsOp(op, payload)
@@ -261,10 +292,12 @@ class CompanionOpsService : Service() {
                     else -> mapOf("error" to "unknown family $family")
                 }
             } catch (exc: Exception) {
-                Logger.e("companion: $family op=$op failed", exc)
+                Logger.e("companion: $family op=$op (opId=$opId) failed after ${System.currentTimeMillis() - opStart}ms", exc)
                 mapOf("error" to (exc.message ?: exc.toString()))
             }
+            Logger.i("companion: $family op=$op (opId=$opId) computed result in ${System.currentTimeMillis() - opStart}ms -- writing response")
             repository.setMine(responsePath, result)
+            Logger.i("companion: $family op=$op (opId=$opId) response written")
         }
     }
 
@@ -277,22 +310,29 @@ class CompanionOpsService : Service() {
 
     private fun handleContactsOp(op: String?, payload: Map<*, *>): Any = when (op) {
         "list" -> contactsRepository.list().map { mapOf("name" to it.name, "numbers" to it.numbers) }
+            .also { Logger.i("companion: contacts list -> ${it.size} contact(s)") }
         "search" -> {
             val query = (payload["query"] as? String).orEmpty()
             contactsRepository.search(query).map { mapOf("name" to it.name, "numbers" to it.numbers) }
+                .also { Logger.i("companion: contacts search(query='$query') -> ${it.size} match(es)") }
         }
         "create" -> {
             val name = (payload["name"] as? String).orEmpty()
             @Suppress("UNCHECKED_CAST")
             val numbers = (payload["numbers"] as? List<Any?>)?.mapNotNull { it as? String } ?: emptyList()
             if (name.isBlank() || numbers.isEmpty()) {
+                Logger.w("companion: contacts create rejected -- name blank or no numbers (name='$name', numbers=$numbers)")
                 mapOf("error" to "'name' and at least one of 'numbers' are required")
             } else {
                 val id = contactsRepository.create(name, numbers)
+                Logger.i("companion: contacts create(name='$name', numbers=$numbers) -> contactId=$id")
                 mapOf("ok" to true, "contactId" to id)
             }
         }
-        else -> mapOf("error" to "unknown contacts op '$op'")
+        else -> {
+            Logger.w("companion: unknown contacts op '$op'")
+            mapOf("error" to "unknown contacts op '$op'")
+        }
     }
 
     // companion_search_sms (2026-09-30) -- see SmsRepository.search's own
@@ -305,8 +345,12 @@ class CompanionOpsService : Service() {
             val address = payload["address"] as? String
             val limit = (payload["limit"] as? Number)?.toInt()?.coerceIn(1, 200) ?: 50
             smsRepository.search(query, address, limit)
+                .also { Logger.i("companion: sms_query search(query=$query, address=$address, limit=$limit) -> ${it.size} message(s)") }
         }
-        else -> mapOf("error" to "unknown sms_query op '$op'")
+        else -> {
+            Logger.w("companion: unknown sms_query op '$op'")
+            mapOf("error" to "unknown sms_query op '$op'")
+        }
     }
 
     // --- foreground notification --------------------------------------------

@@ -35,6 +35,7 @@ object CredentialsStore {
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
+            Logger.i("CredentialsStore.init: ok")
         } catch (exc: Exception) {
             // Keystore issues (custom ROMs, corrupted keystore) shouldn't
             // crash the app -- worst case, login just isn't persisted.
@@ -45,17 +46,21 @@ object CredentialsStore {
     data class Credentials(val email: String, val password: String)
 
     fun load(): Credentials? {
-        val p = prefs ?: return null
-        val email = p.getString(KEY_EMAIL, null) ?: return null
-        val password = p.getString(KEY_PASSWORD, null) ?: return null
+        val p = prefs ?: run { Logger.w("CredentialsStore.load: prefs not initialized"); return null }
+        val email = p.getString(KEY_EMAIL, null) ?: run { Logger.i("CredentialsStore.load: nothing stored"); return null }
+        val password = p.getString(KEY_PASSWORD, null) ?: run { Logger.w("CredentialsStore.load: email present but no password"); return null }
+        Logger.i("CredentialsStore.load: found stored credentials for $email")
         return Credentials(email, password)
     }
 
+    // Never logs the password itself -- only that a save happened, and for whom.
     fun save(email: String, password: String) {
+        Logger.i("CredentialsStore.save: $email")
         prefs?.edit()?.putString(KEY_EMAIL, email)?.putString(KEY_PASSWORD, password)?.apply()
     }
 
     fun clear() {
+        Logger.i("CredentialsStore.clear")
         prefs?.edit()?.clear()?.apply()
     }
 }

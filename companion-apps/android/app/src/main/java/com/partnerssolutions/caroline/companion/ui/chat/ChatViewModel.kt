@@ -96,11 +96,13 @@ class ChatViewModel(
     fun markRecording(value: Boolean) { isRecording = value }
 
     fun transcribe(base64Audio: String, format: String, onText: (String) -> Unit) {
+        Logger.i("ChatViewModel.transcribe: starting (format=$format, audioLen=${base64Audio.length})")
         isTranscribing = true
         voiceError = null
         viewModelScope.launch {
             try {
                 val text = repository.speechToText(base64Audio, format)
+                Logger.i("ChatViewModel.transcribe: result=${if (text == null) "null" else "\"$text\""}")
                 if (text == null) voiceError = "Didn't catch that." else onText(text)
             } catch (exc: Exception) {
                 Logger.e("speech to text failed", exc)
@@ -112,10 +114,11 @@ class ChatViewModel(
     }
 
     fun speak(context: Context, index: Int, text: String) {
-        if (speakingIndex == index) { stopSpeaking(); return }
+        if (speakingIndex == index) { Logger.i("ChatViewModel.speak: index=$index already speaking -- stopping"); stopSpeaking(); return }
         stopSpeaking()
         speakingIndex = index
         voiceError = null
+        Logger.i("ChatViewModel.speak: starting for index=$index textLen=${text.length}")
         viewModelScope.launch {
             try {
                 val audio = repository.textToSpeech(text)
@@ -243,6 +246,7 @@ class ChatViewModel(
             val syncedTexts = synced.map { it.text }.toSet()
             optimisticMessages = optimisticMessages.filterNot { it.text in syncedTexts }
             messages = synced + optimisticMessages
+            Logger.i("ChatViewModel.refreshOnce(tab=$tabId): ${synced.size} synced + ${optimisticMessages.size} optimistic")
             refreshStatus()
             maybeSpeakVoiceReply(synced)
             error = null

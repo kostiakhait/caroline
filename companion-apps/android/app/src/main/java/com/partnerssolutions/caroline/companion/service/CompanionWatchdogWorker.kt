@@ -29,8 +29,10 @@ import java.util.concurrent.TimeUnit
  */
 class CompanionWatchdogWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
+        Logger.i("CompanionWatchdogWorker.doWork: tick")
         val restarted = restartCompanionServiceIfNeeded(applicationContext)
         if (restarted) Logger.w("CompanionWatchdogWorker: service was enabled but not running -- restarted it")
+        else Logger.i("CompanionWatchdogWorker.doWork: nothing to do")
         return Result.success()
     }
 
@@ -38,6 +40,7 @@ class CompanionWatchdogWorker(context: Context, params: WorkerParameters) : Coro
         private const val WORK_NAME = "companion_ops_watchdog"
 
         fun schedule(context: Context) {
+            Logger.i("CompanionWatchdogWorker.schedule: enqueuing (KEEP policy)")
             val request = PeriodicWorkRequestBuilder<CompanionWatchdogWorker>(15, TimeUnit.MINUTES).build()
             // KEEP, not REPLACE: CompanionApplication.onCreate runs on
             // every process start, and re-enqueuing a periodic worker that
