@@ -343,6 +343,25 @@ _NARRATION_GARBAGE_PATTERNS = [
     re.compile(r"\bshort remark\b", re.IGNORECASE),
     re.compile(r"\breacting to (?:the|this|a) (?:given |real )?conversation\b", re.IGNORECASE),
     re.compile(r"\b(?:max|maximum) (?:one|two|three|1|2|3) (?:words?|sentences?)\b", re.IGNORECASE),
+    # Bug fix (2026-10-03), confirmed live: a literal "[tool_name(args)]"
+    # fragment leaked straight into a shown narration bubble -- the model
+    # echoed the shape of real tool-call text already present in the
+    # dialogue it was given, despite the prompt's own "no JSON" rule not
+    # covering this specific shape. Safety net for the prompt instruction
+    # added alongside this, not a replacement for it.
+    re.compile(r"\[\s*\w+\([^)]*\)\s*\]"),
+    # Bug fix (2026-10-03), confirmed live ("вкладка 3 запустила эмулятор,
+    # но сама этого не поняла"): this remark can never actually receive a
+    # reply -- the real task keeps going regardless of what's written here
+    # -- so a question that reads as waiting for the user to pick between
+    # options is always false: by the time it's shown, the real work has
+    # typically already moved past that exact choice. Catches the common
+    # English phrasings this drafts in (the prompt forces English); doesn't
+    # need to cover every language since this runs on the pre-translation
+    # draft, same reasoning as the Cyrillic check below.
+    re.compile(r"\bwhich (?:one|of (?:them|these|those))\b.{0,40}\bshould i\b", re.IGNORECASE),
+    re.compile(r"\bshould i (?:use|pick|choose|launch|run|start) .{0,40}\bor\b", re.IGNORECASE),
+    re.compile(r"\bwhat would you like me to\b", re.IGNORECASE),
 ]
 _NARRATION_MAX_CHARS = 400
 # Han / Hiragana / Katakana / Hangul. Progress narration for this product
@@ -640,6 +659,17 @@ async def generate_progress_comment(
         "she's actually doing right now. Never expose internal machinery either (restarts, tools, files, "
         "backups, session mechanics) even if the conversation below mentions it or repeats the same line "
         "several times -- skip past that, react to the real substance instead.\n"
+        # Bug fix (2026-10-03), confirmed live: this remark is a one-off
+        # aside with no way to ever receive a reply -- the real work
+        # continues on its own regardless of what you write here. A
+        # question phrased as if waiting for the user to pick/decide
+        # something ("which one should I...", "какое из них...") reads as
+        # a real pause-and-wait, but nothing actually waits -- confirmed
+        # live, the real task had already moved past the exact choice
+        # being "asked" about by the time this remark was shown. Never ask "
+        "the user to choose or decide anything, and never write a literal tool-call-looking fragment like "
+        "\"[some_tool(arg=value)]\" even if the conversation below contains real ones -- copying that shape "
+        "verbatim is never a real remark.\n"
         f"  Bad (third person AND a new promise): \"{_NARRATION_COMBINED_BAD}\"\n"
         f"  Good (first person, a real reaction, no promise): \"{_NARRATION_COMBINED_GOOD}\"\n\n"
         # Bug fix (2026-09-16), confirmed live via real logs (two separate
