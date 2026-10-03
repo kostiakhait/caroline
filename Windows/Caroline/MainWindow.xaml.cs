@@ -33,7 +33,7 @@ public partial class MainWindow : Window
     // right one -- she can open one, so she needs to be able to close one
     // too, not just leave it to the user.
     private readonly Dictionary<string, DocumentViewerWindow> _viewerWindows = new(StringComparer.OrdinalIgnoreCase);
-    private readonly AppBrowserHost _appBrowserHost = new();
+    private readonly AppControlHost _appControlHost = new();
     private readonly VisualModeManager _visualMode = new();
     // Guards against launching a second concurrent download for the same
     // purchased model -- can genuinely happen (an immediate trigger right
@@ -51,10 +51,10 @@ public partial class MainWindow : Window
         InitializeComponent();
         _settings = settings;
         _settingsService = settingsService;
-        // For the /test_visual_mode debug endpoint (AppBrowserHost.cs) -- lets a plain
+        // For the /test_visual_mode debug endpoint (AppControlHost.cs) -- lets a plain
         // curl trigger VisualModeWindow's init in total isolation from the chat/TTS
         // pipeline, so a hang there can be diagnosed without any of that noise.
-        _appBrowserHost.VisualMode = _visualMode;
+        _appControlHost.VisualMode = _visualMode;
 
         if (double.IsNaN(_settings.WindowWidth))
         {
@@ -232,8 +232,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        try { _appBrowserHost.Start(); }
-        catch (Exception ex) { Logger.Log($"MainWindow: AppBrowserHost.Start() threw: {ex}"); }
+        try { _appControlHost.Start(); }
+        catch (Exception ex) { Logger.Log($"MainWindow: AppControlHost.Start() threw: {ex}"); }
 
         // The supervisor's own health-poll loop autonomously detects and
         // recovers a frozen/crashed backend (whole-process AND per-tab)
@@ -1265,7 +1265,7 @@ public partial class MainWindow : Window
         _hotkey?.Dispose();
         _supervisorStatusTimer?.Dispose();
         _statusHttp.Dispose();
-        _appBrowserHost.Dispose();
+        _appControlHost.Dispose();
         foreach (var tab in _tabs)
         {
             try { tab.WebView?.Dispose(); }

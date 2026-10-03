@@ -37,9 +37,11 @@ BACKEND_PY_DIR := $(SCRIPT_DIR)/backend-py
 CAMERLENGO_REPO ?= $(SCRIPT_DIR)/../reforce
 CAMERLENGO_VENDOR_STUBS := $(BACKEND_PY_DIR)/camerlengo-vendor-stubs
 CAROLINE_DIR := $(SCRIPT_DIR)/Windows/Caroline
+NATIVEHOST_DIR := $(SCRIPT_DIR)/Windows/Caroline.NativeHost
 INSTALLER_DIR := $(SCRIPT_DIR)/Windows/CarolineInstaller
 XCFA_DIR := $(SCRIPT_DIR)/vendor/XcfaRenderer
 PROJECT := $(CAROLINE_DIR)/Caroline.csproj
+NATIVEHOST_PROJECT := $(NATIVEHOST_DIR)/Caroline.NativeHost.csproj
 INSTALLER_PROJECT := $(INSTALLER_DIR)/CarolineInstaller.csproj
 OUT := $(SCRIPT_DIR)/dist
 INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
@@ -57,6 +59,7 @@ INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
 BACKEND_SRC := $(shell find "$(BACKEND_DIR)/src" -type f 2>/dev/null)
 BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py
 CAROLINE_SRC := $(shell find "$(CAROLINE_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' -o -path '*/wwwroot/*' \) 2>/dev/null)
+NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' \) 2>/dev/null)
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
 XCFA_SRC := $(shell find "$(XCFA_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' -not -path '*/XcfaRenderer.Tests/*' -not -path '*/Demo/*' \( -name '*.cs' -o -name '*.csproj' \) 2>/dev/null)
 
@@ -98,10 +101,12 @@ $(BACKEND_DIR)/mcp-servers/.stamp: $(BACKEND_DIR)/dist/.stamp
 # publish as loose files next to Caroline.exe instead of being bundled into
 # the single-file exe for self-extraction -- harmless, still a working
 # self-contained single-file publish.
-$(OUT)/Caroline.exe: $(CAROLINE_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.stamp $(BACKEND_PY_SRC)
+$(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.stamp $(BACKEND_PY_SRC)
 	@echo "=== Caroline Build ==="
 	rm -rf "$(OUT)"
 	dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)"
+	@echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"
+	dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)"
 	mkdir -p "$(OUT)/backend"
 	cp -r "$(BACKEND_DIR)/dist" "$(OUT)/backend/dist" & \
 	cp -r "$(BACKEND_DIR)/node_modules" "$(OUT)/backend/node_modules" & \

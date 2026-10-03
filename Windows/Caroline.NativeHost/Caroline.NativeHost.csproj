@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Headless: no MainWindow, no tray icon, no taskbar presence beyond
+         whatever AppBrowserWindow instances it's currently hosting. See
+         App.xaml.cs's own doc comment for why this process exists at all:
+         it's the WPF/WebView2 message pump host that Caroline.exe's embedded
+         browser windows used to live inside directly (see this repo's own
+         plan doc for the 2026 10 03 extraction, "Extract Caroline's embedded
+         browser into a separate process"). -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <AssemblyName>Caroline.NativeHost</AssemblyName>
+    <RootNamespace>Caroline.NativeHost</RootNamespace>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2957.106" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <!-- Crop/downscale for app_browser_screenshot: see AppBrowserWindow.xaml.cs's
+         own ApplyCropAndDownscale (moved here verbatim from Caroline.csproj). -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

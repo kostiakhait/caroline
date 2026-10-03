@@ -8,7 +8,7 @@ namespace Caroline.Native;
 /// Read/write mirror of CarolineInstaller's own InstallState.cs -- same JSON shape, same
 /// file (%LocalAppData%\Caroline\state.json) -- kept as a small duplicate here rather than
 /// a shared assembly between the two separately-published projects (same pattern as e.g.
-/// Autostart.cs's own AppBrowserHostPort literal, not shared code). Caroline itself only
+/// Autostart.cs's own AppControlHostPort literal, not shared code). Caroline itself only
 /// ever reads InstalledSha256 (see UpdateChecker) and reads+retries PendingDeletion (see
 /// StaleInstallCleanup) -- it never writes ActiveAppDir; only the installer decides that.
 /// </summary>

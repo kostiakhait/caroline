@@ -1,14 +1,17 @@
 """app-browser -- ports backend/src/appBrowser.ts. Caroline's own embedded
 multi-window browser -- one persistent, labeled WebView2 window per site
-(e.g. "whatsapp", "telegram", "facebook", "slack"), living inside the app
-instead of a separate standalone Chromium process. Window lifecycle
-(open/navigate/close/list/screenshot/scroll/is_visible_on_top/
-fill_file_dialog) and real OS-level input go through AppBrowserHost.cs's
-HTTP bridge (http://127.0.0.1:8767, runs INSIDE the WPF process, untouched
-by this rewrite); page-content operations (snapshot/find/click/type/
-press_key/evaluate) go over a real CDP connection instead
-(app_browser_cdp.py), since CDP isn't subject to a page's own CSP the way
-ExecuteScriptAsync-injected script is.
+(e.g. "whatsapp", "telegram", "facebook", "slack"), living in its own
+standalone process (Caroline.NativeHost.exe, see this file's own
+_ensure_nativehost_running) rather than inside Caroline.exe itself or a
+separate per-window Chromium process. Window lifecycle (open/navigate/close/
+list/screenshot/scroll/is_visible_on_top/fill_file_dialog) and real OS-level
+input go through AppBrowserHost.cs's HTTP bridge (http://127.0.0.1:8767,
+unchanged by the 2026-10-03 extraction of that process out of Caroline.exe --
+see this repo's own plan doc, "Extract Caroline's embedded browser into a
+separate process"); page-content operations (snapshot/find/click/type/
+press_key/evaluate) go over a real CDP connection instead (app_browser_cdp.py),
+since CDP isn't subject to a page's own CSP the way ExecuteScriptAsync-
+injected script is.
 
 This is Caroline's PRIMARY browsing tool -- see policies.py's
 prefer_own_backend_tools_instruction for why any other, non-backend-owned
@@ -17,11 +20,17 @@ browser tool she might see should never be used as a fallback for this one.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import subprocess
+import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 
+from app.logging_setup import log_event
 from app.plugins import app_browser_cdp as cdp
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.voice_api import describe_image_cheap
@@ -38,15 +47,86 @@ DEFAULT_TIMEOUT_S = 45.0
 OPEN_TIMEOUT_S = 90.0
 
 _ACCOUNT_HINT = (
-    "Embedded browser call failed: {exc}. Is Caroline's WPF app running (this tool only works "
-    "inside the desktop app, not headless)? Do NOT fall back to a different browser tool for this -- "
-    "if it's not in describe_own_backend's own list, it's not a substitute for your own embedded "
-    "browser (see prefer_own_backend_tools_instruction). Report the failure to the user instead."
+    "Embedded browser call failed: {exc}. Is Caroline's NativeHost process reachable? Do NOT fall "
+    "back to a different browser tool for this -- if it's not in describe_own_backend's own list, "
+    "it's not a substitute for your own embedded browser (see prefer_own_backend_tools_instruction). "
+    "Report the failure to the user instead."
 )
+
+# --- Caroline.NativeHost lazy launch -------------------------------------
+# The embedded browser used to live inside Caroline.exe itself; since the
+# 2026-10-03 extraction it's a separate process (Caroline.NativeHost.exe)
+# this backend launches on demand -- the first app_browser_* call in a
+# session that finds port 8767 not answering starts it, exactly mirroring
+# _get_cdp_port's own "open the window if it doesn't exist yet" shape one
+# level up (the whole HOST, not just one window). Caroline.exe is never
+# involved in launching or stopping it -- matches the user's own framing of
+# that task ("убрав его из фронтэнда"): the frontend no longer owns this
+# lifecycle at all, only this backend does. Normal process teardown (the
+# user quitting Caroline) already reaches it for free: supervisor.py's own
+# Dispose() kills ITS whole process tree, which this process (a child of
+# run_server.py, itself a child of supervisor.py) sits inside; no separate
+# cleanup hook is needed here for that path. A graceful per-window close on
+# an intentional UPDATE is CarolineInstaller's own job (Autostart.cs calls
+# this process's /shutdown directly before extracting a new install).
+_NATIVEHOST_START_LOCK = asyncio.Lock()
+_nativehost_process: subprocess.Popen[bytes] | None = None
+
+
+def _resolve_nativehost_exe() -> str | None:
+    """CAROLINE_NATIVEHOST_EXE_PATH is set by supervisor.py on every spawn (see its own
+    _child_env), a sibling of Caroline.exe in the same installed app-<hash> folder. No
+    dev-tree-relative fallback (unlike visual_mode.py's models_dir, say) -- a built exe's
+    output path varies by configuration/RID and isn't safely guessable the way a plain data
+    directory is; a dev run needs either a real install layout or Caroline.NativeHost started
+    by hand."""
+    from_env = os.environ.get("CAROLINE_NATIVEHOST_EXE_PATH")
+    if from_env and Path(from_env).is_file():
+        return from_env
+    return None
+
+
+async def _nativehost_is_up(timeout_s: float = 2.0) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            res = await client.get(f"{APP_BROWSER_HOST}/list")
+            return res.status_code == 200
+    except Exception:
+        return False
+
+
+async def _ensure_nativehost_running() -> None:
+    global _nativehost_process
+    if await _nativehost_is_up():
+        return
+    async with _NATIVEHOST_START_LOCK:
+        if await _nativehost_is_up():  # another concurrent caller may have just started it
+            return
+        exe = _resolve_nativehost_exe()
+        if not exe:
+            raise RuntimeError(
+                "Caroline.NativeHost.exe not found (CAROLINE_NATIVEHOST_EXE_PATH is unset or stale) -- "
+                "the embedded browser can't start. This is expected in a dev-tree run unless "
+                "Caroline.NativeHost was built and started by hand; a real install always has it."
+            )
+        log_event("plugin:appbrowser", "nativehost_launch", exe=exe)
+        _nativehost_process = subprocess.Popen(
+            [exe],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if await _nativehost_is_up():
+                log_event("plugin:appbrowser", "nativehost_up", pid=_nativehost_process.pid)
+                return
+            await asyncio.sleep(0.3)
+        raise RuntimeError("Caroline.NativeHost.exe was launched but did not start answering on port 8767 within 15s.")
 
 
 async def _call(path: str, body: dict[str, Any] | None, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
     try:
+        await _ensure_nativehost_running()
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             res = await client.post(f"{APP_BROWSER_HOST}{path}", json=body or {})
             try:
@@ -59,6 +139,7 @@ async def _call(path: str, body: dict[str, Any] | None, timeout_s: float = DEFAU
 
 async def _get(path: str, timeout_s: float = 10.0) -> Any:
     try:
+        await _ensure_nativehost_running()
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             res = await client.get(f"{APP_BROWSER_HOST}{path}")
             try:

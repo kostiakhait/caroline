@@ -1,13 +1,13 @@
 using System.Runtime.InteropServices;
 
-namespace Caroline.Native;
+namespace Caroline.NativeHost.Native;
 
 /// <summary>
 /// Real, OS-level mouse/keyboard input (SetCursorPos + mouse_event for clicks,
 /// SendInput with KEYEVENTF_UNICODE for typing, VK-code SendInput for named
 /// keys) -- the same technique MCP/mouse and MCP/keyboard's native helpers
 /// already use, ported in here directly rather than shelling out to those
-/// separate .exe files (which live in backend/mcp-servers/, not this WPF
+/// separate .exe files (which live in backend/mcp-servers/, not this
 /// project's own output folder).
 ///
 /// Why this exists at all: confirmed live (2026-08-31) that AppBrowserWindow's

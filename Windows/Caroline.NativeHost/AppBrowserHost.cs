@@ -3,31 +3,39 @@ using System.IO;
 using System.Net;
 using System.Text;
 using System.Text.Json;
-using Caroline.Services;
+using Caroline.NativeHost.Native;
+using Caroline.NativeHost.Services;
 
-namespace Caroline.Native;
+namespace Caroline.NativeHost;
 
 /// <summary>
 /// Local HTTP bridge for Caroline's embedded multi-window browser (see
-/// AppBrowserWindow) -- the backend is a separate Node process (server.ts's
-/// in-process "caroline-appbrowser" MCP tool, appBrowser.ts), so it can't
-/// call directly into this WPF process's WebView2 windows; it calls this
-/// tiny local HTTP server instead, same shape (and same reasoning: a local,
-/// same-machine-only, unauthenticated control surface) as server.ts's own
-/// /api/* that backend-py/supervisor.py polls in the opposite direction
-/// (BackendHealthWatchdog.cs, its C# predecessor, retired 2026-09-27). Every
-/// request that touches a window is marshaled onto the UI thread via
-/// Dispatcher -- WebView2/WPF objects can only be touched from there.
+/// AppBrowserWindow) -- moved out of Caroline.exe itself (2026-10-03, "Extract
+/// Caroline's embedded browser into a separate process") into this small,
+/// standalone WPF process so a stuck WebView2 profile or a runaway Chromium
+/// renderer can no longer threaten Caroline's own UI process. backend-py's
+/// app_browser_plugin.py talks to this exact same port (8767, unchanged) and
+/// lazily launches this .exe if it isn't already running -- see that file's
+/// own doc comment for the launch side of this split.
 ///
-/// Every step here is logged (entry, each dispatch branch, timing) --
-/// confirmed live (2026-08-31) that a silent gap between "listening on
-/// :8767" and the client-side timeout, with nothing in between, made a real
-/// bug ("window never even tried to open" -- Show() was called only AFTER
-/// WebView2 init finished, see AppBrowserWindow.ShowNow's doc comment)
-/// impossible to diagnose from logs alone. Never again: every request, every
-/// dispatch branch, and (in AppBrowserWindow itself) every WebView2
-/// operation logs its own entry/exit/timing unconditionally, not just on
-/// error.
+/// This class is a trimmed copy of the original Caroline.Native.AppBrowserHost:
+/// it keeps every browser-lifecycle/real-input endpoint plus /process_list and
+/// /kill_process (plain WinAPI process-tree utilities with zero WPF/UI-thread
+/// dependency -- they rode this same already-open local socket purely for
+/// convenience, nothing to do with browser windows specifically, and porting
+/// ProcessTreeHelper to Python for no benefit wasn't worth it; see the plan
+/// doc). /test_visual_mode and the ORIGINAL /shutdown (which closed Caroline's
+/// own main window) stayed behind in Caroline.exe's own much smaller
+/// AppControlHost (now on port 8768) -- they're about Caroline's avatar/TTS
+/// pipeline and Caroline's own process respectively, not about this one.
+/// This class's own /shutdown below closes every AppBrowserWindow this
+/// process owns, then exits itself -- used by CarolineInstaller's
+/// Autostart.cs before an update, same reasoning as Caroline.exe's /shutdown
+/// always had (a graceful close releases WebView2's profile-directory locks;
+/// an external hard-kill can leave a stray renderer process still holding one).
+///
+/// Every request that touches a window is marshaled onto the UI thread via
+/// Dispatcher -- WebView2/WPF objects can only be touched from there.
 /// </summary>
 public sealed class AppBrowserHost : IDisposable
 {
@@ -37,15 +45,11 @@ public sealed class AppBrowserHost : IDisposable
     // OTHER browser MCP profiles already use (9322-9324, 9822 -- see
     // workspace.ts's defaultServers) so the two systems can never collide.
     private const int FirstCdpPort = 9900;
-    // Above OPEN_TIMEOUT_MS (90s) and the WebView2 init timeout (60s) on the
-    // Node/AppBrowserWindow side respectively -- this is the outermost
-    // safety net, not the primary bound; see HandleRequest's own comment.
+    // Above OPEN_TIMEOUT_S (90s, app_browser_plugin.py) and the WebView2 init
+    // timeout (60s) on the AppBrowserWindow side respectively -- this is the
+    // outermost safety net, not the primary bound; see HandleRequest's own
+    // comment.
     private static readonly TimeSpan HandleRequestTimeout = TimeSpan.FromSeconds(100);
-
-    /// <summary>Wired by MainWindow's constructor -- lets /test_visual_mode below
-    /// trigger VisualModeWindow's init directly, isolated from the chat/TTS pipeline,
-    /// for diagnosing the 2026-09-03 WebView2-init hang.</summary>
-    public Caroline.VisualModeManager? VisualMode { get; set; }
 
     private readonly HttpListener _listener = new();
     private readonly Dictionary<string, AppBrowserWindow> _windows = new(StringComparer.OrdinalIgnoreCase);
@@ -103,13 +107,12 @@ public sealed class AppBrowserHost : IDisposable
                 Logger.Log($"[app-browser-host] HandleRequest: body read ({body.Length} chars)");
             }
             // Hard ceiling on top of whatever bound (if any) the specific
-            // Dispatch branch has itself -- confirmed live (2026-09-01) that
-            // a stuck WebView2 init left this task (and, apparently, the
-            // whole listener's ability to serve OTHER requests too) hanging
-            // forever with no HTTP response ever sent, the underlying
-            // connection stuck permanently in CLOSE_WAIT. Every request
-            // handled here now unconditionally gets an answer -- a real one
-            // or a clear timeout error -- within this ceiling, no exceptions.
+            // Dispatch branch has itself -- a stuck WebView2 init must never
+            // leave this request (or the whole listener's ability to serve
+            // OTHER requests) hanging forever with no HTTP response ever
+            // sent. Every request handled here now unconditionally gets an
+            // answer -- a real one or a clear timeout error -- within this
+            // ceiling, no exceptions.
             var dispatchTask = Dispatch(path, body);
             var (status, json) = await Task.WhenAny(dispatchTask, Task.Delay(HandleRequestTimeout)) == dispatchTask
                 ? await dispatchTask
@@ -167,12 +170,11 @@ public sealed class AppBrowserHost : IDisposable
             int existingCount;
             lock (_windowsLock) { existingCount = _windows.Count; _windows[label] = win; }
             // Cascade each new window's position off the count already open --
-            // confirmed live (2026-08-31) that several labeled windows
-            // (whatsapp, telegram, messenger, chatgpt) otherwise all land at
-            // the exact same screen position, so a coordinate-based click
-            // could land in the wrong one entirely. Wraps every 10 windows
-            // (WrapEvery * CascadeOffsetPx stays comfortably on-screen) --
-            // moot in practice at MaxTabs-scale counts, just a safety cap.
+            // several labeled windows otherwise all land at the exact same
+            // screen position, so a coordinate-based click could land in the
+            // wrong one entirely. Wraps every 10 windows (WrapEvery *
+            // CascadeOffsetPx stays comfortably on-screen) -- moot in
+            // practice at MaxTabs-scale counts, just a safety cap.
             const int CascadeOffsetPx = 40;
             const int WrapEvery = 10;
             var step = existingCount % WrapEvery;
@@ -180,8 +182,7 @@ public sealed class AppBrowserHost : IDisposable
             win.Top = 80 + step * CascadeOffsetPx;
             // Show the window FIRST, before WebView2 initialization -- see
             // AppBrowserWindow.ShowNow's doc comment for why this order
-            // matters (the previous, wrong order was the actual bug behind
-            // "window never even tried to open").
+            // matters.
             win.ShowNow();
             await win.EnsureInitializedAsync();
             Logger.Log($"[app-browser-host] GetOrCreateWindowAsync({label}): window shown and initialized");
@@ -210,76 +211,41 @@ public sealed class AppBrowserHost : IDisposable
 
         Logger.Log($"[app-browser-host] Dispatch: path={path}");
 
-        if (path == "/test_visual_mode")
-        {
-            // Debug-only endpoint (2026-09-03, diagnosing a VisualModeWindow WebView2-init
-            // hang): opens the window and shows its static frame, completely isolated from
-            // the chat turn / TTS synthesis / backend -- so a hang here can ONLY be the
-            // window's own WebView2 init, nothing else in the pipeline. GET
-            // http://127.0.0.1:8767/test_visual_mode from curl or a browser triggers it.
-            Logger.Log("[app-browser-host] Dispatch(/test_visual_mode): entered");
-            if (VisualMode == null)
-            {
-                Logger.Log("[app-browser-host] Dispatch(/test_visual_mode): VisualMode not wired, returning 500");
-                return (500, JsonSerializer.Serialize(new { error = "VisualMode not wired" }));
-            }
-            var testId = "test-" + Guid.NewGuid().ToString("N")[..8];
-            var sw = Stopwatch.StartNew();
-            Logger.Log($"[app-browser-host] Dispatch(/test_visual_mode): calling HandleStartAsync requestId={testId} on UI thread");
-            try
-            {
-                await ((Task)System.Windows.Application.Current.Dispatcher.Invoke(
-                    () => VisualMode.HandleStartAsync(testId)));
-                Logger.Log($"[app-browser-host] Dispatch(/test_visual_mode): HandleStartAsync returned normally after {sw.Elapsed.TotalSeconds:F1}s");
-                return (200, JsonSerializer.Serialize(new { requestId = testId, elapsedSeconds = sw.Elapsed.TotalSeconds }));
-            }
-            catch (Exception ex)
-            {
-                Logger.Log($"[app-browser-host] Dispatch(/test_visual_mode): HandleStartAsync threw after {sw.Elapsed.TotalSeconds:F1}s: {ex}");
-                return (500, JsonSerializer.Serialize(new { error = ex.ToString(), elapsedSeconds = sw.Elapsed.TotalSeconds }));
-            }
-        }
-
         if (path == "/shutdown")
         {
-            // Per explicit instruction (2026-09-03): CarolineInstaller used to always
-            // force-kill a running Caroline.exe from the OUTSIDE (Process.Kill) before an
-            // update, which never runs Caroline's OWN cleanup code (App.xaml.cs's Dispose()
-            // sequence -- AppBrowserHost.Dispose(), BackendProcess.Dispose() with its own
-            // controlled entireProcessTree kill -- now SupervisorClient.Dispose(), same
-            // shape, see its own 2026-09-27 doc comment -- closing every WebView2 window properly)
-            // at all; an external Kill() just tears down the OS process tree, hoping it
-            // catches everything. Confirmed live as a real gap: a stray WebView2 renderer
-            // process could still be found holding a file open under AppDir well after
-            // that external kill supposedly finished. This endpoint lets the installer ask
-            // Caroline to exit HERSELF first, through the exact same graceful path the
-            // tray's "Update to ..." click already uses (UpdateChecker.UpdateNowAsync's own
-            // Application.Current.Shutdown()) -- Autostart.StopRunningClient tries this
-            // first now, falling back to the external hard-kill only if it doesn't work.
-            Logger.Log("[app-browser-host] Dispatch(/shutdown): requested -- scheduling graceful Application.Shutdown()");
+            // Asked by CarolineInstaller's Autostart.cs before an update, same
+            // reasoning Caroline.exe's own /shutdown always had: close every
+            // WebView2 window through its OWN OnClosing path (releases its
+            // profile-directory lock properly) before this process exits,
+            // rather than relying on an external hard-kill to catch
+            // everything. Give the HTTP response a moment to actually reach
+            // the caller first.
+            Logger.Log("[app-browser-host] Dispatch(/shutdown): requested -- closing all windows then exiting");
             _ = Task.Run(async () =>
             {
-                // Give the HTTP response below a moment to actually reach the caller before
-                // this process starts tearing itself down -- Shutdown() closing the WebView2
-                // window that's hosting this very listener's response pipeline could
-                // otherwise race the write.
                 await Task.Delay(200);
-                System.Windows.Application.Current.Dispatcher.Invoke(() => System.Windows.Application.Current.Shutdown());
+                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    AppBrowserWindow[] toClose;
+                    lock (_windowsLock) { toClose = _windows.Values.ToArray(); }
+                    foreach (var w in toClose)
+                    {
+                        try { w.Close(); }
+                        catch (Exception ex) { Logger.Log($"[app-browser-host] Dispatch(/shutdown): closing {w.Label} threw (ignored): {ex.Message}"); }
+                    }
+                    System.Windows.Application.Current.Shutdown();
+                });
             });
             return (200, JsonSerializer.Serialize(new { ok = true }));
         }
 
         if (path == "/process_list")
         {
-            // Per explicit instruction (2026-09-06): the Node backend's own process-tree
-            // bookkeeping (processReaper.ts, server.ts's descendant-process diagnostics)
-            // used to shell out to PowerShell/WMI for this -- slow (300-500ms per call,
-            // on every single query() creation) and, confirmed live the same day, fragile
-            // enough to silently break on a quoting bug. This is the direct WinAPI
-            // equivalent (kernel32.dll's Toolhelp32Snapshot, see ProcessTreeHelper) served
-            // over the same local HTTP bridge Node already talks to for everything else --
-            // no process spawned for the call, just a socket request to this already-
-            // running one.
+            // Plain WinAPI process-tree enumeration (kernel32.dll's
+            // Toolhelp32Snapshot, see ProcessTreeHelper) served over this
+            // already-running local socket -- nothing to do with browser
+            // windows specifically, see this class's own doc comment for why
+            // it lives here rather than being ported to Python.
             var procs = ProcessTreeHelper.ListAll();
             Logger.Log($"[app-browser-host] Dispatch(/process_list): {procs.Count} process(es)");
             return (200, JsonSerializer.Serialize(procs.Select(p => new { pid = p.Pid, parentPid = p.ParentPid, name = p.Name })));
@@ -287,8 +253,8 @@ public sealed class AppBrowserHost : IDisposable
 
         if (path == "/kill_process")
         {
-            // Process.Kill() is itself a thin wrapper over WinAPI's TerminateProcess --
-            // no external process spawned (unlike the taskkill.exe call this replaces).
+            // Process.Kill() is itself a thin wrapper over WinAPI's
+            // TerminateProcess -- no external process spawned.
             var pid = root.GetProperty("pid").GetInt32();
             Logger.Log($"[app-browser-host] Dispatch(/kill_process): pid={pid}");
             try
@@ -358,7 +324,7 @@ public sealed class AppBrowserHost : IDisposable
 
         if (path == "/get_port")
         {
-            // Lightweight lookup for the Node side's CDP client cache -- avoids
+            // Lightweight lookup for backend-py's CDP client cache -- avoids
             // re-running /open's full get-or-create dance (which also touches
             // navigation) just to learn a port it may already have cached from
             // last time but wants to confirm is still this window's real one.
@@ -401,13 +367,13 @@ public sealed class AppBrowserHost : IDisposable
             }
 
             // snapshot/find/evaluate and the non-real (JS-dispatch) paths of
-            // click/type/press_key moved to the Node side (appBrowserCdp.ts),
-            // which connects directly over this window's own CDP port
-            // (see CdpPort/AppBrowserWindow) instead of routing through this
-            // HTTP bridge -- see AppBrowserWindow.xaml.cs's own comment on
-            // why. This host now only ever handles: window lifecycle,
-            // screenshots, and real (OS-level SendInput) click/type/
-            // press_key/scroll, none of which are page-content operations.
+            // click/type/press_key are handled by backend-py's own
+            // app_browser_cdp.py, which connects directly over this window's
+            // own CDP port (see CdpPort/AppBrowserWindow) instead of routing
+            // through this HTTP bridge. This host only ever handles: window
+            // lifecycle, screenshots, and real (OS-level SendInput)
+            // click/type/press_key/scroll, none of which are page-content
+            // operations.
 
             case "/click":
             {

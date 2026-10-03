@@ -13,6 +13,8 @@ dist_installer/
 .vs/
 Windows/Caroline/bin/
 Windows/Caroline/obj/
+Windows/Caroline.NativeHost/bin/
+Windows/Caroline.NativeHost/obj/
 Windows/CarolineInstaller/bin/
 Windows/CarolineInstaller/obj/
 vendor/XcfaRenderer/bin/

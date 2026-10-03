@@ -1,8 +1,8 @@
 using System.Runtime.InteropServices;
 using System.Text;
-using Caroline.Services;
+using Caroline.NativeHost.Services;
 
-namespace Caroline.Native;
+namespace Caroline.NativeHost.Native;
 
 /// <summary>
 /// Collapses the native Windows "Open"/"Save As" file-picker dance into one
@@ -10,7 +10,9 @@ namespace Caroline.Native;
 /// dialog's HWND, find its filename Edit control, type the path, press
 /// Enter) took 4 separate tool calls with a real race if the dialog hadn't
 /// finished appearing yet. This waits for the dialog itself, so callers
-/// don't need their own retry loop for that.
+/// don't need their own retry loop for that. Not tied to any particular
+/// AppBrowserWindow -- EnumWindows scans the whole desktop, so this works
+/// for a dialog opened by any window this process owns.
 /// </summary>
 internal static class FileDialogHelper
 {

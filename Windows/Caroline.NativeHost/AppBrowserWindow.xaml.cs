@@ -7,19 +7,20 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Interop;
-using Caroline.Native;
-using Caroline.Services;
+using Caroline.NativeHost.Native;
+using Caroline.NativeHost.Services;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
-namespace Caroline;
+namespace Caroline.NativeHost;
 
 /// <summary>
 /// One persistent, labeled embedded browser window (e.g. "whatsapp",
 /// "telegram", "facebook", "slack") -- Caroline's own multi-window browser,
-/// living inside the app instead of a separate standalone Chromium process
-/// (see MCP/browser, which does the latter and is kept only as a fallback
-/// for cases this can't handle). Each label gets its own persistent
+/// living in this standalone Caroline.NativeHost process (moved out of
+/// Caroline.exe itself, 2026-10-03) instead of a separate standalone Chromium
+/// process (see MCP/browser, which does the latter and is kept only as a
+/// fallback for cases this can't handle). Each label gets its own persistent
 /// WebView2 profile folder, so logging into WhatsApp Web in one window
 /// doesn't touch Telegram's session in another.
 ///
@@ -29,15 +30,16 @@ namespace Caroline;
 /// tagging/click/type approach mirrors MCP/browser/src/index.ts's own
 /// (data-mcp-ref attributes, JS event-dispatch fallback for React-controlled
 /// inputs) so behavior stays consistent between the embedded and standalone
-/// tools -- see AppBrowserHost.cs for the HTTP bridge that lets the backend
-/// (a plain Node process, not this WPF one) call into these methods.
+/// tools -- see AppBrowserHost.cs for the HTTP bridge that lets backend-py
+/// (a separate process again, same as before the move) call into these
+/// methods.
 /// </summary>
 public partial class AppBrowserWindow : Window
 {
     public string Label { get; }
     /// <summary>Remote-debugging (CDP) port this window's WebView2 will listen on once
-    /// initialized -- see EnsureInitializedAsync. The Node backend connects here directly
-    /// (playwright-core's connectOverCDP) for snapshot/find/click/type/evaluate, since CDP
+    /// initialized -- see EnsureInitializedAsync. backend-py connects here directly
+    /// (Playwright's connect_over_cdp) for snapshot/find/click/type/evaluate, since CDP
     /// doesn't go through the page's own JS context and so isn't subject to its CSP the way
     /// ExecuteScriptAsync-injected script is -- confirmed live (2026-08-31) as a real gap:
     /// evaluate() was silently blocked by page CSP on some sites (ChatGPT, Facebook), and
@@ -179,16 +181,14 @@ public partial class AppBrowserWindow : Window
         _webView = webView;
         Logger.Log($"[app-browser-window:{Label}] EnsureInitializedAsync: WebView2 control created and added to visual tree ({sw.Elapsed.TotalSeconds:F1}s)");
 
-        // Separate profile per label -- same reasoning as DocumentViewerWindow's
-        // dedicated profile dirs (webview2-office, webview2-payment): distinct
-        // login/cookie state per site, never sharing with the chat page's own.
+        // Separate profile per label -- distinct login/cookie state per
+        // site, never sharing with any other window's own.
         var dataDir = ProfileDataDir(Label);
         Logger.Log($"[app-browser-window:{Label}] EnsureInitializedAsync: calling CoreWebView2Environment.CreateAsync (profile dir: {dataDir}, cdpPort={CdpPort})...");
         // --remote-allow-origins=* -- required by modern Chromium's DevTools origin check,
-        // otherwise a WebSocket CDP connection from playwright-core (not itself a browser tab)
+        // otherwise a WebSocket CDP connection from Playwright (not itself a browser tab)
         // gets rejected outright. Loopback-only port, same trust model as every other local
-        // control surface in this app (AppBrowserHost, the backend's own /api/*) -- nothing
-        // remote can reach it.
+        // control surface in this app (AppBrowserHost) -- nothing remote can reach it.
         var envOptions = new CoreWebView2EnvironmentOptions
         {
             AdditionalBrowserArguments = $"--remote-debugging-port={CdpPort} --remote-allow-origins=*",
@@ -273,7 +273,7 @@ public partial class AppBrowserWindow : Window
         return chars.Length > 0 ? new string(chars) : "default";
     }
 
-    /// <summary>Factored out of EnsureInitializedAsync (2026-10-01) so OnClosing can also
+    /// <summary>Factored out of EnsureInitializedAsync so OnClosing can also
     /// name this label's profile dir, for the matching KillStaleWebView2Processes call there
     /// -- see OnClosing's own comment for why.</summary>
     private static string ProfileDataDir(string label) => Path.Combine(
@@ -298,8 +298,8 @@ public partial class AppBrowserWindow : Window
     }
 
     // SnapshotAsync/FindAsync/ClickAsync/TypeAsync/PressKeyAsync/EvaluateAsync
-    // (the JS-injection/ExecuteScriptAsync versions) moved to the Node side
-    // (appBrowserCdp.ts), which connects over real CDP via playwright-core
+    // (the JS-injection/ExecuteScriptAsync versions) live on backend-py's own
+    // side (app_browser_cdp.py), which connects directly over real CDP
     // instead -- confirmed live (2026-08-31) that ExecuteScriptAsync-injected
     // script is silently blocked by page CSP on some sites (ChatGPT,
     // Facebook: even `() => 42` failed), and CDP's Runtime.evaluate is NOT
@@ -458,13 +458,9 @@ public partial class AppBrowserWindow : Window
     }
 
     /// <summary>Optional crop (x/y/width/height, in the captured bitmap's own pixel space) and/or
-    /// proportional maxWidth downscale -- per explicit instruction (2026-09-04): app_browser_screenshot
-    /// was the one screenshot tool in the whole app with NO region/downscale support at all (unlike
-    /// take_screenshot and capture_window, which both already had it), so a caller that only needed
-    /// a small part of the page still paid full-page image-token cost every time. Same crop-then-
-    /// downscale logic as MCP/window-screenshot's own native/Program.cs (ApplyCropAndDownscale),
-    /// ported here since this capture happens in-process (WebView2's CapturePreviewAsync) rather
-    /// than through that separate native exe.</summary>
+    /// proportional maxWidth downscale. Same crop-then-downscale logic as MCP/window-screenshot's
+    /// own native/Program.cs (ApplyCropAndDownscale), ported here since this capture happens
+    /// in-process (WebView2's CapturePreviewAsync) rather than through that separate native exe.</summary>
     public async Task<byte[]> ScreenshotAsync(int? cropX = null, int? cropY = null, int? cropWidth = null, int? cropHeight = null, int? maxWidth = null)
     {
         await EnsureInitializedAsync();

@@ -84,10 +84,19 @@ internal static class Autostart
         }
     }
 
-    // Caroline\Native\AppBrowserHost.cs's own Port const -- kept as a separate literal here
+    // Caroline\Native\AppControlHost.cs's own Port const -- kept as a separate literal here
     // (not shared code between the two projects) since this is the one place the installer
-    // needs it.
-    private const int AppBrowserHostPort = 8767;
+    // needs it. Was 8767 (AppBrowserHost) before the 2026-10-03 extraction of the embedded
+    // browser into its own Caroline.NativeHost process -- see NativeHostPort below for that
+    // process's own (unchanged) port, which this installer now also has to ask nicely.
+    private const int AppControlHostPort = 8768;
+
+    // Caroline.NativeHost\AppBrowserHost.cs's own Port const, same "separate literal, not
+    // shared code" reasoning as above. This is now where Caroline's embedded browser windows
+    // (and their WebView2 profile locks) actually live, so asking it to exit gracefully before
+    // an update matters at least as much as it ever did for Caroline.exe itself.
+    private const int NativeHostPort = 8767;
+    private const string NativeHostProcessName = "Caroline.NativeHost";
 
     /// <summary>How many times to ask (and verify) before giving up on the polite path and
     /// escalating to Kill() -- per explicit instruction (2026-09-06): confirmed live, twice in
@@ -113,7 +122,7 @@ internal static class Autostart
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-            var resp = await http.PostAsync($"http://127.0.0.1:{AppBrowserHostPort}/shutdown", new StringContent(""));
+            var resp = await http.PostAsync($"http://127.0.0.1:{AppControlHostPort}/shutdown", new StringContent(""));
             if (!resp.IsSuccessStatusCode)
             {
                 Logger.Log($"TryGracefulShutdownOnceAsync: /shutdown returned {(int)resp.StatusCode}");
@@ -139,6 +148,40 @@ internal static class Autostart
         }
         Logger.Log("TryGracefulShutdownOnceAsync: process did not exit within 10s");
         return false;
+    }
+
+    /// <summary>Single best-effort attempt to ask Caroline.NativeHost (the separate process
+    /// hosting Caroline's embedded browser windows, see AppBrowserHost.cs there) to close every
+    /// window and exit, via its own /shutdown. Unlike TryGracefulShutdownOnceAsync above, this
+    /// doesn't retry/verify in a loop -- NativeHost is lazily launched by backend-py and may
+    /// legitimately not be running at all (nothing ever opened a browser window this session),
+    /// which is not a failure worth retrying over. Logs and returns either way; the by-path
+    /// sweep below is the authoritative backstop regardless of whether this succeeded.</summary>
+    private static async Task TryGracefulShutdownNativeHostOnceAsync()
+    {
+        if (!Process.GetProcessesByName(NativeHostProcessName).Any())
+        {
+            Logger.Log("TryGracefulShutdownNativeHostOnceAsync: not running, nothing to ask");
+            return;
+        }
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+            var resp = await http.PostAsync($"http://127.0.0.1:{NativeHostPort}/shutdown", new StringContent(""));
+            Logger.Log($"TryGracefulShutdownNativeHostOnceAsync: /shutdown returned {(int)resp.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"TryGracefulShutdownNativeHostOnceAsync: request failed (older build without /shutdown, or not actually running): {ex.Message}");
+            return;
+        }
+        // Brief wait for the windows to actually close and the process to exit -- not a full
+        // verify-and-retry loop (see this method's own doc comment for why).
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline && Process.GetProcessesByName(NativeHostProcessName).Any())
+        {
+            await Task.Delay(250);
+        }
     }
 
     /// <summary>Stops any currently running Caroline.exe, regardless of path -- AND its
@@ -172,6 +215,15 @@ internal static class Autostart
             }
         }
 
+        // One best-effort attempt (not the full retry dance above -- Caroline.NativeHost has
+        // far less of its own state to tear down than Caroline.exe itself, just its open
+        // AppBrowserWindow instances) to let Caroline's embedded browser windows release their
+        // WebView2 profile locks cleanly before the hard-kill sweep below. If this doesn't work
+        // (older build without this endpoint, not running, request fails), the by-name sweep
+        // just below and KillStrayWebView2Processes further down are the backstop -- same
+        // layered posture as Caroline.exe's own graceful-then-forceful shutdown.
+        await TryGracefulShutdownNativeHostOnceAsync();
+
         var carolineProcs = Process.GetProcessesByName("Caroline");
         Logger.Log($"StopRunningClient: found {carolineProcs.Length} 'Caroline' process(es)");
         foreach (var proc in carolineProcs)
@@ -195,7 +247,7 @@ internal static class Autostart
         // of stuck/lingering processes over many hours left literally zero trace
         // here: nothing to tell us whether this loop ever ran, found candidates,
         // or correctly/incorrectly skipped them.
-        foreach (var name in new[] { "node", "claude", "codex-app-server" })
+        foreach (var name in new[] { "node", "claude", "codex-app-server", NativeHostProcessName })
         {
             var procs = Process.GetProcessesByName(name);
             Logger.Log($"StopRunningClient: found {procs.Length} '{name}' process(es) on the machine");

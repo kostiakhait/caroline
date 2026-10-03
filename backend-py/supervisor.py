@@ -100,6 +100,12 @@ def _child_env() -> dict[str, str]:
     env["CAROLINE_CODEX_PATH"] = str(_ROOT_DIR / "runtime" / "codex" / "bin" / "codex-app-server.exe")
     env["CAROLINE_PYTHON_PATH"] = str(_ROOT_DIR / "runtime" / "python" / "python.exe")
     env["CAROLINE_PORT"] = str(BACKEND_PORT)
+    # Caroline.NativeHost.exe (the embedded-browser host, 2026-10-03 extraction out of
+    # Caroline.exe -- see app_browser_plugin.py's own doc comment) publishes as a SIBLING of
+    # Caroline.exe and this backend-py dir inside the same app-<hash> folder (_APP_DIR, not
+    # _ROOT_DIR -- see the Makefile's own publish step), same layout Caroline.exe itself lives
+    # at relative to AppContext.BaseDirectory.
+    env["CAROLINE_NATIVEHOST_EXE_PATH"] = str(_APP_DIR / "Caroline.NativeHost.exe")
     return env
 
 

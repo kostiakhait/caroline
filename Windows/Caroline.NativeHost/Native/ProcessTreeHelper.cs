@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace Caroline.Native;
+namespace Caroline.NativeHost.Native;
 
 /// <summary>
 /// Pure WinAPI process enumeration (kernel32.dll's Toolhelp32Snapshot) -- per
@@ -9,9 +9,9 @@ namespace Caroline.Native;
 /// external process (PowerShell, taskkill, or anything else). This is the
 /// direct native equivalent, same DllImport/struct-marshaling style as
 /// RestartManagerHelper.cs's own rstrtmgr.dll wrapper in CarolineInstaller.
-/// Exposed to the Node backend over AppBrowserHost's existing local HTTP
-/// bridge (see its own /process_list and /kill_process handlers) -- that's
-/// an already-running sibling process answering over a socket, not a new
+/// Exposed to backend-py over AppBrowserHost's existing local HTTP bridge
+/// (see its own /process_list and /kill_process handlers) -- that's an
+/// already-running sibling process answering over a socket, not a new
 /// process being spawned for the call.
 /// </summary>
 public static class ProcessTreeHelper
