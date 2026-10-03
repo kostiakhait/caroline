@@ -119,6 +119,7 @@ from app.plugins.loader import build_mcp_servers
 from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
+from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app import agent_registry
 from app.agent_definitions import caroline_agents
 from app.policies import (
@@ -4065,6 +4066,7 @@ class ChatSession:
                 self._system_prompt_language = current_language_name(self.tab_id)
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
+                    owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),

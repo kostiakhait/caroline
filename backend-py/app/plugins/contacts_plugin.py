@@ -275,7 +275,11 @@ _USAGE_INSTRUCTIONS = (
     "contact info, ALWAYS check here first with contact_search/contact_get -- only ask if it's genuinely "
     "not here. Tags (e.g. \"family\", \"work\", \"bank\") are the organizing concept here, not folders -- "
     "apply the ones that fit, don't invent an elaborate taxonomy. Photos attach via contact_attach_photo, "
-    "same local-file-path convention as notes_attach."
+    "same local-file-path convention as notes_attach. Your OWNER'S OWN contact entry, if you create or find "
+    "one, gets the tag \"self\" (create it if none exists and you learn their name/etc. -- a real person's "
+    "assistant would have their own boss's own card too) -- keep its name/emails/phones in sync with the "
+    "small owner_profile_get/owner_profile_set cache and \"Caroline:Profile\" Notes whenever any one of the "
+    "three changes."
 )
 
 

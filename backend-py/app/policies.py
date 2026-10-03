@@ -559,7 +559,11 @@ def owner_profile_instruction() -> str:
         "durable fact about your owner worth remembering long-term (not a one-off detail only relevant to the "
         "current task), or an existing one turns out to be wrong or outdated, update it there yourself "
         '(notes_update on the relevant note, or notes_create in "Caroline:Profile" for something genuinely new) '
-        "-- keep it current, don't let it silently drift out of date."
+        "-- keep it current, don't let it silently drift out of date. Separately, owner_profile_get/"
+        "owner_profile_set (own on-demand instructions, fetched the same way) hold just the name/gender/age "
+        "subset of this that's small enough to bake into every system prompt -- keep that in sync with this "
+        "folder and with the owner's own entry in your address book (contact_search/contact_get), if one exists, "
+        "rather than treating any one of the three as a separate, independently-drifting copy."
     )
 
 

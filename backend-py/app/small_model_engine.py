@@ -86,6 +86,7 @@ from app.model_key_provisioning import get_model_provider_key
 from app.operations import REGISTRY as OPERATIONS_REGISTRY
 from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
+from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.policies import (
     continuity_pointer_instruction,
@@ -876,6 +877,7 @@ async def run_small_model_turn(
     registry = build_tool_registry()
     system = "\n\n".join([
         _persona_system_message(persona),
+        owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
     ])
