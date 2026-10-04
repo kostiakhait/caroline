@@ -34,9 +34,19 @@ OPENAI_KEY = ""
 OPENROUTER_KEY = ""
 
 # Real, non-secret model-routing values -- must match reforce's own Config.py
-# so "SMALL"/"LARGE"/"ALTERNATE" resolve to the same actual model ids.
+# so "SMALL"/"LARGE"/"ALTERNATE"/"MINI"/"CODEX_MAX" resolve to the same actual
+# model ids. Bug fix (2026-10-03), confirmed live: this stub is a SEPARATE file
+# from reforce's own Config.py (see module docstring -- AI.py/Cache.py/etc. are
+# vendored verbatim from reforce's `caroline` branch, but Config.py is always
+# THIS file instead), so updating reforce's Config.py alone never reaches a
+# real Caroline build -- AI_MODEL_MINI was missing here entirely, crashing
+# every small-model turn with AttributeError the moment the 4-tier cascade
+# shipped. Keep this in sync with reforce/Config.py by hand whenever either
+# changes.
 AI_MODEL_LARGE = "openai/gpt-5.1"
-AI_MODEL_ALTERNATE = "meta-llama/llama-4-maverick"
+AI_MODEL_ALTERNATE = "anthropic/claude-sonnet-5"
+AI_MODEL_MINI = "openai/gpt-5.1-codex-mini"
+AI_MODEL_CODEX_MAX = "openai/gpt-5.1-codex-max"
 AI_MODEL_SMALL = "openai/gpt-5-nano"
 AI_MODEL_CODE_LARGE = "anthropic/claude-sonnet-4.5"
 AI_FLEXIBLE_MODEL_USE = True
