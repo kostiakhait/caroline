@@ -725,7 +725,7 @@ async def generate_progress_comment(
     try:
         data = await _post_json(body, timeout=timeout)
     except Exception as exc:
-        log_event("plugin:voice", "generate_progress_comment_request_failed", error=str(exc))
+        log_event("plugin:voice", "generate_progress_comment_request_failed", error=str(exc), error_type=type(exc).__name__, timeout_s=timeout)
         return None
     if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
         log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))

@@ -255,7 +255,7 @@ NARRATION_GENERATION_RETRY_ATTEMPTS = 3
 # generate_progress_comment/translate_text, which forward it to sw_api.
 # py's _post_json) makes a slow/hung attempt fail fast so the OUTER retry
 # loop above gets a real chance to try again within the same minute.
-NARRATION_NETWORK_TIMEOUT_S = 6.0
+NARRATION_NETWORK_TIMEOUT_S = 30.0
 
 # Bug fix (2026-09-22), same instruction: _check_progress_narration used
 # to claim the 60s interval (last_visible_output_at) BEFORE attempting
