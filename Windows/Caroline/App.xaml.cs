@@ -139,10 +139,11 @@ public partial class App : System.Windows.Application
 
         Logger.Log($"[DIAG] before WaitForSplashDismissAsync, elapsed since Hide()={diagSw.Elapsed.TotalSeconds:F1}s");
         await WaitForSplashDismissAsync(dismissedEarly.Task);
-        Logger.Log($"[DIAG] after WaitForSplashDismissAsync, elapsed since Hide()={diagSw.Elapsed.TotalSeconds:F1}s, IsVisible before re-Show={_mainWindow.IsVisible}");
+        Logger.Log($"[DIAG] after WaitForSplashDismissAsync, elapsed={diagSw.Elapsed.TotalSeconds:F1}s, dismissedEarly={dismissedEarly.Task.IsCompleted}, IsVisible={_mainWindow.IsVisible}, Opacity={_mainWindow.Opacity}");
         if (splash.IsLoaded) splash.Close();
         _mainWindow.Show();
         Logger.Log($"[DIAG] main window Show() done, IsVisible={_mainWindow.IsVisible}");
+        _ = _mainWindow.StartTabsAsync();
 
         _mainWindow.Activate();
         // Activate() alone can silently no-op here: Windows' foreground-lock

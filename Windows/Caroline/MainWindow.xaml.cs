@@ -228,7 +228,7 @@ public partial class MainWindow : Window
         });
         if (!_supervisor.Start())
         {
-            ShowError("Backend failed to start -- is Node.js installed?");
+            ShowError("Backend failed to start -- the bundled Python runtime (runtime\\python\\pythonw.exe) was not found next to this install. See caroline.log.");
             return;
         }
 
@@ -240,9 +240,12 @@ public partial class MainWindow : Window
         // without any help from here. This timer only watches for the one
         // case still worth a human-visible dialog -- see PollSupervisorStatus.
         _supervisorStatusTimer = new System.Threading.Timer(_ => PollSupervisorStatus(), null, SupervisorStatusPollInterval, SupervisorStatusPollInterval);
-
-        await InitTabsAsync();
     }
+
+    // Tabs (and their WebView2 controls) must be created only once the window is
+    // actually shown -- App.OnStartup hides the window during the splash, and a
+    // WebView2 initialized into a hidden window never paints its content.
+    public Task StartTabsAsync() => InitTabsAsync();
 
     /// <summary>
     /// Per explicit instruction (2026-09-27): the only thing MainWindow
@@ -520,12 +523,20 @@ public partial class MainWindow : Window
         try
         {
             await TimeoutAfter(webView.EnsureCoreWebView2Async(env), WebViewInitTimeout, $"EnsureCoreWebView2Async (chat tab {tab.Id})");
+            Logger.Log($"[DIAG-WV] tab {tab.Id}: EnsureCoreWebView2Async done, window Opacity={Opacity} IsVisible={IsVisible} WindowState={WindowState}");
 
+            webView.CoreWebView2.NavigationStarting += (_, args) =>
+                Logger.Log($"[DIAG-WV] tab {tab.Id}: NavigationStarting {args.Uri}");
             webView.CoreWebView2.NavigationCompleted += (_, args) =>
             {
+                Logger.Log($"[DIAG-WV] tab {tab.Id}: NavigationCompleted success={args.IsSuccess} status={args.WebErrorStatus} url={webView.Source}");
                 if (!args.IsSuccess)
                     ShowError($"Could not load chat UI (error {args.WebErrorStatus}).");
             };
+            webView.CoreWebView2.DOMContentLoaded += (_, _) =>
+                Logger.Log($"[DIAG-WV] tab {tab.Id}: DOMContentLoaded");
+            webView.CoreWebView2.ContentLoading += (_, _) =>
+                Logger.Log($"[DIAG-WV] tab {tab.Id}: ContentLoading");
 
             // Confirmed real failure mode: the WPF window/tray can stay
             // completely alive and responsive while WebView2's own render
