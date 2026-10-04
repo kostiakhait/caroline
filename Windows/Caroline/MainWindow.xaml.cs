@@ -319,12 +319,30 @@ public partial class MainWindow : Window
     {
         var idsToOpen = (_settings.OpenTabIds is { Count: > 0 } ? _settings.OpenTabIds : new List<string> { "1" })
             .Distinct().Take(MaxTabs).ToList();
-        foreach (var id in idsToOpen)
+        _restoringTabs = true;
+        try
         {
-            await AddTabAsync(id, selectAfter: false);
+            foreach (var id in idsToOpen)
+            {
+                await AddTabAsync(id, selectAfter: false);
+            }
+        }
+        finally
+        {
+            _restoringTabs = false;
+        }
+        if (_tabs.Count == idsToOpen.Count)
+        {
+            PersistOpenTabIds();
+        }
+        else
+        {
+            Logger.Log($"MainWindow.InitTabsAsync: restored {_tabs.Count} of {idsToOpen.Count} tabs; keeping the saved tab list unchanged");
         }
         if (_tabs.Count > 0) SelectTab(_tabs[0]);
     }
+
+    private bool _restoringTabs;
 
     // Same reasoning as AppBrowserWindow.EnsureInitializedAsync's own copy of
     // this (see its doc comment -- confirmed live 2026-09-01 a stuck WebView2
@@ -756,6 +774,7 @@ public partial class MainWindow : Window
 
     private void PersistOpenTabIds()
     {
+        if (_restoringTabs) return;
         _settings.OpenTabIds = _tabs.Select(t => t.Id).ToList();
         _settingsService.Save(_settings);
         SyncTabListToBackend();

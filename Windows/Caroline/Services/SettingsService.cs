@@ -11,6 +11,11 @@ public class SettingsService
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Caroline");
 
     private static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
+    private static readonly string BackupPath = SettingsPath + ".bak";
+
+    // Set when settings.json existed but could not be read. Saving over it then
+    // would replace the user's real settings with defaults, so Save refuses.
+    private bool _loadFailed;
 
     // Bug fix (2026-09-13, per explicit report from a real user's logs):
     // AppSettings.WindowLeft/Top/Width/Height deliberately default to
@@ -40,25 +45,44 @@ public class SettingsService
             {
                 var json = File.ReadAllText(SettingsPath);
                 var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions);
-                if (settings != null) return settings;
+                if (settings != null)
+                {
+                    Logger.Log($"[SettingsService] Load: OpenTabIds=[{string.Join(",", settings.OpenTabIds)}] TabNames={settings.TabNames.Count}");
+                    return settings;
+                }
             }
         }
         catch (IOException ex)
         {
-            Logger.Log($"[SettingsService] Load: read of {SettingsPath} failed, falling back to defaults: {ex.Message}");
+            _loadFailed = true;
+            Logger.Log($"[SettingsService] Load: read of {SettingsPath} failed, using defaults and refusing to overwrite it: {ex.Message}");
         }
         catch (JsonException ex)
         {
-            Logger.Log($"[SettingsService] Load: {SettingsPath} is corrupt, falling back to defaults: {ex.Message}");
+            _loadFailed = true;
+            Logger.Log($"[SettingsService] Load: {SettingsPath} is corrupt, using defaults and refusing to overwrite it: {ex.Message}");
         }
 
         return new AppSettings();
     }
 
-    public void Save(AppSettings settings)
+    public void Save(AppSettings settings, [System.Runtime.CompilerServices.CallerMemberName] string caller = "")
     {
+        if (_loadFailed)
+        {
+            Logger.Log($"[SettingsService] Save from {caller} refused: settings.json could not be read at startup; not overwriting it");
+            return;
+        }
         Directory.CreateDirectory(SettingsDir);
+        var previous = File.Exists(SettingsPath) ? File.ReadAllText(SettingsPath) : null;
         var json = JsonSerializer.Serialize(settings, JsonOptions);
-        File.WriteAllText(SettingsPath, json);
+        Logger.Log($"[SettingsService] Save from {caller}: OpenTabIds=[{string.Join(",", settings.OpenTabIds)}] TabNames={settings.TabNames.Count}");
+        if (previous != null)
+        {
+            File.WriteAllText(BackupPath, previous);
+        }
+        var temp = SettingsPath + ".tmp";
+        File.WriteAllText(temp, json);
+        File.Move(temp, SettingsPath, overwrite: true);
     }
 }
