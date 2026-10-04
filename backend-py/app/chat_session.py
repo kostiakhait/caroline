@@ -4006,6 +4006,26 @@ class ChatSession:
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:
+                if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+                    # sw mode (2026-10-03 bug fix, confirmed live): submit()/
+                    # inject_proactive() route every turn straight to the small-model
+                    # cascade (_route_sw_turn) and never feed this loop's own
+                    # _input_stream() queue -- so the real SDK session this loop used
+                    # to build below was pure waste for an sw-mode tab (a full `claude`
+                    # CLI subprocess spun up just to sit idle forever, since nothing
+                    # ever sends it anything) AND a real, confirmed bug source: that
+                    # idle subprocess crashing ("Fatal error in message reader") still
+                    # flipped conn_state to "restarting", with no guaranteed path back
+                    # to "connected" for a session nothing was actually using -- the UI
+                    # status bar got stuck on a stale error indefinitely while the
+                    # small-model path kept working underneath it, confusingly (the tab
+                    # LOOKED dead while it wasn't). Skip building any real session at
+                    # all in this mode; just report healthy and idle, re-checking
+                    # whether the mode itself changed (a real reason to start one).
+                    self._set_conn_state("connected")
+                    while not self.ended and load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+                        await asyncio.sleep(5.0)
+                    continue
                 self.hang_count = 0
                 self.has_seen_init = False
                 # Bug fix (2026-09-10): confirmed live -- last_activity is only

@@ -88,6 +88,7 @@ from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
+from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
     continuity_pointer_instruction,
     credentials_check_notes_first_instruction,
@@ -212,6 +213,62 @@ def _is_silent_infra_failure(text: str) -> str | None:
     if stripped == _AGENT_MAX_ITERATIONS_TEXT:
         return stripped
     return None
+
+
+# Per explicit instruction (2026-10-03), after a live incident where the account's
+# OpenRouter balance ran out mid-cascade (tier 3 and the final verification pass
+# both got "Agent error: OpenRouter returned 402 Insufficient funds") and the
+# system quietly swallowed that into the same generic "try again later" text used
+# for any other failure -- hiding a concrete, fixable cause behind a dead end
+# instead of a wait. This account-wide balance is the SAME one sw_api.py's own
+# narration/translation calls already detect and surface on the status bar (see
+# mark_funds_exhausted/get_funds_exhausted_reason there) -- wired in here too, and
+# given the SAME "wait for it to clear" treatment the SDK path already gives a
+# rate limit, instead of finalizing a failure on the very first hit.
+_FUNDS_EXHAUSTED_RETRY_INTERVAL_S = 60.0
+_FUNDS_EXHAUSTED_MAX_WAIT_S = 1800.0
+
+
+class _FundsExhaustedGivingUp(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _funds_exhausted_reason_in(text: str) -> str | None:
+    reason = _is_silent_infra_failure(text)
+    if reason and ("insufficient funds" in reason.lower() or " 402" in reason):
+        return reason
+    return None
+
+
+async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], tab_id: str, emit: Callable[[str], None]) -> str:
+    """Wraps one resolve_agentic call: on a detected OpenRouter funds-exhaustion
+    response, marks it on the shared status-bar channel and waits/retries instead
+    of treating it as an ordinary failure. Gives up (raising _FundsExhaustedGivingUp)
+    only after _FUNDS_EXHAUSTED_MAX_WAIT_S of polling -- a real top-up can take a
+    while, but an indefinite silent wait would never surface to the user at all."""
+    waited_s = 0.0
+    while True:
+        result = await call_fn()
+        reason = _funds_exhausted_reason_in(result)
+        if reason is None:
+            clear_funds_exhausted()
+            return result
+        mark_funds_exhausted(reason)
+        log_event("engine", "small_model_funds_exhausted", tab_id=tab_id, reason=reason, waited_s=round(waited_s))
+        emit(f"Не хватает баланса OpenRouter ({reason}) -- жду пополнения.")
+        if waited_s >= _FUNDS_EXHAUSTED_MAX_WAIT_S:
+            raise _FundsExhaustedGivingUp(reason)
+        await asyncio.sleep(_FUNDS_EXHAUSTED_RETRY_INTERVAL_S)
+        waited_s += _FUNDS_EXHAUSTED_RETRY_INTERVAL_S
+
+
+def _funds_exhausted_final_answer(reason: str) -> str:
+    return (
+        f"Не могу сейчас ответить -- на балансе OpenRouter закончились деньги ({reason}). "
+        "Нужно пополнить баланс, после этого всё заработает как раньше."
+    )
 
 
 # Per explicit instruction (2026-09-13), corrected same-day after a real
@@ -1107,24 +1164,32 @@ async def run_small_model_turn(
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate)})
-        return await _resolve_agentic_with_watchdog(
-            ai, tracker,
-            messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
-            model=cfg.AI_MODEL_ALTERNATE, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
-            get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-            reasoning=REASONING_EFFORT, on_usage=on_usage,
+        return await _call_with_funds_wait(
+            lambda: _resolve_agentic_with_watchdog(
+                ai, tracker,
+                messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
+                model=cfg.AI_MODEL_ALTERNATE, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
+                reasoning=REASONING_EFFORT, on_usage=on_usage,
+            ),
+            tab_id, emit,
         )
 
     async def verify_candidate(candidate_text: str, can_escalate: bool) -> tuple[str, bool]:
         """Returns (text, needs_escalation). A technical verifier failure (empty
         reply/exception on both attempts) is never treated as an escalation signal --
-        it just falls back to the candidate as-is, same as before this change."""
+        it just falls back to the candidate as-is, same as before this change.
+        _FundsExhaustedGivingUp is NOT a technical failure -- let it propagate to
+        the caller, which turns it into the same honest final answer regardless of
+        whether funds ran out on a tier call or here."""
         emit("Проверка результата (без инструментов).")
         verified = ""
         for attempt in (1, 2):
             log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate)
             try:
                 verified = await run_verifier(candidate_text, can_escalate)
+            except _FundsExhaustedGivingUp:
+                raise
             except Exception as exc:  # noqa: BLE001 -- verifier failure is a retry, never silence
                 log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt=attempt, error=str(exc), error_type=type(exc).__name__)
                 verified = ""
@@ -1148,12 +1213,15 @@ async def run_small_model_turn(
         emit(f"Работает уровень {index + 1} ({model}).")
         candidate = ""
         try:
-            candidate = await _resolve_agentic_with_watchdog(
-                ai, tracker,
-                messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
-                model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
-                get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                reasoning=REASONING_EFFORT, on_usage=on_usage,
+            candidate = await _call_with_funds_wait(
+                lambda: _resolve_agentic_with_watchdog(
+                    ai, tracker,
+                    messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
+                    model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                    get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
+                    reasoning=REASONING_EFFORT, on_usage=on_usage,
+                ),
+                tab_id, emit,
             )
         except _TurnStalled as exc:
             # Not escalated: the stalled worker thread may still be running, and
@@ -1161,6 +1229,9 @@ async def run_small_model_turn(
             # acting -- continuing here would either let it act or block the next tier.
             log_event("engine", "small_model_tier_stalled", tab_id=tab_id, tier=index, model=model, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
             break
+        except _FundsExhaustedGivingUp as exc:
+            log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
+            return _answer(_funds_exhausted_final_answer(exc.reason))
         except NeedsEscalation as exc:
             log_event("engine", "small_model_tier_escalation_mechanical", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
         except Exception as exc:  # noqa: BLE001 -- the cascade must never raise into chat
@@ -1170,7 +1241,11 @@ async def run_small_model_turn(
             log_event("engine", "small_model_tier_answered", tab_id=tab_id, tier=index, model=model, text_len=len(candidate), text=candidate)
             emit(f"Уровень {index + 1} ({model}) дал ответ, переходим к проверке.")
             can_escalate = index < len(tiers) - 1
-            verified_text, needs_escalation = await verify_candidate(candidate, can_escalate)
+            try:
+                verified_text, needs_escalation = await verify_candidate(candidate, can_escalate)
+            except _FundsExhaustedGivingUp as exc:
+                log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
+                return _answer(_funds_exhausted_final_answer(exc.reason))
             if not needs_escalation:
                 final_text = verified_text
                 break
@@ -1191,7 +1266,11 @@ async def run_small_model_turn(
         # No tier ever produced a usable candidate (all stalled/errored/escalated
         # mechanically) -- one last, non-escalating verification pass so the user
         # still gets a real, honest answer instead of silence.
-        verified_text, _ = await verify_candidate(final_text, can_escalate=False)
+        try:
+            verified_text, _ = await verify_candidate(final_text, can_escalate=False)
+        except _FundsExhaustedGivingUp as exc:
+            log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=None, model=None, reason=exc.reason)
+            return _answer(_funds_exhausted_final_answer(exc.reason))
         final_text = verified_text if _usable(verified_text) else _UNAVAILABLE_ANSWER
 
     log_event("engine", "small_model_turn_answered", tab_id=tab_id, text_len=len(final_text))

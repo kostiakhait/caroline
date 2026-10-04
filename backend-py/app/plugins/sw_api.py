@@ -60,6 +60,21 @@ def get_funds_exhausted_reason() -> str | None:
     return _funds_exhausted_reason
 
 
+def mark_funds_exhausted(reason: str) -> None:
+    """Same account-wide global as _check_funds_exhaustion below -- exposed
+    (2026-10-03) for small_model_engine.py's OWN direct OpenRouter calls (via
+    camerlengo_ai's adapter, not this module's _post_json) to report into, since
+    it's the exact same OpenRouter balance either way -- see this module's own
+    comment above for why this is tracked account-wide, not per-caller."""
+    global _funds_exhausted_reason
+    _funds_exhausted_reason = reason
+
+
+def clear_funds_exhausted() -> None:
+    global _funds_exhausted_reason
+    _funds_exhausted_reason = None
+
+
 def _check_funds_exhaustion(envelope: Any) -> None:
     global _funds_exhausted_reason
     if not isinstance(envelope, dict):
