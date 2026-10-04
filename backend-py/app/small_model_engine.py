@@ -1214,8 +1214,10 @@ _COMPLEXITY_PROMPT = (
 
 
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
-    """Pre-assessment (2026-10-03): a complex multi-step tool task starts directly at
-    the second tier. AI_MODEL_SMALL is used only for this one-word service call."""
+    """Pre-assessment: a complex multi-step tool task starts directly at the second
+    tier (mini) instead of the first (nano). AI_MODEL_SMALL is used only for this
+    one-word service call -- it's also tier 0 of the real cascade, just invoked here
+    tool-free and in isolation."""
     try:
         raw = await asyncio.wait_for(
             asyncio.to_thread(ai.resolve, _COMPLEXITY_PROMPT + user_text[:2000], model=cfg.AI_MODEL_SMALL, no_fallback=True),
@@ -1245,11 +1247,11 @@ async def run_small_model_turn(
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
 
-    Four-tier cascade (mini -> large -> codex-max -> AI_MODEL_ALTERNATE/Sonnet,
-    the last added 2026-10-03), carrying the previous tier's real tool-call trace
-    forward on every escalation. A tier escalates mechanically (ESCALATION_SENTINEL,
-    NeedsEscalation, _TurnStalled) same as before, AND a verifier (the same
-    AI_MODEL_ALTERNATE, but tool-free -- a separate role) checks every tier's
+    Three-tier cascade (nano -> mini -> AI_MODEL_ALTERNATE/Sonnet), carrying the
+    previous tier's real tool-call trace forward on every escalation. A tier
+    escalates mechanically (ESCALATION_SENTINEL, NeedsEscalation, _TurnStalled)
+    same as before, AND a verifier (AI_MODEL_MINI, tool-free -- a separate role)
+    checks every tier's
     "done" candidate against the mechanical facts (undone plan steps, unconfirmed
     operations): if it finds the task genuinely unfinished and a later tier still
     exists, that is ALSO an escalation, not a final answer. Only once the last tier
@@ -1305,7 +1307,7 @@ async def run_small_model_turn(
 
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
-    current_model = {"name": cfg.AI_MODEL_LARGE}
+    current_model = {"name": cfg.AI_MODEL_SMALL}
 
     async def run_stage(stage_index: int) -> str:
         return await _run_parallel_stage(
@@ -1368,13 +1370,13 @@ async def run_small_model_turn(
     def on_usage(usage: dict[str, Any]) -> None:
         log_event("engine", "small_model_usage", tab_id=tab_id, **usage)
 
-    # 4th tier (2026-10-03, explicit instruction): AI_MODEL_ALTERNATE (Sonnet) used
-    # here WITH tools as a real escalation worker -- a distinct role from the same
-    # model's OTHER, tool-free use below as the verifier.
-    tiers = [cfg.AI_MODEL_MINI, cfg.AI_MODEL_LARGE, cfg.AI_MODEL_CODEX_MAX, cfg.AI_MODEL_ALTERNATE]
+    # Final tier: AI_MODEL_ALTERNATE (Sonnet) used here WITH tools as a real
+    # escalation worker -- a distinct role from AI_MODEL_MINI's OTHER, tool-free
+    # use below as the verifier.
+    tiers = [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE]
     log_event("engine", "small_model_resolved", tab_id=tab_id, tiers=tiers, tool_count=len(registry.tool_defs))
 
-    # Verification (AI_MODEL_ALTERNATE/Sonnet, no tools) runs after every tier that
+    # Verification (AI_MODEL_MINI, no tools) runs after every tier that
     # thinks it's done. Per explicit instruction (2026-10-03, "если задача не
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
@@ -1387,7 +1389,7 @@ async def run_small_model_turn(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
                 messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
-                model=cfg.AI_MODEL_ALTERNATE, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                model=cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                 reasoning=REASONING_EFFORT, on_usage=on_usage,
             ),
