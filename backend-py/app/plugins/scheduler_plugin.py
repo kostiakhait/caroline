@@ -1,15 +1,13 @@
-"""scheduler -- ports backend/src/scheduler.ts's schedule_reminder/
-list_reminders/cancel_reminder tools, PLUS (2026-09-09) the proactive-firing
-mechanism (startDueCheckLoop/nextOccurrence/ensureRecurringBackup in the
-original) -- a background poll loop that injects a due reminder as a new
-message into a live chat session (hasLiveDialog-aware background/priority
-distinction). This is genuine session/engine-level infrastructure, not a
-per-tool concern, so start_due_check_loop/ensure_recurring_backup are called
-from app/main.py (which owns primary_session()), not from here -- this
-module just exposes them, same file-organization choice scheduler.ts itself
-made (tool-creation and the due-check loop coexist in one file there too).
-Storage is workspace/schedule.json, survives both a session restart and a
-full app restart.
+"""scheduler -- Caroline's reminders and recurring tasks.
+
+A reminder is one record in workspace/schedule.json. A one-off reminder has no
+`cron` field and is marked fired once delivered. A recurring one carries a
+`cron` expression (6 fields: second minute hour day-of-month month day-of-week,
+local time, Sunday = 0) and keeps the same record: after each delivery its
+dueAtIso moves to the next matching time. Nothing is copied or re-created.
+
+If the app was closed when a recurring time passed, it fires once on the next
+check and then resumes at the next future match, without catching up.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,8 +25,8 @@ from app.policies import follow_explicit_parameters_instruction
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
-
-_CALENDAR_RECURRENCES = {"daily", "weekly"}
+BACKUP_KIND = "vault-backup-hourly"
+_FIELD_RANGES = (("second", 0, 59), ("minute", 0, 59), ("hour", 0, 23), ("day", 1, 31), ("month", 1, 12), ("weekday", 0, 7))
 
 
 def _schedule_path() -> Path:
@@ -51,37 +49,142 @@ def _save_reminders(reminders: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(reminders, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _parse_field(text: str, lo: int, hi: int, name: str) -> set[int]:
+    values: set[int] = set()
+    for part in text.split(","):
+        base, _, step_text = part.partition("/")
+        step = int(step_text) if step_text else 1
+        if step < 1:
+            raise ValueError(f"{name}: step must be at least 1")
+        if base == "*":
+            start, end = lo, hi
+        elif "-" in base:
+            a, b = base.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = int(base)
+            end = hi if step_text else start
+        if not (lo <= start <= hi and lo <= end <= hi and start <= end):
+            raise ValueError(f"{name}: '{part}' is outside {lo}-{hi}")
+        values.update(range(start, end + 1, step))
+    if name == "weekday":
+        values = {0 if v == 7 else v for v in values}
+    return values
+
+
+class _Cron:
+    def __init__(self, expression: str) -> None:
+        fields = expression.split()
+        if len(fields) != 6:
+            raise ValueError("cron needs exactly 6 fields: second minute hour day month weekday")
+        parsed = [_parse_field(f, lo, hi, name) for f, (name, lo, hi) in zip(fields, _FIELD_RANGES)]
+        self.seconds, self.minutes, self.hours, self.days, self.months, self.weekdays = parsed
+        # Vixie-cron rule: if either day field is '*', both must match; otherwise either may.
+        self.dom_star = fields[3].startswith("*")
+        self.dow_star = fields[5].startswith("*")
+
+    def _day_matches(self, d: date) -> bool:
+        if d.month not in self.months:
+            return False
+        dom_ok = d.day in self.days
+        dow_ok = (d.isoweekday() % 7) in self.weekdays
+        if self.dom_star or self.dow_star:
+            return dom_ok and dow_ok
+        return dom_ok or dow_ok
+
+    def next_after(self, after: datetime) -> datetime:
+        local_after = after.astimezone().replace(tzinfo=None, microsecond=0)
+        start = local_after + timedelta(seconds=1)
+        for offset in range(366 * 8):
+            d = start.date() + timedelta(days=offset)
+            if not self._day_matches(d):
+                continue
+            for h in sorted(self.hours):
+                for m in sorted(self.minutes):
+                    for s in sorted(self.seconds):
+                        candidate = datetime(d.year, d.month, d.day, h, m, s)
+                        if candidate >= start:
+                            return candidate.astimezone()
+        raise ValueError("cron expression never matches")
+
+
+def _cron_for_legacy(due_at_iso: str, recurring: str | None, every_minutes: float | None) -> str:
+    """Maps the old recurring / recurring_every_minutes arguments onto cron."""
+    if recurring in ("daily", "weekly"):
+        due = datetime.fromisoformat(due_at_iso)
+        if due.tzinfo is None:
+            due = due.astimezone()
+        local = due.astimezone()
+        weekday = "*" if recurring == "daily" else str((local.isoweekday() % 7))
+        return f"{local.second} {local.minute} {local.hour} * * {weekday}"
+    if every_minutes:
+        minutes = int(every_minutes)
+        if minutes < 60 and 60 % minutes == 0:
+            return f"0 */{minutes} * * * *"
+        if minutes % 60 == 0 and 24 % (minutes // 60) == 0:
+            return f"0 0 */{minutes // 60} * * *"
+        raise ValueError(f"an every-{minutes}-minutes repeat cannot be expressed exactly; pass a cron expression instead")
+    raise ValueError("recurring needs recurring_every_minutes or daily/weekly")
+
+
+def _migrate_legacy_recurrence(reminders: list[dict[str, Any]]) -> bool:
+    changed = False
+    for r in reminders:
+        if r.get("fired") or r.get("cron"):
+            continue
+        if not (r.get("recurringCalendar") or r.get("recurringMs")):
+            continue
+        cal = r.get("recurringCalendar")
+        ms = r.get("recurringMs") or 0
+        try:
+            if cal in ("daily", "weekly"):
+                r["cron"] = _cron_for_legacy(r["dueAtIso"], cal, None)
+            else:
+                r["cron"] = _cron_for_legacy(r["dueAtIso"], None, ms / 60_000)
+        except ValueError as exc:
+            log_event("engine", "reminder_migration_failed", reminder_id=r.get("id"), error=str(exc))
+            continue
+        r.pop("recurringCalendar", None)
+        r.pop("recurringMs", None)
+        r["dueAtIso"] = _Cron(r["cron"]).next_after(datetime.now().astimezone()).isoformat()
+        changed = True
+        log_event("engine", "reminder_migrated_to_cron", reminder_id=r.get("id"), cron=r["cron"])
+    return changed
+
+
 async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     reminders = _load_reminders()
-    recurring = args.get("recurring")
-    recurring_every_minutes = args.get("recurring_every_minutes")
+    cron_text = args.get("cron")
+    if not cron_text and (args.get("recurring") or args.get("recurring_every_minutes")):
+        cron_text = _cron_for_legacy(args.get("due_at_iso") or datetime.now().astimezone().isoformat(), args.get("recurring"), args.get("recurring_every_minutes"))
+    try:
+        if cron_text:
+            cron = _Cron(cron_text)
+            due = args.get("due_at_iso")
+            first = datetime.fromisoformat(due) if due else cron.next_after(datetime.now().astimezone())
+            if first.tzinfo is None:
+                first = first.astimezone()
+            if due and first <= datetime.now().astimezone():
+                first = cron.next_after(first)
+            due_iso = first.isoformat()
+        else:
+            cron = None
+            due_iso = args["due_at_iso"]
+    except ValueError as exc:
+        return {"text": f"Invalid schedule: {exc}", "is_error": True}
     reminder = {
         "id": uuid.uuid4().hex,
-        "dueAtIso": args["due_at_iso"],
+        "dueAtIso": due_iso,
         "note": args["note"],
         "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "fired": False,
         "priority": args.get("priority") or "priority",
-        # Bug fix (2026-10-01), confirmed live: an unvalidated `recurring`
-        # value ("interval", a mix-up with recurring_every_minutes) got
-        # stored as-is and silently misread by _next_occurrence as calendar
-        # recurrence (any truthy string that isn't "weekly" -> daily, a
-        # 24h step) -- a real incident where a "every 2 hours" reminder kept
-        # drifting to 24h and self-perpetuating the corruption on every
-        # renewal. Only the two real calendar values are ever stored; any
-        # other value (including a future typo) falls back to None, which
-        # correctly defers to recurringMs below.
-        "recurringCalendar": recurring if recurring in _CALENDAR_RECURRENCES else None,
-        "recurringMs": recurring_every_minutes * 60_000 if recurring_every_minutes else None,
+        "cron": cron_text if cron else None,
     }
     reminders.append(reminder)
     _save_reminders(reminders)
-    rec_text = (
-        f", recurring {reminder['recurringCalendar']}" if reminder["recurringCalendar"]
-        else f", recurring every {recurring_every_minutes}min" if reminder["recurringMs"]
-        else ""
-    )
-    return {"text": f"Scheduled (id {reminder['id']}) for {args['due_at_iso']} [{reminder['priority']}{rec_text}]: {args['note']}"}
+    rec_text = f", repeats on cron '{cron_text}'" if cron_text else ""
+    return {"text": f"Scheduled (id {reminder['id']}) for {due_iso} [{reminder['priority']}{rec_text}]: {args['note']}"}
 
 
 async def list_reminders(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -97,52 +200,15 @@ async def cancel_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f"Cancelled {args['id']}." if removed else f"No pending reminder with id {args['id']}."}
 
 
-def _next_occurrence(reminder: dict[str, Any]) -> datetime:
-    """Ported verbatim from scheduler.ts's nextOccurrence: calendar recurrence
-    advances by whole calendar days (1 or 7) in LOCAL time so "every day/
-    Saturday at 17:30" keeps landing on 17:30 local time across a DST
-    transition, instead of drifting the way a fixed 24h/7-day timedelta
-    would. Falls back to the plain millisecond interval otherwise. If the
-    app was closed long enough to miss one or more occurrences, skips
-    straight to the next one still in the future rather than firing a burst
-    of catch-up reminders for every missed day/week."""
-    now = datetime.now().astimezone()
-    calendar = reminder.get("recurringCalendar")
-    # Bug fix (2026-10-01), confirmed live: this used to treat ANY truthy
-    # value as calendar recurrence (defaulting to a 1-day step for anything
-    # that wasn't literally "weekly") -- a reminder whose recurringCalendar
-    # was contaminated with an invalid value ("interval") kept drifting to
-    # 24h instead of honoring its real recurringMs, and every renewal below
-    # copied the same bad value forward forever. Only ever treat the two
-    # real calendar values as calendar recurrence now; anything else falls
-    # through to the plain-interval branch below, same as None always did.
-    if calendar in _CALENDAR_RECURRENCES:
-        step_days = 7 if calendar == "weekly" else 1
-        base = datetime.fromisoformat(reminder["dueAtIso"])
-        if base.tzinfo is None:
-            base = base.astimezone()
-        while True:
-            base = base + timedelta(days=step_days)
-            if base > now:
-                return base
-    recurring_ms = reminder.get("recurringMs") or 0
-    return now + timedelta(milliseconds=recurring_ms)
-
-
 def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: float = 20.0) -> asyncio.Task[None]:
-    """Ported from scheduler.ts's startDueCheckLoop. Polls workspace/
-    schedule.json and calls on_due for every reminder whose time has
-    passed. on_due returns whether it actually got delivered (e.g. there's
-    a live chat session to inject it into) -- a reminder is only marked
-    fired when that's true, so one that comes due while the app happens to
-    be between sessions (or fully closed) stays pending and fires on the
-    very next check instead of being silently dropped."""
+    """Polls workspace/schedule.json and delivers every pending reminder whose
+    time has passed. on_due returns whether it was actually delivered; an
+    undelivered reminder stays pending and is retried on the next check."""
 
     def _check() -> None:
         reminders = _load_reminders()
+        changed = _migrate_legacy_recurrence(reminders)
         now = datetime.now().astimezone()
-        changed = False
-        new_reminders: list[dict[str, Any]] = []
         for r in reminders:
             if r.get("fired"):
                 continue
@@ -156,42 +222,24 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
             except Exception as exc:
                 log_event("engine", "due_check_on_due_failed", reminder_id=r.get("id"), error=str(exc))
                 delivered = False
-            if delivered:
-                r["fired"] = True
-                changed = True
-                if r.get("recurringCalendar") or r.get("recurringMs"):
-                    new_reminders.append({
-                        "id": uuid.uuid4().hex,
-                        "dueAtIso": _next_occurrence(r).isoformat(),
-                        "note": r["note"],
-                        "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "fired": False,
-                        "priority": r.get("priority"),
-                        "recurringMs": r.get("recurringMs"),
-                        "recurringCalendar": r.get("recurringCalendar"),
-                        "kind": r.get("kind"),
-                    })
-        if new_reminders:
-            reminders.extend(new_reminders)
+            if not delivered:
+                continue
             changed = True
+            if r.get("cron"):
+                r["dueAtIso"] = _Cron(r["cron"]).next_after(now).isoformat()
+            else:
+                r["fired"] = True
         if changed:
             _save_reminders(reminders)
 
     def _check_safe() -> None:
-        # Bug fix (2026-09-10): confirmed live elsewhere (chat_session.py's
-        # watchdog loop) that a "while True" background loop with no
-        # per-tick guard dies completely silently the moment ANYTHING
-        # inside one tick raises -- _load_reminders()/date parsing here
-        # aren't otherwise guarded (only on_due() itself was). A single
-        # corrupted schedule.json entry must not cost every future
-        # reminder check for the rest of the process's lifetime.
         try:
             _check()
-        except Exception as exc:  # noqa: BLE001 -- must log, never let this tick die silently
+        except Exception as exc:  # noqa: BLE001 -- a bad entry must not stop future checks
             log_event("engine", "due_check_tick_failed", error=str(exc), error_type=type(exc).__name__)
 
     async def _loop() -> None:
-        _check_safe()  # catch up on anything already overdue right away, don't wait a full interval
+        _check_safe()
         while True:
             await asyncio.sleep(interval_s)
             _check_safe()
@@ -200,44 +248,34 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
     return supervise("due_check", _loop)
 
 
-def ensure_recurring_backup(note: str, interval_s: float = 60 * 60) -> None:
-    """Ported from scheduler.ts's ensureRecurringBackup: seeds an hourly
-    recurring "back up your memory" reminder exactly once, detected via the
-    `kind` tag, so restarting the app never piles up duplicate recurring
-    chains. Safe to call on every startup."""
-    kind = "vault-backup-hourly"
+def ensure_recurring_backup(note: str) -> None:
+    """Seeds the hourly memory-backup reminder once; detected by its kind tag."""
     reminders = _load_reminders()
-    if any(r.get("kind") == kind for r in reminders):
+    if any(r.get("kind") == BACKUP_KIND for r in reminders):
         log_event("engine", "ensure_recurring_backup_already_seeded")
         return
-    log_event("engine", "ensure_recurring_backup_seeding", interval_s=interval_s)
+    cron = "0 0 * * * *"
+    log_event("engine", "ensure_recurring_backup_seeding", cron=cron)
     reminders.append({
         "id": uuid.uuid4().hex,
-        "dueAtIso": (datetime.now(timezone.utc) + timedelta(seconds=interval_s)).isoformat().replace("+00:00", "Z"),
+        "dueAtIso": _Cron(cron).next_after(datetime.now().astimezone()).isoformat(),
         "note": note,
         "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "fired": False,
-        "recurringMs": interval_s * 1000,
-        "kind": kind,
+        "cron": cron,
+        "kind": BACKUP_KIND,
     })
     _save_reminders(reminders)
 
 
 def _usage_instructions() -> str:
     return "\n\n".join((
-        "For ANY periodic/recurring task (checking something on a schedule, a daily/weekly routine) or a task "
-        "tied to a recurring real-world date (a birthday, an anniversary), ALWAYS use schedule_reminder's own "
-        "`recurring` (calendar-anchored: daily/weekly) or `recurring_every_minutes` (plain interval) "
-        'parameter to make it self-sustaining on the backend. NEVER implement recurrence by writing "reschedule '
-        'yourself for N from now" into the note text and relying on yourself to actually do that every time it '
-        "fires -- confirmed in practice this silently stops forever the first time a turn fails, gets "
-        "interrupted, or you simply don't follow through, with nothing to notice or recover it. A backend-"
-        "scheduled recurrence cannot be skipped this way.\n"
-        'Example -- "check my mail every 2 hours": call schedule_reminder ONCE with '
-        '`recurring_every_minutes: 120` and a note describing the check itself (e.g. "Check all 8 mailboxes '
-        'for new messages, report anything relevant"). WRONG: a note ending in something like "then '
-        're-schedule this same reminder for 2 hours later" -- that text does nothing on its own; it only works '
-        "if you personally remember and follow through on your own every single time it fires, forever.",
+        "For ANY periodic/recurring task (checking something on a schedule, a daily/weekly routine, a birthday or "
+        "anniversary) pass a `cron` expression to schedule_reminder. It is ONE reminder that the backend keeps "
+        "repeating on its own -- never write 'reschedule this for later' into the note and rely on yourself to do "
+        "it, because that silently stops the first time a turn fails or gets interrupted.\n"
+        "cron has 6 fields, local time: second minute hour day-of-month month day-of-week (Sunday = 0). "
+        "Examples: '0 0 9 * * *' every day at 09:00; '0 30 17 * * 6' every Saturday at 17:30; '0 0 */2 * * *' every 2 hours.",
         follow_explicit_parameters_instruction(),
     ))
 
@@ -248,18 +286,14 @@ PLUGIN = Plugin(
     tools=[
         PluginTool(
             "schedule_reminder",
-            "Schedule a reminder/task for yourself (Caroline) to act on at a specific future date/time, "
-            "surviving app restarts. When it comes due you will be prompted with the note text "
-            "automatically, without the user saying anything -- use this for anything the user asks you to "
-            "do 'at' or 'in' some time, or any follow-up you decide you should do later, including recurring "
-            "periodic tasks (e.g. 'every morning check my email').\n\n"
-            "priority controls what happens if this comes due while you're in the middle of something with "
-            "the user: 'priority' (default) fires immediately regardless -- use this when the user needs it "
-            "to happen at that exact time no matter what. 'background' only fires once there's no live "
-            "back-and-forth going on -- deferred and retried later if the user is actively chatting when it "
-            "comes due. Use 'background' for routine periodic chores that aren't time-critical.",
+            "Schedule a reminder/task for yourself (Caroline) to act on, surviving app restarts. When it comes due "
+            "you will be prompted with the note text automatically, without the user saying anything. Use due_at_iso "
+            "for a one-off time. For a repeating task pass cron (6 fields: second minute hour day month weekday, local "
+            "time, Sunday=0) instead -- the one reminder keeps repeating. priority controls what happens if it comes "
+            "due mid-conversation: 'priority' (default) fires regardless; 'background' waits until there is no live "
+            "back-and-forth -- use it for routine chores.",
             {
-                "due_at_iso": str, "note": str, "priority": str | None,
+                "due_at_iso": str | None, "note": str, "priority": str | None, "cron": str | None,
                 "recurring": str | None, "recurring_every_minutes": float | None,
             }, schedule_reminder,
         ),
