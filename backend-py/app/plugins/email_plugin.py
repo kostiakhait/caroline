@@ -110,6 +110,8 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             extra["unseenOnly"] = bool(args["unseenOnly"])
         if args.get("query"):
             extra["query"] = args["query"]
+        if args.get("sinceIso"):
+            extra["sinceDate"] = args["sinceIso"]
         result = await call_v2("email:listMessages", **extra)
         return result.get("messages") or []
 
@@ -295,9 +297,12 @@ PLUGIN = Plugin(
         PluginTool(
             "email_list_messages",
             "Lists lightweight message metadata (uid, from, subject, date, flags) for a folder, newest "
-            "first. Use `query` for a simple subject/from/body substring search, or `unseenOnly` to "
-            "restrict to unread mail." + _ACCOUNT_PARAM_NOTE,
-            {**_CREDENTIAL_PARAMS, "folder": str | None, "limit": int | None, "unseenOnly": bool | None, "query": str | None},
+            "first. Use `query` for a simple subject/from/body substring search, `unseenOnly` to "
+            "restrict to unread mail, or `sinceIso` (an ISO date, e.g. \"2026-10-01\") to restrict to "
+            "messages received on or after that date (day granularity only -- IMAP has no finer filter). "
+            "Checking more than one mailbox or folder at once? Use email_list_messages_batch instead -- "
+            "it does this concurrently in one call." + _ACCOUNT_PARAM_NOTE,
+            {**_CREDENTIAL_PARAMS, "folder": str | None, "limit": int | None, "unseenOnly": bool | None, "query": str | None, "sinceIso": str | None},
             email_list_messages,
         ),
         PluginTool(
@@ -309,18 +314,21 @@ PLUGIN = Plugin(
         PluginTool(
             "email_mark",
             'Adds or removes an IMAP flag on a message, e.g. flag:"\\\\Seen" set:true to mark read, or '
-            'flag:"\\\\Flagged" for starring.' + _ACCOUNT_PARAM_NOTE,
+            'flag:"\\\\Flagged" for starring. Marking several messages at once (possibly across different '
+            "mailboxes)? Use email_mark_batch instead." + _ACCOUNT_PARAM_NOTE,
             {**_CREDENTIAL_PARAMS, "folder": str, "uid": int, "flag": str, "set": bool}, email_mark,
         ),
         PluginTool(
             "email_move",
-            "Moves a message from one folder to another (e.g. archiving, filing into a project folder)." + _ACCOUNT_PARAM_NOTE,
+            "Moves a message from one folder to another (e.g. archiving, filing into a project folder). "
+            "Moving several messages at once? Use email_move_batch instead." + _ACCOUNT_PARAM_NOTE,
             {**_CREDENTIAL_PARAMS, "folder": str, "uid": int, "destFolder": str}, email_move,
         ),
         PluginTool(
             "email_delete",
             "Deletes a message -- moves it to the account's Trash folder if one exists, otherwise flags "
-            "\\Deleted and expunges it." + _ACCOUNT_PARAM_NOTE,
+            "\\Deleted and expunges it. Deleting several messages at once (a cleanup list, possibly across "
+            "different mailboxes)? Use email_delete_batch instead." + _ACCOUNT_PARAM_NOTE,
             {**_CREDENTIAL_PARAMS, "folder": str, "uid": int}, email_delete,
         ),
         PluginTool(
@@ -351,7 +359,7 @@ PLUGIN = Plugin(
             "them together to relay through the shared no_reply@partners.solutions identity instead (no "
             "mailbox authentication, no Sent-folder copy). Use `from` to set a different display From header "
             "while still authenticating as `address` -- double-check they match the identity you intend "
-            "before sending.",
+            "before sending. Sending several emails at once? Use email_send_batch instead.",
             {
                 "address": str | None, "password": str | None, "imapHost": str | None,
                 "imapPort": int | None, "smtpHost": str | None, "smtpPort": int | None,
