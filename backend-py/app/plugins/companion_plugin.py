@@ -71,6 +71,7 @@ from app.plugins.companion_api import (
     NoPairedDeviceError,
     PhoneUnreachableError,
     UnknownDeviceError,
+    device_or_all_request,
     list_devices,
     request_response,
     resolve_device,
@@ -249,32 +250,43 @@ async def companion_create_contact(args: dict[str, Any], report_progress: Any) -
     return {"text": f"Could not save the contact: {error or 'unknown error'}", "is_error": True}
 
 
+async def companion_get_logs(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
+    """Added 2026-10-04, per explicit instruction, after a real incident:
+    an SMS send looked like it failed with a vague "internal error" and
+    there was no way to see what the phone itself actually saw/did (which
+    device it picked, what SmsManager returned, ...) without asking the
+    user to manually open the app and share its log file. Pulls the
+    companion app's own on-device log tail through the same two-phase
+    request-family protocol as contacts/sms_query -- a genuinely new
+    "logs" family, not a new mechanism (see CompanionOpsService.kt's
+    handleLogsOp for the phone side)."""
+    gate_msg = await _gate()
+    if gate_msg:
+        return {"text": gate_msg, "is_error": True}
+    from_number = args.get("fromNumber")
+    try:
+        device = await resolve_device(str(from_number).strip() if from_number else None)
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+        return {"text": _device_error_text(exc), "is_error": True}
+    max_chars = args.get("maxChars")
+    payload = {"op": "tail", "maxChars": int(max_chars)} if max_chars else {"op": "tail"}
+    try:
+        result = await request_response(WORKSPACE_DIR, _current_tab_id(), device["deviceId"], "logs", payload, report_progress)
+    except PhoneUnreachableError as exc:
+        return {"text": str(exc), "is_error": True}
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = result.get("error") if isinstance(result, dict) else str(result)
+        return {"text": f"Could not get logs from the phone: {error or 'unknown error'}", "is_error": True}
+    note = " (truncated to the most recent portion -- ask for a larger maxChars if you need more)" if result.get("truncated") else ""
+    return {"text": f"Log tail from {device.get('phoneNumber') or 'the phone'}{note}:\n\n{result.get('log') or '(empty)'}"}
+
+
 async def _device_request(family: str, from_number: Any, payload: dict[str, Any], report_progress: Any) -> Any:
-    """A named phone: that device's own answer, as-is. No phone named:
-    every paired phone's, gathered one after another and tagged with
-    sourceNumber -- a deliberate default (not just a single-phone
-    fallback), since "across all my phones" is a reasonable ask on its
-    own for a list-shaped result (contacts, SMS search hits). Sequential,
-    not concurrent, same reasoning as _sms_sync_tick: simplest correct
-    thing, and a handful of phones is still fine against the (generous,
-    no-timeout) two-phase protocol. Shared by contacts (list/search/
-    create) and sms_query (search) -- same fan-out shape either way."""
-    tab_id = _current_tab_id()
-    if from_number:
-        device = await resolve_device(str(from_number).strip())
-        return await request_response(WORKSPACE_DIR, tab_id, device["deviceId"], family, payload, report_progress)
-    devices = await list_devices()
-    if not devices:
-        raise NoPairedDeviceError()
-    if len(devices) == 1:
-        return await request_response(WORKSPACE_DIR, tab_id, devices[0]["deviceId"], family, payload, report_progress)
-    merged: list[dict[str, Any]] = []
-    for device in devices:
-        result = await request_response(WORKSPACE_DIR, tab_id, device["deviceId"], family, payload, report_progress)
-        if isinstance(result, list):
-            for item in result:
-                merged.append({**item, "sourceNumber": device.get("phoneNumber")} if isinstance(item, dict) else item)
-    return merged
+    """Thin wrapper over companion_api.device_or_all_request (shared with
+    main.py's REST endpoints, see that function's own docstring for the
+    fan-out behavior) -- just supplies this plugin's own WORKSPACE_DIR/
+    tab_id."""
+    return await device_or_all_request(WORKSPACE_DIR, _current_tab_id(), family, from_number, payload, report_progress)
 
 
 async def _contacts_request(from_number: Any, payload: dict[str, Any], report_progress: Any) -> Any:
@@ -472,6 +484,24 @@ PLUGIN = Plugin(
                 "required": [],
             },
             companion_search_sms,
+        ),
+        PluginTool(
+            "companion_get_logs",
+            "Get the tail of the companion app's OWN on-device log from a paired phone -- for debugging a "
+            "companion problem itself (an SMS send that failed or behaved oddly, device pairing confusion, a "
+            "request that never got answered), not for anything the user asked about normally. Shows what the "
+            "phone actually did/saw: which device id handled a request, what the underlying send call returned, "
+            "errors, etc. If more than one phone is paired, pass fromNumber to say which one (otherwise this "
+            "fails with the list of paired numbers to choose from).",
+            {
+                "type": "object",
+                "properties": {
+                    "fromNumber": {"type": "string", "description": "Which paired phone to get logs from, if more than one is paired. Optional when only one phone is paired."},
+                    "maxChars": {"type": "integer", "description": "Max characters of log to return, from the end (most recent). Defaults to 20000, capped at 1000000."},
+                },
+                "required": [],
+            },
+            companion_get_logs,
         ),
     ],
 )

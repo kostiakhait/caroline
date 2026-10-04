@@ -517,6 +517,35 @@ async def request_response(
     return result
 
 
+async def device_or_all_request(
+    workspace_dir: str, tab_id: str, family: str, from_number: Any, payload: dict[str, Any], report_progress: ReportProgress = None,
+) -> Any:
+    """Shared by companion_plugin.py's tool handlers AND main.py's REST
+    endpoints (2026-10-04, "запрашивать все данные с телефона не из чата")
+    -- the same fan-out either path needs: a named phone gets that device's
+    own answer as-is; no phone named fans out to EVERY paired phone,
+    sequentially (a handful of phones at most, generous no-timeout
+    protocol), each result tagged with sourceNumber. report_progress is
+    optional/cosmetic (feeds a mid-wait status line back to a live tool
+    call) -- safely None for a REST caller with no chat turn to narrate
+    into."""
+    if from_number:
+        device = await resolve_device(str(from_number).strip())
+        return await request_response(workspace_dir, tab_id, device["deviceId"], family, payload, report_progress)
+    devices = await list_devices()
+    if not devices:
+        raise NoPairedDeviceError()
+    if len(devices) == 1:
+        return await request_response(workspace_dir, tab_id, devices[0]["deviceId"], family, payload, report_progress)
+    merged: list[dict[str, Any]] = []
+    for device in devices:
+        result = await request_response(workspace_dir, tab_id, device["deviceId"], family, payload, report_progress)
+        if isinstance(result, list):
+            for item in result:
+                merged.append({**item, "sourceNumber": device.get("phoneNumber")} if isinstance(item, dict) else item)
+    return merged
+
+
 # --- restart-survival: resume whatever the journal says is still open -------
 
 # Per explicit instruction (2026-09-15): exact correspondence in BOTH

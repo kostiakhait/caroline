@@ -170,6 +170,7 @@ class CompanionOpsService : Service() {
                 handleSmsSync()
                 handleRequestFamily("contacts")
                 handleRequestFamily("sms_query")
+                handleRequestFamily("logs")
             } catch (exc: Exception) {
                 // A single bad tick (a transient network error, say) must
                 // never kill the loop -- there's no other recovery path
@@ -289,6 +290,7 @@ class CompanionOpsService : Service() {
                 when (family) {
                     "contacts" -> handleContactsOp(op, payload)
                     "sms_query" -> handleSmsQueryOp(op, payload)
+                    "logs" -> handleLogsOp(op, payload)
                     else -> mapOf("error" to "unknown family $family")
                 }
             } catch (exc: Exception) {
@@ -350,6 +352,28 @@ class CompanionOpsService : Service() {
         else -> {
             Logger.w("companion: unknown sms_query op '$op'")
             mapOf("error" to "unknown sms_query op '$op'")
+        }
+    }
+
+    // --- devices/<deviceId>/logs: companion_get_logs ------------------------
+    // Added 2026-10-04, per explicit instruction, after a real incident this
+    // service's OWN log couldn't be inspected remotely: an SMS send appeared
+    // to fail with a vague internal error, and whether that was the real
+    // phone or a lingering test device in the registry was unknowable from
+    // the desktop side. This family lets Caroline pull this phone's own
+    // companion.log tail on demand instead of asking the user to manually
+    // open the app and use Logger.shareLogs.
+
+    private fun handleLogsOp(op: String?, payload: Map<*, *>): Any = when (op) {
+        "tail" -> {
+            val maxChars = (payload["maxChars"] as? Number)?.toInt()?.coerceIn(1_000, 1_000_000) ?: 20_000
+            val text = Logger.tail(maxChars)
+            Logger.i("companion: logs tail(maxChars=$maxChars) -> ${text.length} char(s)")
+            mapOf("ok" to true, "log" to text, "truncated" to (text.length >= maxChars))
+        }
+        else -> {
+            Logger.w("companion: unknown logs op '$op'")
+            mapOf("error" to "unknown logs op '$op'")
         }
     }
 

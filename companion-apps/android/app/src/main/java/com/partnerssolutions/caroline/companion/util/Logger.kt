@@ -52,6 +52,24 @@ object Logger {
         }
     }
 
+    /** The last `maxChars` characters of the log file, for companion_get_logs
+     * (CompanionOpsService's "logs" request family) -- Caroline pulling this
+     * remotely on demand to debug a companion issue (a stuck SMS send, device
+     * pairing confusion, ...) without the user having to manually share the
+     * file. Simplest correct truncation: a char-count tail, not a line-count
+     * one -- a single wrapped stack trace can be many "lines" on its own. */
+    @Synchronized
+    fun tail(maxChars: Int): String {
+        val file = logFile ?: return "(no log file yet)"
+        if (!file.exists()) return "(no log file yet)"
+        return try {
+            val text = file.readText()
+            if (text.length <= maxChars) text else text.takeLast(maxChars)
+        } catch (exc: Exception) {
+            "(failed to read log file: ${exc.message})"
+        }
+    }
+
     /** Fires an ACTION_SEND chooser with the current log file attached. */
     fun shareLogs(context: Context) {
         val file = logFile ?: return

@@ -37,7 +37,26 @@ from app.plugins.notes_api import load_credentials
 from app.plugins.office_editor import finish_office_edit_session
 from app.plugins.ratatosk_api import find_or_create_dm, send_message
 from app.plugins.ratatosk_own_account import ensure_own_ratatosk_account, get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
-from app.plugins.companion_api import resume_companion_operations, request_tab_list_publish as companion_request_tab_list, load_visible_transcript, save_visible_transcript, start_companion_inbox_loop, start_sms_sync_loop
+from app.plugins.companion_api import (
+    AmbiguousDeviceError,
+    NoPairedDeviceError,
+    PhoneUnreachableError,
+    UnknownDeviceError,
+    device_or_all_request,
+    list_devices as companion_list_devices,
+    request_response as companion_request_response,
+    resolve_device as companion_resolve_device,
+    resume_companion_operations,
+    request_tab_list_publish as companion_request_tab_list,
+    load_visible_transcript, save_visible_transcript, start_companion_inbox_loop, start_sms_sync_loop,
+)
+from app.plugins.companion_sms_store import (
+    last_synced_at as companion_last_synced_at,
+    list_all_threads as companion_list_all_threads,
+    list_messages as companion_list_messages,
+    list_threads as companion_list_threads,
+    load_store as companion_load_sms_store,
+)
 from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -419,6 +438,124 @@ async def _control_json(op: str, tab: str, params: dict[str, Any] | None = None)
     if not ok:
         payload = {"error": result.get("stderr") or "failed"}
     return JSONResponse({"ok": ok, **payload}, status_code=200 if ok else 400)
+
+
+# --- REST endpoints: phone-companion data, direct (no chat/model involved) --
+# Added 2026-10-04, per explicit instruction ("запрашивать все данные с
+# телефона не из чата"): the same underlying functions companion_plugin.py's
+# tools wrap for the model (companion_api.py / companion_sms_store.py), but
+# called directly here -- no ChatSession, no tool-calling turn, no model
+# involved at all. Read-only (device list, SMS, contacts, phone-side logs);
+# the companion's WRITE actions (sending a real SMS, saving a real contact)
+# are deliberately not exposed this way -- those stay behind the chat/model
+# path, which is where a judgment call about actually DOING something real
+# on the user's behalf belongs. Loopback-only (see uvicorn.run's own
+# host="127.0.0.1" below), same trust boundary as /api/local-file.
+#
+# A synthetic tab_id ("api") is used for the live (two-phase) operations'
+# own local journaling -- if the backend restarts mid-request, the eventual
+# result has nowhere real to be delivered (no chat tab to inject a proactive
+# message into), same outcome as if the caller had simply timed out.
+_COMPANION_API_TAB_ID = "api"
+
+
+def _companion_device_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, NoPairedDeviceError):
+        return JSONResponse({"ok": False, "error": "No phone is currently paired to this account."}, status_code=404)
+    numbers = [d.get("phoneNumber") or "(number not set)" for d in getattr(exc, "devices", [])]
+    if isinstance(exc, AmbiguousDeviceError):
+        return JSONResponse({"ok": False, "error": f"More than one phone is paired ({', '.join(numbers)}) -- pass fromNumber."}, status_code=409)
+    if isinstance(exc, UnknownDeviceError):
+        return JSONResponse({"ok": False, "error": f"'{exc.phone_number}' doesn't match any paired phone. Paired numbers: {', '.join(numbers) or '(none)'}."}, status_code=404)
+    return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
+@app.get("/api/companion/devices")
+async def get_companion_devices() -> JSONResponse:
+    return JSONResponse({"ok": True, "devices": await companion_list_devices()})
+
+
+@app.get("/api/companion/sms/threads")
+async def get_companion_sms_threads(fromNumber: str | None = None, unreadOnly: bool = False) -> JSONResponse:
+    """Caroline's own local copy (kept fresh by start_sms_sync_loop) -- instant, no phone round trip."""
+    store = companion_load_sms_store(WORKSPACE_DIR)
+    if fromNumber:
+        try:
+            device = await companion_resolve_device(fromNumber)
+        except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+            return _companion_device_error(exc)
+        threads = companion_list_threads(store, device["deviceId"], unread_only=unreadOnly)
+        synced = companion_last_synced_at(store, device["deviceId"])
+    else:
+        threads = companion_list_all_threads(store, unread_only=unreadOnly)
+        synced = companion_last_synced_at(store)
+    return JSONResponse({"ok": True, "lastSyncedAt": synced, "threads": threads})
+
+
+@app.get("/api/companion/sms/thread/{thread_id}")
+async def get_companion_sms_thread(thread_id: str) -> JSONResponse:
+    store = companion_load_sms_store(WORKSPACE_DIR)
+    messages = companion_list_messages(store, thread_id)
+    if messages is None:
+        return JSONResponse({"ok": False, "error": f'No SMS thread found for "{thread_id}".'}, status_code=404)
+    return JSONResponse({"ok": True, "lastSyncedAt": companion_last_synced_at(store), "messages": messages})
+
+
+@app.get("/api/companion/sms/search")
+async def get_companion_sms_search(query: str | None = None, address: str | None = None, limit: int = 50, fromNumber: str | None = None) -> JSONResponse:
+    """LIVE query straight to the phone's real SMS table (not the local copy) -- can take a while (a real phone round trip)."""
+    payload = {"op": "search", "limit": max(1, min(limit, 200))}
+    if query:
+        payload["query"] = query
+    if address:
+        payload["address"] = address
+    try:
+        result = await device_or_all_request(WORKSPACE_DIR, _COMPANION_API_TAB_ID, "sms_query", fromNumber, payload)
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError, PhoneUnreachableError) as exc:
+        return _companion_device_error(exc)
+    return JSONResponse({"ok": True, "messages": result})
+
+
+@app.get("/api/companion/contacts")
+async def get_companion_contacts(fromNumber: str | None = None) -> JSONResponse:
+    """LIVE query to the phone's address book."""
+    try:
+        result = await device_or_all_request(WORKSPACE_DIR, _COMPANION_API_TAB_ID, "contacts", fromNumber, {"op": "list"})
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError, PhoneUnreachableError) as exc:
+        return _companion_device_error(exc)
+    return JSONResponse({"ok": True, "contacts": result})
+
+
+@app.get("/api/companion/contacts/search")
+async def get_companion_contacts_search(query: str, fromNumber: str | None = None) -> JSONResponse:
+    try:
+        result = await device_or_all_request(WORKSPACE_DIR, _COMPANION_API_TAB_ID, "contacts", fromNumber, {"op": "search", "query": query})
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError, PhoneUnreachableError) as exc:
+        return _companion_device_error(exc)
+    return JSONResponse({"ok": True, "contacts": result})
+
+
+@app.get("/api/companion/logs")
+async def get_companion_logs(fromNumber: str | None = None, maxChars: int | None = None) -> JSONResponse:
+    """Tail of the companion app's OWN on-device log -- for debugging the
+    companion feature itself (a stuck/failed SMS send, device pairing
+    confusion, ...), straight from a shell/script, no chat turn needed.
+    Always a single named-or-only device, never an all-phones merge (logs
+    don't merge meaningfully), same as companion_plugin.py's own
+    companion_get_logs tool."""
+    try:
+        device = await companion_resolve_device(fromNumber)
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+        return _companion_device_error(exc)
+    payload = {"op": "tail", "maxChars": int(maxChars)} if maxChars else {"op": "tail"}
+    try:
+        result = await companion_request_response(WORKSPACE_DIR, _COMPANION_API_TAB_ID, device["deviceId"], "logs", payload, None)
+    except PhoneUnreachableError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=504)
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = result.get("error") if isinstance(result, dict) else str(result)
+        return JSONResponse({"ok": False, "error": error or "unknown error"}, status_code=502)
+    return JSONResponse({"ok": True, "phoneNumber": device.get("phoneNumber"), "log": result.get("log") or "", "truncated": bool(result.get("truncated"))})
 
 
 @app.get("/api/mode")
