@@ -3148,21 +3148,19 @@ class ChatSession:
         # mean there's genuinely nothing to narrate about right now.
         if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
             return
-        # Bug fix (2026-09-15), per explicit instruction: narration must
-        # never fire for a turn the user didn't actually start -- a
-        # scheduled reminder, a ratatosk nudge, a startup greeting, a
-        # vault-backup check, any of inject_proactive()'s other callers
-        # (all pass is_real_user=False, tracked here as pending_is_real_
-        # user). Confirmed live: narration comments were reaching the
-        # user at 12:26/1:51/1:59/2:00 AM -- clearly proactive/scheduled
-        # activity, not a live conversation -- because this function never
-        # checked who actually started the turn it was narrating, only
-        # whether SOME turn was pending. The user isn't watching and
-        # waiting on a proactive turn the way they are on one they just
-        # sent, so there's nothing for this cosmetic aside to usefully do
-        # there anyway.
-        if not self.pending_is_real_user:
-            return
+        # Reverted (2026-10-03), explicit direct instruction: the 2026-09-15 gate
+        # below used to skip narration entirely for a proactive/scheduled turn
+        # (reminder, vault backup, startup greeting, ratatosk nudge -- anything
+        # inject_proactive() starts with is_real_user=False), on the reasoning
+        # that the user isn't watching one of those the way they watch a turn
+        # they just sent. Overridden: narration's job is to keep ANY silence
+        # during active work from reading as nothing happening, regardless of
+        # who/what started that work -- a long-running proactive turn is still
+        # a gap in communication if it goes quiet for a minute. The original
+        # odd-hour-narration complaint this gate fixed (comments landing at
+        # 12:26/1:51/1:59/2:00 AM) is a real tradeoff of this reversion, not
+        # solved here -- if it recurs, that's the next thing to fix, not a
+        # reason to bring this gate back silently.
         # Bug fix (2026-09-14): see consecutive_narration_count's own
         # __init__ comment and MAX_CONSECUTIVE_NARRATION_COMMENTS's own
         # comment -- a turn stuck this long isn't helped by yet another
