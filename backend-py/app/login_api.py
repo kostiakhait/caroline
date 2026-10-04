@@ -7,9 +7,8 @@ all until one of those exists).
 Credentials live in the SAME file every other SW-backed tool already
 reads/writes (sw_api.py's load_credentials/save_credentials,
 ~/.mcp-notes/credentials.json) -- reused directly here, not duplicated.
-The legacy verifyPassword call is likewise reused from notes_api.py
-(same ".command": "verifyPassword" protocol, same APP_KEY) rather than
-reimplemented a third time.
+The login call (user:verify) is likewise reused from notes_api.py rather
+than reimplemented a third time.
 
 The password NEVER flows through the model's own context: the native
 login form posts credentials straight to this backend over the app's own
@@ -103,9 +102,8 @@ async def register_account_only(email: str, password: str) -> LoginResult:
     email = _normalize_email(email)
     """Self-service registration via the v2 "user:add" command (auth=public,
     no key/session needed) -- same underlying account store as
-    verify_and_save_login's legacy verifyPassword (Auth.Authorizer, shared
-    by both API generations), so the account this creates works for both
-    without any extra step. Deliberately does NOT touch the shared
+    user:verify (same Auth.Authorizer account store), so the account this
+    creates works for every login path without any extra step. Deliberately does NOT touch the shared
     credentials file -- factored out so ratatosk_own_account.py can
     register Caroline's OWN separate account the same way without it
     overwriting the user's own login (mirrors login.ts's own split)."""

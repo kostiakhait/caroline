@@ -1,29 +1,22 @@
-"""Ports mcp-servers-src/notes/src/{api,session}.ts -- a DIFFERENT, OLDER
-Camerlengo protocol than sw_api.py's v2 (dot-prefixed ".status"/".reason"
-envelope fields, a "plugins:call"/plugin="Notes" wrapper around every real
-action, its own APP_KEY, a "verifyPassword" login command instead of
-"user:verify") -- NOT interchangeable with sw_api.py despite both talking
-to the same squirrelwisdom.com backend. Shares the exact same credentials
-file (~/.mcp-notes/credentials.json) with sms/sw_api.py -- same account, so
-logging in via either tool family covers both (reuses sw_api.py's
-load_credentials/save_credentials directly rather than duplicating them).
+"""Notes actions for Caroline, over the Camerlengo v2 protocol: login is
+user:verify, every Notes action is a plugin:call (plugin="Notes") carrying the
+session token. Shares the credentials file (~/.mcp-notes/credentials.json)
+with sms/sw_api.py -- same account, so logging in via either covers both.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import secrets
 import string
 from typing import Any
 
-import httpx
-
 from app.plugins.sw_api import load_credentials, save_credentials
+from app.reforce_v2 import ReforceError as NotesApiError
+from app.reforce_v2 import ReforceSessionExpired as SessionExpiredError
+from app.reforce_v2 import call as reforce_call
 
-BASE_URL = "https://squirrelwisdom.com"
-APP_KEY = "01Az8nB8mB4cCV"
 ID_ALPHABET = string.ascii_letters + string.digits
 
 # nginx caps the request body at 64MB; base64 inflates raw bytes by ~33%, so
@@ -31,52 +24,20 @@ ID_ALPHABET = string.ascii_letters + string.digits
 MAX_ATTACHMENT_BYTES = 47 * 1024 * 1024
 
 
-class SessionExpiredError(Exception):
-    pass
-
-
-class NotesApiError(Exception):
-    pass
-
-
-async def _post_json(body: dict[str, Any]) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                res = await client.post(BASE_URL + "/", json=body)
-                break
-            except httpx.TransportError as exc:
-                last_err = exc
-                if attempt < 2:
-                    await asyncio.sleep(0.5 * (attempt + 1))
-        else:
-            raise last_err  # type: ignore[misc]
-        if res.status_code >= 400:
-            raise NotesApiError(f'Squirrel Wisdom API HTTP {res.status_code} for command "{body.get(".command")}"')
-        return res.json()
-
-
 async def verify_password(email: str, password: str) -> str:
-    result = await _post_json({".command": "verifyPassword", "key": APP_KEY, "path": "/users", "user": email, "password": password})
-    session = result.get("session") if isinstance(result, dict) else None
+    result = await reforce_call("user:verify", {"path": "/users", "user": email, "password": password})
+    session = result.get("session")
     if not session:
         raise NotesApiError(f'Login failed for "{email}": {json.dumps(result)}')
     return session
 
 
 async def call_plugin(action: str, session: str, **extra: Any) -> Any:
-    """Every Notes action goes through the generic plugins:call envelope,
-    authorized by the per-request session token. `query` duplicates
-    `action`: it's a mandatory field on the outer envelope, unrelated to
-    which Notes action is being invoked -- ported as-is from api.ts."""
-    body = {".command": "plugins:call", "plugin": "Notes", "query": action, "action": action, "key": APP_KEY, "session": session, **extra}
-    envelope = await _post_json(body)
-    if not isinstance(envelope, dict) or envelope.get(".status") != "ok":
-        reason = envelope.get(".reason", json.dumps(envelope)) if isinstance(envelope, dict) else json.dumps(envelope)
-        if isinstance(reason, str) and "session" in reason.lower():
-            raise SessionExpiredError(reason)
-        raise NotesApiError(f'Notes plugin action "{action}" failed: {reason}')
+    """Every Notes action goes through the v2 plugin:call command, authorized
+    by the per-request session token. `query` duplicates `action`: it's a
+    mandatory field on the envelope, unrelated to which Notes action is being
+    invoked -- ported as-is from api.ts."""
+    envelope = await reforce_call("plugin:call", {"plugin": "Notes", "query": action, "action": action, "session": session, **extra})
     return envelope.get("result")
 
 

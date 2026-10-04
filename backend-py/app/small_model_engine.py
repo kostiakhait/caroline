@@ -77,7 +77,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from app import session_context
 from app.durability import load_tab_continuity_archive
@@ -593,8 +593,26 @@ _PLAN_TOOL_DEFS: list[dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"steps": {"type": "array", "items": {"type": "string"}}},
-                "required": ["steps"],
+                "properties": {
+                    "steps": {"type": "array", "items": {"type": "string"}},
+                    "stages": {
+                        "type": "array",
+                        "description": (
+                            "Optional. Use instead of steps when parts of the work can run at the same time: "
+                            "an ordered list of stages, each either 'sequential' (its steps run one after another) "
+                            "or 'parallel' (its steps are independent and run concurrently, at most 4 at once). "
+                            "Each stage starts only after the previous one finishes."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "mode": {"type": "string", "enum": ["sequential", "parallel"]},
+                                "steps": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["mode", "steps"],
+                        },
+                    },
+                },
             },
         },
     },
@@ -617,6 +635,30 @@ _PLAN_TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 _PLAN_TOOL_NAMES = {t["function"]["name"] for t in _PLAN_TOOL_DEFS}
+
+_STAGE_TOOL_DEFS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_parallel_stage",
+            "description": (
+                "Runs one 'parallel' stage of the plan you declared with declare_plan: each of its steps is "
+                "executed as its own independent sub-task, at most 4 at a time, and the results come back "
+                "together. Call it only when every earlier stage is already done. Each step is marked done "
+                "automatically if it succeeded; a step that failed (even after one retry) is reported as not done "
+                "-- report that honestly, do not pretend it worked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"stage": {"type": "integer", "description": "0-based index of the parallel stage in your plan"}},
+                "required": ["stage"],
+            },
+        },
+    },
+]
+_STAGE_TOOL_NAMES = {t["function"]["name"] for t in _STAGE_TOOL_DEFS}
+PARALLEL_STAGE_CONCURRENCY = 4
+PARALLEL_BRANCH_ATTEMPTS = 2
 
 # Per explicit instruction (2026-10-03), after a live incident where a tier
 # guessed at a fact (which Windows process name the Android emulator VM
@@ -683,7 +725,13 @@ class _TurnTracker:
 
     tool_call_count: int = 0
     plan_steps: list[str] | None = None
+    # (mode, step indices) per stage, in order; indices refer to plan_steps.
+    plan_stages: list[tuple[str, list[int]]] = field(default_factory=list)
     plan_done: dict[int, str] = field(default_factory=dict)
+    parallel_stages_run: set[int] = field(default_factory=set)
+    # Per-branch real tool calls and results from run_parallel_stage, kept
+    # separately so the verifier sees each parallel branch's own evidence.
+    branch_trace: list[str] = field(default_factory=list)
     # operation_ids seen with status "running" that were never subsequently
     # observed (via check_operation_status) to reach a terminal status --
     # see the "имитирует результат" incident this was built for: a real
@@ -719,10 +767,34 @@ class _TurnTracker:
 
 def _run_plan_tool(name: str, args: dict[str, Any], tracker: _TurnTracker) -> str:
     if name == "declare_plan":
-        steps = list(args.get("steps") or [])
+        stages_arg = args.get("stages")
+        if stages_arg:
+            steps: list[str] = []
+            stages: list[tuple[str, list[int]]] = []
+            for stage in stages_arg:
+                if not isinstance(stage, dict):
+                    return "ERROR: each stage must be an object with 'mode' and 'steps'."
+                mode = stage.get("mode")
+                if mode not in ("sequential", "parallel"):
+                    return f"ERROR: stage mode must be 'sequential' or 'parallel', got {mode!r}."
+                indices = []
+                for step in stage.get("steps") or []:
+                    indices.append(len(steps))
+                    steps.append(str(step))
+                if indices:
+                    stages.append((mode, indices))
+        else:
+            steps = [str(s) for s in (args.get("steps") or [])]
+            stages = [("sequential", list(range(len(steps))))] if steps else []
         tracker.plan_steps = steps
+        tracker.plan_stages = stages
         tracker.plan_done = {}
-        return f"Plan recorded with {len(steps)} step(s). Call mark_step_done after each one actually completes."
+        parallel_hints = [str(i) for i, (mode, _) in enumerate(stages) if mode == "parallel"]
+        hint = (
+            f" Parallel stage(s) {', '.join(parallel_hints)}: run each with run_parallel_stage(stage=N) once every earlier stage is done."
+            if parallel_hints else ""
+        )
+        return f"Plan recorded with {len(steps)} step(s) in {len(stages)} stage(s).{hint} Call mark_step_done after each one actually completes."
     if name == "mark_step_done":
         index = args.get("index")
         result = args.get("result", "")
@@ -734,6 +806,97 @@ def _run_plan_tool(name: str, args: dict[str, Any], tracker: _TurnTracker) -> st
         remaining = len(tracker.plan_steps) - len(tracker.plan_done)
         return f"Step {index} marked done. {remaining} step(s) remaining." if remaining else "All steps marked done."
     return f"ERROR: unknown plan tool '{name}'"
+
+
+async def _run_parallel_stage(
+    stage_index: int, *, tracker: _TurnTracker, tab_id: str | None, send: session_context.SendFn | None,
+    main_loop: asyncio.AbstractEventLoop, registry: "ToolRegistry", ai: Any, cfg: Any,
+    system_text: str, user_text: str, model: str,
+) -> str:
+    if tracker.plan_stages is None or not (0 <= stage_index < len(tracker.plan_stages)):
+        return f"ERROR: the declared plan has no stage {stage_index}."
+    mode, indices = tracker.plan_stages[stage_index]
+    if mode != "parallel":
+        return f"ERROR: stage {stage_index} is sequential -- do its steps yourself, one at a time."
+    if stage_index in tracker.parallel_stages_run:
+        return f"ERROR: stage {stage_index} already ran."
+    tracker.parallel_stages_run.add(stage_index)
+
+    branch_tools = [
+        t for t in registry.tool_defs
+        if t["function"]["name"] not in _PLAN_TOOL_NAMES and t["function"]["name"] not in _STAGE_TOOL_NAMES
+    ]
+    semaphore = asyncio.Semaphore(PARALLEL_STAGE_CONCURRENCY)
+
+    async def run_branch(step_index: int) -> tuple[bool, str]:
+        step = tracker.plan_steps[step_index]
+        last_error = ""
+        async with semaphore:
+            for attempt in range(1, PARALLEL_BRANCH_ATTEMPTS + 1):
+                log_event("engine", "small_model_branch_started", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt)
+                branch_tracker = _TurnTracker()
+                base_executor = _make_executor_fn(registry, tab_id, send, main_loop, branch_tracker, ai, cfg)
+                calls: list[str] = []
+
+                def traced_executor(name: str, args: dict[str, Any], _base=base_executor, _calls=calls) -> str:
+                    result = _base(name, args)
+                    _calls.append(f"- {name}({json.dumps(args or {}, ensure_ascii=False, default=str)[:200]}) -> {str(result)[:300]}")
+                    return result
+
+                branch_messages = [
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": (
+                        f"Общая задача пользователя (для контекста): {user_text}\n\n"
+                        f"Ты выполняешь ОДИН шаг из общего плана, параллельно с другими шагами. Шаг: {step}\n\n"
+                        "Выполни только его: вызови нужные инструменты, дождись реальных результатов и ответь одним "
+                        "коротким фактическим итогом. Чужие шаги не делай."
+                    )},
+                ]
+                try:
+                    text = await _call_with_funds_wait(
+                        lambda: _resolve_agentic_with_watchdog(
+                            ai, branch_tracker,
+                            messages=branch_messages, tool_defs=branch_tools, executor_fn=traced_executor,
+                            model=model, max_iterations=MAX_ITERATIONS,
+                            transforms=DISABLE_MIDDLE_OUT, reasoning=REASONING_EFFORT,
+                        ),
+                        tab_id, lambda _line: None,
+                    )
+                    if _usable(text):
+                        log_event("engine", "small_model_branch_finished", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt, ok=True)
+                        tracker.branch_trace.append(
+                            f"Ветка шага {step_index} («{step}»), попытка {attempt}:\n" + ("\n".join(calls) or "  (инструменты не вызывались)")
+                        )
+                        return True, text.strip()
+                    last_error = "пустой ответ"
+                except _FundsExhaustedGivingUp:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- a failed branch is a result, not a turn-ending error
+                    last_error = f"{type(exc).__name__}: {exc}"
+                log_event("engine", "small_model_branch_finished", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt, ok=False, error=last_error)
+                tracker.branch_trace.append(
+                    f"Ветка шага {step_index} («{step}»), попытка {attempt}, не выполнена ({last_error}):\n"
+                    + ("\n".join(calls) or "  (инструменты не вызывались)")
+                )
+        return False, last_error
+
+    outcomes = await asyncio.gather(*(run_branch(i) for i in indices), return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, _FundsExhaustedGivingUp):
+            raise outcome
+
+    lines = [f"Стадия {stage_index} (параллельно) завершена."]
+    for step_index, outcome in zip(indices, outcomes):
+        if isinstance(outcome, BaseException):
+            ok, info = False, f"{type(outcome).__name__}: {outcome}"
+        else:
+            ok, info = outcome
+        if ok:
+            tracker.plan_done[step_index] = info[:500]
+            lines.append(f"OK, шаг {step_index}: {info[:300]}")
+        else:
+            lines.append(f"НЕ ВЫПОЛНЕН, шаг {step_index}: {info}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -766,7 +929,7 @@ def build_tool_registry() -> ToolRegistry:
     ever learn the real result, so it had to guess or just claim success.
     Confirmed live as the actual cause of a placeholder note being left
     behind while the model told the user it was "preparing" the real one."""
-    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_WEB_SEARCH_TOOL_DEFS)
+    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_STAGE_TOOL_DEFS) + list(_WEB_SEARCH_TOOL_DEFS)
     lookup: dict[str, tuple[str, PluginTool]] = {}
     tool_instructions: dict[str, str] = {}
     own_plugins: list[dict[str, Any]] = []
@@ -839,6 +1002,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
 def _make_executor_fn(
     registry: ToolRegistry, tab_id: str | None, send: session_context.SendFn | None,
     main_loop: asyncio.AbstractEventLoop, tracker: _TurnTracker, ai: Any, cfg: Any,
+    stage_runner: Callable[[int], Awaitable[str]] | None = None,
 ) -> Callable[[str, dict[str, Any]], str]:
     """Bridges resolve_agentic()'s synchronous, worker-thread-side
     executor_fn(name, args) -> str callback into Caroline's own async
@@ -878,6 +1042,14 @@ def _make_executor_fn(
 
         if name in _PLAN_TOOL_NAMES:
             return _run_plan_tool(name, args, tracker)
+
+        if name in _STAGE_TOOL_NAMES:
+            if stage_runner is None:
+                return "ERROR: parallel stages are not available in this context."
+            stage_index = args.get("stage")
+            if not isinstance(stage_index, int):
+                return "ERROR: 'stage' must be an integer index."
+            return asyncio.run_coroutine_threadsafe(stage_runner(stage_index), main_loop).result()
 
         if name in _WEB_SEARCH_TOOL_NAMES:
             # Already running on this turn's own worker thread (resolve_agentic calls
@@ -959,6 +1131,11 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
         parts.append(
             "Real tool calls made while producing that reply, with their real results (this is ground truth -- "
             "the reply above is a separate, later summary of this, not the source of it):\n" + "\n".join(tier_trace[-40:])
+        )
+    if tracker.branch_trace:
+        parts.append(
+            "Parallel-stage branches, each with its own real tool calls and results (ground truth, same rule):\n"
+            + "\n".join(tracker.branch_trace[-40:])
         )
     elif not can_escalate:
         # No tier_trace at all on the terminal, non-escalating pass usually means no
@@ -1128,7 +1305,16 @@ async def run_small_model_turn(
 
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
-    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker, ai, cfg)
+    current_model = {"name": cfg.AI_MODEL_LARGE}
+
+    async def run_stage(stage_index: int) -> str:
+        return await _run_parallel_stage(
+            stage_index, tracker=tracker, tab_id=tab_id, send=send, main_loop=main_loop,
+            registry=registry, ai=ai, cfg=cfg, system_text=messages[0]["content"],
+            user_text=user_text, model=current_model["name"],
+        )
+
+    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage)
 
     live_dialogue = [f"User: {user_text}"]
     if on_live_dialogue_update:
@@ -1244,6 +1430,7 @@ async def run_small_model_turn(
             continue
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
         emit(f"Работает уровень {index + 1} ({model}).")
+        current_model["name"] = model
         candidate = ""
         try:
             candidate = await _call_with_funds_wait(

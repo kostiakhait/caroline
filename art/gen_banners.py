@@ -1,17 +1,10 @@
-import requests, base64, os, io
+import base64, os, io
 from PIL import Image
 
+from _reforce import v2
+
 def generate_image(description, size='1792x1024'):
-    r = requests.post('https://squirrelwisdom.com/', json={
-        '.command': 'generateImage',
-        'key': '01Az8nB8mB4cCV',
-        'description': description,
-        'size': size,
-    }, timeout=120)
-    data = r.json()
-    if data.get('.status') != 'ok':
-        raise Exception(f"API error: {data}")
-    return data['result']
+    return v2('ai:generateImage', {'description': description, 'size': size})['result']
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), 'banners')
 os.makedirs(OUT_DIR, exist_ok=True)

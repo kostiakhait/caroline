@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slideshow</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font-family: Segoe UI, sans-serif; overflow: hidden; }
+  #stage { position: absolute; top: 0; bottom: 40px; left: 0; right: 0; display: flex; align-items: center; justify-content: center; }
+  #stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #bar { position: absolute; bottom: 0; left: 0; right: 0; height: 40px; display: flex; align-items: center; justify-content: center; gap: 12px; background: #1b1b1b; font-size: 13px; }
+  #bar button { background: #3a3f8f; color: #fff; border: 0; padding: 4px 12px; cursor: pointer; }
+  #empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: #999; }
+</style>
+</head>
+<body>
+<div id="stage"><img id="pic" alt=""></div>
+<div id="empty">No images to show.</div>
+<div id="bar">
+  <button id="prev">&larr;</button>
+  <span id="counter"></span>
+  <button id="next">&rarr;</button>
+</div>
+<script>
+  let images = [];
+  let index = 0;
+  let timer = null;
+
+  function show(i) {
+    if (images.length === 0) return;
+    index = (i + images.length) % images.length;
+    document.getElementById("pic").src = images[index].dataUrl;
+    document.getElementById("counter").textContent = (index + 1) + " / " + images.length + " — " + images[index].name;
+  }
+
+  function startAutoplay(seconds) {
+    if (timer) clearInterval(timer);
+    if (seconds > 0) timer = setInterval(function () { show(index + 1); }, seconds * 1000);
+  }
+
+  function open(msg) {
+    images = msg.images || [];
+    if (images.length === 0) {
+      document.getElementById("empty").style.display = "flex";
+      return;
+    }
+    show(0);
+    startAutoplay(msg.intervalSec || 0);
+  }
+
+  document.getElementById("prev").addEventListener("click", function () { show(index - 1); });
+  document.getElementById("next").addEventListener("click", function () { show(index + 1); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft") show(index - 1);
+    if (e.key === "ArrowRight") show(index + 1);
+  });
+
+  window.chrome.webview.addEventListener("message", function (e) {
+    const msg = e.data;
+    if (msg && msg.type === "open_editor") open(msg);
+  });
+</script>
+</body>
+</html>

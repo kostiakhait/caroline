@@ -1,7 +1,7 @@
 import { createHash, randomInt } from "node:crypto";
 
 const BASE_URL = "https://squirrelwisdom.com";
-const APP_KEY = "01Az8nB8mB4cCV";
+const APP_KEY = "EaYW2x8-oi7qjz4cl9cZWj7Udg6U8RcotHLs0B9xZUM";
 const ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 // nginx caps the request body at 64MB; base64 inflates raw bytes by ~33%, so the
@@ -53,25 +53,25 @@ async function postJson(body: Record<string, unknown>): Promise<any> {
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`Squirrel Wisdom API HTTP ${res.status} for command "${body[".command"]}"`);
+    throw new Error(`Squirrel Wisdom API HTTP ${res.status} for command "${body.command}"`);
   }
   return res.json();
 }
 
 export async function verifyPassword(email: string, password: string): Promise<VerifyPasswordResult> {
-  const result = await postJson({ ".command": "verifyPassword", key: APP_KEY, path: "/users", user: email, password });
+  const result = await postJson({ command: "user:verify", key: APP_KEY, path: "/users", user: email, password });
   if (!result?.session) {
     throw new Error(`Login failed for "${email}": ${JSON.stringify(result)}`);
   }
   return { session: result.session, user: result.user ?? email };
 }
 
-// Every Notes action goes through the generic plugins:call envelope, authorized by the
+// Every Notes action goes through the v2 plugin:call command, authorized by the
 // per-request session token (not just at login) — the backend derives hash16 from the
 // session server-side, so we never pass it. `query` duplicates `action`: it's a mandatory
 // field on the outer envelope, unrelated to which Notes action is being invoked.
 export async function callPlugin(action: string, session: string, extra: Record<string, unknown> = {}): Promise<any> {
-  const body = { ".command": "plugins:call", plugin: "Notes", query: action, action, key: APP_KEY, session, ...extra };
+  const body = { command: "plugin:call", plugin: "Notes", query: action, action, key: APP_KEY, session, ...extra };
   const envelope = await postJson(body);
   if (envelope?.[".status"] !== "ok") {
     const reason = envelope?.[".reason"] ?? JSON.stringify(envelope);

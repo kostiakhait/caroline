@@ -7,10 +7,7 @@ image-generation capability at all (she said so herself, mid-task, when
 asked to render presentation graphics) -- this had been requested before
 but never actually built during the backend-py port. Added directly.
 
-Deliberately a separate, standalone client rather than routed through
-Camerlengo/SquirrelWisdom -- beautysqrl.com is a wholly different service
-with its own static API key and v1-style `.command` envelope (no
-session/login at all, unlike sw_api.py's v2 protocol).
+Goes through the Camerlengo v2 ai:generateImage command (see app/reforce_v2.py).
 """
 
 from __future__ import annotations
@@ -19,28 +16,25 @@ import base64
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
-
-API_URL = "https://beautysqrl.com"
-API_KEY = "01Az8nB8mB4cCV"
+from app.reforce_v2 import call as reforce_call
 
 
 async def generate_image(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
-    body: dict[str, Any] = {".command": "generateImage", "key": API_KEY, "description": args["description"]}
+    body: dict[str, Any] = {"description": args["description"]}
     if args.get("size"):
         body["size"] = args["size"]
     if args.get("model"):
         body["model"] = args["model"]
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        res = await client.post(API_URL, json=body)
-        res.raise_for_status()
-        data = res.json()
-    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
-        log_event("plugin:image-gen", "generate_image_failed", reason=data.get(".reason"))
-        raise RuntimeError(str(data.get(".reason") or "generateImage failed"))
+    try:
+        data = await reforce_call("ai:generateImage", body, timeout=120.0)
+    except Exception as exc:
+        log_event("plugin:image-gen", "generate_image_failed", reason=str(exc))
+        raise
+    if not isinstance(data.get("result"), str):
+        log_event("plugin:image-gen", "generate_image_failed", reason="no image in response")
+        raise RuntimeError("generateImage returned no image")
     image_b64 = data["result"]
     save_path = args.get("savePath")
     if save_path:

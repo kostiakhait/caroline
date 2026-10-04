@@ -1053,12 +1053,13 @@ public partial class MainWindow : Window
 
             var requestId = root.GetProperty("requestId").GetString()!;
             Logger.Log($"MainWindow: {type} requestId={requestId} path={path}");
+            var viewerKey = path.Length > 0 ? path : requestId;
 
             Action<ViewerOutcome, string?> onDone = (outcome, resultPath) =>
             {
                 Dispatcher.Invoke(() =>
                 {
-                    if (resultPath != null) _viewerWindows.Remove(resultPath);
+                    _viewerWindows.Remove(viewerKey);
                     var outcomeStr = outcome switch
                     {
                         ViewerOutcome.Saved => "saved",
@@ -1089,9 +1090,17 @@ public partial class MainWindow : Window
             else
             {
                 var kind = root.GetProperty("kind").GetString()!;
-                viewer = new DocumentViewerWindow(path, kind, onDone);
+                if (kind == "code" || kind == "slideshow")
+                {
+                    var title = root.TryGetProperty("title", out var titleEl) ? titleEl.GetString() ?? "" : "";
+                    viewer = new DocumentViewerWindow(title, kind, path, root.GetRawText(), onDone);
+                }
+                else
+                {
+                    viewer = new DocumentViewerWindow(path, kind, onDone);
+                }
             }
-            _viewerWindows[path] = viewer;
+            _viewerWindows[viewerKey] = viewer;
             viewer.Show();
         }
         catch (Exception ex)

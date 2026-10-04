@@ -1,7 +1,5 @@
 """notes -- ports mcp-servers-src/notes/src/{index,notes,attachments}.ts (17
-tools) to notes_api.py's httpx-based client for the older, dot-envelope
-Camerlengo protocol (see notes_api.py's own docstring for why this is a
-separate client from sw_api.py rather than a shared one)."""
+tools) on top of notes_api.py's client (Camerlengo v2 plugin:call)."""
 
 from __future__ import annotations
 

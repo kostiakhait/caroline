@@ -1,4 +1,6 @@
 using System.IO;
+using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Media.Imaging;
 using Microsoft.Web.WebView2.Core;
@@ -39,6 +41,23 @@ public partial class DocumentViewerWindow : Window
     private readonly Action<string?, string?, bool, bool, bool>? _onLoginDone;
     private bool _resultReported;
     private WebView2? _officeWebView;
+    private string? _pagePayloadJson;
+
+    /// <summary>
+    /// Web-page viewers ("code" = Monaco, "slideshow"): the page is loaded from
+    /// wwwroot and receives the backend's open_editor event (payloadJson) once it
+    /// has finished loading. path is the file a code view saves back to, or empty.
+    /// </summary>
+    public DocumentViewerWindow(string title, string kind, string path, string payloadJson, Action<ViewerOutcome, string?> onDone)
+    {
+        InitializeComponent();
+        _path = path;
+        _kind = kind;
+        _onDone = onDone;
+        _pagePayloadJson = payloadJson;
+        TitleText.Text = title.Length > 0 ? title : (path.Length > 0 ? Path.GetFileName(path) : kind);
+        _ = ShowWebPage(kind == "code" ? "monaco_viewer.html" : "slideshow.html");
+    }
 
     public DocumentViewerWindow(string path, string kind, Action<ViewerOutcome, string?> onDone)
     {
@@ -213,6 +232,70 @@ public partial class DocumentViewerWindow : Window
         catch (Exception ex)
         {
             ShowError($"Could not load video: {ex.Message}");
+        }
+    }
+
+    private async Task ShowWebPage(string page)
+    {
+        ViewButtons.Visibility = Visibility.Visible;
+        OfficeHost.Visibility = Visibility.Visible;
+        StatusText.Text = "Loading…";
+        StatusText.Visibility = Visibility.Visible;
+
+        var webView = new WebView2();
+        OfficeHost.Children.Add(webView);
+        _officeWebView = webView;
+        try
+        {
+            var dataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Caroline", "webview2-viewer");
+            var env = await CoreWebView2Environment.CreateAsync(userDataFolder: dataDir);
+            await webView.EnsureCoreWebView2Async(env);
+
+            webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                "caroline.local", Path.Combine(AppContext.BaseDirectory, "wwwroot"), CoreWebView2HostResourceAccessKind.Allow);
+            webView.CoreWebView2.WebMessageReceived += OnWebPageMessage;
+            webView.CoreWebView2.NavigationCompleted += (_, args) =>
+            {
+                if (!args.IsSuccess)
+                {
+                    ShowError($"Could not load the viewer (error {args.WebErrorStatus}).");
+                    return;
+                }
+                StatusText.Visibility = Visibility.Collapsed;
+                if (_pagePayloadJson != null) webView.CoreWebView2.PostWebMessageAsJson(_pagePayloadJson);
+            };
+            webView.Source = new Uri($"https://caroline.local/{page}");
+        }
+        catch (Exception ex)
+        {
+            OfficeHost.Visibility = Visibility.Collapsed;
+            ShowError($"Could not start the viewer: {ex.Message}");
+        }
+    }
+
+    /// <summary>Code view save: the page sends the full text, which overwrites the
+    /// file after keeping the previous version as .bak. Only code opened from a
+    /// real file path is ever saveable (see viewer_plugin's show_code).</summary>
+    private void OnWebPageMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        using var doc = JsonDocument.Parse(e.WebMessageAsJson);
+        var root = doc.RootElement;
+        if (!root.TryGetProperty("type", out var typeEl) || typeEl.GetString() != "save") return;
+        if (string.IsNullOrEmpty(_path))
+        {
+            ShowError("This code has no file to save to.");
+            return;
+        }
+        var content = root.GetProperty("content").GetString() ?? "";
+        try
+        {
+            if (File.Exists(_path)) File.Copy(_path, _path + ".bak", overwrite: true);
+            File.WriteAllText(_path, content, new UTF8Encoding(false));
+        }
+        catch (Exception ex)
+        {
+            ShowError($"Could not save: {ex.Message}");
         }
     }
 

@@ -1,17 +1,9 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { randomBytes } from "node:crypto";
-import { getSession, SQUIRRELWISDOM_APP_KEY, SQUIRRELWISDOM_API_URL, SQUIRRELWISDOM_ORIGIN } from "./login.js";
+import { SQUIRRELWISDOM_APP_KEY, SQUIRRELWISDOM_API_URL, SQUIRRELWISDOM_ORIGIN } from "./login.js";
 import { fetchWithRetry } from "./httpRetry.js";
 
-// document:openForEdit is a v2 command (undotted "command" key -- see
-// Camerlengo.py's do_POST routing) with its own separate scoped-key auth
-// model, distinct from the legacy APP_KEY used for verifyPassword/write/
-// read/delete above -- confirmed live the legacy key gets rejected here
-// with v2 error 104 ("Missing, unknown, expired or revoked key"), same as
-// voice.ts hit for ai:tts/ai:stt before that got its own key. Minted
-// specifically for Caroline, scoped only to document:openForEdit.
-const V2_DOCUMENT_KEY = "m83G0G1mvtfT8gIMecDJY8oUaisIMiyfcgH2gvbDvzU";
 
 /**
  * Replaces the old fragile approach (launching a real soffice.exe process and
@@ -54,7 +46,6 @@ async function callApi(body: Record<string, unknown>): Promise<any> {
 
 export async function prepareOfficeEditSession(localPath: string): Promise<{ config: OfficeConfig; remotePath: string }> {
   console.error(`[caroline] [officeEditor] prepareOfficeEditSession: localPath=${localPath}`);
-  const session = await getSession();
   const ext = extname(localPath).slice(1).toLowerCase();
   // Long random component is the only access control on this temp copy,
   // same model as Notes' own short-lived preview temp files -- acceptable
@@ -64,7 +55,7 @@ export async function prepareOfficeEditSession(localPath: string): Promise<{ con
 
   const content = readFileSync(localPath);
   const writeRes = await callApi({
-    ".command": "write", key: SQUIRRELWISDOM_APP_KEY, session,
+    command: "file:write", key: SQUIRRELWISDOM_APP_KEY,
     path: remotePath, content: content.toString("base64"),
   });
   if (writeRes?.[".status"] !== "ok") {
@@ -72,7 +63,7 @@ export async function prepareOfficeEditSession(localPath: string): Promise<{ con
   }
 
   const editRes = await callApi({
-    command: "document:openForEdit", key: V2_DOCUMENT_KEY, session,
+    command: "document:openForEdit", key: SQUIRRELWISDOM_APP_KEY,
     path: remotePath, title: basename(localPath), origin: SQUIRRELWISDOM_ORIGIN,
   });
   if (editRes?.[".status"] !== "ok") {
@@ -97,25 +88,15 @@ export async function prepareOfficeEditSession(localPath: string): Promise<{ con
  * changed, but re-downloading it anyway is harmless and keeps this one
  * code path simple.
  */
-// Legacy quirk confirmed live against production: cmdReadFile (FileCommands.py)
-// doesn't return a clean {".status":"ok", content:"<base64>"} -- it stuffs the
-// path and base64 content INTO the ".status" string itself, delimited by
-// "=====" markers: "ok\n=====\n<path>\n=====\n<base64>\n======\n". Not a bug
-// to fix here (other callers may already depend on this exact shape) -- just
-// something this code has to parse instead of the sane shape you'd expect.
-const READ_STATUS_RE = /^ok\n=====\n([\s\S]*?)\n=====\n([\s\S]*?)\n======\n$/;
-
 export async function finishOfficeEditSession(remotePath: string, localPath: string): Promise<void> {
   console.error(`[caroline] [officeEditor] finishOfficeEditSession: remotePath=${remotePath} localPath=${localPath}`);
-  const session = await getSession();
-  const readRes = await callApi({ ".command": "read", key: SQUIRRELWISDOM_APP_KEY, session, path: remotePath });
-  const match = typeof readRes?.[".status"] === "string" ? READ_STATUS_RE.exec(readRes[".status"]) : null;
-  if (match) {
-    writeFileSync(localPath, Buffer.from(match[2], "base64"));
+  const readRes = await callApi({ command: "file:read", key: SQUIRRELWISDOM_APP_KEY, path: remotePath });
+  if (readRes?.[".status"] === "ok" && typeof readRes.content === "string") {
+    writeFileSync(localPath, Buffer.from(readRes.content, "base64"));
     console.error(`[caroline] [officeEditor] finishOfficeEditSession: wrote back edits to ${localPath}`);
   } else {
-    console.error(`[caroline] [officeEditor] finishOfficeEditSession: no parseable content in read response for ${remotePath}, local file left untouched`);
+    console.error(`[caroline] [officeEditor] finishOfficeEditSession: read failed for ${remotePath} (${readRes?.[".reason"] ?? "no content"}), local file left untouched`);
   }
-  await callApi({ ".command": "delete", key: SQUIRRELWISDOM_APP_KEY, session, path: remotePath })
+  await callApi({ command: "file:delete", key: SQUIRRELWISDOM_APP_KEY, path: remotePath })
     .catch((err) => console.error(`[caroline] [officeEditor] finishOfficeEditSession: failed to delete temp remote copy ${remotePath} (ignored):`, err));
 }

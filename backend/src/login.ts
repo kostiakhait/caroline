@@ -13,9 +13,8 @@ import { fetchWithRetry } from "./httpRetry.js";
 // rather than inventing its own credential store, per the shared-login ask this
 // was built for.
 const CREDENTIALS_PATH = join(homedir(), ".mcp-notes", "credentials.json");
-// Same legacy protocol/app key MCP/notes uses for verifyPassword -- this is the
-// same account system, not something Caroline-specific.
-const APP_KEY = "01Az8nB8mB4cCV";
+// Caroline's Camerlengo v2 key (scoped; see backend-py/app/reforce_v2.py).
+const APP_KEY = "EaYW2x8-oi7qjz4cl9cZWj7Udg6U8RcotHLs0B9xZUM";
 const API_URL = "https://www.squirrelwisdom.com/";
 export const SQUIRRELWISDOM_APP_KEY = APP_KEY;
 export const SQUIRRELWISDOM_API_URL = API_URL;
@@ -104,7 +103,7 @@ async function verifyPassword(email: string, password: string): Promise<LoginRes
     const res = await fetchWithRetry(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ".command": "verifyPassword", key: APP_KEY, path: "/users", user: email, password }),
+      body: JSON.stringify({ command: "user:verify", key: APP_KEY, path: "/users", user: email, password }),
     });
     const data: any = await res.json();
     if (!data?.session) {

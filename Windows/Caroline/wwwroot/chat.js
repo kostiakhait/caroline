@@ -1107,6 +1107,14 @@
     runSpeechQueue();
   }
 
+  // Backend-synthesized audio pushed by the play_speech tool (see
+  // voice_playback_plugin.py). Animated playback always uses the visual path
+  // when a native host exists, regardless of the Visual Mode toggle.
+  function speakPrefetched({ text, audioBase64, animated }) {
+    speechQueue.push({ text, btn: null, prefetched: audioBase64, forceVisual: !!animated });
+    runSpeechQueue();
+  }
+
   // Resolves once no voice-input recording session is active. Voice output
   // waits on this before starting each queued item -- confirmed this was
   // wanted so Caroline's own playback never talks over (or gets picked up
@@ -1142,9 +1150,9 @@
     return visualModeState.enabled && visualModeState.available && !!window.chrome?.webview;
   }
 
-  function playOneSpeech({ text, btn }) {
+  function playOneSpeech({ text, btn, prefetched, forceVisual }) {
     return new Promise((resolve) => {
-      const useVisual = shouldUseVisualMode(btn);
+      const useVisual = forceVisual ? !!window.chrome?.webview : shouldUseVisualMode(btn);
       const requestId = `tts-${++ttsRequestSeq}`;
       clog(`playOneSpeech requestId=${requestId} scheme=${useVisual ? "visual" : "plain-audio"}`, {
         visualModeEnabled: visualModeState.enabled,
@@ -1161,7 +1169,7 @@
         // before the audio (let alone the render) is actually ready.
         window.chrome.webview.postMessage({ type: "visual_speech_start", requestId });
       }
-      pendingTtsRequests.set(requestId, (ok, audioBase64, err) => {
+      const onAudio = (ok, audioBase64, err) => {
         if (entry.aborted) return; // stopActiveSpeech() already resolved this slot
         if (!ok || !audioBase64) {
           if (!ok) addBanner(`Could not read that aloud: ${err || "unknown error"}`);
@@ -1173,8 +1181,13 @@
         }
         if (useVisual) playAudioViaVisualMode(audioBase64, entry, resolve);
         else playAudioBase64(audioBase64, entry, resolve);
-      });
-      sendControl("tts", { text, requestId });
+      };
+      if (prefetched) {
+        onAudio(true, prefetched);
+      } else {
+        pendingTtsRequests.set(requestId, onAudio);
+        sendControl("tts", { text, requestId });
+      }
     });
   }
 
@@ -1516,6 +1529,11 @@
       // multi-GB resumable download. Progress/completion come back the
       // other way via the window.chrome.webview message listener below.
       if (window.chrome?.webview) window.chrome.webview.postMessage(evt);
+      return;
+    }
+
+    if (evt.type === "play_speech") {
+      speakPrefetched(evt);
       return;
     }
 

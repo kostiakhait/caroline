@@ -1,33 +1,14 @@
-import requests, base64, os, io
+import base64, os, io
 import numpy as np
 from PIL import Image
 
+from _reforce import v2
+
 def generate_image(description, size='1024x1024'):
-    r = requests.post('https://squirrelwisdom.com/', json={
-        '.command': 'generateImage',
-        'key': '01Az8nB8mB4cCV',
-        'description': description,
-        'size': size,
-    }, timeout=120)
-    data = r.json()
-    if data.get('.status') != 'ok':
-        raise Exception(f"API error: {data}")
-    return data['result']
+    return v2('ai:generateImage', {'description': description, 'size': size})['result']
 
 def resize_image(b64, width, height, mode='stretch'):
-    r = requests.post('https://squirrelwisdom.com/', json={
-        '.command': 'resizeImage',
-        'key': '01Az8nB8mB4cCV',
-        'data': b64,
-        'mode': mode,
-        'width': width,
-        'height': height,
-        'format': 'PNG',
-    }, timeout=30)
-    data = r.json()
-    if data.get('.status') != 'ok':
-        raise Exception(f"API error: {data}")
-    return data['result']
+    return v2('ai:resizeImage', {'data': b64, 'mode': mode, 'width': width, 'height': height, 'format': 'PNG'}, timeout=30)['result']
 
 def chroma_key_magenta(b64_data):
     img_bytes = base64.b64decode(b64_data)

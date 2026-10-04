@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: Segoe UI, sans-serif; }
+  #bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #2b2b2b; font-size: 13px; }
+  #bar .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #bar button { background: #3a3f8f; color: #fff; border: 0; padding: 4px 12px; cursor: pointer; }
+  #bar button:disabled { opacity: 0.4; cursor: default; }
+  #status { color: #9c9; }
+  #editor { position: absolute; top: 34px; bottom: 0; left: 0; right: 0; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="name" id="name"></span>
+  <span id="status"></span>
+  <button id="save" disabled>Save</button>
+</div>
+<div id="editor"></div>
+<script src="vendor/monaco/vs/loader.js"></script>
+<script>
+  let editor = null;
+  let editable = false;
+  let pending = null;
+
+  function post(msg) {
+    if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(msg);
+  }
+
+  function setStatus(text) {
+    document.getElementById("status").textContent = text || "";
+  }
+
+  function open(msg) {
+    document.getElementById("name").textContent = msg.title || "";
+    editable = !!msg.editable;
+    document.getElementById("save").disabled = !editable;
+    require.config({ paths: { vs: "vendor/monaco/vs" } });
+    require(["vs/editor/editor.main"], function () {
+      if (!editor) {
+        editor = monaco.editor.create(document.getElementById("editor"), {
+          value: msg.code || "",
+          language: msg.language || "plaintext",
+          theme: "vs-dark",
+          readOnly: !editable,
+          automaticLayout: true,
+          minimap: { enabled: false },
+          fontSize: 13,
+        });
+      } else {
+        editor.setValue(msg.code || "");
+        monaco.editor.setModelLanguage(editor.getModel(), msg.language || "plaintext");
+        editor.updateOptions({ readOnly: !editable });
+      }
+      editor.onDidChangeModelContent(function () { setStatus(editable ? "Unsaved changes" : ""); });
+    });
+  }
+
+  document.getElementById("save").addEventListener("click", function () {
+    if (!editor || !editable) return;
+    post({ type: "save", content: editor.getValue() });
+    setStatus("Saved");
+  });
+
+  window.chrome.webview.addEventListener("message", function (e) {
+    const msg = e.data;
+    if (msg && msg.type === "open_editor") open(msg);
+  });
+</script>
+</body>
+</html>
