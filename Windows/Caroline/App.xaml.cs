@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
@@ -83,12 +84,25 @@ public partial class App : System.Windows.Application
         // first shown, and both the global hotkey (registered in
         // OnSourceInitialized) and the backend/WebView2 startup (in Loaded)
         // depend on that HWND existing -- staying hidden at launch meant
-        // neither the hotkey nor the backend ever started. Opacity=0 (not
-        // Visibility=Hidden) keeps that HWND/Loaded pipeline running exactly
-        // as before while keeping the window itself invisible to the user
-        // during this window -- see the Opacity=1 restore below for why.
+        // neither the hotkey nor the backend ever started.
         _mainWindow.Show();
-        _mainWindow.Opacity = 0;
+        // Bug fix (2026-10-04), per explicit instruction: Opacity=0 (the
+        // previous approach here) does NOT actually hide WebView2's own
+        // content -- WebView2 is a native windowed child HWND, outside
+        // WPF's own visual tree/compositor ("airspace"), so it keeps
+        // painting its own page regardless of the PARENT WPF Window's
+        // Opacity. Confirmed live: exactly the half-loaded/blank-tab
+        // flash the 2026-09-13 fix below describes could still show through
+        // the "invisible" window the whole time the splash was up. Hide()
+        // (Visibility.Hidden) actually unmaps the window at the Win32 level
+        // (ShowWindow SW_HIDE) -- including every child HWND, WebView2
+        // included -- without destroying it: Loaded/OnSourceInitialized
+        // have already fired by this point (both tied to Show() above, not
+        // to the window currently being visible), so the hotkey/backend-
+        // startup pipeline this comment used to worry about is untouched.
+        _mainWindow.Hide();
+        var diagSw = Stopwatch.StartNew();
+        Logger.Log($"[DIAG] main window Hide() done, IsVisible={_mainWindow.IsVisible}");
         // Per explicit instruction (2026-09-13): while the splash is up, the
         // dialog window must not be visible at all -- confirmed live as a
         // real bug (2026-09-13): a startup forced-compaction on a large tab
@@ -102,7 +116,7 @@ public partial class App : System.Windows.Application
         // real. This supersedes the 2026-09-03 correction below for
         // specifically the loading window; that correction's actual point
         // (don't disable a window the user can already see and use) still
-        // holds once Opacity is restored to 1 further down.
+        // holds once the window is shown again further down.
         //
         // Per that 2026-09-03 correction: once visible, the main window must
         // stay fully usable while the backend connects -- the tab strip,
@@ -123,9 +137,12 @@ public partial class App : System.Windows.Application
         splash.Closed += (_, _) => dismissedEarly.TrySetResult();
         splash.Show();
 
+        Logger.Log($"[DIAG] before WaitForSplashDismissAsync, elapsed since Hide()={diagSw.Elapsed.TotalSeconds:F1}s");
         await WaitForSplashDismissAsync(dismissedEarly.Task);
+        Logger.Log($"[DIAG] after WaitForSplashDismissAsync, elapsed since Hide()={diagSw.Elapsed.TotalSeconds:F1}s, IsVisible before re-Show={_mainWindow.IsVisible}");
         if (splash.IsLoaded) splash.Close();
-        _mainWindow.Opacity = 1;
+        _mainWindow.Show();
+        Logger.Log($"[DIAG] main window Show() done, IsVisible={_mainWindow.IsVisible}");
 
         _mainWindow.Activate();
         // Activate() alone can silently no-op here: Windows' foreground-lock
@@ -150,7 +167,7 @@ public partial class App : System.Windows.Application
     }
 
     /// <summary>
-    /// Keeps the splash up (and, per OnStartup's Opacity=0/1 dance, the main
+    /// Keeps the splash up (and, per OnStartup's Hide()/Show() dance, the main
     /// window invisible) until the backend actually answers GET /api/status
     /// (started by MainWindow.OnLoaded, already running by the time this is
     /// called) AND no tab in that response's own tabs[] array reports

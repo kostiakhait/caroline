@@ -64,6 +64,24 @@ public sealed class SupervisorClient : IDisposable
         }
 
         var pythonwExe = ResolvePythonwExe();
+        if (pythonwExe == null)
+        {
+            // Bug fix (2026-10-04), per explicit instruction ("Бэкенд никогда
+            // не должен запускаться под системным питоном"): this used to
+            // fall back to the bare string "pythonw", which Process.Start
+            // resolves via PATH -- silently launching under WHATEVER Python
+            // happens to be installed system-wide (confirmed live: a Debug
+            // build with no runtime/ folder next to it launched under
+            // D:\python310\pythonw.exe, which has none of the bundled
+            // dependencies -- claude_agent_sdk included -- so the backend
+            // crashed on import every single time and the supervisor
+            // crash-looped forever holding the port, with every tool call
+            // just hanging with no response and no error, ever). The bundled
+            // runtime not being there is a real, fail-loud condition now,
+            // not a "try something else" one.
+            OutputLine?.Invoke($"[SupervisorClient] isolated Python runtime not found next to this build -- refusing to fall back to a system-wide pythonw (would run without the bundled dependencies). Expected it at: {Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "pythonw.exe")}");
+            return false;
+        }
         OutputLine?.Invoke($"[SupervisorClient] resolved pythonw exe: {pythonwExe} (exists={File.Exists(pythonwExe)})");
 
         var psi = new ProcessStartInfo
@@ -127,14 +145,17 @@ public sealed class SupervisorClient : IDisposable
         }
     }
 
-    /// <summary>Same reasoning as BackendProcess.cs's own ResolvePythonwExe
-    /// (this class deliberately duplicates rather than shares it -- see
-    /// BackendProcess.cs's own doc comment for why it's now just a Port
-    /// constant, not a class other code should still depend on).</summary>
-    private static string ResolvePythonwExe()
+    /// <summary>Only the bundled, isolated runtime -- never a system-wide
+    /// "pythonw" resolved via PATH, which would run the backend without any
+    /// of its actual dependencies (see the null-check at this method's call
+    /// site for the incident that made this an explicit requirement, not
+    /// just a preference). Returns null when the isolated runtime isn't
+    /// there (e.g. a dev tree with no runtime/ copied next to the build) --
+    /// the caller must fail loudly, not fall back to anything else.</summary>
+    private static string? ResolvePythonwExe()
     {
         var isolated = Path.Combine(AppContext.BaseDirectory, "..", "runtime", "python", "pythonw.exe");
-        return File.Exists(isolated) ? Path.GetFullPath(isolated) : "pythonw";
+        return File.Exists(isolated) ? Path.GetFullPath(isolated) : null;
     }
 
     /// <summary>Polls supervisor.py's own GET /status. Returns null (and
