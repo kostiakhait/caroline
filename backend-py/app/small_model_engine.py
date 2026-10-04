@@ -99,6 +99,7 @@ from app.policies import (
     prefer_own_backend_tools_instruction,
     proactive_context_recovery_instruction,
     recall_memory_check_first_instruction,
+    recent_dialogue_history_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     timestamp_awareness_instruction,
@@ -455,6 +456,15 @@ def _shared_policy_text(workspace_dir: str, tab_id: str) -> str:
             "yourself before asking the user to repeat or clarify anything. Never tell the user you had to go "
             "read a file to recall this."
         )
+    # Bug fix (2026-10-03), confirmed live: recent_dialogue_history_instruction (the rolling
+    # last-24h dialogue file, a SEPARATE safety net from continuity_pointer_instruction above --
+    # see its own docstring) was never wired in here at all, only on the full SDK path -- this
+    # engine had no pointer to any of its own memory/session-history files whatsoever. Deferred
+    # import: chat_session.py imports this module at load time, so a top-level import would be
+    # circular -- see this module's other deferred imports for the same reason.
+    from app.chat_session import _recent_24h_dialogue_path
+    dialogue_path = str(_recent_24h_dialogue_path(workspace_dir, tab_id))
+    parts.append(recent_dialogue_history_instruction(dialogue_path))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -918,7 +928,7 @@ def _make_executor_fn(
     return executor_fn
 
 
-def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escalate: bool) -> str:
+def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
     any work. It checks the candidate against the mechanical facts below.
 
@@ -928,11 +938,34 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
     ESCALATION_SENTINEL/NeedsEscalation/_TurnStalled signals -- the verifier is not
     the end of the line while a stronger tier is still available. Only once the last
     tier has also been verified and found wanting does the verifier write a final
-    "could not complete" message instead of escalating further."""
+    "could not complete" message instead of escalating further.
+
+    `tier_trace` (2026-10-03 bug fix, confirmed live, "дай верификатору информацию о
+    проделанных действиях и их результатах"): verification_messages (the call site)
+    is built from a COPY of `messages` -- but the tier's own tool-calling conversation
+    happens inside resolve_agentic()'s own internal loop and is never written back to
+    that outer list, only the continuation-note SUMMARY is (and only once, on
+    cross-tier escalation). Without this, the verifier saw nothing but the user's
+    question and the candidate's own claimed answer -- no evidence any tool was ever
+    called -- and (confirmed live) concluded the reply was fabricated even when 8 real
+    IMAP calls had just happened. This is the SAME tier_trace the tier loop already
+    tracks for its own continuation notes, passed straight through before it's
+    cleared."""
     parts = [
         "The reply above is from another assistant that worked on the user's request. You are a verifier only: "
         "you have no tools and must not try to do or finish any work. Check the reply against the facts below."
     ]
+    if tier_trace:
+        parts.append(
+            "Real tool calls made while producing that reply, with their real results (this is ground truth -- "
+            "the reply above is a separate, later summary of this, not the source of it):\n" + "\n".join(tier_trace[-40:])
+        )
+    elif not can_escalate:
+        # No tier_trace at all on the terminal, non-escalating pass usually means no
+        # tier ever got far enough to call anything -- worth saying explicitly, since
+        # its absence could otherwise read as "nothing to check" rather than "nothing
+        # was ever actually done".
+        parts.append("No tool calls were recorded for this attempt at all.")
     if tracker.plan_steps is not None:
         undone = [s for i, s in enumerate(tracker.plan_steps) if i not in tracker.plan_done]
         if undone:
@@ -1160,10 +1193,10 @@ async def run_small_model_turn(
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
     # is no longer only a final polish pass tacked on after the loop.
-    async def run_verifier(candidate_text: str, can_escalate: bool) -> str:
+    async def run_verifier(candidate_text: str, can_escalate: bool, trace: list[str]) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
-        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate)})
+        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace)})
         return await _call_with_funds_wait(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
@@ -1175,7 +1208,7 @@ async def run_small_model_turn(
             tab_id, emit,
         )
 
-    async def verify_candidate(candidate_text: str, can_escalate: bool) -> tuple[str, bool]:
+    async def verify_candidate(candidate_text: str, can_escalate: bool, trace: list[str] | None = None) -> tuple[str, bool]:
         """Returns (text, needs_escalation). A technical verifier failure (empty
         reply/exception on both attempts) is never treated as an escalation signal --
         it just falls back to the candidate as-is, same as before this change.
@@ -1187,7 +1220,7 @@ async def run_small_model_turn(
         for attempt in (1, 2):
             log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate)
             try:
-                verified = await run_verifier(candidate_text, can_escalate)
+                verified = await run_verifier(candidate_text, can_escalate, trace or [])
             except _FundsExhaustedGivingUp:
                 raise
             except Exception as exc:  # noqa: BLE001 -- verifier failure is a retry, never silence
@@ -1242,7 +1275,7 @@ async def run_small_model_turn(
             emit(f"Уровень {index + 1} ({model}) дал ответ, переходим к проверке.")
             can_escalate = index < len(tiers) - 1
             try:
-                verified_text, needs_escalation = await verify_candidate(candidate, can_escalate)
+                verified_text, needs_escalation = await verify_candidate(candidate, can_escalate, tier_trace)
             except _FundsExhaustedGivingUp as exc:
                 log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
                 return _answer(_funds_exhausted_final_answer(exc.reason))
@@ -1267,7 +1300,7 @@ async def run_small_model_turn(
         # mechanically) -- one last, non-escalating verification pass so the user
         # still gets a real, honest answer instead of silence.
         try:
-            verified_text, _ = await verify_candidate(final_text, can_escalate=False)
+            verified_text, _ = await verify_candidate(final_text, can_escalate=False, trace=tier_trace)
         except _FundsExhaustedGivingUp as exc:
             log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=None, model=None, reason=exc.reason)
             return _answer(_funds_exhausted_final_answer(exc.reason))

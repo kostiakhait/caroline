@@ -2238,6 +2238,17 @@ class ChatSession:
         def on_activity(line: str) -> None:
             self.small_model_activity.append(line[:300])
             del self.small_model_activity[:-20]
+            # Bug fix (2026-10-03), explicit instruction: status is push-on-CHANGE
+            # (turn_pending flips true once, _publish_status fires once, then nothing
+            # republishes it) -- fine for the SDK path, where real SDK stream messages
+            # keep last_activity/the UI otherwise occupied, but confirmed live for an
+            # sw-mode turn running many minutes (an 8-mailbox check escalating through
+            # tiers): the client's own "Working" display went stale well before the
+            # turn actually finished, with no backend signal telling it anything was
+            # still happening. Republish on every real operation -- same content each
+            # time ("working"), but keeps a long-running turn's status visibly fresh
+            # until the turn itself actually ends, not just until the first tick.
+            asyncio.create_task(self._publish_status())
 
         try:
             result = await run_small_model_turn(
@@ -3161,13 +3172,17 @@ class ChatSession:
         # 12:26/1:51/1:59/2:00 AM) is a real tradeoff of this reversion, not
         # solved here -- if it recurs, that's the next thing to fix, not a
         # reason to bring this gate back silently.
-        # Bug fix (2026-09-14): see consecutive_narration_count's own
-        # __init__ comment and MAX_CONSECUTIVE_NARRATION_COMMENTS's own
-        # comment -- a turn stuck this long isn't helped by yet another
-        # paraphrase of the same stale context; stop until real progress
-        # (a real reply, or a fresh real user message) resets the counter.
-        if self.consecutive_narration_count >= MAX_CONSECUTIVE_NARRATION_COMMENTS:
-            return
+        # Reverted (2026-10-03), explicit direct instruction ("не должно такого быть,
+        # убрать"): this used to stop narration dead after MAX_CONSECUTIVE_NARRATION_
+        # COMMENTS comments in a row, on the reasoning that a long-stuck turn wasn't
+        # helped by yet another paraphrase of the same stale dialogue window. That
+        # reasoning no longer fully applies now that narration is fed real, changing
+        # facts (on_activity/emit -- see generate_progress_comment's own activity
+        # param), not just a re-paraphrase of unchanging context -- and per the same
+        # 2026-10-03 instruction that already reverted the proactive-turn gate above,
+        # the narrator's job is to keep ANY silence during active work from reading as
+        # nothing happening, for as long as the work actually takes, not just the
+        # first few minutes of it.
         now = time.monotonic()
         if self.last_visible_output_at is not None and now - self.last_visible_output_at < PROGRESS_NARRATION_INTERVAL_MS / 1000:
             return
@@ -3632,6 +3647,19 @@ class ChatSession:
             )
 
     async def _check_hang(self) -> None:
+        if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+            # sw mode (2026-10-03 bug fix, confirmed live): this whole check is built
+            # around the real SDK/CLI process (self.client, self._process_activity_
+            # monitor, self.last_activity -- all only ever populated by _run_loop's
+            # real-session branch, which an sw-mode tab now skips entirely -- see that
+            # method's own 2026-10-03 comment). None of that state exists here, so
+            # `elapsed` below grows unboundedly against a last_activity nothing ever
+            # refreshes -- confirmed live: hang_count climbed past 120 and
+            # hang_repeat_force_close fired every single tick on a tab that was
+            # actively working the whole time (small_model_engine.py has its own,
+            # completely separate stall detection for this turn -- _TurnStalled/
+            # STALL_TIMEOUT_S). Skip entirely; nothing here applies to this mode.
+            return
         # Bug fix (2026-09-15), per explicit instruction: "Это должно быть
         # 90-секунд отсчитываемых, когда ничего не происходит: процессы не
         # потребляют процессор и не меняется загрузка памяти. Это не

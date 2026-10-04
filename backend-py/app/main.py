@@ -206,6 +206,23 @@ def _inject_companion_message(tab_id: str, text: str, attachments: list[dict[str
     return True
 
 
+def _inject_companion_restart_notice(tab_id: str, text: str, attachments: list[dict[str, Any]] | None = None) -> bool:
+    """Callback for companion_api.resume_companion_operations ONLY -- a restart-recovery
+    notice about an operation interrupted by the last backend restart is internal system
+    context, never something the user actually said. Bug fix (2026-10-03), confirmed
+    live: this used to reuse _inject_companion_message (meant for real phone-originated
+    messages), which unconditionally sends a "user_message_echo" WS event regardless of
+    is_real_user -- the notice was drawn as a genuine blue user bubble on the desktop,
+    duplicated on top of that (one per interrupted operation). Routes through
+    inject_proactive instead, the same path every OTHER restart-recovery nudge in this
+    file already uses (see the pending-turn/pending-operations ones above) -- the model
+    sees it, the user never sees a fake message appear to come from them."""
+    session = sessions.get(tab_id)
+    if session is None:
+        return False
+    return session.inject_proactive(text, attachments or [])
+
+
 def _active_tab_ids() -> list[str]:
     """Callback for the same loop: every tab with a live session right
     now, so history sync (and the inbox drain) covers all of them, not
@@ -291,7 +308,7 @@ async def _start_ratatosk_background_loops() -> None:
     # was still in flight when the backend last went down -- see
     # companion_api.py's own module docstring for the never-gives-up
     # protocol this is completing the restart-survival half of.
-    await resume_companion_operations(WORKSPACE_DIR, _inject_companion_message)
+    await resume_companion_operations(WORKSPACE_DIR, _inject_companion_restart_notice)
 
 
 def primary_session() -> ChatSession | None:
