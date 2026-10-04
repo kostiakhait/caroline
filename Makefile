@@ -101,7 +101,17 @@ $(BACKEND_DIR)/mcp-servers/.stamp: $(BACKEND_DIR)/dist/.stamp
 # publish as loose files next to Caroline.exe instead of being bundled into
 # the single-file exe for self-extraction -- harmless, still a working
 # self-contained single-file publish.
-$(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.stamp $(BACKEND_PY_SRC)
+# CAMERLENGO_VENDOR_STUBS/Config.py listed explicitly (2026-10-03 bug fix, confirmed
+# live): the vendoring recipe below copies it into dist/backend-py/camerlengo/Config.py,
+# but nothing above (BACKEND_PY_SRC only covers backend-py/app + run_server.py/
+# supervisor.py) ever told Make this target depends on it -- two deploys in a row
+# silently shipped a STALE dist/Caroline.exe with the old stub because Make saw no
+# changed prerequisite and skipped the entire rebuild recipe, including `rm -rf $(OUT)`.
+# NOTE: the actual vendored AI.py/etc. content (pulled live via `git show caroline:...`
+# from CAMERLENGO_REPO) still has NO file-based prerequisite here and can't easily get
+# one -- a change on the reforce side alone still requires `make clean` to force a
+# real rebuild; only the local stub file is now tracked automatically.
+$(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.stamp $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/Config.py
 	@echo "=== Caroline Build ==="
 	rm -rf "$(OUT)"
 	dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)"
