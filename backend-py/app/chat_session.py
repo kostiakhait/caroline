@@ -2175,9 +2175,15 @@ class ChatSession:
         log_event("engine", "small_model_turn_attempting", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
         model_text = text
         if attachments:
-            # The small model gets no file content in this mode; it at least learns what was attached.
-            names = ", ".join(str(a.get("name") if isinstance(a, dict) else a) for a in attachments)
-            model_text = f"{text}\n[Attachments were not delivered in this mode: {names}]"
+            # Saved to workspace/uploads/ like the SDK path does, so tools can open the file by path.
+            saved_lines = []
+            for a in attachments:
+                if isinstance(a, dict) and a.get("dataBase64"):
+                    saved_path = _save_attachment_to_uploads(a)
+                    saved_lines.append(f"- {saved_path} ({a.get('mimeType') or 'unknown type'})")
+                else:
+                    saved_lines.append(f"- {a.get('name') if isinstance(a, dict) else a} (not saved: no data)")
+            model_text = f"{text}\n[The user attached these files, saved locally:\n" + "\n".join(saved_lines) + "\n]"
         # Mirrors submit()'s own is_real_user bookkeeping (see its comments for
         # why each field exists). Real-user-only state (silent-wait nudge, crash
         # recovery of a pending question) is skipped for internal turns.
