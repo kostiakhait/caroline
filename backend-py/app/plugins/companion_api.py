@@ -318,6 +318,24 @@ async def list_devices() -> list[dict[str, Any]]:
     return devices
 
 
+async def remove_device(device_id: str) -> None:
+    """Un-pairs a device by deleting every leaf known to persist in steady
+    state -- info (what makes list_devices/resolve_device see it at all)
+    and the SMS sync pair (the only other leaves that outlive a single
+    request/response round trip; every per-opId leaf under sms/outbox*,
+    contacts/*, sms_query/*, logs/* is already deleted by
+    _finish_and_cleanup right after that one operation finishes, so there's
+    normally nothing left under those at any given moment). Deliberately
+    NOT a server-side namespace delete -- see this function's own call site
+    for why that was considered and dropped (plain var:deleteMine, already
+    existing, is enough; no new Camerlengo command needed for this). Any
+    stray empty sub-namespace left behind on disk is cosmetic, never
+    visible through list_mine("devices") + each id's own info leaf, which
+    is all list_devices() ever looks at."""
+    for leaf in ("info", "sms/sync_request", "sms/sync_response"):
+        await _safe_delete(f"devices/{device_id}/{leaf}")
+
+
 async def resolve_device(phone_number: str | None) -> dict[str, Any]:
     """Resolves a `fromNumber` tool argument to one paired device, matched
     on the last 10 digits (tolerant of +country-code/spacing/formatting

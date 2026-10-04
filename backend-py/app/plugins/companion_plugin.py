@@ -73,6 +73,7 @@ from app.plugins.companion_api import (
     UnknownDeviceError,
     device_or_all_request,
     list_devices,
+    remove_device,
     request_response,
     resolve_device,
     send_sms,
@@ -122,6 +123,27 @@ async def companion_list_phones(args: dict[str, Any], report_progress: Any) -> d
         return {"text": gate_msg, "is_error": True}
     devices = await list_devices()
     return {"text": _json([{"phoneNumber": d.get("phoneNumber"), "model": d.get("model"), "online": d.get("online")} for d in devices])}
+
+
+async def companion_remove_phone(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
+    """Unpairs a phone (e.g. a leftover test/emulator device, or one the
+    user no longer uses) -- stops it showing up in companion_list_phones/
+    being auto-picked by other companion_* tools. Only ever use this when
+    the user has clearly identified a specific phone to remove; never guess
+    which one, and never remove the only paired phone without the user
+    naming it explicitly, even if it looks like a test device."""
+    gate_msg = await _gate()
+    if gate_msg:
+        return {"text": gate_msg, "is_error": True}
+    from_number = str(args.get("fromNumber") or "").strip()
+    if not from_number:
+        return {"text": "fromNumber is required -- name exactly which paired phone to remove (see companion_list_phones).", "is_error": True}
+    try:
+        device = await resolve_device(from_number)
+    except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+        return {"text": _device_error_text(exc), "is_error": True}
+    await remove_device(device["deviceId"])
+    return {"text": f"Removed {device.get('phoneNumber') or device['deviceId']} ({device.get('model') or 'unknown model'}) from the paired phones."}
 
 
 async def companion_sms_send(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -368,6 +390,13 @@ PLUGIN = Plugin(
             "which numbers exist before picking a fromNumber for another companion_* tool.",
             {},
             companion_list_phones,
+        ),
+        PluginTool(
+            "companion_remove_phone",
+            "Unpair a phone from this account (e.g. a leftover test/emulator device). fromNumber is required -- "
+            "always name exactly which paired phone, from companion_list_phones; never guess or assume.",
+            {"fromNumber": str},
+            companion_remove_phone,
         ),
         PluginTool(
             "companion_sms_send",
