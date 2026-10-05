@@ -44,7 +44,19 @@ from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 APP_ROOT = Path(os.environ.get("CAROLINE_APP_ROOT", HERE.parent))
-WWWROOT = Path(os.environ.get("CAROLINE_WWWROOT", HERE.parent / "Windows" / "Caroline" / "wwwroot"))
+def _default_wwwroot() -> Path:
+    """A packaged install bundles wwwroot as a sibling of linux-shell/ (see
+    the Makefile's Linux packaging target) -- that's checked first. Falling
+    back to the WPF project's own copy only matters for running straight out
+    of a dev-tree checkout, where no packaging step has run yet; a real
+    install never has a Windows/ directory at all."""
+    packaged = HERE.parent / "wwwroot"
+    if packaged.is_dir():
+        return packaged
+    return HERE.parent / "Windows" / "Caroline" / "wwwroot"
+
+
+WWWROOT = Path(os.environ.get("CAROLINE_WWWROOT", _default_wwwroot()))
 SUPERVISOR_PY = Path(os.environ.get("CAROLINE_SUPERVISOR_PY", HERE.parent / "backend-py" / "supervisor.py"))
 PYTHON = Path(os.environ.get("CAROLINE_PYTHON", APP_ROOT / "runtime" / "python" / "bin" / "python3"))
 PAGE_PORT = 48767

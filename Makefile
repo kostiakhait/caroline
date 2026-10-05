@@ -63,10 +63,15 @@ NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' 
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
 XCFA_SRC := $(shell find "$(XCFA_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' -not -path '*/XcfaRenderer.Tests/*' -not -path '*/Demo/*' \( -name '*.cs' -o -name '*.csproj' \) 2>/dev/null)
 
-.PHONY: help build installer clean
+LINUX_SHELL_DIR := $(SCRIPT_DIR)/linux-shell
+LINUX_SHELL_SRC := $(shell find "$(LINUX_SHELL_DIR)" -type f 2>/dev/null)
+WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
+OUT_LINUX := $(SCRIPT_DIR)/dist-linux
+
+.PHONY: help build installer clean dist-linux
 
 help:
-	@echo "Targets: build, installer, clean"
+	@echo "Targets: build, installer, clean, dist-linux"
 	@echo "(deploy, deploy-models: available only when deploy.mk is present -- see its header comment)"
 
 # --- 1. Backend: npm install only when package.json/lockfile change --------
@@ -150,6 +155,48 @@ $(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR
 
 build: $(OUT)/Caroline.exe
 
+# --- Linux shell package (no dotnet publish at all -- linux-shell/ is plain
+# Python; see docs/LINUX_PORT_PLAN.md's Phase 5 for why the shell itself
+# can't be bundled into a self-contained runtime the way the backend's
+# runtime/python is: python3-gi/gir1.2-webkit2-4.1 are system packages tied
+# to the installed GTK3/WebKitGTK versions). This recipe only assembles the
+# directory tree an AppImage step (not yet built) would wrap; it's
+# deliberately runnable from this Windows build machine too, since every
+# step here is a plain file copy, nothing Linux-specific about the build
+# itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
+# back into Windows/Caroline/), matching caroline_shell.py's own
+# _default_wwwroot() packaged-install lookup.
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/Config.py
+	@echo "=== Caroline Linux shell package ==="
+	rm -rf "$(OUT_LINUX)"
+	mkdir -p "$(OUT_LINUX)/linux-shell"
+	cp -r "$(LINUX_SHELL_DIR)/." "$(OUT_LINUX)/linux-shell/"
+	@echo "--- wwwroot (chat UI assets, shared with the Windows build) ---"
+	cp -r "$(WWWROOT_DIR)" "$(OUT_LINUX)/wwwroot"
+	@echo "--- backend-py ---"
+	mkdir -p "$(OUT_LINUX)/backend-py"
+	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT_LINUX)/backend-py/app"
+	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT_LINUX)/backend-py/run_server.py"
+	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT_LINUX)/backend-py/supervisor.py"
+	find "$(OUT_LINUX)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find "$(OUT_LINUX)/linux-shell" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	@echo "--- camerlengo (small-model primary path, same conditional vendoring as the Windows build) ---"
+	@if git -C "$(CAMERLENGO_REPO)" cat-file -e caroline:AI.py 2>/dev/null; then \
+		mkdir -p "$(OUT_LINUX)/backend-py/camerlengo"; \
+		for f in AI.py Cache.py EmailBasics.py Logger.py JSONStorage.py; do \
+			git -C "$(CAMERLENGO_REPO)" show caroline:$$f > "$(OUT_LINUX)/backend-py/camerlengo/$$f"; \
+		done; \
+		cp "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/Config.py"; \
+		echo "vendored from $(CAMERLENGO_REPO)@caroline"; \
+	else \
+		echo "WARNING: $(CAMERLENGO_REPO) has no reachable 'caroline' branch -- skipping camerlengo vendoring."; \
+	fi
+	@echo "Linux shell package complete: $(OUT_LINUX)"
+	@echo "NOTE: runtime/python (claude_agent_sdk) and runtime/codex are NOT produced by this recipe --"
+	@echo "      see docs/LINUX_PORT_PLAN.md's Phase 5 open gap. Not runnable standalone without them."
+
+dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
+
 # --- 5. Zip + hash + version stamp (was build_installer.bat, steps 1-2) ----
 #
 # PowerShell's Compress-Archive AND a plain System.IO.Compression call run
@@ -181,7 +228,7 @@ $(INSTALLER_OUT)/CarolineInstaller.exe.sha256: $(INSTALLER_OUT)/CarolineInstalle
 installer: $(INSTALLER_OUT)/CarolineInstaller.exe
 
 clean:
-	rm -rf "$(OUT)" "$(INSTALLER_OUT)"
+	rm -rf "$(OUT)" "$(INSTALLER_OUT)" "$(OUT_LINUX)"
 
 # --- 7. Deploy targets (private) ---------------------------------------------
 #
