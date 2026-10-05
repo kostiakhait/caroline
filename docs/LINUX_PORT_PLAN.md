@@ -495,6 +495,40 @@ global-hotkey/window-stacking behavior under XWayland is uncertain and needs ver
 desktop session before relying on it. A real Linux machine/VM is still worth having for final
 pre-release validation.
 
+### Disposable test-box recipe (used 2026-10-04/05, destroyed after use)
+
+Every live verification in this doc (Phase 4's UI pass, the `runtime/python`/`runtime/codex`
+provisioning, the full-screen screenshot review) ran on a single-use Vultr instance, torn down once
+done, per standing instruction to never test on the user's own machine. Recipe to stand up an
+equivalent box again:
+
+- **Image**: Ubuntu 24.04.5 LTS ("Noble Numbat"), kernel 6.8.0-146-generic, x86_64.
+- **Size**: 1 vCPU, 2 GiB RAM, 52 GiB disk was enough for the full install plus both runtimes
+  (`runtime/python` + `runtime/codex`) with room to spare (~14 GiB used of 52 GiB).
+- **Access**: root over SSH with a key pair (`~/.ssh/id_rsa` on the dev machine).
+- **Packages** (`apt-get install`): `xvfb`, `openbox`, `python3-gi`, `gir1.2-webkit2-4.1`,
+  `python3-xlib`, `desktop-file-utils`, `locales`, `ffmpeg`, `gstreamer1.0-plugins-good`,
+  `gstreamer1.0-plugins-bad`, `gstreamer1.0-plugins-ugly`, `gstreamer1.0-libav`.
+  (`python3-gi`/`gir1.2-webkit2-4.1`/`python3-xlib` went through apt rather than pip -- PEP 668
+  externally-managed-environment blocks pip into system python3 directly, see Phase 4's notes.)
+- **Locale**: `locale-gen ru_RU.UTF-8` (needed to verify real Russian date/time formatting and text
+  rendering, not just English).
+- **Display**: `Xvfb :1 -screen 0 1920x1080x24 &` then `openbox &` against `DISPLAY=:1` -- a full
+  virtual desktop with window decorations and stacking, no physical display needed.
+- **System python3**: 3.12.3 (Ubuntu's own, used to run `linux-shell/caroline_shell.py` itself --
+  needs the `python3-gi`/WebKit2 bindings above, tied to the OS package versions).
+- **Bundled runtimes** (built via `linux-shell/provision_runtime.sh`, not apt): `runtime/python`
+  3.12.15 (python-build-standalone) and `runtime/codex` 0.155.1 -- see that script and its section
+  above for exact source URLs and pinned hashes.
+- **Screenshot/input tooling for automated verification** (not part of the product, dev-only):
+  a separate venv (`/root/venv`) with `mss` (screenshots) and the repo's own `backend-py` on
+  `PYTHONPATH` for `app.plugins._x11_window`/`_x11_input` (window listing, click/move via Xlib) --
+  the same modules the product's own automation plugins use, reused here as a test driver instead of
+  installing a separate tool like `xdotool`.
+
+None of this is unusual or hard to reproduce; recorded here only so standing up the next disposable
+box doesn't require re-deriving it from scratch.
+
 ## Critical files (representative, not exhaustive)
 
 - `backend-py/app/workspace_dir.py`, `supervisor.py`, `app/chat_session.py` (~line 2507),
