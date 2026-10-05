@@ -141,31 +141,57 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
     return name
 
 
-def _gender_agreement_clause(gender: str | None) -> str:
+def _first_person_examples(gender_lower: str) -> str | None:
+    if "female" in gender_lower:
+        return '"поняла" not "понял", "сказала" not "сказал", "сделала" not "сделал"'
+    if "male" in gender_lower:
+        return '"понял" not "поняла", "сказал" not "сказала", "сделал" not "сделала"'
+    return None
+
+
+def _second_person_examples(gender_lower: str) -> str | None:
+    if "female" in gender_lower:
+        return '"ты сделала" not "ты сделал", "ты сказала" not "ты сказал"'
+    if "male" in gender_lower:
+        return '"ты сделал" not "ты сделала", "ты сказал" not "ты сказала"'
+    return None
+
+
+def _gender_agreement_clause(speaker_gender: str | None, addressee_gender: str | None = None) -> str:
     """Same grammatical-gender-agreement rule persona.py's own system-prompt
-    block states for the main session (persona_system_prompt_append) --
+    block states for the main session (persona_system_prompt_append) and
+    owner_profile.py's own clause states for addressing the owner --
     duplicated here (not imported/shared) because this module's callers are
     a completely separate, small-model side channel (narration drafting,
-    forced translation) that never sees that system prompt at all. Without
-    this, a translated/drafted first-person line has no idea which
-    grammatical gender to use and defaults inconsistently -- confirmed live
-    (2026-09-26): the narrator kept coming out masculine in Russian despite
-    Caroline's persona being female. Returns "" (no clause at all) when
-    gender is unknown, rather than guessing."""
-    if not gender:
-        return ""
-    gender_lower = gender.lower()
-    if "female" in gender_lower:
-        examples = '"поняла" not "понял", "сказала" not "сказал", "сделала" not "сделал"'
-    elif "male" in gender_lower:
-        examples = '"понял" not "поняла", "сказал" not "сказала", "сделал" not "сделала"'
-    else:
-        return ""
-    return (
-        f" The speaker is {gender} -- in every language where verbs/adjectives inflect for the speaker's "
-        f"grammatical gender (e.g. Russian past tense), use that gender's forms consistently, e.g. {examples} "
-        "-- never mix or default to the other gender."
-    )
+    forced translation) that never sees either system prompt at all.
+    Without this, a translated/drafted line has no idea which grammatical
+    gender to use for the SPEAKER (Caroline, first person: "я сделала") or
+    for who she's ADDRESSING/describing (the owner, second/third person:
+    "ты сделал") and defaults inconsistently -- confirmed live (2026-09-26)
+    for the speaker side, and again (2026-10-05, explicit report: "все
+    время ко мне в женском роде обращается") for the addressee side --
+    translating from English (no grammatical gender marking on "you") left
+    the owner's own gender completely unknown to the translator, so it
+    guessed. Each half is independent and optional: pass whichever genders
+    are actually known; an unknown one is simply omitted, never guessed."""
+    parts = []
+    speaker_examples = _first_person_examples(speaker_gender.lower()) if speaker_gender else None
+    if speaker_examples:
+        parts.append(
+            f"The speaker (Caroline, first person) is {speaker_gender} -- in every language where verbs/"
+            f"adjectives inflect for the speaker's grammatical gender (e.g. Russian past tense), use that "
+            f"gender's forms consistently, e.g. {speaker_examples} -- never mix or default to the other gender."
+        )
+    addressee_examples = _second_person_examples(addressee_gender.lower()) if addressee_gender else None
+    if addressee_examples:
+        parts.append(
+            f"The person being addressed or referred to (second/third person -- \"ты\"/\"он\"/\"она\", or a past-"
+            f"tense verb about something THEY did) is {addressee_gender} -- a fact about THEM, separate from "
+            f"the speaker's own gender (if stated elsewhere in this instruction); use grammatical forms "
+            f"matching THEIR gender, e.g. {addressee_examples} -- never bleed the speaker's own gender into "
+            "how they're addressed."
+        )
+    return (" " + " ".join(parts)) if parts else ""
 
 
 # Bug fix (2026-09-26), per explicit instruction ("3 с разными промптами"): three
@@ -174,7 +200,10 @@ def _gender_agreement_clause(gender: str | None) -> str:
 # fail the same way again for the same reason. Each still ends in the same <translation>
 # tag contract so translate_text's own extraction/garbage-filter logic doesn't need to
 # know which variant answered.
-async def translate_text(text: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None) -> str | None:
+async def translate_text(
+    text: str, language: str, session: str | None = None, timeout: float = 30.0,
+    gender: str | None = None, addressee_gender: str | None = None,
+) -> str | None:
     """Per explicit instruction (2026-09-13): the target language for a
     generated piece of text (progress narration, today) must come from
     Caroline's own DEDICATED, already-continuously-refreshed language
@@ -224,7 +253,7 @@ async def translate_text(text: str, language: str, session: str | None = None, t
     same philosophy as everywhere else it's used."""
     body: dict[str, Any] = {
         "command": "ai:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
-        "instructions": _gender_agreement_clause(gender) or None,
+        "instructions": _gender_agreement_clause(gender, addressee_gender) or None,
     }
     if session:
         body["session"] = session
@@ -595,7 +624,7 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
 
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
-    activity: str | None = None,
+    activity: str | None = None, addressee_gender: str | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
@@ -765,7 +794,7 @@ async def generate_progress_comment(
     # report a language mismatch, so a forced pass is the only guarantee.
     # Falls back to the untranslated text on any failure -- a narration
     # comment in the wrong language is still better than none at all.
-    translated = await translate_text(text, language, session=session, timeout=timeout, gender=gender)
+    translated = await translate_text(text, language, session=session, timeout=timeout, gender=gender, addressee_gender=addressee_gender)
     final_text = translated or text
     if translated is None:
         log_event("plugin:voice", "generate_progress_comment_translate_failed_using_original", text=text[:300])
