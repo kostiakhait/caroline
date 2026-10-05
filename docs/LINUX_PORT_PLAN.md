@@ -344,12 +344,11 @@ Windows" per explicit instruction):
 confirmed live by checking `_NET_WM_STATE` via `xprop` directly -- `set_keep_above(True)` actually
 adds `_NET_WM_STATE_ABOVE` on this WM (openbox), not just a no-op GTK call.
 
-Still open: tray, and packaging itself (actually wiring the
-`.desktop` file into an installer, bundling the icon it references, settings persistence). The
-wwwroot path still points at the WPF project's own assets; Phase 5 must copy them into the package.
-The emoji/icon-font gap (📎, 🎙️, etc. render as boxes) is tracked separately -- drawn replacement
-icons exist outside the repo pending a decision on light-background contrast, not yet wired in
-beyond the dark-background-only tab-strip hamburger (`linux-shell/icons/menu.png`).
+Still open: tray, and packaging itself (actually wiring the `.desktop` file into an installer,
+bundling the icon it references, settings persistence). The emoji/icon-font gap (📎, 🎙️, etc.
+render as boxes) is tracked separately -- drawn replacement icons exist outside the repo pending a
+decision on light-background contrast, not yet wired in beyond the dark-background-only tab-strip
+hamburger (`linux-shell/icons/menu.png`).
 
 ### Phase 5 -- installer/packaging
 
@@ -379,12 +378,28 @@ Linux at all. The bullets below replace the original (now-stale) .NET-publish-ce
 - `ShortcutManager.cs`'s COM-based `.lnk` creation -> `linux-shell/caroline.desktop` (already
   written and verified, see Phase 4) -- the installer's job is substituting `@INSTALL_DIR@` and
   copying it into `~/.local/share/applications/` and `~/.config/autostart/`.
-- `Makefile`: add a Linux packaging target that copies `linux-shell/`, `backend-py/`,
-  `Windows/Caroline/wwwroot/` (still the only copy of the chat assets -- see Phase 4's own note that
-  this needs to move or be shared properly, not stay WPF-project-relative on Linux), the fonts/icons
-  already in `linux-shell/fonts`+`linux-shell/icons`, and whatever `runtime/` ends up looking like,
-  into an AppImage; replace the PowerShell-based SHA-256/date commands in the zip-packaging step
-  with `sha256sum`/`date` for this target specifically (the Windows zip step itself is unaffected).
+- **`make dist-linux` done and verified (2026-10-06)**: assembles `linux-shell/` (fonts/icons
+  included), `backend-py/` (app, `run_server.py`, `supervisor.py`, the same conditional camerlengo
+  vendoring the Windows build does), and `wwwroot` copied as a real sibling -- no `dotnet publish`,
+  since there's nothing to compile. `caroline_shell.py`'s own `_default_wwwroot()` checks that
+  sibling location first now (falling back to the WPF project's copy only for an un-packaged dev-
+  tree checkout). Verified end to end: copied the assembled tree to a clean directory on the test
+  box, ran it with only `CAROLINE_APP_ROOT` set (no other env var overrides), and the full UI
+  rendered correctly -- the first time this shell ran with every path resolved from packaging
+  conventions instead of hand-set env vars.
+- **AppImage wrapping validated end to end (2026-10-06)**, separately from the still-open
+  `runtime/python`/`runtime/codex` provisioning gap below: built a real `.AppImage` (`appimagetool`,
+  an `AppRun` script setting `CAROLINE_APP_ROOT` and exec'ing the system python3 against
+  `linux-shell/caroline_shell.py`) from the `dist-linux` output plus a manually-assembled
+  `runtime/python` venv, and ran it directly (simulating a double-click) on the test box -- it
+  launched, resolved every path correctly, and rendered the splash screen. FUSE is available on the
+  test box (`/dev/fuse`, `fusermount`/`fusermount3`); `--appimage-extract-and-run` also works as a
+  fallback for environments without it. Not yet wired into the Makefile as a real target -- this was
+  a manual proof that the mechanism itself works, blocked from being a committed target by the same
+  `runtime/` provisioning gap (an AppImage with no backend runtime inside it would be genuinely
+  broken, not just untested). Also surfaced and fixed a real shell bug while testing this: a missing
+  bundled runtime used to fail with nothing visible at all (no window, no terminal output -- `log()`
+  only writes to the log file); fixed to show a GTK error dialog naming the expected path.
 
 **Open gap, found 2026-10-05: there is no build step anywhere in this repo that provisions
 `runtime/python` or `runtime/codex`, for either platform.** `CarolineInstaller` itself never
