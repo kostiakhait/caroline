@@ -193,9 +193,8 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	fi
 	@echo "Linux shell package complete: $(OUT_LINUX)"
 	@echo "NOTE: runtime/python and runtime/codex are NOT produced by this recipe (it's plain file"
-	@echo "      copying, cross-platform by design). For runtime/python, run on a Linux host:"
+	@echo "      copying, cross-platform by design). Run on a Linux host:"
 	@echo "      linux-shell/provision_runtime.sh $(OUT_LINUX)"
-	@echo "      runtime/codex provisioning is not yet scripted -- see docs/LINUX_PORT_PLAN.md."
 
 dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
 

@@ -431,9 +431,17 @@ and it reached a fully healthy state -- `backend_started`, `GET /status` and `GE
 both 200, no traceback, normal engine startup log lines (`ensure_recurring_backup_already_seeded`,
 `due_check_loop_starting`, etc.).
 
-`runtime/codex` (the compiled `codex-app-server` Linux binary) is still unprovisioned -- not yet
-attempted this session. Likely just `curl -fsSL https://chatgpt.com/codex/install.sh | sh` into
-the runtime tree, per Codex's own documented install flow, but unverified.
+`runtime/codex` is provisioned by the same script, pinned to the same release as Windows' own
+`CodexInstaller.cs` (`0.155.1`): the upstream `codex-app-server-package-x86_64-unknown-linux-musl.tar.gz`,
+sha256-verified against the release's own `codex-package_SHA256SUMS`. Its layout (`bin/codex-app-server`
+with sibling `bin/codex-code-mode-host`, `codex-path/rg`, `codex-resources/`) is exactly what
+`supervisor.py` already expects for Linux. Deliberately NOT using `chatgpt.com/codex/install.sh`: it
+edits shell profiles and symlinks into `$HOME`, which is wrong for a self-contained `runtime/` tree.
+Unlike Windows, this is fetched from GitHub rather than our own dependency mirror -- the mirror has no
+Linux archive uploaded yet, so this is an open follow-up, not a decided design.
+
+Verified end-to-end on a clean `runtime/`: the script provisioned both trees from scratch, and the
+supervisor started healthy against them.
 
 ## Maintenance-burden note (for future reference)
 
