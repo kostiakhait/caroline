@@ -353,18 +353,38 @@ beyond the dark-background-only tab-strip hamburger (`linux-shell/icons/menu.png
 
 ### Phase 5 -- installer/packaging
 
-- `dotnet publish -r linux-x64 --self-contained` producing one binary, same model as Windows.
-- AppImage-wrap that binary (`appimagetool`) for reliable double-click launch.
-- Bundle a portable Python via `python-build-standalone`'s Linux builds (no system-Python
-  dependency, matching the Windows embeddable-Python bundling philosophy).
+**Revised 2026-10-06 to match the pivot away from Avalonia** (see Phase 4's own "Pivot" note): the
+shell is `linux-shell/*.py`, not a compiled .NET binary, so there is nothing to `dotnet publish` on
+Linux at all. The bullets below replace the original (now-stale) .NET-publish-centric plan.
+
+- No `dotnet publish` for the shell -- it's plain Python, runs via the system python3 (see Phase 4's
+  own finding on why: `python3-gi`/`gir1.2-webkit2-4.1` are system packages, not something bundled
+  into an isolated runtime the way the backend's own deps are). The installer's job is laying files
+  down and declaring package dependencies, not compiling anything for the shell.
+- AppImage packaging needs to bundle `python3-gi`/`gir1.2-webkit2-4.1`/GTK3/WebKitGTK themselves
+  (not just reference them), since an AppImage can't rely on the host having matching versions
+  installed -- more involved than a typical AppImage (which usually just bundles app-specific
+  libs), worth validating early rather than assuming it'll "just work" like the backend's own
+  self-contained runtime does.
+- `runtime/python` (backend-py's own isolated interpreter, with `claude_agent_sdk`) and
+  `runtime/codex` stay the same shape as Windows -- see the still-open provisioning gap noted below,
+  which applies equally regardless of this pivot.
 - Drop Node.js/`NodeInstaller`/`GitBashInstaller` entirely (dead weight / unnecessary on Linux).
-- `ffmpeg`/`codex-app-server` dependency installers: fetch Linux build artifacts.
+- `ffmpeg` dependency: fetch a Linux build artifact, same bundling idea as Windows -- but see Phase
+  4's Visual Mode finding: `ffmpeg` is only needed at all once a XcfaRenderer bridge exists, which it
+  doesn't yet, so this is lower priority than it was when Visual Mode was assumed portable.
+  `codex-app-server`: fetch a Linux build, same as Windows' own `CodexInstaller`-shaped step.
 - `DefenderExclusion.cs`/`RestartManagerHelper.cs`: no Linux equivalent, drop entirely -- also
   means the Linux installer needs **no elevation at all**, a real simplification vs. Windows.
-- `ShortcutManager.cs`'s COM-based `.lnk` creation -> a plain `.desktop` file (simpler, no COM
-  interop needed).
-- `Makefile`: add a `linux-x64` publish path alongside the existing `win-x64` ones; replace the
-  PowerShell-based SHA-256/date commands in the zip-packaging step with `sha256sum`/`date`.
+- `ShortcutManager.cs`'s COM-based `.lnk` creation -> `linux-shell/caroline.desktop` (already
+  written and verified, see Phase 4) -- the installer's job is substituting `@INSTALL_DIR@` and
+  copying it into `~/.local/share/applications/` and `~/.config/autostart/`.
+- `Makefile`: add a Linux packaging target that copies `linux-shell/`, `backend-py/`,
+  `Windows/Caroline/wwwroot/` (still the only copy of the chat assets -- see Phase 4's own note that
+  this needs to move or be shared properly, not stay WPF-project-relative on Linux), the fonts/icons
+  already in `linux-shell/fonts`+`linux-shell/icons`, and whatever `runtime/` ends up looking like,
+  into an AppImage; replace the PowerShell-based SHA-256/date commands in the zip-packaging step
+  with `sha256sum`/`date` for this target specifically (the Windows zip step itself is unaffected).
 
 **Open gap, found 2026-10-05: there is no build step anywhere in this repo that provisions
 `runtime/python` or `runtime/codex`, for either platform.** `CarolineInstaller` itself never
