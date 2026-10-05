@@ -340,7 +340,11 @@ Windows" per explicit instruction):
   in `MainWindow.xaml.cs` registers autostart itself -- mirrored here: nothing in
   `caroline_shell.py` does either).
 
-Still open: tray, always-on-top live verification, and packaging itself (actually wiring the
+**Always-on-top verified**: `set_always_on_top` (already wired to `window.set_keep_above`) was
+confirmed live by checking `_NET_WM_STATE` via `xprop` directly -- `set_keep_above(True)` actually
+adds `_NET_WM_STATE_ABOVE` on this WM (openbox), not just a no-op GTK call.
+
+Still open: tray, and packaging itself (actually wiring the
 `.desktop` file into an installer, bundling the icon it references, settings persistence). The
 wwwroot path still points at the WPF project's own assets; Phase 5 must copy them into the package.
 The emoji/icon-font gap (📎, 🎙️, etc. render as boxes) is tracked separately -- drawn replacement
