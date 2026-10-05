@@ -267,9 +267,21 @@ working: tried `Avalonia.Controls.WebView` 12.1.0 (official avaloniaui package, 
 adapter) with `NativeWebView` + `Source`, WebKitGTK 4.1 installed on the test box. It built, but no
 WebKit process started and no content rendered, even with an explicit minimum height. The package's
 own README steers Linux toward `NativeWebDialog` (a separate native window) instead of the embedded
-control. Reverted; nothing committed for this. Open: either embed-with-a-different-approach, or accept
-separate windows (`NativeWebDialog` or Phase 3's Playwright windows), which contradicts the embedded
-choice and needs the user's decision.
+control. Reverted; nothing committed for this.
+
+**Pivot (2026-10-05): the Linux shell is now Python, not Avalonia.** The user chose to move the shell
+to Python + WebKit2. Verified on the test box, in order:
+- `pywebview` 6.2.1 and 5.4 on GTK: page and JS bridge work, but the window never maps. Dropped.
+- Bare WebKit2 inside GTK 3 (`PyGObject`): window maps and renders.
+- JS to Python and back through `WebKit2` script message handler: works.
+- `linux-shell/caroline_shell.py`: GTK window, WebKit2 view, `window.chrome.webview` shim (the page's
+  WebView2 API), local HTTP server for `Windows/Caroline/wwwroot`, supervisor start and stop. The real
+  chat page loads and renders. Backend shows `reconnecting` on the test box because `claude_agent_sdk`
+  isn't installable there. Supervisor cleanup on SIGTERM verified (no leftover process).
+
+Not done: the viewer windows, tray, hotkey, autostart, always-on-top verification, and packaging. The
+wwwroot path still points at the WPF project's assets; Phase 5 must copy them into the package. Icon
+font: the test box has no icon font, so icons render as boxes there. Phase 5 must bundle it.
 
 ### Phase 5 -- installer/packaging
 
