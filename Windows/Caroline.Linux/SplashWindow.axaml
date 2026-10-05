@@ -1,0 +1,25 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Caroline.SplashWindow"
+        Title="Caroline"
+        WindowDecorations="None"
+        TransparencyLevelHint="Transparent"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        CanResize="False"
+        WindowStartupLocation="CenterScreen"
+        Width="480" Height="320"
+        PointerPressed="OnPointerPressed">
+    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+        <!-- Rounded corners via Border.CornerRadius clipping an ImageBrush
+             background: same technique the WPF version used, Avalonia
+             supports it identically. -->
+        <Border x:Name="PhotoBorder" Width="480" Height="270" CornerRadius="18" Background="Black" />
+        <TextBlock x:Name="ConnectingText" Text="Connecting..." Foreground="White" FontSize="16"
+                   HorizontalAlignment="Center" Margin="0,12,0,0">
+            <TextBlock.Effect>
+                <DropShadowEffect Color="Black" BlurRadius="8" OffsetX="0" OffsetY="0" Opacity="0.8" />
+            </TextBlock.Effect>
+        </TextBlock>
+    </StackPanel>
+</Window>

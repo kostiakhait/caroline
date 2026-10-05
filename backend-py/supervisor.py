@@ -80,6 +80,24 @@ STARTUP_GRACE_S = 10 * 60
 STUCK_TURN_MS = 5 * 60_000
 
 
+def _set_parent_death_signal() -> None:
+    """Linux: ask the kernel to SIGKILL this process when its parent dies.
+
+    Signal handlers in the parent can't cover this -- a GUI host (Avalonia on
+    X11) may exit on SIGTERM without running any managed cleanup, and SIGKILL
+    can never be caught at all. PR_SET_PDEATHSIG is enforced by the kernel
+    regardless of how the parent dies. Called in the child right after
+    spawn (preexec_fn) and at this process's own startup, so both
+    supervisor.py and the backend it owns are covered.
+    """
+    import ctypes
+    import signal
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    PR_SET_PDEATHSIG = 1
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+
+
 def _resolve_pythonw_exe() -> str:
     """Mirrors BackendProcess.cs's ResolvePythonwExe: prefer the
     installer's own isolated embeddable Python (a sibling of the app's own
@@ -203,6 +221,7 @@ class Supervisor:
                 cwd=str(_BACKEND_PY_DIR),
                 env=_child_env(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                preexec_fn=_set_parent_death_signal if sys.platform != "win32" else None,
                 # Linux-port bug fix (2026-10-05): makes run_server.py the leader of its
                 # own new process group so _kill_pid's os.killpg can reach its whole
                 # descendant tree -- see _kill_pid's own doc comment. False (the default,
@@ -408,4 +427,6 @@ async def post_restart() -> JSONResponse:
 
 
 if __name__ == "__main__":
+    if sys.platform != "win32":
+        _set_parent_death_signal()
     uvicorn.run(app, host="127.0.0.1", port=SUPERVISOR_PORT)

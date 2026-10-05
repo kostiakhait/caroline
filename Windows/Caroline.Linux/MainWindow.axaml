@@ -1,0 +1,11 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Caroline.MainWindow"
+        Title="Caroline"
+        Width="420" Height="760">
+    <DockPanel>
+        <TextBlock DockPanel.Dock="Top" x:Name="StatusText" Text="Starting..." Margin="12" FontSize="14" />
+        <TextBox x:Name="LogBox" AcceptsReturn="True" IsReadOnly="True" FontFamily="monospace" FontSize="11"
+                 TextWrapping="NoWrap" />
+    </DockPanel>
+</Window>

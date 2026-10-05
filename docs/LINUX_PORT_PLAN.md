@@ -232,6 +232,38 @@ Port, not rewrite-from-scratch, each existing WPF surface:
 - `XcfaRenderer` (vendored `ProjectReference`) -- not yet audited for hidden Win32 P/Invoke; a real
   open question, not assumed portable.
 
+**Status: in progress (2026-10-05).** New project `Windows/Caroline.Linux` (Avalonia 12.1.3, net8.0,
+namespace `Caroline` to match the WPF project). Windows/Caroline is untouched.
+
+Done and verified on the Vultr Ubuntu 24.04 box (Xvfb + openbox):
+- `SplashWindow` (transparent, banner cycle, click to dismiss), `MainWindow` (placeholder status view
+  and log box), `App` startup (single-instance guard, global exception logging).
+- `Native/SupervisorClient` launches `python3 backend-py/supervisor.py` from the bundled
+  `runtime/python/bin/python3`, streams its output, and polls its `/status` endpoint. Confirmed with a
+  real child process and a real 200 response.
+- `Services/Logger.cs` is reused unchanged: .NET resolves LocalApplicationData to `~/.local/share` on
+  Linux, so the WPF file works as-is.
+- Cross-compiling `linux-x64` from the Windows dev box works.
+
+Real findings from the teardown work:
+- **Killing the shell with SIGTERM left `supervisor.py` orphaned.** Investigated in order:
+  - `AppDomain.ProcessExit` does fire on SIGTERM for a plain .NET console app, but does NOT fire for
+    the Avalonia/X11 host.
+  - `PosixSignalRegistration` for SIGTERM/SIGINT did not run either (the process exits first).
+  - Fix that works: `backend-py/supervisor.py` calls `prctl(PR_SET_PDEATHSIG, SIGKILL)` on itself
+    and on the backend it spawns (Linux only, no-op on Windows). The kernel then kills the child
+    whenever the shell dies, including SIGKILL, which no handler can catch.
+  - Verified: after SIGTERM and after SIGKILL, no supervisor process remains.
+  - Not verified: the grandchild (`run_server.py`) path. It can't stay up on the test box because
+    `claude_agent_sdk` isn't installable there, so that half is covered by code review only.
+- Test-harness gotcha, not a product bug: `pkill -f <pattern>` run inline over SSH matches the
+  remote shell's own command line and kills the session. Run such commands from a script file.
+
+Not started: `DocumentViewerWindow`, `VisualModeWindow`/`VisualModeManager`, tray icon (DBus
+StatusNotifierItem), global hotkey (`XGrabKey`), autostart (`.desktop`), the real chat-tab UI. The
+open design question for chat/viewer web content is unchanged: a Playwright chrome-less window per
+surface (same approach as Phase 3), not a new native webview binding.
+
 ### Phase 5 -- installer/packaging
 
 - `dotnet publish -r linux-x64 --self-contained` producing one binary, same model as Windows.
