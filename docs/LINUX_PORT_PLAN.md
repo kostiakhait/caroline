@@ -463,6 +463,20 @@ slideshow viewers. Fixed along the way:
 New runtime dependency: video playback needs the GStreamer plugin sets
 (`gstreamer1.0-plugins-good`, `-bad`, `-libav`, `-ugly`) on the host.
 
+**Full-screen review, 2026-10-05 (same test box).** Re-captured every screen as whole-screen shots
+(not window crops) to see exactly what a user lands on. Two real UX issues found, neither fixed yet --
+both are product decisions, not bugs to just patch:
+- On a cold start with no account configured, the SquirrelWisdom login viewer opens on top of the
+  chat window and fully covers it. The chat behind it is invisible until Cancel/X is clicked. Matches
+  `_open_login_viewer`'s current behavior exactly (same trigger as Windows's own login prompt), but
+  seeing it full-screen makes the effect clearer than a cropped shot did.
+- A brand-new tab shows the red "stop" button instead of the send button, because the backend reports
+  `turnPending: true` with no account connected. Visible on every cold-start screenshot. Needs a
+  decision on how the UI should represent "no account yet" rather than "a turn is in flight".
+
+Screens and the presentation page referencing them: `d:\tmp\full\` (not committed -- scratch per
+standing instruction) and `d:\tmp\pres\index.html`.
+
 ## Maintenance-burden note (for future reference)
 
 backend-py (the bulk of day-to-day feature work -- plugins, policies, memory) stays a single shared
