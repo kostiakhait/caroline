@@ -310,12 +310,42 @@ Windows" per explicit instruction):
   the exact signal `chat.js` already uses (Windows side, "model not warmed yet") to fall back to
   plain audio -- so a voice reply stays audible instead of `chat.js` hanging on a reply that would
   otherwise never arrive. `visual_mode_config`/`visual_speech_start/stop/cancel` are no-ops (no
-  native reply is expected for these on Windows either). Still open: tray, hotkey, autostart,
-  always-on-top live verification, and packaging. The wwwroot path still points at the WPF
-  project's own assets; Phase 5 must copy them into the package. The emoji/icon-font gap (📎, 🎙️,
-  etc. render as boxes) is tracked separately -- drawn replacement icons exist outside the repo
-  pending a decision on light-background contrast, not yet wired in beyond the dark-background-only
-  tab-strip hamburger (`linux-shell/icons/menu.png`).
+  native reply is expected for these on Windows either).
+- **Single-instance guard**: `flock(LOCK_EX | LOCK_NB)` on `<XDG_DATA_HOME>/caroline/caroline.lock`
+  (the direct analog of the WPF build's named Mutex) -- released automatically by the kernel if the
+  process dies without closing it, no stale-lock cleanup needed. A second launch shows the same
+  "Caroline is already running." message and starts no second supervisor/backend. Verified live:
+  confirmed via the shell log that only one supervisor/backend process ever started with two
+  instances launched back to back.
+- **Global hotkey**: `linux-shell/hotkeys.py` uses `XGrabKey` on the root window (the direct X11
+  analog of `RegisterHotKey`/`WM_HOTKEY`, `GlobalHotkeyService.cs`) on a background thread (python-
+  xlib's event loop blocks), marshaling callbacks onto the GTK main loop via `GLib.idle_add`. Same
+  two bindings/defaults as `MainWindow.xaml.cs`: Ctrl+Alt+C toggles window visibility, Ctrl+Shift+C
+  toggles voice recording on the active tab. Neither is user-configurable yet (no settings
+  persistence). Verified live: two Ctrl+Alt+C presses toggled real X11 window visibility
+  (`_x11_window.list_windows`) from visible to hidden and back.
+- **`.desktop` file** (`linux-shell/caroline.desktop`): passes `desktop-file-validate`, and a
+  substituted copy placed in `~/.local/share/applications/` actually launches the app correctly via
+  `gtk-launch` (confirmed by a real new window with the right pid). `X-GNOME-Autostart-enabled=true`
+  is set so the same file works for both the app-menu entry and (copied into
+  `~/.config/autostart/`) autostart -- matches `Autostart.cs`'s own two roles. **Found while writing
+  this**: unlike the backend (`runtime/python`, fully self-contained), the shell's own Python
+  process needs the SYSTEM python3 specifically, because `python3-gi`/`gir1.2-webkit2-4.1` are
+  system packages tied to the installed GTK3/WebKitGTK library versions -- not something pip-
+  installable into an isolated venv/bundled runtime the way the backend's own dependencies are.
+  Phase 5's installer needs to either declare these as runtime package dependencies or find another
+  way to bundle them; it can't just copy a self-contained Python tree for the shell the way it does
+  for the backend. Registering the `.desktop` file into those two directories at install time is
+  itself still Phase 5's job (`Autostart.cs`'s own role on Windows is 100% installer-side, nothing
+  in `MainWindow.xaml.cs` registers autostart itself -- mirrored here: nothing in
+  `caroline_shell.py` does either).
+
+Still open: tray, always-on-top live verification, and packaging itself (actually wiring the
+`.desktop` file into an installer, bundling the icon it references, settings persistence). The
+wwwroot path still points at the WPF project's own assets; Phase 5 must copy them into the package.
+The emoji/icon-font gap (📎, 🎙️, etc. render as boxes) is tracked separately -- drawn replacement
+icons exist outside the repo pending a decision on light-background contrast, not yet wired in
+beyond the dark-background-only tab-strip hamburger (`linux-shell/icons/menu.png`).
 
 ### Phase 5 -- installer/packaging
 

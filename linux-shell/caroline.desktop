@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Caroline
+Comment=Konstantin's AI assistant
+Exec=/usr/bin/python3 @INSTALL_DIR@/linux-shell/caroline_shell.py
+Icon=caroline
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
