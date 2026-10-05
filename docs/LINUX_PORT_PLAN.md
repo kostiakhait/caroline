@@ -298,6 +298,26 @@ font: the test box has no icon font, so icons render as boxes there. Phase 5 mus
 - `Makefile`: add a `linux-x64` publish path alongside the existing `win-x64` ones; replace the
   PowerShell-based SHA-256/date commands in the zip-packaging step with `sha256sum`/`date`.
 
+**Open gap, found 2026-10-05: there is no build step anywhere in this repo that provisions
+`runtime/python` or `runtime/codex`, for either platform.** `CarolineInstaller` itself never
+installs anything -- it only downloads and extracts a pre-built `Caroline.zip`
+(`DownloadsInfo.cs`/`Downloader.cs`) that already contains a working `runtime/python` (with
+`claude_agent_sdk` in site-packages) and a working `runtime/codex` (with a compiled
+`codex-app-server` binary). No script in this repo builds that `runtime/` tree from a clean
+checkout -- confirmed by the same search that found no `requirements.txt`/pinned-deps manifest
+anywhere (see Phase 2's own note). It was assembled by hand at some point and has just been reused
+since.
+
+Both SDKs do publish for Linux (confirmed 2026-10-05): `claude-agent-sdk` ships glibc 2.17+ x86-64
+and ARM64 wheels on PyPI, each bundling a prebuilt `claude` CLI; Codex's `app-server` officially
+supports Linux (`codex app-server daemon bootstrap --remote-control`, same interface
+`backend-py/app/engines/codex_rpc.py` already talks to). So this is NOT a Linux-specific blocker --
+but Phase 5 can't just "do what Windows does," because what Windows does today is undocumented and
+manual. This phase needs to actually write the provisioning step (`pip install claude-agent-sdk`
+into a `python-build-standalone` tree, plus however the real `codex-app-server` Linux binary gets
+obtained) as a real, repeatable build step -- not hand-assembled once like the Windows `runtime/`
+was.
+
 ## Maintenance-burden note (for future reference)
 
 backend-py (the bulk of day-to-day feature work -- plugins, policies, memory) stays a single shared
