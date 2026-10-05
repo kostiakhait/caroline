@@ -29,6 +29,7 @@ as early as possible in main.py/run_server.py.
 from __future__ import annotations
 
 import subprocess
+import sys
 from typing import Any
 
 import anyio
@@ -43,6 +44,14 @@ _applied = False
 async def _patched_open_process(*args: Any, **kwargs: Any) -> Any:
     if _NO_WINDOW and "creationflags" not in kwargs:
         kwargs["creationflags"] = _NO_WINDOW
+    # Linux port (2026-10-05): makes the spawned claude/codex CLI process the
+    # leader of its own new process group, so _force_kill_underlying_cli_
+    # process's POSIX branch (chat_session.py) can os.killpg the whole tree
+    # instead of just the one pid -- same reasoning as supervisor.py's own
+    # identical fix for run_server.py's own spawn, see that file's doc
+    # comment on _kill_pid for the full incident this guards against.
+    if sys.platform != "win32" and "start_new_session" not in kwargs:
+        kwargs["start_new_session"] = True
     process = await _real_open_process(*args, **kwargs)
     # Bug fix (2026-09-15, "Стоп должен срабатывать ВСЕГДА"): report the
     # real pid straight back to whichever ChatSession just asked for it

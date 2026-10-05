@@ -84,7 +84,17 @@ def _resolve_pythonw_exe() -> str:
     """Mirrors BackendProcess.cs's ResolvePythonwExe: prefer the
     installer's own isolated embeddable Python (a sibling of the app's own
     install dir), fall back to "pythonw" on PATH for dev/debug runs where
-    the installer was never involved."""
+    the installer was never involved.
+
+    Linux port (2026-10-05): there is no windowless/console distinction on
+    Linux the way "pythonw" vs "python" exists on Windows (no console ever
+    gets auto-allocated for a spawned process the way Windows does for a
+    console-subsystem child) -- this collapses to a single bundled
+    `python3`, falling back to "python3" on PATH for the same dev/debug
+    reason as the Windows branch."""
+    if sys.platform != "win32":
+        isolated = _ROOT_DIR / "runtime" / "python" / "bin" / "python3"
+        return str(isolated) if isolated.exists() else "python3"
     isolated = _ROOT_DIR / "runtime" / "python" / "pythonw.exe"
     return str(isolated) if isolated.exists() else "pythonw"
 
@@ -92,20 +102,32 @@ def _resolve_pythonw_exe() -> str:
 def _child_env() -> dict[str, str]:
     """Same env vars BackendProcess.cs used to set on the child process --
     see its own comments for why each is a SIBLING of the app dir, never
-    inside it (survives the app dir being fully replaced on every update)."""
+    inside it (survives the app dir being fully replaced on every update).
+
+    Linux port (2026-10-05): no ".exe" suffix on any of these on non-Windows,
+    and no CAROLINE_NATIVEHOST_EXE_PATH at all there -- Phase 3 of the Linux
+    port (see docs/LINUX_PORT_PLAN.md) runs the embedded-browser host
+    in-process inside backend-py itself via Playwright, there is no separate
+    exe to launch, so app_browser_plugin.py's own Linux branch never reads
+    this var in the first place."""
     env = dict(os.environ)
     env["CAROLINE_MODELS_DIR"] = str(_ROOT_DIR / "art" / "models")
     env["CAROLINE_WHISPER_MODEL_PATH"] = str(_ROOT_DIR / "art" / "whisper-model")
-    env["CAROLINE_FFMPEG_PATH"] = str(_ROOT_DIR / "runtime" / "ffmpeg" / "ffmpeg.exe")
-    env["CAROLINE_CODEX_PATH"] = str(_ROOT_DIR / "runtime" / "codex" / "bin" / "codex-app-server.exe")
-    env["CAROLINE_PYTHON_PATH"] = str(_ROOT_DIR / "runtime" / "python" / "python.exe")
     env["CAROLINE_PORT"] = str(BACKEND_PORT)
-    # Caroline.NativeHost.exe (the embedded-browser host, 2026-10-03 extraction out of
-    # Caroline.exe -- see app_browser_plugin.py's own doc comment) publishes as a SIBLING of
-    # Caroline.exe and this backend-py dir inside the same app-<hash> folder (_APP_DIR, not
-    # _ROOT_DIR -- see the Makefile's own publish step), same layout Caroline.exe itself lives
-    # at relative to AppContext.BaseDirectory.
-    env["CAROLINE_NATIVEHOST_EXE_PATH"] = str(_APP_DIR / "Caroline.NativeHost.exe")
+    if sys.platform == "win32":
+        env["CAROLINE_FFMPEG_PATH"] = str(_ROOT_DIR / "runtime" / "ffmpeg" / "ffmpeg.exe")
+        env["CAROLINE_CODEX_PATH"] = str(_ROOT_DIR / "runtime" / "codex" / "bin" / "codex-app-server.exe")
+        env["CAROLINE_PYTHON_PATH"] = str(_ROOT_DIR / "runtime" / "python" / "python.exe")
+        # Caroline.NativeHost.exe (the embedded-browser host, 2026-10-03 extraction out of
+        # Caroline.exe -- see app_browser_plugin.py's own doc comment) publishes as a SIBLING of
+        # Caroline.exe and this backend-py dir inside the same app-<hash> folder (_APP_DIR, not
+        # _ROOT_DIR -- see the Makefile's own publish step), same layout Caroline.exe itself lives
+        # at relative to AppContext.BaseDirectory.
+        env["CAROLINE_NATIVEHOST_EXE_PATH"] = str(_APP_DIR / "Caroline.NativeHost.exe")
+    else:
+        env["CAROLINE_FFMPEG_PATH"] = str(_ROOT_DIR / "runtime" / "ffmpeg" / "ffmpeg")
+        env["CAROLINE_CODEX_PATH"] = str(_ROOT_DIR / "runtime" / "codex" / "bin" / "codex-app-server")
+        env["CAROLINE_PYTHON_PATH"] = str(_ROOT_DIR / "runtime" / "python" / "bin" / "python3")
     return env
 
 
@@ -115,9 +137,19 @@ def _kill_pid(pid: int) -> None:
     path mirrors BackendProcess.cs's own taskkill fallback (and
     chat_session.py's _force_kill_underlying_cli_process, which already
     does the identical thing for the SAME reason: a graceful stop that
-    doesn't reliably land). The POSIX branch is not exercised on Windows
-    builds today, but costs nothing to have right -- see this module's own
-    docstring on why that forward-compatibility matters here specifically."""
+    doesn't reliably land).
+
+    Linux port (2026-10-05), bug fix: the POSIX branch used to call
+    os.kill(pid, SIGKILL) on just that one pid -- NOT a tree kill despite
+    this function's own docstring/callers assuming one (confirmed by this
+    file's own Linux-port audit). A plain SIGKILL leaves every grandchild
+    (e.g. a stuck claude.exe/codex-app-server spawned BY run_server.py)
+    orphaned and running. os.killpg targets the whole process GROUP instead
+    -- this only works because Supervisor.start() now passes
+    start_new_session=True on POSIX, which makes run_server.py the leader of
+    its own fresh group that every descendant inherits, exactly mirroring
+    what taskkill's own /T flag already does via the Windows job/process-tree
+    walk."""
     if sys.platform == "win32":
         subprocess.Popen(
             ["taskkill.exe", "/F", "/T", "/PID", str(pid)],
@@ -127,7 +159,7 @@ def _kill_pid(pid: int) -> None:
     else:
         import signal
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
 
@@ -171,6 +203,11 @@ class Supervisor:
                 cwd=str(_BACKEND_PY_DIR),
                 env=_child_env(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                # Linux-port bug fix (2026-10-05): makes run_server.py the leader of its
+                # own new process group so _kill_pid's os.killpg can reach its whole
+                # descendant tree -- see _kill_pid's own doc comment. False (the default,
+                # a no-op) on Windows; start_new_session is POSIX-only.
+                start_new_session=(sys.platform != "win32"),
                 stdout=asyncio.subprocess.PIPE,
                 # Merged into stdout, same as BackendProcess.cs piping both
                 # OutputDataReceived and ErrorDataReceived into the same

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,14 @@ MAX_READ_BYTES = 200_000
 
 
 def open_file_with_default_app(path: str) -> None:
-    os.startfile(path)  # Windows-only, matching this whole codebase's platform.
+    # Linux port (2026-10-05): os.startfile doesn't exist on non-Windows at all
+    # (would raise AttributeError) -- xdg-open is the de facto standard
+    # "open with whatever the desktop considers the default app" on Linux,
+    # same effective behavior as os.startfile.
+    if sys.platform == "win32":
+        os.startfile(path)
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 
 async def open_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:

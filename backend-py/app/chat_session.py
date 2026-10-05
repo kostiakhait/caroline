@@ -2535,11 +2535,22 @@ class ChatSession:
             return
         log_event("engine", "force_kill_cli_process", tab_id=self.tab_id, pid=pid)
         try:
-            subprocess.Popen(
-                ["taskkill.exe", "/F", "/T", "/PID", str(pid)],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            if sys.platform == "win32":
+                subprocess.Popen(
+                    ["taskkill.exe", "/F", "/T", "/PID", str(pid)],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            else:
+                # Linux port (2026-10-05): os.killpg, not os.kill -- the CLI
+                # process is the leader of its own process group (see
+                # win_subprocess_patch.py's own start_new_session fix), so this
+                # reaches the same whole-tree kill taskkill's /T flag gives on
+                # Windows, not just the one pid.
+                import signal
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone -- not an error for a caller whose whole point is "make sure it's dead"
         except Exception as exc:
             log_event("engine", "force_kill_cli_process_failed", tab_id=self.tab_id, error=str(exc))
 
