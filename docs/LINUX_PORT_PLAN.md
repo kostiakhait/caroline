@@ -401,25 +401,39 @@ Linux at all. The bullets below replace the original (now-stale) .NET-publish-ce
   bundled runtime used to fail with nothing visible at all (no window, no terminal output -- `log()`
   only writes to the log file); fixed to show a GTK error dialog naming the expected path.
 
-**Open gap, found 2026-10-05: there is no build step anywhere in this repo that provisions
-`runtime/python` or `runtime/codex`, for either platform.** `CarolineInstaller` itself never
+**Gap found 2026-10-05, `runtime/python` half resolved same day.** `CarolineInstaller` itself never
 installs anything -- it only downloads and extracts a pre-built `Caroline.zip`
 (`DownloadsInfo.cs`/`Downloader.cs`) that already contains a working `runtime/python` (with
 `claude_agent_sdk` in site-packages) and a working `runtime/codex` (with a compiled
-`codex-app-server` binary). No script in this repo builds that `runtime/` tree from a clean
+`codex-app-server` binary). No script in this repo built that `runtime/` tree from a clean
 checkout -- confirmed by the same search that found no `requirements.txt`/pinned-deps manifest
-anywhere (see Phase 2's own note). It was assembled by hand at some point and has just been reused
+anywhere (see Phase 2's own note). It was assembled by hand at some point and had just been reused
 since.
 
 Both SDKs do publish for Linux (confirmed 2026-10-05): `claude-agent-sdk` ships glibc 2.17+ x86-64
 and ARM64 wheels on PyPI, each bundling a prebuilt `claude` CLI; Codex's `app-server` officially
 supports Linux (`codex app-server daemon bootstrap --remote-control`, same interface
-`backend-py/app/engines/codex_rpc.py` already talks to). So this is NOT a Linux-specific blocker --
-but Phase 5 can't just "do what Windows does," because what Windows does today is undocumented and
-manual. This phase needs to actually write the provisioning step (`pip install claude-agent-sdk`
-into a `python-build-standalone` tree, plus however the real `codex-app-server` Linux binary gets
-obtained) as a real, repeatable build step -- not hand-assembled once like the Windows `runtime/`
-was.
+`backend-py/app/engines/codex_rpc.py` already talks to). So this was never a Linux-specific
+blocker -- Phase 5 just couldn't "do what Windows does," because what Windows does is undocumented
+and manual.
+
+`runtime/python` now has a real, repeatable build step: `backend-py/requirements-linux.txt` (a
+pinned dependency list, captured by downloading a clean `python-build-standalone` CPython
+3.12.15 and iteratively resolving every `ModuleNotFoundError` hit by `from app.main import PORT,
+app` until it imported cleanly -- 41 packages, notably without the Windows-only automation extras
+`pywin32`/`playwright`/`edge-tts`/`edge-playback`, which are tied to plugins already confirmed
+Linux-incompatible in earlier phases and simply fail to import there) and
+`linux-shell/provision_runtime.sh <install_root>`, which downloads that same
+python-build-standalone release, installs the pinned requirements into it, and verifies with the
+same import check. Verified end-to-end on the test box on top of a real `dist-linux` output: ran
+the actual `supervisor.py` (not just the import) under the freshly provisioned `runtime/python`,
+and it reached a fully healthy state -- `backend_started`, `GET /status` and `GET /api/status`
+both 200, no traceback, normal engine startup log lines (`ensure_recurring_backup_already_seeded`,
+`due_check_loop_starting`, etc.).
+
+`runtime/codex` (the compiled `codex-app-server` Linux binary) is still unprovisioned -- not yet
+attempted this session. Likely just `curl -fsSL https://chatgpt.com/codex/install.sh | sh` into
+the runtime tree, per Codex's own documented install flow, but unverified.
 
 ## Maintenance-burden note (for future reference)
 

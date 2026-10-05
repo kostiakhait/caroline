@@ -1,0 +1,51 @@
+# Pinned dependency set for running backend-py under the Linux shell's
+# bundled runtime/python (see linux-shell/provision_runtime.sh). Captured via
+# `pip freeze` after iteratively resolving every ModuleNotFoundError hit by
+# `from app.main import PORT, app` on a clean python-build-standalone
+# CPython 3.12.15 interpreter -- NOT the full backend-py dependency set for
+# every platform. Windows-only extras tied to automation plugins that are
+# out of scope for this port (pywin32, playwright, edge-tts/edge-playback)
+# are intentionally absent; those plugins fail to import on Linux and are
+# skipped, same as already verified in earlier Linux-port phases.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+attrs==26.1.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+claude-agent-sdk==0.2.163
+click==8.5.0
+cryptography==50.0.2
+fastapi==0.142.2
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.13.1
+httpx==0.28.1
+httpx2==2.13.1
+idna==3.20
+jiter==0.17.0
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+mcp==2.3.0
+mcp-types==2.3.0
+openai==3.24.0
+opentelemetry-api==1.45.0
+psutil==7.2.2
+pycparser==3.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+PyJWT==2.15.1
+pymupdf==1.28.2
+python-multipart==0.0.32
+referencing==0.37.0
+requests==2.34.2
+rpds-py==2026.9.1
+sniffio==1.3.1
+sse-starlette==3.5.0
+starlette==1.7.0
+truststore==0.10.4
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0
+uvicorn==0.54.0

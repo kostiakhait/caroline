@@ -192,8 +192,10 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 		echo "WARNING: $(CAMERLENGO_REPO) has no reachable 'caroline' branch -- skipping camerlengo vendoring."; \
 	fi
 	@echo "Linux shell package complete: $(OUT_LINUX)"
-	@echo "NOTE: runtime/python (claude_agent_sdk) and runtime/codex are NOT produced by this recipe --"
-	@echo "      see docs/LINUX_PORT_PLAN.md's Phase 5 open gap. Not runnable standalone without them."
+	@echo "NOTE: runtime/python and runtime/codex are NOT produced by this recipe (it's plain file"
+	@echo "      copying, cross-platform by design). For runtime/python, run on a Linux host:"
+	@echo "      linux-shell/provision_runtime.sh $(OUT_LINUX)"
+	@echo "      runtime/codex provisioning is not yet scripted -- see docs/LINUX_PORT_PLAN.md."
 
 dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
 
