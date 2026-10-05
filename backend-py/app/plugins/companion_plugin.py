@@ -64,14 +64,17 @@ due-check loop -- NOT a plugin tool -- so it lives there, not here.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
+from app.logging_setup import log_event
 from app.plugins.companion_api import (
     AmbiguousDeviceError,
     NoPairedDeviceError,
     PhoneUnreachableError,
     UnknownDeviceError,
     device_or_all_request,
+    find_recent_duplicate_send,
     list_devices,
     remove_device,
     request_response,
@@ -159,6 +162,11 @@ async def companion_sms_send(args: dict[str, Any], report_progress: Any) -> dict
         device = await resolve_device(str(from_number).strip() if from_number else None)
     except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
         return {"text": _device_error_text(exc), "is_error": True}
+    duplicate = find_recent_duplicate_send(WORKSPACE_DIR, to, text)
+    if duplicate is not None:
+        log_event("plugin:companion", "sms_send_duplicate_blocked", to=to, earlier_op_id=duplicate.get("opId"), earlier_status=duplicate.get("status"))
+        sent_at = datetime.fromtimestamp(duplicate["ts"]).strftime("%H:%M:%S")
+        return {"text": f"An identical SMS to {to} was already sent at {sent_at} -- not sending it again. Tell the user it's already gone out."}
     try:
         result = await send_sms(WORKSPACE_DIR, _current_tab_id(), device["deviceId"], to, text, report_progress)
     except PhoneUnreachableError as exc:

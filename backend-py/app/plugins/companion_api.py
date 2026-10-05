@@ -85,6 +85,7 @@ import hashlib
 import json
 import re
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -514,7 +515,10 @@ async def run_operation(
         _journal_remove(workspace_dir, op_id)
         raise
     except Exception as exc:
-        log_event("plugin:companion", "operation_failed", op_id=op_id, error_type=type(exc).__name__, error=str(exc))
+        log_event(
+            "plugin:companion", "operation_failed", op_id=op_id, error_type=type(exc).__name__, error=str(exc),
+            traceback=traceback.format_exc(),
+        )
         await _safe_delete(request_path)
         await _safe_delete(result_path)
         _journal_remove(workspace_dir, op_id)
@@ -529,17 +533,66 @@ async def _finish_and_cleanup(workspace_dir: str, op_id: str, request_path: str,
 
 # --- model-facing operation constructors -------------------------------------
 
+SMS_DUPLICATE_WINDOW_S = 600.0
+
+
+def _recent_sends_path(workspace_dir: str) -> Path:
+    return Path(workspace_dir) / "companion-sms-recent-sends.json"
+
+
+def _load_recent_sends(workspace_dir: str) -> list[dict[str, Any]]:
+    try:
+        return json.loads(_recent_sends_path(workspace_dir).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_recent_sends(workspace_dir: str, entries: list[dict[str, Any]]) -> None:
+    _recent_sends_path(workspace_dir).write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def find_recent_duplicate_send(workspace_dir: str, to: str, text: str) -> dict[str, Any] | None:
+    """A SMS with the same recipient and text, requested within the window and
+    not already reported by the phone as a genuine failure -- including one
+    whose result we never managed to read (status "pending"), since the phone
+    may well have sent it anyway."""
+    cutoff = time.time() - SMS_DUPLICATE_WINDOW_S
+    for entry in reversed(_load_recent_sends(workspace_dir)):
+        if entry.get("ts", 0) < cutoff:
+            continue
+        if entry.get("to") == to and entry.get("text") == text and entry.get("status") != "failed":
+            return entry
+    return None
+
+
+def _record_send(workspace_dir: str, op_id: str, to: str, text: str) -> None:
+    entries = [e for e in _load_recent_sends(workspace_dir) if e.get("ts", 0) >= time.time() - SMS_DUPLICATE_WINDOW_S]
+    entries.append({"opId": op_id, "to": to, "text": text, "ts": time.time(), "status": "pending"})
+    _save_recent_sends(workspace_dir, entries)
+
+
+def _mark_send(workspace_dir: str, op_id: str, status: str) -> None:
+    entries = _load_recent_sends(workspace_dir)
+    for e in entries:
+        if e.get("opId") == op_id:
+            e["status"] = status
+    _save_recent_sends(workspace_dir, entries)
+
+
 async def send_sms(
     workspace_dir: str, tab_id: str, device_id: str, to: str, text: str, report_progress: ReportProgress,
 ) -> dict[str, Any]:
     op_id = uuid.uuid4().hex
     request_path = f"devices/{device_id}/sms/outbox/{op_id}"
     result_path = f"devices/{device_id}/sms/outbox_result/{op_id}"
+    _record_send(workspace_dir, op_id, to, text)
     result = await run_operation(
         workspace_dir, tab_id, request_path, result_path,
         {"to": to, "text": text}, f"SMS to {to}", report_progress, op_id,
     )
     await _finish_and_cleanup(workspace_dir, op_id, request_path, result_path)
+    ok = isinstance(result, dict) and bool(result.get("ok"))
+    _mark_send(workspace_dir, op_id, "sent" if ok else "failed")
     return result if isinstance(result, dict) else {"ok": False, "error": "malformed result from phone"}
 
 
