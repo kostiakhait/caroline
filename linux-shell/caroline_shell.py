@@ -39,6 +39,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
 
+from hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, GlobalHotkeyListener  # noqa: E402
 from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -454,6 +455,25 @@ class Shell:
     def reveal(self) -> None:
         self.window.show_all()
 
+    def toggle_visibility(self) -> None:
+        """Port of ToggleVisibility: hide if shown, show+raise+focus if
+        hidden -- same global-hotkey toggle, bound in main() to Ctrl+Alt+C
+        by default (AppSettings.HotkeyModifiers/HotkeyVirtualKey's own
+        default, no settings persistence here yet to make it configurable)."""
+        if self.window.get_visible():
+            self.window.hide()
+        else:
+            self.window.present()
+
+    def toggle_voice_recording_from_hotkey(self) -> None:
+        """Port of ToggleVoiceRecordingFromHotkey (Ctrl+Shift+C): same JS
+        call, targeted at whichever tab is currently active."""
+        log("hotkey: toggle voice recording (Ctrl+Shift+C)")
+        if self.active_tab and self.active_tab.webview:
+            self.active_tab.webview.run_javascript(
+                "window.carolineToggleVoiceRecording && window.carolineToggleVoiceRecording();", None, None, None,
+            )
+
     def _next_tab_id(self) -> str:
         for i in range(1, MAX_TABS + 1):
             candidate = str(i)
@@ -776,6 +796,13 @@ def main() -> int:
     splash = SplashWindow(on_dismissed=lambda: None)
     splash.show()
     wait_for_backend_then_show(supervisor, splash, shell.reveal)
+
+    hotkeys = GlobalHotkeyListener()
+    if not hotkeys.register(MOD_CONTROL | MOD_ALT, "c", shell.toggle_visibility):
+        log("[hotkey] registration failed -- already in use, or this keyboard layout has no 'c' keycode")
+    if not hotkeys.register(MOD_CONTROL | MOD_SHIFT, "c", shell.toggle_voice_recording_from_hotkey):
+        log("[hotkey] voice-record hotkey registration failed -- already in use by another app?")
+    hotkeys.start()
 
     signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(shell.on_destroy, None))
     signal.signal(signal.SIGINT, lambda *_: GLib.idle_add(shell.on_destroy, None))
