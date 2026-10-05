@@ -12,15 +12,11 @@ SquirrelWisdom/OnlyOffice session, a Revolut checkout URL) that can't be
 exercised without a live backend, and are a real, separate chunk of work
 on top of this, not a smaller version of it.
 
-Verified live (test box, 2026-10-05): image/code viewers open and close
-cleanly with the right outcome/path reported back; the login form renders
-and Cancel/X-close routes through the same finish path a real Cancel
-click would. monaco_viewer.html itself loads (its own dark theme and Save
-button render) and the postMessage payload dispatch fires with no JS
-errors, but the Monaco editor body stayed blank in a short (~3s) test --
-not yet confirmed whether that's just Monaco's own init timing (it's
-known to need a non-zero-size container at creation) or a real gap; flag
-this specifically if code-viewer content doesn't appear in real use.
+Verified live on the test box: Monaco shows the file with syntax highlighting
+once the page has finished loading, image and video render (video needs the
+GStreamer plugins listed in docs/LINUX_PORT_PLAN.md), slideshow pages through
+its images, and the login form renders and routes Cancel/X through the same
+finish path as a real Cancel click.
 """
 
 from __future__ import annotations
@@ -41,7 +37,12 @@ from gi.repository import Gtk, WebKit2  # noqa: E402
 HEADER_CSS = b"""
 #viewer-header { background-color: #3A3F8F; }
 #viewer-header label { color: white; }
+#viewer-header button { background: #4169E1; color: white; border: none; border-radius: 0; box-shadow: none; }
+#viewer-header button:hover { background: #5A7FEA; }
 #viewer-content { background-color: #222222; }
+#login-label, #login-check label { color: #CCCCCC; }
+#login-subtitle { color: #AAAAAA; }
+#login-error { color: #FF8080; }
 """
 
 
@@ -83,14 +84,18 @@ class ViewerWindow:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         header.set_name("viewer-header")
-        header.set_margin_top(6)
-        header.set_margin_bottom(6)
-        header.set_margin_start(12)
-        header.set_margin_end(8)
         self.title_label = Gtk.Label(label="")
         self.title_label.set_halign(Gtk.Align.START)
+        self.title_label.set_selectable(False)
+        self.title_label.set_can_focus(False)
+        self.title_label.set_margin_top(6)
+        self.title_label.set_margin_bottom(6)
+        self.title_label.set_margin_start(12)
         header.pack_start(self.title_label, True, True, 0)
         self.button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.button_box.set_margin_top(4)
+        self.button_box.set_margin_bottom(4)
+        self.button_box.set_margin_end(8)
         header.pack_end(self.button_box, False, False, 0)
         root.pack_start(header, False, False, 0)
 
@@ -150,19 +155,26 @@ class ViewerWindow:
                       "SquirrelWisdom below, or use your own Claude account instead.",
             )
             subtitle.set_line_wrap(True)
+            subtitle.set_name("login-subtitle")
             form.pack_start(subtitle, False, False, 0)
 
-        form.pack_start(Gtk.Label(label="Email", halign=Gtk.Align.START), False, False, 0)
+        email_label = Gtk.Label(label="Email", halign=Gtk.Align.START)
+        email_label.set_name("login-label")
+        form.pack_start(email_label, False, False, 0)
         email_entry = Gtk.Entry()
         form.pack_start(email_entry, False, False, 0)
-        form.pack_start(Gtk.Label(label="Password", halign=Gtk.Align.START), False, False, 0)
+        password_label = Gtk.Label(label="Password", halign=Gtk.Align.START)
+        password_label.set_name("login-label")
+        form.pack_start(password_label, False, False, 0)
         password_entry = Gtk.Entry(visibility=False)
         form.pack_start(password_entry, False, False, 0)
         register_check = Gtk.CheckButton(label="I don't have an account -- register instead")
+        register_check.set_name("login-check")
         form.pack_start(register_check, False, False, 0)
 
         error_label = Gtk.Label(label=error or "")
         error_label.set_line_wrap(True)
+        error_label.set_name("login-error")
         if error:
             form.pack_start(error_label, False, False, 0)
 
@@ -234,7 +246,8 @@ class ViewerWindow:
     def _load_html(self, body_html: str) -> None:
         webview = self._make_webview()
         self.content.pack_start(webview, True, True, 0)
-        webview.load_html(f"<html><body style='margin:0;background:#222'>{body_html}</body></html>", None)
+        base_uri = Path(self._path).parent.as_uri() + "/"
+        webview.load_html(f"<html><body style='margin:0;background:#222'>{body_html}</body></html>", base_uri)
         webview.show_all()
 
     def _add_close_button(self) -> None:

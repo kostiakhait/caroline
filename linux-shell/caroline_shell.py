@@ -70,11 +70,89 @@ ICONS_DIR = HERE / "icons"
 # The page asks for "Segoe UI" (Windows). Selawik (SIL OFL, Microsoft) has the
 # same metrics and is shipped with the shell, so map Segoe UI's weights onto it.
 FONT_CSS = """
-@font-face { font-family: "Segoe UI"; font-weight: 300; src: url("/fonts/selawkl.woff2") format("woff2"); }
-@font-face { font-family: "Segoe UI"; font-weight: 400; src: url("/fonts/selawk.woff2") format("woff2"); }
-@font-face { font-family: "Segoe UI"; font-weight: 600; src: url("/fonts/selawksb.woff2") format("woff2"); }
-@font-face { font-family: "Segoe UI"; font-weight: 700; src: url("/fonts/selawkb.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 300; src: url("__ORIGIN__/fonts/selawkl.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 400; src: url("__ORIGIN__/fonts/selawk.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 600; src: url("__ORIGIN__/fonts/selawksb.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 700; src: url("__ORIGIN__/fonts/selawkb.woff2") format("woff2"); }
 """
+
+ICON_CSS = """
+#attachBtn, #micBtn, #stopBtn, #sendBtn, #settingsBtn, #closeSettingsBtn,
+#voiceRestartBtn, #voiceStopBtn {
+  font-size: 0 !important; background-repeat: no-repeat !important;
+  background-position: center !important; background-size: 18px 18px !important;
+  min-width: 22px; min-height: 22px;
+}
+#attachBtn { background-image: url("__ORIGIN__/icons/attach-dark.png") !important; }
+#micBtn { background-image: url("__ORIGIN__/icons/mic-dark.png") !important; }
+#stopBtn { background-image: url("__ORIGIN__/icons/stop.png") !important; }
+#sendBtn { background-image: url("__ORIGIN__/icons/send.png") !important; }
+#settingsBtn { background-image: url("__ORIGIN__/icons/settings.png") !important; }
+#closeSettingsBtn { background-image: url("__ORIGIN__/icons/close.png") !important; }
+#voiceStopBtn { background-image: url("__ORIGIN__/icons/stop-dark.png") !important; }
+#voiceRestartBtn { background-image: url("__ORIGIN__/icons/restart-dark.png") !important; }
+img.cg { width: 16px; height: 16px; vertical-align: -3px; display: inline-block; }
+"""
+
+GLYPH_JS = """
+(function () {
+  var ICONS = {
+    "\\uD83D\\uDCCE": "attach-dark", "\\uD83C\\uDF99\\uFE0F": "mic-dark", "\\uD83C\\uDF99": "mic-dark",
+    "\\uD83D\\uDD0A": "speaker-dark", "\\uD83D\\uDCC4": "document-dark",
+    "\\uD83D\\uDDBC\\uFE0F": "image-dark", "\\uD83D\\uDDBC": "image-dark", "\\uD83C\\uDFAC": "clapper-dark",
+    "\\u23F8": "pause-dark", "\\u25B6": "play-dark", "\\u2715": "close-dark",
+    "\\u2714": "check-dark", "\\u25BE": "chevron-dark"
+  };
+  var KEYS = Object.keys(ICONS).sort(function (a, b) { return b.length - a.length; });
+  var HOSTS = { BUTTON: 1, SPAN: 1, A: 1 };
+  var CSS_ICON_BUTTONS = { attachBtn: 1, micBtn: 1, closeSettingsBtn: 1 };
+
+  function swap(node) {
+    var parent = node.parentNode;
+    if (!parent || !HOSTS[parent.nodeName]) return;
+    if (CSS_ICON_BUTTONS[parent.id]) return;
+    var text = node.nodeValue;
+    for (var i = 0; i < KEYS.length; i++) {
+      var at = text.indexOf(KEYS[i]);
+      if (at === -1) continue;
+      var img = document.createElement("img");
+      img.className = "cg";
+      img.alt = "";
+      img.src = "__ORIGIN__/icons/" + ICONS[KEYS[i]] + ".png";
+      var rest = document.createTextNode(text.slice(at + KEYS[i].length));
+      node.nodeValue = text.slice(0, at);
+      parent.insertBefore(img, node.nextSibling);
+      parent.insertBefore(rest, img.nextSibling);
+      return swap(rest);
+    }
+  }
+
+  function walk(root) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    var nodes = [];
+    for (var n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n);
+    nodes.forEach(swap);
+  }
+
+  function start() {
+    walk(document.body);
+    new MutationObserver(function (mutations) {
+      mutations.forEach(function (m) {
+        if (m.type === "characterData") swap(m.target);
+        m.addedNodes.forEach(function (c) {
+          if (c.nodeType === 3) swap(c);
+          else if (c.nodeType === 1) walk(c);
+        });
+      });
+    }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else start();
+})();
+"""
+
+PAGE_CSS = (FONT_CSS + ICON_CSS).replace("__ORIGIN__", f"http://127.0.0.1:{PAGE_PORT}")
 
 SHIM_JS = """
 window.chrome = window.chrome || {};
@@ -101,6 +179,7 @@ window.chrome = window.chrome || {};
   };
 })();
 """
+SHIM_JS += GLYPH_JS.replace("__ORIGIN__", f"http://127.0.0.1:{PAGE_PORT}")
 
 TAB_STRIP_CSS = b"""
 #tab-strip { background-color: #3A3F8F; }
@@ -197,6 +276,8 @@ class PageHandler(http.server.SimpleHTTPRequestHandler):
         path = urllib.parse.urlparse(path).path
         if path.startswith("/fonts/"):
             return str(FONTS_DIR / Path(path[len("/fonts/"):]).name)
+        if path.startswith("/icons/"):
+            return str(ICONS_DIR / Path(path[len("/icons/"):]).name)
         return super().translate_path(path)
 
     def log_message(self, format, *args):  # noqa: A002
@@ -500,7 +581,7 @@ class Shell:
             WebKit2.UserScriptInjectionTime.START, None, None,
         ))
         manager.add_style_sheet(WebKit2.UserStyleSheet(
-            FONT_CSS, WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+            PAGE_CSS, WebKit2.UserContentInjectedFrames.ALL_FRAMES,
             WebKit2.UserStyleLevel.USER, None, None,
         ))
         manager.register_script_message_handler("caroline")
@@ -709,7 +790,7 @@ class Shell:
             payload = {"type": "editor_result", "requestId": request_id, "outcome": result.outcome, "path": result.path}
             self._dispatch(tab, payload)
 
-        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, FONT_CSS, on_done=on_done)
+        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, PAGE_CSS, on_done=on_done)
         if viewer_kind in ("code", "slideshow"):
             viewer.show_web_page(msg.get("title", ""), viewer_kind, path, msg)
         elif viewer_kind == "image":
@@ -742,7 +823,7 @@ class Shell:
                     "window.carolineOpenSettings && window.carolineOpenSettings();", None, None, None,
                 )
 
-        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, FONT_CSS, on_login_done=on_login_done)
+        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, PAGE_CSS, on_login_done=on_login_done)
         viewer.show_login(msg.get("error"), bool(msg.get("noAiAtAll")))
         self.viewer_windows[self.LOGIN_WINDOW_KEY] = viewer
         viewer.show()
@@ -802,6 +883,7 @@ def show_error_dialog(summary: str, detail: str) -> None:
 
 
 def main() -> int:
+    GLib.set_prgname("caroline")
     lock = acquire_single_instance_lock()
     if lock is None:
         log("another instance is already running -- exiting")

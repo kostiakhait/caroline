@@ -443,6 +443,26 @@ Linux archive uploaded yet, so this is an open follow-up, not a decided design.
 Verified end-to-end on a clean `runtime/`: the script provisioned both trees from scratch, and the
 supervisor started healthy against them.
 
+**Full UI pass, 2026-10-05 (test box, seeded test data).** Screens captured: splash with the real
+onboarding banners, main chat with a restored transcript, tab strip and mode menu, settings panel,
+already-running and missing-runtime dialogs, login viewer, Monaco code viewer, image, video and
+slideshow viewers. Fixed along the way:
+- `websockets` and `httptools` were missing from the pinned list (chat stuck in a reconnect loop,
+  uvicorn answering the WebSocket upgrade with 404). Both are now pinned at the Windows runtime's versions.
+- Pictogram glyphs rendered as empty boxes. Replaced with drawn icons, Linux-only: static buttons via
+  `ICON_CSS`, dynamic glyphs (speaker, file chips, document links) via `GLYPH_JS`. Windows UI untouched.
+- Injected stylesheets used relative `/icons/` and `/fonts/` URLs, which WebKit resolves against
+  about:blank. Now absolute.
+- WebKit keys `localStorage` by program name, so the chat transcript location depended on the script
+  filename. `GLib.set_prgname("caroline")` pins it.
+- Image and video viewers loaded `file://` media from an about:blank page, which WebKit refuses. The
+  page now uses the file's own directory as base URI.
+- Login viewer labels were dark on dark. Now match the Windows login window colors.
+- `dist-linux` now copies `SplashBanners` from the installer's banner set, as the Windows build does.
+
+New runtime dependency: video playback needs the GStreamer plugin sets
+(`gstreamer1.0-plugins-good`, `-bad`, `-libav`, `-ugly`) on the host.
+
 ## Maintenance-burden note (for future reference)
 
 backend-py (the bulk of day-to-day feature work -- plugins, policies, memory) stays a single shared
