@@ -513,6 +513,12 @@ async def run_operation(
         await _safe_delete(result_path)
         _journal_remove(workspace_dir, op_id)
         raise
+    except Exception as exc:
+        log_event("plugin:companion", "operation_failed", op_id=op_id, error_type=type(exc).__name__, error=str(exc))
+        await _safe_delete(request_path)
+        await _safe_delete(result_path)
+        _journal_remove(workspace_dir, op_id)
+        raise
 
 
 async def _finish_and_cleanup(workspace_dir: str, op_id: str, request_path: str, result_path: str) -> None:
