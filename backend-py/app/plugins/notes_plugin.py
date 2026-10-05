@@ -47,6 +47,22 @@ def _title_of(text: str) -> str:
     return text.split("\n", 1)[0]
 
 
+# --- Read-through cache --------------------------------------------------
+# Per explicit instruction (2026-10-04): readIndex/getNote were hit on EVERY
+# call with zero caching -- recall_memory (memory_search_plugin.py) in
+# particular calls list_notes() -> _read_index() on literally every
+# invocation, re-fetching every note in the account each time. Keyed by the
+# session token itself (one shared SessionManager/one active account per
+# process at a time, same as every other notes_* caller already assumes) --
+# a re-login naturally starts a fresh cache under the new token, nothing to
+# explicitly clean up. TTL bounds staleness from an edit made from OUTSIDE
+# Caroline (the web portal, a phone); Caroline's own writes invalidate
+# immediately below, so they're never stale regardless of TTL.
+NOTES_CACHE_TTL_S = 180.0
+_index_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
+_note_cache: dict[str, dict[str, tuple[dict[str, Any], float]]] = {}
+
+
 def _in_folder_scope(folder: str | None, scope: str) -> bool:
     f = folder or ""
     return f == scope or f.startswith(scope + "/")
@@ -68,17 +84,31 @@ def _summarize(entry: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def _read_index(session: str) -> dict[str, dict[str, Any]]:
+    cached = _index_cache.get(session)
+    if cached is not None and time.time() - cached[1] < NOTES_CACHE_TTL_S:
+        return cached[0]
     result = await call_plugin("readIndex", session)
-    return (result or {}).get("notes") or {}
+    index = (result or {}).get("notes") or {}
+    _index_cache[session] = (index, time.time())
+    return index
 
 
 async def _read_note_file(session: str, note_id: str) -> dict[str, Any] | None:
+    cached = _note_cache.get(session, {}).get(note_id)
+    if cached is not None and time.time() - cached[1] < NOTES_CACHE_TTL_S:
+        return cached[0]
     result = await call_plugin("getNote", session, id=note_id)
-    return (result or {}).get("note")
+    note = (result or {}).get("note")
+    if note is not None:
+        _note_cache.setdefault(session, {})[note_id] = (note, time.time())
+    return note
 
 
 async def _write_note_file(session: str, note_id: str, note: dict[str, Any]) -> None:
     await call_plugin("writeNoteFile", session, id=note_id, note=note)
+    # Invalidate immediately -- Caroline's own write is never allowed to read
+    # back stale, TTL-cached content.
+    _note_cache.get(session, {}).pop(note_id, None)
 
 
 async def _patch_index(session: str, entries: dict[str, dict[str, Any]]) -> None:
@@ -86,6 +116,10 @@ async def _patch_index(session: str, entries: dict[str, dict[str, Any]]) -> None
     # safer than read-modify-write, can't race a concurrent writer's own
     # patchIndex call.
     await call_plugin("patchIndex", session, entries=entries)
+    # The cached index is now stale (it reflects server state from before
+    # this patch) -- drop it rather than try to merge in-place; the next
+    # _read_index() call just re-fetches, same cost as any other cache miss.
+    _index_cache.pop(session, None)
 
 
 async def list_notes(session: str, folder: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:

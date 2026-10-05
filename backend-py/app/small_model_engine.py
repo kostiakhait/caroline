@@ -87,6 +87,7 @@ from app.operations import REGISTRY as OPERATIONS_REGISTRY
 from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
+from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
@@ -103,6 +104,7 @@ from app.policies import (
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     timestamp_awareness_instruction,
+    working_memory_check_first_instruction,
 )
 
 # Per explicit instruction (2026-09-13), after a real capability audit
@@ -127,6 +129,7 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     system_temp_dir_instruction,
     credentials_check_notes_first_instruction,
     recall_memory_check_first_instruction,
+    working_memory_check_first_instruction,
 )
 
 # Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__
@@ -1289,6 +1292,7 @@ async def run_small_model_turn(
     system = "\n\n".join([
         _persona_system_message(persona),
         owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
+        working_memory_system_prompt_clause(load_working_memory(workspace_dir)),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
     ])

@@ -120,6 +120,7 @@ from app.small_model_engine import run_small_model_turn
 from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
+from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app import agent_registry
 from app.agent_definitions import caroline_agents
 from app.policies import (
@@ -4171,6 +4172,7 @@ class ChatSession:
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
+                    working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),

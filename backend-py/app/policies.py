@@ -645,6 +645,27 @@ def recall_memory_check_first_instruction() -> str:
     )
 
 
+def working_memory_check_first_instruction() -> str:
+    """Per explicit instruction (2026-10-04): frequently-needed facts (a
+    credential, a contact, a command that worked, a reference, an event)
+    don't only come from Notes, and Notes may not exist at all for a given
+    install (no SW account) -- working_memory.py's own small, source-agnostic
+    cache exists for exactly this, independent of Notes. Same shape as
+    recall_memory_check_first_instruction just above: a short trigger only,
+    always-on so it's never forgotten; the full mechanics (categories,
+    touch_fact vs. remember_fact, eviction) stay on-demand via
+    get_tool_instructions, fetched once a working_memory_* tool is actually
+    in play (working_memory_plugin.py's own usage_instructions)."""
+    return (
+        "Before re-deriving, re-fetching, or re-asking for a credential, contact, command, or reference you've "
+        "needed before this session, call working_memory_list (or just check the \"Things you've chosen to keep "
+        "handy\" block already in this system prompt, if present) first. When you find yourself using something "
+        "a second time, or you expect to need it again soon, save it yourself with working_memory_remember -- "
+        "this is separate from Notes (works even without a SquirrelWisdom account) and from recall_memory "
+        "(that's durable, topic-searched long-term memory; this is a small, auto-evicting short-term cache)."
+    )
+
+
 def notes_folder_fallback_instruction() -> str:
     """Per explicit instruction (2026-09-22), after a real, concrete
     incident: told to reconnect a mailbox, Caroline checked only
@@ -859,6 +880,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     prefer_command_line_and_scripting_instruction,
     credentials_check_notes_first_instruction,
     recall_memory_check_first_instruction,
+    working_memory_check_first_instruction,
 )
 
 
