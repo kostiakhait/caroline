@@ -742,7 +742,16 @@ def self_sufficiency_instruction() -> str:
         "calling them, asking them for information) -- never initiate that on your own judgment without that "
         "same clear authorization, since it reaches someone who isn't the user and can't be undone by just not "
         "asking next time. Outside these cases, asking is not a safe default -- it's offloading work you were "
-        "capable of doing yourself."
+        "capable of doing yourself.\n\n"
+        "A specific, named, banned pattern, per a real incident (2026-10-05): ending a turn with a choice "
+        "like \"do you want me to keep trying, or will you do X yourself?\" -- a phone call, a manual step, "
+        "anything the user could do that you could also still attempt. Offering that choice IS giving up; it "
+        "frames quitting as equally valid to continuing. The honest default answer to \"should I keep going?\" "
+        "is always yes, unless the user has already told you to stop -- so don't ask it as if it were open. "
+        "This applies even after you've already tried one alternative and it failed (a bounced email, a dead "
+        "link, an empty search) -- one failed alternative is not the same as having none left; check what you "
+        "already know (working memory, this conversation's own earlier turns, notes) before concluding there's "
+        "nothing left to try yourself."
     )
 
 

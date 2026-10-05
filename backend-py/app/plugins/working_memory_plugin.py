@@ -50,6 +50,13 @@ async def working_memory_list(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 _USAGE_INSTRUCTIONS = (
+    "The moment you find out a contact's correct email, phone number, or address through real work -- a "
+    "search, reading an email thread, a web lookup -- call working_memory_remember (category \"contacts\") "
+    "RIGHT THEN, before you go on to use it, not only if it later seems worth keeping. Per a real incident "
+    "(2026-10-05): a clinic's correct email was found and used correctly once, never saved, and hours later "
+    "-- needing it again, with no durable record of it -- the reply-to address on an unrelated automated "
+    "reminder email got used instead, which bounced. Don't rely on finding it again by scrolling back through "
+    "the conversation; by the time you need a fact like this a second time, save it the first time. "
     "Six fixed categories, pass exactly one: " + ", ".join(CATEGORIES) + " (\"facts\" is the catch-all for "
     "anything that doesn't fit the other five). This is a SMALL, auto-evicting scratch space, not durable "
     "storage -- durable facts still belong in Notes (\"Caroline:Profile\"/\"Caroline:Topics\"/\"Caroline:Vault\" "
