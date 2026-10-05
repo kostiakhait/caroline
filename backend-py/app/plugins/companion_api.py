@@ -298,11 +298,22 @@ async def list_devices() -> list[dict[str, Any]]:
     at all), then fetch each one's own info leaf individually. Concurrent,
     not sequential -- a handful of phones at most, same "simplest correct
     thing" call already made for this exact shape in _contacts_request."""
+    # return_exceptions=True (bug fix 2026-10-05, confirmed live): a lingering
+    # empty namespace (e.g. an unpaired device whose leaves were deleted but
+    # whose directory wasn't) can make this ONE device's get_mine raise
+    # instead of cleanly returning None -- without this, asyncio.gather's
+    # default behavior lets that single bad entry kill visibility into every
+    # OTHER, perfectly healthy paired device, which took down companion_sms_
+    # send for the user's real phone. A per-device failure is logged and
+    # skipped, never allowed to hide the rest of the registry.
     device_ids = await list_mine("devices")
-    infos = await asyncio.gather(*(get_mine(f"devices/{device_id}/info") for device_id in device_ids))
+    infos = await asyncio.gather(*(get_mine(f"devices/{device_id}/info") for device_id in device_ids), return_exceptions=True)
     now_ms = time.time() * 1000
     devices = []
     for device_id, info in zip(device_ids, infos):
+        if isinstance(info, BaseException):
+            log_event("plugin:companion", "list_devices_info_lookup_failed", device_id=device_id, error=str(info))
+            continue
         if not isinstance(info, dict):
             continue
         last_seen = info.get("lastSeenAt")
@@ -319,21 +330,24 @@ async def list_devices() -> list[dict[str, Any]]:
 
 
 async def remove_device(device_id: str) -> None:
-    """Un-pairs a device by deleting every leaf known to persist in steady
-    state -- info (what makes list_devices/resolve_device see it at all)
-    and the SMS sync pair (the only other leaves that outlive a single
-    request/response round trip; every per-opId leaf under sms/outbox*,
-    contacts/*, sms_query/*, logs/* is already deleted by
-    _finish_and_cleanup right after that one operation finishes, so there's
-    normally nothing left under those at any given moment). Deliberately
-    NOT a server-side namespace delete -- see this function's own call site
-    for why that was considered and dropped (plain var:deleteMine, already
-    existing, is enough; no new Camerlengo command needed for this). Any
-    stray empty sub-namespace left behind on disk is cosmetic, never
-    visible through list_mine("devices") + each id's own info leaf, which
-    is all list_devices() ever looks at."""
-    for leaf in ("info", "sms/sync_request", "sms/sync_response"):
-        await _safe_delete(f"devices/{device_id}/{leaf}")
+    """Un-pairs a device: deletes its WHOLE devices/<id>/ namespace server-
+    side via var:deleteNamespaceMine.
+
+    Bug fix (2026-10-05), confirmed live: this used to delete only the
+    leaves known to persist in steady state (info, sms/sync_request/
+    response), reasoning that a leftover EMPTY sub-namespace was purely
+    cosmetic clutter list_devices() would never see. That was wrong --
+    list_mine("devices") enumerates the namespace itself, not its leaves,
+    so the emptied-but-still-existing directory kept showing up in every
+    list_devices() call forever, and get_mine() on its now-missing info
+    leaf raised instead of the expected clean None on at least one real
+    occasion -- which companion_sms_send's own exception handling doesn't
+    catch, taking down SMS sending to the OTHER, perfectly healthy paired
+    phone too (see list_devices()'s own return_exceptions=True fix, added
+    alongside this one as defense in depth -- that fix keeps one bad
+    device from hiding the rest even if a stray namespace shows up again
+    some other way, but removing it properly here is the actual fix)."""
+    await _call("var:deleteNamespaceMine", path=f"devices/{device_id}")
 
 
 async def resolve_device(phone_number: str | None) -> dict[str, Any]:
