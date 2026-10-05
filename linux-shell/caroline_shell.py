@@ -36,6 +36,16 @@ PYTHON = Path(os.environ.get("CAROLINE_PYTHON", APP_ROOT / "runtime" / "python" 
 PAGE_PORT = 48767
 SUPERVISOR_PORT = 48766
 LOG_PATH = Path(os.environ.get("CAROLINE_SHELL_LOG", Path.home() / ".local" / "share" / "Caroline" / "shell.log"))
+FONTS_DIR = HERE / "fonts"
+
+# The page asks for "Segoe UI" (Windows). Selawik (SIL OFL, Microsoft) has the
+# same metrics and is shipped with the shell, so map Segoe UI's weights onto it.
+FONT_CSS = """
+@font-face { font-family: "Segoe UI"; font-weight: 300; src: url("/fonts/selawkl.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 400; src: url("/fonts/selawk.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 600; src: url("/fonts/selawksb.woff2") format("woff2"); }
+@font-face { font-family: "Segoe UI"; font-weight: 700; src: url("/fonts/selawkb.woff2") format("woff2"); }
+"""
 
 SHIM_JS = """
 window.chrome = window.chrome || {};
@@ -109,9 +119,18 @@ class Supervisor:
             os.killpg(self.proc.pid, signal.SIGKILL)
 
 
+class PageHandler(http.server.SimpleHTTPRequestHandler):
+    def translate_path(self, path: str) -> str:
+        if path.startswith("/fonts/"):
+            return str(FONTS_DIR / Path(path[len("/fonts/"):]).name)
+        return super().translate_path(path)
+
+    def log_message(self, format, *args):  # noqa: A002
+        return
+
+
 def serve_wwwroot() -> http.server.ThreadingHTTPServer:
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(WWWROOT))
-    handler.log_message = lambda *a, **k: None  # type: ignore[assignment]
+    handler = functools.partial(PageHandler, directory=str(WWWROOT))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PAGE_PORT), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -133,6 +152,12 @@ class Shell:
             SHIM_JS,
             WebKit2.UserContentInjectedFrames.ALL_FRAMES,
             WebKit2.UserScriptInjectionTime.START,
+            None, None,
+        ))
+        manager.add_style_sheet(WebKit2.UserStyleSheet(
+            FONT_CSS,
+            WebKit2.UserContentInjectedFrames.ALL_FRAMES,
+            WebKit2.UserStyleLevel.USER,
             None, None,
         ))
         manager.register_script_message_handler("caroline")
