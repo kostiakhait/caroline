@@ -149,6 +149,13 @@ Real findings from live testing (not assumptions):
   occlusion-safe `PrintWindow` equivalent (none exists in core X11 without compositor cooperation) --
   a real, documented fidelity gap, not an oversight.
 
+**Re-verified (2026-10-05) on a disposable Vultr cloud instance** (Ubuntu 24.04, Xvfb + openbox --
+a genuine reparenting WM, not WSLg's RDP/RAIL-remoted one) after the user asked that testing move
+off their own machine entirely. The full Phase 2 suite (mouse/keyboard primitives, window
+enumeration, posted window input, the chain interpreter including its failure path) passed cleanly
+on real X11 with no changes needed -- confirms the WSLg-specific caveats above really are WSLg-
+specific, not artifacts of the implementation itself.
+
 ### Phase 3 -- embedded browser on Linux (Playwright-launched real windows)
 
 - New `app/plugins/_linux_app_browser.py` replacing `Caroline.NativeHost.exe`/`AppBrowserHost.cs`'s
@@ -163,6 +170,44 @@ Real findings from live testing (not assumptions):
   simplification over `FileDialogHelper.cs` (which has no clean Linux equivalent).
 - `/is_visible_on_top` -- X11 stacking hit-test at the Playwright window's own X11 window ID.
 - Drop the lazy-launch-a-separate-exe logic entirely on Linux -- nothing to launch.
+
+**Status: done (2026-10-05), verified live** on the same disposable Vultr instance Phase 2 was
+re-verified on (Ubuntu 24.04, Xvfb + openbox). `app_browser_plugin.py` got the same
+`sys.platform`-gated branch treatment as every Phase 2 plugin; `app_browser_cdp.py` needed zero
+changes (it was already a pure CDP-port client, platform-agnostic by construction). Each label's
+Chromium launches with `--app=<url>` (no address bar/tabs/toolbar) -- the visual and positional
+analog of WebView2 being embedded with no chrome on Windows, which also makes the `real:true`
+OS-level click escalation's math exact (zero chrome means the OS window's rect IS the page
+viewport at offset 0,0) instead of needing a toolbar-height estimate.
+
+Real findings from live testing:
+- **The exact `data:`-URL-produces-an-empty-page bug hit during initial (WSLg) testing does NOT
+  reproduce on a real X11 desktop** -- confirmed by running the identical test unmodified on the
+  Vultr box. Root-caused to WSLg's own remoting/compositor layer, not this code; no workaround was
+  needed once testing moved off WSLg, exactly the outcome the user's "test on Vultr instead"
+  instruction was aiming for.
+- **A real, non-WSLg-specific bug, caught here**: `_x11_window.py`'s `_wm_name()` read only the
+  legacy ICCCM `WM_NAME` property, which Chromium (and modern GUI apps generally) leaves empty --
+  the actual title lives in the EWMH `_NET_WM_NAME` property (UTF8_STRING) instead. This silently
+  broke every title-based window match (`app_browser`'s `is_visible_on_top`/`real_os_click`, which
+  match a Playwright page to its OS window by title since X11 window properties don't otherwise
+  expose which CDP port a window belongs to). Fixed by reading `_NET_WM_NAME` first, falling back
+  to legacy `WM_NAME` for older clients that only set that -- this also improves `inspect_plugin.py`
+  /`chain_plugin.py`'s window matching generally, not just app_browser's own use of it.
+- `page.screenshot()` failed outright ("Unable to capture screenshot") against the GPU compositing
+  path in both test environments (WSLg and the Vultr Xvfb box) until Chromium was launched with
+  `--disable-gpu` -- kept on unconditionally for every Linux app-browser window, not just as a
+  test-environment workaround, since it trades a little rendering performance for not depending on
+  GPU driver state this installer can't control on an arbitrary end-user machine.
+- `maxWidth` screenshot downscaling resizes the actual Playwright viewport before capturing (no
+  pixel-resampling dependency needed) when no crop is requested; combined with an explicit crop in
+  the same call, the crop is honored exactly and the downscale is skipped rather than attempting to
+  rescale clip coordinates against a resized viewport too -- a documented simplification for an
+  uncommon combination, not a silent gap.
+- `is_visible_on_top` is a real, documented simplification, not full parity with the Windows
+  version: it confirms the window is mapped/viewable, not that it's the actual unobscured topmost
+  window at its position -- a true occlusion test needs `_NET_CLIENT_LIST_STACKING`, which (per
+  Phase 2's own finding) this class of WM doesn't reliably set.
 
 ### Phase 4 -- Avalonia shell (the largest phase; do after 1-3 are independently working)
 

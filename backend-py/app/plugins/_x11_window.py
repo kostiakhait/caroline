@@ -52,9 +52,27 @@ def window_for(hwnd: str):
 
 
 def _wm_name(w: Any) -> str | None:
+    """Confirmed live (Vultr Ubuntu 24.04 + Xvfb/openbox, 2026-10-05):
+    Chromium (and modern apps generally) sets ONLY the EWMH _NET_WM_NAME
+    property (UTF8_STRING) and leaves the legacy ICCCM WM_NAME python-
+    xlib's own get_wm_name() reads either empty or in a format it can't
+    decode -- a window with a real, visible title came back as "" every
+    time, which silently broke title-based matching (app_browser's
+    is_visible_on_top/real_os_click). _NET_WM_NAME is checked first since
+    it's what actually carries the title on a modern window; WM_NAME
+    stays as the fallback for older/simpler clients that only set that."""
+    try:
+        d = _d()
+        net_wm_name = d.intern_atom("_NET_WM_NAME")
+        utf8_string = d.intern_atom("UTF8_STRING")
+        prop = w.get_full_property(net_wm_name, utf8_string)
+        if prop and prop.value:
+            return bytes(prop.value).decode("utf-8", errors="replace")
+    except Exception:
+        pass
     try:
         name = w.get_wm_name()
-        return name if isinstance(name, str) else None
+        return name if isinstance(name, str) and name else None
     except Exception:
         return None
 

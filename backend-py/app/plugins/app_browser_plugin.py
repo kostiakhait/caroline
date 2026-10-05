@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,9 @@ from app.plugins.voice_api import describe_image_cheap
 from app.policies import close_windows_after_task_instruction, prefer_cropped_screenshots_instruction, prefer_window_targeted_input_instruction
 from app.session_context import get_tab_id
 from app.window_registry import register_window, unregister_window
+
+if sys.platform != "win32":
+    from app.plugins import _linux_app_browser as linux_browser
 
 APP_BROWSER_HOST = "http://127.0.0.1:8767"
 
@@ -154,6 +158,12 @@ async def _get_cdp_port(label: str) -> int:
     """Every CDP-routed tool needs the label's window to exist first --
     replicates AppBrowserHost's old lazy-open-if-needed behavior now that
     these ops bypass that HTTP bridge entirely."""
+    if sys.platform != "win32":
+        port = await linux_browser.get_port(label)
+        if port is not None:
+            return port
+        opened = await linux_browser.open_window(label, None)
+        return opened["cdpPort"]
     got = await _call("/get_port", {"label": label})
     if "cdpPort" in got:
         return got["cdpPort"]
@@ -162,16 +172,22 @@ async def _get_cdp_port(label: str) -> int:
 
 
 async def open_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    body: dict[str, Any] = {"label": args["label"]}
-    if args.get("url"):
-        body["url"] = args["url"]
-    result = await _call("/open", body, OPEN_TIMEOUT_S)
+    if sys.platform != "win32":
+        result = await linux_browser.open_window(args["label"], args.get("url"))
+    else:
+        body: dict[str, Any] = {"label": args["label"]}
+        if args.get("url"):
+            body["url"] = args["url"]
+        result = await _call("/open", body, OPEN_TIMEOUT_S)
     register_window(f"browser:{args['label']}", kind="browser", label=args["label"], purpose=args["purpose"], tab_id=get_tab_id())
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def app_browser_navigate(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    result = await _call("/navigate", {"label": args["label"], "url": args["url"]})
+    if sys.platform != "win32":
+        result = await linux_browser.navigate(args["label"], args["url"])
+    else:
+        result = await _call("/navigate", {"label": args["label"], "url": args["url"]})
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
@@ -189,6 +205,16 @@ async def app_browser_find(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 async def app_browser_click(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     label = args["label"]
+    if sys.platform != "win32":
+        if args.get("x") is not None and args.get("y") is not None:
+            result = await linux_browser.click_coords(label, args["x"], args["y"], args.get("button"))
+            return {"text": json.dumps(result, ensure_ascii=False)}
+        if args.get("real"):
+            result = await linux_browser.real_os_click(label, args.get("ref"), args.get("selector"))
+            return {"text": json.dumps(result, ensure_ascii=False)}
+        port = await _get_cdp_port(label)
+        result = await cdp.click(port, args.get("ref"), args.get("selector"))
+        return {"text": json.dumps({"result": result}, ensure_ascii=False)}
     if args.get("x") is not None and args.get("y") is not None:
         result = await _call("/click", {"label": label, "x": args["x"], "y": args["y"]})
         return {"text": json.dumps(result, ensure_ascii=False)}
@@ -201,6 +227,9 @@ async def app_browser_click(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 async def app_browser_scroll(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if sys.platform != "win32":
+        result = await linux_browser.scroll(args["label"], args.get("ref"), args.get("selector"), args.get("x"), args.get("y"), args.get("clicks"))
+        return {"text": json.dumps(result, ensure_ascii=False)}
     body = {
         "label": args["label"], "ref": args.get("ref"), "selector": args.get("selector"),
         "x": args.get("x"), "y": args.get("y"), "clicks": args.get("clicks"),
@@ -211,6 +240,17 @@ async def app_browser_scroll(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 async def app_browser_type(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     label = args["label"]
+    if sys.platform != "win32":
+        # No separate OS-level "real" typing path on Linux yet (the posted-
+        # window text input _x11_input.py/_linux_app_browser.py would need
+        # is more involved to target correctly inside a real browser than
+        # the mouse-click case) -- CDP's keyboard.insertText fallback in
+        # app_browser_cdp.py's _type_with_fallback already covers the same
+        # "site rejects a plain .fill()" case real:true exists for on
+        # Windows, so route both paths through it for now.
+        port = await _get_cdp_port(label)
+        result = await cdp.type_text(port, args["text"], args.get("ref"), args.get("selector"))
+        return {"text": json.dumps({"result": result}, ensure_ascii=False)}
     if args.get("real"):
         result = await _call("/type", {"label": label, "ref": args.get("ref"), "selector": args.get("selector"), "text": args["text"], "real": True})
         return {"text": json.dumps(result, ensure_ascii=False)}
@@ -221,6 +261,10 @@ async def app_browser_type(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 async def app_browser_press_key(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     label = args["label"]
+    if sys.platform != "win32":
+        port = await _get_cdp_port(label)
+        result = await cdp.press_key(port, args["key"])
+        return {"text": result}
     if args.get("real"):
         result = await _call("/press_key", {"label": label, "key": args["key"], "real": True})
         return {"text": json.dumps(result, ensure_ascii=False)}
@@ -230,11 +274,14 @@ async def app_browser_press_key(args: dict[str, Any], _rp: Any) -> dict[str, Any
 
 
 async def app_browser_screenshot(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    body = {
-        "label": args["label"], "x": args.get("x"), "y": args.get("y"),
-        "width": args.get("width"), "height": args.get("height"), "maxWidth": args.get("maxWidth"),
-    }
-    result = await _call("/screenshot", body)
+    if sys.platform != "win32":
+        result = await linux_browser.screenshot(args["label"], args.get("x"), args.get("y"), args.get("width"), args.get("height"), args.get("maxWidth"))
+    else:
+        body = {
+            "label": args["label"], "x": args.get("x"), "y": args.get("y"),
+            "width": args.get("width"), "height": args.get("height"), "maxWidth": args.get("maxWidth"),
+        }
+        result = await _call("/screenshot", body)
     image_b64 = result.get("imageBase64")
     if not image_b64:
         raise RuntimeError("No image returned")
@@ -242,7 +289,10 @@ async def app_browser_screenshot(args: dict[str, Any], _rp: Any) -> dict[str, An
 
 
 async def app_browser_describe(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    result = await _call("/screenshot", {"label": args["label"]})
+    if sys.platform != "win32":
+        result = await linux_browser.screenshot(args["label"], None, None, None, None, None)
+    else:
+        result = await _call("/screenshot", {"label": args["label"]})
     image_b64 = result.get("imageBase64")
     if not image_b64:
         raise RuntimeError("No image returned")
@@ -257,24 +307,36 @@ async def app_browser_evaluate(args: dict[str, Any], _rp: Any) -> dict[str, Any]
 
 
 async def app_browser_is_visible_on_top(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if sys.platform != "win32":
+        result = await linux_browser.is_visible_on_top(args["label"])
+        return {"text": json.dumps(result, ensure_ascii=False)}
     result = await _call("/is_visible_on_top", {"label": args["label"]})
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def app_browser_fill_file_dialog(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if sys.platform != "win32":
+        result = await linux_browser.fill_file_dialog(args["paths"], args.get("timeoutMs"))
+        return {"text": json.dumps(result, ensure_ascii=False)}
     body = {"paths": args["paths"], "timeoutMs": args.get("timeoutMs")}
     result = await _call("/fill_file_dialog", body)
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def close_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    result = await _call("/close", {"label": args["label"]})
+    if sys.platform != "win32":
+        result = await linux_browser.close_window(args["label"])
+    else:
+        result = await _call("/close", {"label": args["label"]})
     unregister_window(f"browser:{args['label']}")
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def list_app_browsers(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    result = await _get("/list")
+    if sys.platform != "win32":
+        result = await linux_browser.list_windows()
+    else:
+        result = await _get("/list")
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
