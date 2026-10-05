@@ -282,13 +282,16 @@ internal static class Program
         await WithStepAsync(ErrorCodes.PlaywrightInstall, "Setting up browser automation",
             () => PlaywrightInstaller.InstallAsync(s => window.SetStatus(s), ct));
 
-        // Step 4: Visual Mode's talking-head models -- tens of GB, idempotent (see
-        // ModelsInstaller's own doc comment), best-effort (a model that isn't deployed
-        // yet is skipped, not a fatal error -- see ModelsInfo.FetchAsync's 404 handling).
-        await WithStepAsync(ErrorCodes.ModelsInstall, "Downloading talking-head models", () => ModelsInstaller.InstallAsync(downloader, http,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Downloading talking-head models…", p),
-            ct));
+        // Step 4 used to fetch Visual Mode's talking-head models here,
+        // unconditionally, on every install -- tens of GB, ~90% of a fresh
+        // install's disk footprint, even for the large majority of users
+        // who never turn Visual Mode on. Per explicit instruction
+        // (2026-10-05), removed: those models now download on demand, the
+        // first time the Settings toggle is turned on for a profile (see
+        // backend-py/app/visual_mode.py's BUILTIN_MODELS_BASE_URL and
+        // main.py's visual_mode_set), reusing the exact same resumable/
+        // verified downloader Windows/Caroline/Native/
+        // VisualModelDownloader.cs already had for a purchased model.
 
         // Step 4b: local speech-recognition model (~1.5GB, best-effort, unconditional --
         // explicit instruction, 2026-09-26: ships with every install regardless of the

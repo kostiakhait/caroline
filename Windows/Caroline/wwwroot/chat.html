@@ -126,9 +126,9 @@
 
       <section class="settings-section">
         <h4>Visual mode</h4>
-        <p class="settings-hint">Instead of just playing voice replies aloud, shows a small animated talking-head window instead. Caroline/Peter profiles only.</p>
+        <p class="settings-hint">Instead of just playing voice replies aloud, shows a small animated talking-head window instead. Caroline/Peter profiles only. Off by default -- the first time you turn it on for a profile, Caroline downloads that profile's animation models (tens of GB) in the background; voice replies keep working normally while that's in progress, and the status bar shows progress.</p>
         <label class="settings-checkbox">
-          <input type="checkbox" id="visualModeEnabled" checked />
+          <input type="checkbox" id="visualModeEnabled" />
           Enable visual mode for voice replies
         </label>
         <div id="visualModeUnavailableHint" class="settings-hint" style="display:none">Unavailable for a custom profile -- switch to the Caroline or Peter standard profile above to use it.</div>

@@ -2718,7 +2718,11 @@ class ChatSession:
                 return
             log_event("engine", "one_shot_followup_firing", tab_id=self.tab_id, reason=reason)
             self.inject_proactive(
-                f"[Internal: automatic follow-up check -- your previous turn concluded by reporting a usage cap.] "
+                f"[Internal: automatic follow-up check -- your previous turn concluded by reporting a usage cap, "
+                f"and this check fires again every 90s until a real reply gets through. The user has not said "
+                f"anything new and is not waiting on a repeated confirmation -- if you already told them about "
+                f"finished work in an earlier reply and nothing has changed since, do NOT restate, re-confirm, "
+                f"or apologize about it again, even briefly; reply with exactly [[NO_UPDATE]] instead.] "
                 f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
                 is_voice,
             )

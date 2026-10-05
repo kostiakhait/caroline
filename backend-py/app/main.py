@@ -72,7 +72,20 @@ from app.plugins.visual_models_plugin import (
     load_pending_visual_model_downloads,
     remove_pending_visual_model_download,
 )
-from app.visual_mode import is_visual_mode_enabled, models_dir, resolve_visual_model, set_visual_mode_enabled
+from app.visual_mode import (
+    BUILTIN_MODEL_NAMES,
+    BUILTIN_MODELS_BASE_URL,
+    add_pending_builtin_download,
+    is_visual_mode_enabled,
+    load_pending_builtin_downloads,
+    missing_builtin_models,
+    models_dir,
+    profile_supports_visual_mode,
+    remove_pending_builtin_download,
+    resolve_visual_model,
+    set_visual_mode_enabled,
+    trigger_builtin_download_now,
+)
 from app.local_stt import is_local_stt_available, is_local_stt_enabled, set_local_stt_enabled, transcribe_local
 from app.window_registry import unregister_window
 from app.workspace_dir import WORKSPACE_DIR
@@ -910,6 +923,24 @@ async def handle_control_request(
         ok = bool(parsed.get("ok"))
         error = parsed.get("error")
         log_event("engine", "visual_model_download_done", model_name=model_name, ok=ok, error=error)
+        if model_name in BUILTIN_MODEL_NAMES:
+            # The Settings-toggle-triggered download (visual_mode_set above),
+            # not a purchased model -- tracked in its own pending list, and
+            # "enabled" only gets persisted true once every file the current
+            # persona needs (both its A and B day-parity files) is actually
+            # on disk, not just this one.
+            remove_pending_builtin_download(WORKSPACE_DIR, model_name)
+            if ok and not missing_builtin_models(WORKSPACE_DIR):
+                set_visual_mode_enabled(WORKSPACE_DIR, True)
+                vm_model = resolve_visual_model(WORKSPACE_DIR)
+                if send is not None:
+                    await send({"type": "visual_mode_config", "enabled": True, "modelPath": (vm_model or {}).get("modelPath")})
+            elif not ok and send is not None:
+                # Leave enabled=false (it was never set true for this
+                # attempt) -- just tell the page so an optimistically-checked
+                # checkbox reverts instead of lying about the real state.
+                await send({"type": "visual_mode_config", "enabled": False, "modelPath": None})
+            return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
         if model_name:
             primary = primary_session()
             if ok:
@@ -1189,16 +1220,45 @@ async def handle_control_request(
         model = resolve_visual_model(WORKSPACE_DIR)
         stdout = json.dumps({
             "enabled": is_visual_mode_enabled(WORKSPACE_DIR),
-            "available": model is not None,
+            # Per explicit instruction (2026-10-05): "available" now means
+            # the PERSONA supports Visual Mode at all (caroline/peter), not
+            # that the multi-GB model is already downloaded -- a missing
+            # file no longer disables the checkbox, it's exactly what
+            # visual_mode_set below downloads on demand when turned on.
+            "available": profile_supports_visual_mode(WORKSPACE_DIR),
             "source": model["source"] if model else None,
         })
         return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}
     if op == "visual_mode_set":
         if not isinstance(parsed.get("enabled"), bool):
             return {"type": "control_response", "op": op, "ok": False, "stderr": "visual_mode_set requires a boolean 'enabled'", "requestId": request_id}
-        log_event("engine", "visual_mode_set", enabled=parsed["enabled"])
-        set_visual_mode_enabled(WORKSPACE_DIR, parsed["enabled"])
-        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+        requested = parsed["enabled"]
+        log_event("engine", "visual_mode_set", enabled=requested)
+        if not requested:
+            set_visual_mode_enabled(WORKSPACE_DIR, False)
+            return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+        missing = missing_builtin_models(WORKSPACE_DIR)
+        if not missing:
+            set_visual_mode_enabled(WORKSPACE_DIR, True)
+            return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+        # Per explicit instruction (2026-10-05): models are no longer
+        # bundled at install time -- turning this on for a persona that
+        # isn't downloaded yet starts fetching its two day-parity files
+        # (CarolineA/B or PeterA/B) now, over the SAME WS mechanism already
+        # built for a purchased model (visual_models_plugin.py), just
+        # pointed at BUILTIN_MODELS_BASE_URL. `enabled` isn't persisted
+        # true yet -- visual_model_download_done flips it once every
+        # needed file actually lands (see that handler below), so a user
+        # who closes the app mid-download doesn't end up with the toggle
+        # silently "on" over nothing.
+        log_event("engine", "visual_mode_builtin_download_needed", missing=missing)
+        for name in missing:
+            add_pending_builtin_download(WORKSPACE_DIR, name)
+            await trigger_builtin_download_now(name)
+        return {
+            "type": "control_response", "op": op, "ok": True,
+            "stdout": json.dumps({"downloading": missing}), "requestId": request_id,
+        }
     if op == "shutdown_sync":
         # Best-effort: the WPF shell calls this before killing the backend
         # process, which doesn't wait for a real answer -- this just gets
@@ -1388,6 +1448,21 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "modelName": pending_name,
                 "url": f"{FACE_ANIMATION_BASE_URL}{pending_name}.xcfa",
                 "shaUrl": f"{FACE_ANIMATION_BASE_URL}{pending_name}.xcfa.sha256",
+            })
+
+        # Same flush, for a Settings-toggle-triggered built-in download
+        # (visual_mode_set) that was still in flight when the app last
+        # closed -- a fresh process is exactly a fresh chance to resume it.
+        for pending_name in list(load_pending_builtin_downloads(WORKSPACE_DIR)):
+            if (Path(models_dir()) / f"{pending_name}.xcfa").exists():
+                remove_pending_builtin_download(WORKSPACE_DIR, pending_name)
+                continue
+            log_event("engine", "visual_model_builtin_download_flush", model_name=pending_name)
+            await websocket.send_json({
+                "type": "visual_model_download_start",
+                "modelName": pending_name,
+                "url": f"{BUILTIN_MODELS_BASE_URL}/{pending_name}.xcfa",
+                "shaUrl": f"{BUILTIN_MODELS_BASE_URL}/{pending_name}.xcfa.sha256",
             })
 
     # Per explicit instruction: Caroline must never come back up silently.

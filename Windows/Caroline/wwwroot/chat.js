@@ -1514,10 +1514,19 @@
     }
 
     if (evt.type === "visual_mode_config") {
-      // One-time push at Caroline's own startup (see server.ts's OutEvent doc
-      // comment) -- just relayed to the native host so it can warm up the
-      // right model in the background; the page's own visualModeState comes
-      // from visual_mode_get (sent right after this on the same connection).
+      // Pushed once at Caroline's own startup (see server.ts's OutEvent doc
+      // comment), AND again by main.py's visual_model_download_done once a
+      // Settings-toggle-triggered built-in download (see visual_mode_set)
+      // finishes or fails -- that second case is the only time this needs
+      // to update the checkbox itself: enabling it when nothing had to
+      // download already set it optimistically, but enabling it while a
+      // multi-GB download was in flight left it checked-but-not-yet-true
+      // on the backend, so this is what flips it to match (or reverts it
+      // on a failed download) once the real outcome is known.
+      if (typeof evt.enabled === "boolean") {
+        visualModeState.enabled = evt.enabled;
+        visualModeEnabled.checked = evt.enabled;
+      }
       if (window.chrome?.webview) window.chrome.webview.postMessage(evt);
       return;
     }

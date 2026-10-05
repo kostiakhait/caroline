@@ -15,8 +15,23 @@ from typing import Literal
 
 from app.logging_setup import log_event
 from app.persona import get_persona
+from app.session_context import get_send
 
 VisualModelSource = Literal["caroline", "peter"]
+
+# Per explicit instruction (2026-10-05): these models are tens of GB and
+# account for ~90% of a fresh install's disk footprint, yet most users never
+# turn Visual Mode on -- CarolineInstaller used to fetch all four
+# unconditionally regardless. Now downloaded on demand, triggered by
+# enabling the Settings toggle (see main.py's visual_mode_set), the exact
+# same resumable/verified mechanism Windows/Caroline/Native/
+# VisualModelDownloader.cs already uses for a purchased model -- just
+# pointed at this base instead of the purchasable catalog's CDN (see
+# plugins/visual_models_plugin.py's own docstring for why those are
+# deliberately separate subtrees of the same host). Matches
+# Windows/CarolineInstaller/ModelsInfo.cs's own (now-removed) BaseUrl.
+BUILTIN_MODELS_BASE_URL = "https://downloader.multi-portal.org/apps/caroline/models"
+BUILTIN_MODEL_NAMES = frozenset({"CarolineA", "CarolineB", "PeterA", "PeterB"})
 
 
 def _settings_path(workspace_dir: str) -> Path:
@@ -35,8 +50,15 @@ def _load_settings(workspace_dir: str) -> dict:
 
 
 def is_visual_mode_enabled(workspace_dir: str) -> bool:
-    """Default true per explicit instruction ("по умолчанию он включен")."""
-    enabled = _load_settings(workspace_dir).get("enabled", True)
+    """Default FALSE (per explicit instruction, 2026-10-05, superseding the
+    old "по умолчанию он включен" default) -- the models are tens of GB and
+    the installer no longer fetches them unconditionally (see
+    BUILTIN_MODELS_BASE_URL's own doc comment), so defaulting to enabled
+    would just leave the toggle on with nothing downloaded. Only affects a
+    workspace that has never written visualMode.json at all -- an existing
+    user's own persisted choice (this file already exists for them) is
+    untouched either way."""
+    enabled = _load_settings(workspace_dir).get("enabled", False)
     log_event("engine", "visual_mode_is_enabled", enabled=enabled)
     return bool(enabled)
 
@@ -128,3 +150,79 @@ def resolve_visual_model(workspace_dir: str) -> dict | None:
 
 def is_visual_mode_available(workspace_dir: str) -> bool:
     return resolve_visual_model(workspace_dir) is not None
+
+
+def profile_supports_visual_mode(workspace_dir: str) -> bool:
+    """Whether Visual Mode could EVER apply to the current persona --
+    independent of whether the model files are actually downloaded yet (see
+    resolve_visual_model for that). Only "custom" has no model at all; for
+    caroline/peter, a missing file just means the Settings toggle needs to
+    download it first (main.py's visual_mode_set), not that it's
+    unavailable."""
+    return get_persona(workspace_dir).profile_key in ("caroline", "peter")
+
+
+def _builtin_names_for_profile(workspace_dir: str) -> list[str]:
+    profile_key = get_persona(workspace_dir).profile_key
+    if profile_key == "caroline":
+        return ["CarolineA", "CarolineB"]
+    if profile_key == "peter":
+        return ["PeterA", "PeterB"]
+    return []
+
+
+def missing_builtin_models(workspace_dir: str) -> list[str]:
+    """Which of the current persona's two day-parity files (both needed --
+    see resolve_visual_model's own A/B rotation) aren't on disk yet."""
+    base = Path(models_dir())
+    return [name for name in _builtin_names_for_profile(workspace_dir) if not (base / f"{name}.xcfa").exists()]
+
+
+def _pending_builtin_downloads_path(workspace_dir: str) -> Path:
+    return Path(workspace_dir) / "visual-mode-pending-builtin-downloads.json"
+
+
+def load_pending_builtin_downloads(workspace_dir: str) -> list[str]:
+    try:
+        return json.loads(_pending_builtin_downloads_path(workspace_dir).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_pending_builtin_downloads(workspace_dir: str, names: list[str]) -> None:
+    _pending_builtin_downloads_path(workspace_dir).write_text(json.dumps(names, indent=2) + "\n", encoding="utf-8")
+
+
+def add_pending_builtin_download(workspace_dir: str, name: str) -> None:
+    pending = load_pending_builtin_downloads(workspace_dir)
+    if name not in pending:
+        pending.append(name)
+        _save_pending_builtin_downloads(workspace_dir, pending)
+
+
+def remove_pending_builtin_download(workspace_dir: str, name: str) -> None:
+    pending = load_pending_builtin_downloads(workspace_dir)
+    if name in pending:
+        pending.remove(name)
+        _save_pending_builtin_downloads(workspace_dir, pending)
+
+
+async def trigger_builtin_download_now(name: str) -> bool:
+    """Best-effort immediate trigger over this turn's own WS connection, same
+    shape/caveats as visual_models_plugin.py's own _try_trigger_download_now
+    (never raises -- a headless session with no real websocket just means
+    the caller's own pending-list + main.py's startup flush deliver it
+    later)."""
+    try:
+        send = get_send()
+        await send({
+            "type": "visual_model_download_start",
+            "modelName": name,
+            "url": f"{BUILTIN_MODELS_BASE_URL}/{name}.xcfa",
+            "shaUrl": f"{BUILTIN_MODELS_BASE_URL}/{name}.xcfa.sha256",
+        })
+        log_event("engine", "visual_model_builtin_download_triggered", model_name=name)
+        return True
+    except Exception as exc:
+        log_event("engine", "visual_model_builtin_download_trigger_failed", model_name=name, error=str(exc))
+        return False
