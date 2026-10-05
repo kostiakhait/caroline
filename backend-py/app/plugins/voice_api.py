@@ -191,6 +191,24 @@ def _gender_agreement_clause(speaker_gender: str | None, addressee_gender: str |
             f"matching THEIR gender, e.g. {addressee_examples} -- never bleed the speaker's own gender into "
             "how they're addressed."
         )
+    if parts:
+        # Bug fix (2026-10-05), confirmed live: this instruction, meant to fix
+        # ONLY grammatical gender, once caused ai:translate to also flip an
+        # unrelated verb's PERSON and MOOD in the same sentence -- Caroline's
+        # own "Отправила..." (I sent it, first person, reporting a thing she'd
+        # already done herself) came back as "Отправь это..." (an imperative
+        # telling the user to send it), while the actual gender fix elsewhere
+        # in that same sentence (ты писала -> ты писал) was applied correctly.
+        # Scoped explicitly below so a gender-agreement instruction can never
+        # again be read as license to restructure who did what.
+        parts.append(
+            "This is a narrow grammatical-gender instruction, not license to rewrite anything else: change "
+            "ONLY the gender of inflected forms per the rules above. Never change grammatical person (first/"
+            "second/third) or mood on any verb, and never change who is reported to have done something -- a "
+            "declarative statement about an action the speaker already completed (e.g. \"I sent it\") must "
+            "never become an imperative telling someone else to do it (e.g. \"send it\"), or vice versa. If "
+            "a verb's gender is already correct, or doesn't need fixing, leave that verb completely untouched."
+        )
     return (" " + " ".join(parts)) if parts else ""
 
 
