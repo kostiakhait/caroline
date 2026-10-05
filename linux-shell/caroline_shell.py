@@ -39,6 +39,8 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
 
+from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 APP_ROOT = Path(os.environ.get("CAROLINE_APP_ROOT", HERE.parent))
 WWWROOT = Path(os.environ.get("CAROLINE_WWWROOT", HERE.parent / "Windows" / "Caroline" / "wwwroot"))
@@ -63,13 +65,28 @@ FONT_CSS = """
 
 SHIM_JS = """
 window.chrome = window.chrome || {};
-window.chrome.webview = {
-  postMessage: function (obj) {
-    window.webkit.messageHandlers.caroline.postMessage(JSON.stringify(obj));
-  },
-  addEventListener: function () {},
-  removeEventListener: function () {}
-};
+(function () {
+  var listeners = [];
+  window.chrome.webview = {
+    postMessage: function (obj) {
+      window.webkit.messageHandlers.caroline.postMessage(JSON.stringify(obj));
+    },
+    addEventListener: function (name, fn) {
+      if (name === "message") listeners.push(fn);
+    },
+    removeEventListener: function (name, fn) {
+      if (name === "message") listeners = listeners.filter(function (f) { return f !== fn; });
+    },
+    // Python-side equivalent of CoreWebView2.PostWebMessageAsJson: dispatches
+    // a "message" event to every addEventListener("message", ...) listener,
+    // e.data set to the parsed payload -- same shape monaco_viewer.html/
+    // slideshow.html already expect from the WebView2 build.
+    __dispatch: function (jsonText) {
+      var data = JSON.parse(jsonText);
+      listeners.forEach(function (fn) { fn({ data: data }); });
+    }
+  };
+})();
 """
 
 TAB_STRIP_CSS = b"""
@@ -397,6 +414,7 @@ class Shell:
         self.supervisor = supervisor
         self.tabs: list[ChatTab] = []
         self.active_tab: ChatTab | None = None
+        self.viewer_windows: dict[str, ViewerWindow] = {}
 
         self.window = Gtk.Window(title="Caroline")
         self.window.set_default_size(420, 640)
@@ -619,8 +637,76 @@ class Shell:
                 for mode_id in tab.mode_available:
                     tab.mode_available[mode_id] = bool(available.get(mode_id))
             self._apply_tab_mode_style(tab)
+        elif kind in ("open_editor", "open_office_editor", "close_editor"):
+            self._on_editor_message(tab, msg)
+        elif kind == "open_login":
+            self._open_login_viewer(tab, msg)
         else:
             log(f"[page:{tab.id}] unhandled message type={kind!r} (not implemented in the Linux shell yet)")
+
+    def _on_editor_message(self, tab: ChatTab, msg: dict) -> None:
+        path = msg.get("path", "")
+        kind = msg.get("type")
+        if kind == "close_editor":
+            viewer = self.viewer_windows.get(path)
+            if viewer:
+                viewer.close()
+            return
+        if kind == "open_office_editor":
+            log(f"[page:{tab.id}] open_office_editor not implemented in the Linux shell yet (path={path})")
+            return
+        request_id = msg.get("requestId", "")
+        viewer_key = path or request_id
+        viewer_kind = msg.get("kind", "")
+
+        def on_done(result: ViewerResult) -> None:
+            self.viewer_windows.pop(viewer_key, None)
+            payload = {"type": "editor_result", "requestId": request_id, "outcome": result.outcome, "path": result.path}
+            self._dispatch(tab, payload)
+
+        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, FONT_CSS, on_done=on_done)
+        if viewer_kind in ("code", "slideshow"):
+            viewer.show_web_page(msg.get("title", ""), viewer_kind, path, msg)
+        elif viewer_kind == "image":
+            viewer.show_image(path)
+        elif viewer_kind == "video":
+            viewer.show_video(path)
+        else:
+            log(f"[page:{tab.id}] open_editor kind={viewer_kind!r} not implemented in the Linux shell yet")
+            return
+        self.viewer_windows[viewer_key] = viewer
+        viewer.show()
+
+    LOGIN_WINDOW_KEY = "squirrelwisdom-login"
+
+    def _open_login_viewer(self, tab: ChatTab, msg: dict) -> None:
+        request_id = msg.get("requestId", "")
+        existing = self.viewer_windows.get(self.LOGIN_WINDOW_KEY)
+        if existing:
+            existing.close()
+
+        def on_login_done(email, password, cancelled, is_register, open_settings_instead):
+            self.viewer_windows.pop(self.LOGIN_WINDOW_KEY, None)
+            payload = {
+                "type": "login_result", "requestId": request_id, "email": email,
+                "password": password, "cancelled": cancelled, "isRegister": is_register,
+            }
+            self._dispatch(tab, payload)
+            if open_settings_instead and self.active_tab and self.active_tab.webview:
+                self.active_tab.webview.run_javascript(
+                    "window.carolineOpenSettings && window.carolineOpenSettings();", None, None, None,
+                )
+
+        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, FONT_CSS, on_login_done=on_login_done)
+        viewer.show_login(msg.get("error"), bool(msg.get("noAiAtAll")))
+        self.viewer_windows[self.LOGIN_WINDOW_KEY] = viewer
+        viewer.show()
+
+    def _dispatch(self, tab: ChatTab, payload: dict) -> None:
+        if tab.webview is not None:
+            tab.webview.run_javascript(
+                f"window.chrome.webview.__dispatch({json.dumps(json.dumps(payload))});", None, None, None,
+            )
 
     def on_destroy(self, _widget) -> None:
         self.supervisor.stop()
