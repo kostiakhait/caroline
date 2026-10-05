@@ -83,6 +83,24 @@ TAB_STRIP_CSS = b"""
 
 MODE_LABELS = (("claude", "Claude"), ("sw", "Squirrel Wisdom"), ("openai", "OpenAI"))
 
+SPLASH_BANNERS_DIR = Path(os.environ.get("CAROLINE_SPLASH_BANNERS", APP_ROOT / "SplashBanners"))
+SPLASH_CYCLE_INTERVAL_S = 2.5
+# Same three constants as App.xaml.cs's own SplashMinDuration/SplashMaxWait/
+# BackendPollInterval: a floor so a warm start still gets a brief branding
+# beat, a ceiling so a genuinely broken backend doesn't strand the user on
+# the splash forever (MainWindow's own health watchdog takes over either
+# way), both mirrored exactly rather than re-tuned for this platform.
+SPLASH_MIN_DURATION_S = 3.0
+SPLASH_MAX_WAIT_S = 5 * 60.0
+BACKEND_POLL_INTERVAL_S = 1.0
+
+SPLASH_CSS = b"""
+window.splash { background-color: #3A3F8F; }
+#splash-banner { background-color: #000; border-radius: 18px;
+  background-size: cover; background-position: center; background-repeat: no-repeat; }
+#splash-text { color: white; }
+"""
+
 
 def log(line: str) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +226,172 @@ class ChatTab:
         self.webview: WebKit2.WebView | None = None
 
 
+class SplashWindow:
+    """Port of SplashWindow.xaml(.cs): a chrome-less, transparent window
+    cycling the onboarding banners with a "Connecting..." label, shown while
+    the backend starts and dismissed by App.axaml.cs's equivalent
+    (wait_for_backend_then_show below) once it's actually healthy, a click,
+    or a timeout, whichever comes first.
+
+    True per-pixel window transparency depends on an RGBA visual being
+    available from the X server/compositor -- requested here, but not
+    guaranteed on every Linux desktop the way WPF's AllowsTransparency is
+    on Windows; falls back to an opaque dark window if the screen has no
+    such visual, rather than failing to show anything."""
+
+    def __init__(self, on_dismissed) -> None:
+        self.on_dismissed = on_dismissed
+        self._photos: list[Path] = []
+        self._photo_index = 0
+        self._cycle_source: int | None = None
+        self._dismissed = False
+
+        self.window = Gtk.Window(title="Caroline")
+        self.window.set_decorated(False)
+        self.window.set_default_size(480, 320)
+        self.window.set_resizable(False)
+        self.window.set_position(Gtk.WindowPosition.CENTER)
+        self.window.set_skip_taskbar_hint(True)
+        screen = self.window.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual is not None and screen.is_composited():
+            self.window.set_visual(visual)
+            self.window.set_app_paintable(True)
+            self.window.connect("draw", self._draw_transparent_bg)
+        else:
+            # No compositor (confirmed live: WSLg and this test box's Xvfb+
+            # openbox both lack one) -- an opaque window with GTK's default
+            # light background left "Connecting..." (white text) unreadable.
+            # Falls back to the same indigo used elsewhere in the UI
+            # (TabStrip's own #3A3F8F) rather than trying for transparency
+            # that isn't actually available.
+            self.window.get_style_context().add_class("splash")
+        self.window.connect("button-press-event", lambda *_a: self.dismiss())
+
+        css = Gtk.CssProvider()
+        css.load_from_data(SPLASH_CSS)
+        Gtk.StyleContext.add_provider_for_screen(screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+        self.banner = Gtk.EventBox()
+        self.banner.set_name("splash-banner")
+        self.banner.set_size_request(480, 270)
+        self.text = Gtk.Label(label="Connecting...")
+        self.text.set_name("splash-text")
+        box.pack_start(self.banner, False, False, 0)
+        box.pack_start(self.text, False, False, 0)
+        self.window.add(box)
+
+        self._load_banners()
+
+    @staticmethod
+    def _draw_transparent_bg(_widget, ctx) -> bool:
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.set_operator(1)  # cairo.OPERATOR_SOURCE
+        ctx.paint()
+        return False
+
+    def _load_banners(self) -> None:
+        try:
+            if SPLASH_BANNERS_DIR.is_dir():
+                self._photos = sorted(SPLASH_BANNERS_DIR.glob("*.png"))
+        except OSError as exc:
+            log(f"splash: could not list {SPLASH_BANNERS_DIR}: {exc}")
+        if not self._photos:
+            log(f"splash: no banners found under {SPLASH_BANNERS_DIR} -- showing a plain panel")
+            return
+        import random
+
+        self._photo_index = random.randrange(len(self._photos))
+        self._show_photo(self._photo_index)
+        if len(self._photos) > 1:
+            self._cycle_source = GLib.timeout_add(int(SPLASH_CYCLE_INTERVAL_S * 1000), self._on_cycle_tick)
+
+    def _on_cycle_tick(self) -> bool:
+        self._photo_index = (self._photo_index + 1) % len(self._photos)
+        self._show_photo(self._photo_index)
+        return True
+
+    def _show_photo(self, index: int) -> None:
+        path = self._photos[index].as_posix()
+        css = f'#splash-banner {{ background-image: url("file://{path}"); }}'.encode()
+        provider = Gtk.CssProvider()
+        try:
+            provider.load_from_data(css)
+        except GLib.Error as exc:
+            log(f"splash: could not load banner {path}: {exc}")
+            return
+        self.banner.get_style_context().add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def show(self) -> None:
+        self.window.show_all()
+
+    def dismiss(self) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        if self._cycle_source is not None:
+            GLib.source_remove(self._cycle_source)
+            self._cycle_source = None
+        self.window.destroy()
+        self.on_dismissed()
+
+
+def wait_for_backend_then_show(supervisor: Supervisor, splash: SplashWindow, reveal) -> None:
+    """Port of App.xaml.cs's WaitForSplashDismissAsync: polls the BACKEND's
+    own /api/status (not the supervisor's /status -- a different endpoint,
+    same one chat.js's WS connects alongside) once a second, holding the
+    splash until it reports no tab mid-startup-compaction AND at least
+    SPLASH_MIN_DURATION_S has passed, or until SPLASH_MAX_WAIT_S elapses
+    regardless. A click (SplashWindow.dismiss) short-circuits this entirely
+    via the on_dismissed callback already firing reveal()."""
+    start = time.monotonic()
+    state = {"revealed": False}
+
+    def do_reveal() -> None:
+        if state["revealed"]:
+            return
+        state["revealed"] = True
+        reveal()
+
+    original_dismiss = splash.dismiss
+
+    def dismiss_and_reveal() -> None:
+        original_dismiss()
+        do_reveal()
+
+    splash.dismiss = dismiss_and_reveal  # type: ignore[method-assign]
+
+    def backend_healthy() -> bool:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{BACKEND_PORT}/api/status", timeout=2) as r:
+                body = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            return False
+        tabs = body.get("tabs")
+        if isinstance(tabs, list):
+            if any(t.get("forcedCompactionPending") for t in tabs if isinstance(t, dict)):
+                return False
+        return True
+
+    def tick() -> bool:
+        if state["revealed"]:
+            return False
+        elapsed = time.monotonic() - start
+        if elapsed >= SPLASH_MAX_WAIT_S:
+            log("wait_for_backend_then_show: SPLASH_MAX_WAIT_S elapsed, showing anyway")
+            dismiss_and_reveal()
+            return False
+        if backend_healthy() and elapsed >= SPLASH_MIN_DURATION_S:
+            dismiss_and_reveal()
+            return False
+        return True
+
+    GLib.timeout_add(int(BACKEND_POLL_INTERVAL_S * 1000), tick)
+
+
 class Shell:
     def __init__(self, supervisor: Supervisor) -> None:
         self.supervisor = supervisor
@@ -241,9 +425,16 @@ class Shell:
         self.add_tab_button.set_relief(Gtk.ReliefStyle.NONE)
         self.add_tab_button.connect("clicked", lambda _b: self.add_tab(self._next_tab_id(), select=True))
 
-    def show(self) -> None:
-        self.window.show_all()
+    def prepare(self) -> None:
+        """Creates the first tab (and its WebKit2.WebView, already navigating
+        to chat.html) without showing the window -- unlike the WPF build,
+        no WebView2 "airspace" bug forces a Show()/Hide() dance here first;
+        a GTK window never shown at all is enough. Called while the splash
+        is up so the chat page is already loading underneath it."""
         self.add_tab("1", select=True)
+
+    def reveal(self) -> None:
+        self.window.show_all()
 
     def _next_tab_id(self) -> str:
         for i in range(1, MAX_TABS + 1):
@@ -442,7 +633,12 @@ def main() -> int:
         return 1
     serve_wwwroot()
     shell = Shell(supervisor)
-    shell.show()
+    shell.prepare()
+
+    splash = SplashWindow(on_dismissed=lambda: None)
+    splash.show()
+    wait_for_backend_then_show(supervisor, splash, shell.reveal)
+
     signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(shell.on_destroy, None))
     signal.signal(signal.SIGINT, lambda *_: GLib.idle_add(shell.on_destroy, None))
     Gtk.main()
