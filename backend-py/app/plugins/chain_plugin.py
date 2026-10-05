@@ -11,20 +11,34 @@ as-is (only "key" steps get their key name resolved to a VK code, and
 transformations), trusting chain.exe's own validation to report a
 malformed step. Worth reconsidering once the plugin API's schema story
 (pydantic models vs. plain dicts) is settled more broadly.
+
+Linux port (2026-10-04): app.plugins._linux_chain's run_chain_linux is a
+Python-native reimplementation of the SAME interpreter loop (see that
+module's own docstring for the full op-by-op mapping and documented
+fidelity gaps) -- steps are NOT run through _to_wire_step's VK-resolution
+on this platform; "key"/"modifiers" reach it as plain name strings,
+resolved internally via _x11_input.resolve_keysym, and "pid" stays
+whatever type it arrived as (the Linux interpreter's own
+_resolve_pid/_resolve_hwnd handle both int and "$name" forms directly).
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
-from app.plugins.native_exe import exe_path, resolve_vk, run_exe
 
-EXE = exe_path("chain", "chain.exe")
+if sys.platform == "win32":
+    from app.plugins.native_exe import exe_path, resolve_vk, run_exe
+
+    EXE = exe_path("chain", "chain.exe")
+else:
+    from app.plugins._linux_chain import run_chain_linux
 
 
 def _to_wire_step(step: dict[str, Any]) -> dict[str, Any]:
@@ -38,7 +52,28 @@ def _to_wire_step(step: dict[str, Any]) -> dict[str, Any]:
     return dict(step)
 
 
+async def _run_chain_linux(args: dict[str, Any]) -> dict[str, Any]:
+    import asyncio
+
+    steps = args["steps"]
+    with tempfile.TemporaryDirectory(prefix="caroline-chain-") as tmp_dir:
+        out_file = str(Path(tmp_dir) / "checkpoint.png")
+        result = await asyncio.to_thread(run_chain_linux, steps, out_file)
+        response: dict[str, Any] = {
+            "text": json.dumps({**result, "screenshot": "(attached below)" if result.get("screenshot") else None}, indent=2)
+        }
+        screenshot_path = result.get("screenshot")
+        if screenshot_path and Path(screenshot_path).exists():
+            response["image_base64"] = base64.b64encode(Path(screenshot_path).read_bytes()).decode("ascii")
+            response["mime_type"] = "image/png"
+        if result.get("status") == "failed":
+            response["is_error"] = True
+        return response
+
+
 async def run_chain(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if sys.platform != "win32":
+        return await _run_chain_linux(args)
     steps = args["steps"]
     with tempfile.TemporaryDirectory(prefix="caroline-chain-") as tmp_dir:
         steps_file = Path(tmp_dir) / "steps.json"

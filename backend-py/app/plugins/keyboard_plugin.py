@@ -1,19 +1,35 @@
 """windows-keyboard -- ports mcp-servers-src/keyboard/src/index.ts's real
-SendInput keyboard control (keyboard.exe), unchanged native binary."""
+SendInput keyboard control (keyboard.exe), unchanged native binary.
+
+Linux port (2026-10-04): in-process XTest calls via app.plugins._x11_input
+instead of a native exe -- see that module's docstring for the keysym/
+keycode remap it needs on this machine's own layout (confirmed live:
+Russian, so plain Latin letters have no keycode at all without it).
+asyncio.to_thread wraps every call for the same reason mouse_plugin.py's
+Linux branch does (python-xlib itself is synchronous)."""
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
-from app.plugins.native_exe import exe_path, resolve_vk, run_exe
 from app.policies import prefer_window_targeted_input_instruction
 
-EXE = exe_path("keyboard", "keyboard.exe")
+if sys.platform == "win32":
+    from app.plugins.native_exe import exe_path, resolve_vk, run_exe
+
+    EXE = exe_path("keyboard", "keyboard.exe")
+else:
+    from app.plugins import _x11_input as x11
 
 
 async def type_text(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     text = args["text"]
+    if sys.platform != "win32":
+        await asyncio.to_thread(x11.type_text, text)
+        return {"text": f"Typed {len(text)} character(s)"}
     delay_ms = args.get("delayMs")
     await run_exe(EXE, ["--action", "Type", "--text", text, "--delayms", str(delay_ms if delay_ms is not None else 10)])
     return {"text": f"Typed {len(text)} character(s)"}
@@ -22,21 +38,30 @@ async def type_text(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 async def press_key(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     key = args["key"]
     modifiers = args.get("modifiers") or []
+    combo = "+".join([*modifiers, key])
+    if sys.platform != "win32":
+        await asyncio.to_thread(x11.press_key, key, modifiers)
+        return {"text": f"Pressed {combo}"}
     vk = resolve_vk(key)
     mod_vks = [resolve_vk(m) for m in modifiers]
     await run_exe(EXE, ["--action", "Press", "--vk", str(vk), "--modifiers", ",".join(map(str, mod_vks))])
-    combo = "+".join([*modifiers, key])
     return {"text": f"Pressed {combo}"}
 
 
 async def key_down(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     key = args["key"]
+    if sys.platform != "win32":
+        await asyncio.to_thread(x11.key_down, key)
+        return {"text": f"Holding {key} down"}
     await run_exe(EXE, ["--action", "Down", "--vk", str(resolve_vk(key))])
     return {"text": f"Holding {key} down"}
 
 
 async def key_up(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     key = args["key"]
+    if sys.platform != "win32":
+        await asyncio.to_thread(x11.key_up, key)
+        return {"text": f"Released {key}"}
     await run_exe(EXE, ["--action", "Up", "--vk", str(resolve_vk(key))])
     return {"text": f"Released {key}"}
 

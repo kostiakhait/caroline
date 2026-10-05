@@ -101,6 +101,54 @@ shells out to it. On Linux, skip the subprocess layer entirely: a small `app/plu
 - The browser host's `IsVisibleOnTop` equivalent (Phase 3) uses the same X11 toolkit --
   `_NET_CLIENT_LIST_STACKING` hit-test at a screen point.
 
+**Status: done (2026-10-04), verified live against a real X server (WSL2 + WSLg).** All eight
+plugins (`mouse`, `keyboard`, `inspect`, `screenshot`, `window_mouse`, `window_keyboard`,
+`window_screenshot`, `chain`) have a Linux branch now, each gated by `sys.platform`, Windows branch
+byte-for-byte untouched (confirmed: all eight still import cleanly under a real win32 Python).
+Two new helper modules: `app/plugins/_x11_input.py` (XTest mouse/keyboard + posted/XSendEvent
+window-targeted input) and `app/plugins/_x11_window.py` (recursive-XQueryTree window enumeration/
+geometry). `chain_plugin.py`'s Linux branch is a full Python-native reimplementation of
+`chain.exe`'s interpreter loop (`app/plugins/_linux_chain.py`), not a thinner subset -- every op
+(move/click/mouse_down/mouse_up/drag/key/type/scroll/sleep/wait_window/wait_pixel/wait_idle/launch/
+kill/restart/checkpoint) ported and exercised live, including the retry/failedAt/screenshot result
+shape matching the C# original's JSON exactly.
+
+Real findings from live testing (not assumptions):
+- **`_NET_CLIENT_LIST` is NOT set** by WSLg's own window manager -- `inspect`/`chain`/window-*
+  tools' window enumeration deliberately never relies on it, using recursive `XQueryTree` +
+  WM_NAME/WM_CLASS filtering instead (the same WM-independent fallback xdotool itself uses, used
+  here unconditionally rather than as a fallback path).
+- **This machine's X server keyboard layout is Russian** -- plain Latin keysyms (e.g. `XK_a`) have
+  *no keycode at all* in the live layout, so XTest (which only takes a keycode, never a keysym)
+  can't type them directly. Fixed with the same technique `xdotool type` uses: temporarily bind one
+  unused keycode to whatever keysym is needed via `ChangeKeyboardMapping`
+  (`_x11_input.py`'s `_keysym_to_keycode`/`_find_free_keycode`) -- confirmed this makes `type_text`/
+  `press_key` layout-independent, not just a Russian-layout workaround.
+- **WSLg's WM reports a sentinel `(-32768, -32768)` geometry** for a just-created top-level frame
+  window for a brief, variable window after mapping (confirmed: a 1.2s settle resolves correctly
+  100% of the time; shorter waits are flaky) before it settles to the real position --
+  `_x11_window.get_window_rect` retries a few times with a short sleep rather than returning the
+  sentinel as if it were real, and documents this as unconfirmed on a real (non-WSLg) X.Org desktop
+  either way.
+- Window-targeted ("posted") input uses `XSendEvent`, which marks `send_event=true` on the
+  delivered event -- confirmed delivered correctly to a plain X11 window in testing, but same
+  documented caveat as the Windows posted-message tools already carry: some GTK/Qt/Electron
+  toolkits deliberately ignore synthetic events for that exact reason and need real XTest input
+  instead.
+- Screenshot capture uses `mss` (pure-Python + zlib PNG encoding via `mss.tools.to_png`, no Pillow)
+  rather than hand-rolled Xlib `GetImage` -- the latter threw `BadMatch` against the real server in
+  testing; `mss` worked cleanly for both full-screen and cropped capture. `maxWidth` downscaling is
+  a small hand-written nearest-neighbor resize (avoids a new Pillow/numpy dependency for one rarely
+  used parameter).
+- **New Python dependencies this phase introduces, not yet pinned/bundled anywhere**: `python-xlib`
+  and `mss`. No `requirements.txt`/pinned-deps manifest exists anywhere in this repo today --
+  Phase 5 (installer/packaging) needs to land wherever/however backend-py's other dependencies get
+  bundled into the shipped runtime; flagged here so it isn't missed, not resolved in this phase.
+- Single-window capture (`window_screenshot_plugin.py`) and `chain_plugin.py`'s `wait_pixel`/
+  `wait_idle`/`checkpoint` window modes screen-crop via the window's resolved rect rather than an
+  occlusion-safe `PrintWindow` equivalent (none exists in core X11 without compositor cooperation) --
+  a real, documented fidelity gap, not an oversight.
+
 ### Phase 3 -- embedded browser on Linux (Playwright-launched real windows)
 
 - New `app/plugins/_linux_app_browser.py` replacing `Caroline.NativeHost.exe`/`AppBrowserHost.cs`'s

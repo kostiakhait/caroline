@@ -1,22 +1,62 @@
 """windows-window-screenshot -- ports mcp-servers-src/window-screenshot/
 src/index.ts's PrintWindow-based single-window capture
-(windowscreenshot.exe), unchanged native binary."""
+(windowscreenshot.exe), unchanged native binary.
+
+Linux port (2026-10-04): no PrintWindow equivalent exists in core X11 --
+this just resolves the window's own screen rect (_x11_window.get_window_rect)
+and screen-crops that region via mss, same mechanism screenshot_plugin.py's
+own Linux branch already uses and already verified live. This is NOT
+occlusion-safe (unlike PrintWindow, which renders the window's own content
+even when covered): a window partly behind another window captures
+whatever is actually on top on Linux. That's a real fidelity gap, not an
+oversight -- flagged the same way this project already flags the
+Windows-side "GPU-rendered controls may not respond to posted input"
+fidelity gaps elsewhere, rather than silently pretending parity. Also
+inherits get_window_rect's defensive None-rect fallback (see
+_x11_window.py's docstring) for the one confirmed-live WSLg geometry
+quirk -- a None rect here raises rather than capturing a bogus region."""
 
 from __future__ import annotations
 
 import base64
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
-from app.plugins.native_exe import exe_path, run_exe
 from app.policies import prefer_cropped_screenshots_instruction
 
-EXE = exe_path("window-screenshot", "windowscreenshot.exe")
+if sys.platform == "win32":
+    from app.plugins.native_exe import exe_path, run_exe
+
+    EXE = exe_path("window-screenshot", "windowscreenshot.exe")
+else:
+    from app.plugins import _x11_window as x11win
+    from app.plugins.screenshot_plugin import _take_screenshot_linux
+
+
+async def _capture_window_linux(args: dict[str, Any]) -> dict[str, Any]:
+    import asyncio
+
+    rect = await asyncio.to_thread(x11win.get_window_rect, args["hwnd"])
+    if rect["x"] is None:
+        return {"text": f"Could not resolve window {args['hwnd']}'s screen position.", "is_error": True}
+    shot_args: dict[str, Any] = {
+        "x": rect["x"], "y": rect["y"], "width": rect["width"], "height": rect["height"],
+        "maxWidth": args.get("maxWidth"), "savePath": args.get("savePath"),
+    }
+    if all(args.get(k) is not None for k in ("x", "y", "width", "height")):
+        shot_args["x"] = rect["x"] + int(args["x"])
+        shot_args["y"] = rect["y"] + int(args["y"])
+        shot_args["width"] = int(args["width"])
+        shot_args["height"] = int(args["height"])
+    return await _take_screenshot_linux(shot_args)
 
 
 async def capture_window(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if sys.platform != "win32":
+        return await _capture_window_linux(args)
     hwnd = args["hwnd"]
     with tempfile.TemporaryDirectory(prefix="caroline-window-screenshot-") as tmp_dir:
         out_path = Path(tmp_dir) / "window.png"
@@ -45,6 +85,19 @@ async def capture_window(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 async def capture_window_burst(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     hwnd, save_path = args["hwnd"], args["savePath"]
     Path(save_path).mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        import asyncio
+
+        count, interval_ms = int(args["count"]), int(args["intervalMs"])
+        for i in range(count):
+            result = await _capture_window_linux({"hwnd": hwnd})
+            if result.get("is_error"):
+                return result
+            frame_path = Path(save_path) / f"frame_{i + 1:04d}.png"
+            frame_path.write_bytes(base64.b64decode(result["image_base64"]))
+            if i < count - 1:
+                await asyncio.sleep(interval_ms / 1000)
+        return {"text": f"Captured {count} frame(s) to {save_path}"}
     summary = await run_exe(EXE, [
         "--action", "burst", "--hwnd", hwnd,
         "--count", str(args["count"]), "--intervalMs", str(args["intervalMs"]), "--outDir", save_path,
