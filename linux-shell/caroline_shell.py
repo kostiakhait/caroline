@@ -726,7 +726,46 @@ class Shell:
         Gtk.main_quit()
 
 
+def acquire_single_instance_lock() -> object | None:
+    """Analog of the WPF App.xaml.cs's named Mutex -- flock on a file under
+    the XDG data dir. Returns the open file (keep a reference alive for the
+    process's lifetime, or the lock releases) or None if another instance
+    already holds it. Unlike a Windows named Mutex, the kernel releases an
+    flock automatically if this process dies without closing it (crash,
+    SIGKILL), so no stale-lock cleanup is needed -- same effective behavior
+    as a Windows abandoned-mutex, just via a different OS mechanism."""
+    import fcntl
+
+    xdg_data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    lock_dir = Path(xdg_data_home) / "caroline"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "caroline.lock"
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def show_already_running_dialog() -> None:
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK,
+        text="Caroline is already running.",
+    )
+    dialog.set_title("Caroline")
+    dialog.run()
+    dialog.destroy()
+
+
 def main() -> int:
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        log("another instance is already running -- exiting")
+        show_already_running_dialog()
+        return 1
+
     supervisor = Supervisor()
     if not supervisor.start():
         return 1
