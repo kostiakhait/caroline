@@ -260,9 +260,16 @@ Real findings from the teardown work:
   remote shell's own command line and kills the session. Run such commands from a script file.
 
 Not started: `DocumentViewerWindow`, `VisualModeWindow`/`VisualModeManager`, tray icon (DBus
-StatusNotifierItem), global hotkey (`XGrabKey`), autostart (`.desktop`), the real chat-tab UI. The
-open design question for chat/viewer web content is unchanged: a Playwright chrome-less window per
-surface (same approach as Phase 3), not a new native webview binding.
+StatusNotifierItem), global hotkey (`XGrabKey`), autostart (`.desktop`), the real chat-tab UI.
+
+Web content, decided 2026-10-05 as "embedded Avalonia webview" (user's choice), then found not
+working: tried `Avalonia.Controls.WebView` 12.1.0 (official avaloniaui package, has a WebKitGTK
+adapter) with `NativeWebView` + `Source`, WebKitGTK 4.1 installed on the test box. It built, but no
+WebKit process started and no content rendered, even with an explicit minimum height. The package's
+own README steers Linux toward `NativeWebDialog` (a separate native window) instead of the embedded
+control. Reverted; nothing committed for this. Open: either embed-with-a-different-approach, or accept
+separate windows (`NativeWebDialog` or Phase 3's Playwright windows), which contradicts the embedded
+choice and needs the user's decision.
 
 ### Phase 5 -- installer/packaging
 
