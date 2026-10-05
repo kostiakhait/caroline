@@ -26,7 +26,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import GLib, Gtk, WebKit2  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, WebKit2  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 APP_ROOT = Path(os.environ.get("CAROLINE_APP_ROOT", HERE.parent))
@@ -121,7 +121,11 @@ class Shell:
     def __init__(self, supervisor: Supervisor) -> None:
         self.supervisor = supervisor
         self.window = Gtk.Window(title="Caroline")
-        self.window.set_default_size(420, 760)
+        self.window.set_default_size(420, 640)
+        geometry = Gdk.Geometry()
+        geometry.min_width = 320
+        geometry.min_height = 400
+        self.window.set_geometry_hints(None, geometry, Gdk.WindowHints.MIN_SIZE)
         self.window.connect("destroy", self.on_destroy)
 
         manager = WebKit2.UserContentManager()
