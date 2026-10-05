@@ -791,6 +791,16 @@ def show_already_running_dialog() -> None:
     dialog.destroy()
 
 
+def show_error_dialog(summary: str, detail: str) -> None:
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text=summary,
+    )
+    dialog.format_secondary_text(detail)
+    dialog.set_title("Caroline")
+    dialog.run()
+    dialog.destroy()
+
+
 def main() -> int:
     lock = acquire_single_instance_lock()
     if lock is None:
@@ -800,6 +810,16 @@ def main() -> int:
 
     supervisor = Supervisor()
     if not supervisor.start():
+        # Confirmed live (2026-10-05, AppImage test): this used to exit with
+        # nothing visible at all -- no window, no terminal output (log() only
+        # writes to the log file) -- when the bundled runtime/python was
+        # missing. A packaged app failing this early needs to actually tell
+        # the person running it something, not just leave them looking at
+        # nothing with no clue where to even look.
+        show_error_dialog(
+            "Caroline couldn't start",
+            f"The bundled Python runtime was not found at {PYTHON}.\n\nSee {LOG_PATH} for details.",
+        )
         return 1
     serve_wwwroot()
     shell = Shell(supervisor)
