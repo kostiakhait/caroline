@@ -259,9 +259,6 @@ Real findings from the teardown work:
 - Test-harness gotcha, not a product bug: `pkill -f <pattern>` run inline over SSH matches the
   remote shell's own command line and kills the session. Run such commands from a script file.
 
-Not started: `DocumentViewerWindow`, `VisualModeWindow`/`VisualModeManager`, tray icon (DBus
-StatusNotifierItem), global hotkey (`XGrabKey`), autostart (`.desktop`), the real chat-tab UI.
-
 Web content, decided 2026-10-05 as "embedded Avalonia webview" (user's choice), then found not
 working: tried `Avalonia.Controls.WebView` 12.1.0 (official avaloniaui package, has a WebKitGTK
 adapter) with `NativeWebView` + `Source`, WebKitGTK 4.1 installed on the test box. It built, but no
@@ -279,9 +276,46 @@ to Python + WebKit2. Verified on the test box, in order:
   chat page loads and renders. Backend shows `reconnecting` on the test box because `claude_agent_sdk`
   isn't installable there. Supervisor cleanup on SIGTERM verified (no leftover process).
 
-Not done: the viewer windows, tray, hotkey, autostart, always-on-top verification, and packaging. The
-wwwroot path still points at the WPF project's assets; Phase 5 must copy them into the package. Icon
-font: the test box has no icon font, so icons render as boxes there. Phase 5 must bundle it.
+Since the pivot, also done and verified on the test box (icons/fonts aside, "maximally close to
+Windows" per explicit instruction):
+- **Font**: Selawik (SIL OFL 1.1, Microsoft -- same metrics as Segoe UI) bundled in
+  `linux-shell/fonts/` and mapped onto the page's own `font-family: "Segoe UI"` requests via a
+  WebKit user stylesheet; the page itself is unchanged.
+- **Tab strip**: ports `MainWindow.xaml.cs`'s `RebuildTabStrip`/`ApplyTabModeStyle` -- one
+  `WebKit2.WebView` per tab at the same `chat.html?port=...&tab=...&alwaysOnTop=...&assetsVersion=...`
+  URL the WebView2 build already uses, a hamburger menu (Mode submenu/Clear/Close, same enable/
+  disable rules), active-tab RoyalBlue highlight on the `#3A3F8F` strip, double-click rename. Not
+  yet persisted (open tab ids/names/window position -- no `SettingsService` equivalent here).
+- **Splash screen**: chrome-less, centered, cycling `SplashBanners/*.png`, dismiss logic ports
+  `WaitForSplashDismissAsync` exactly (3s floor, 5min ceiling, polls the backend's own
+  `/api/status` for `forcedCompactionPending`). No compositor on this test box (same as WSLg), so
+  real window transparency isn't available -- falls back to a solid `#3A3F8F` panel rather than
+  GTK's default light background, which otherwise left the white "Connecting..." text unreadable.
+- **Viewer windows** (`linux-shell/viewer_window.py`, ports `DocumentViewerWindow`): image, video,
+  code/slideshow (loads the same `monaco_viewer.html`/`slideshow.html` from the shell's own local
+  HTTP server), and the SquirrelWisdom login form. The `window.chrome.webview` shim gained a real
+  `addEventListener("message", ...)` + an internal `__dispatch` the native side calls, needed for
+  these pages' own message listener and for posting `editor_result`/`login_result` back -- same
+  shape `PostWebMessageAsJson` already produces. NOT ported: the OnlyOffice editor ("office" kind)
+  and the payment checkout viewer -- both need a live backend session to exercise at all. Monaco's
+  own editor body didn't render content within a short (~3s) live test; flagged as unconfirmed, not
+  claimed working.
+- **Visual Mode found NOT to be a simple port**: audited `vendor/XcfaRenderer` (the talking-head
+  renderer `VisualModeManager.cs`/`VisualModeWindow.xaml.cs` depend on) -- its real dependencies
+  (SkiaSharp, OpenCvSharp) both ship Linux builds, and the only confirmed Win32-specific code is
+  `ProcessWatchdog.cs`'s small `kernel32.dll` P/Invoke. The actual blocker is architectural: XcfaRenderer
+  is a C# library and the Linux shell is now Python, so using it needs either a bridge process or a
+  full reimplementation -- neither exists. Resolved honestly rather than left silently broken:
+  `visual_speech_audio` now replies immediately with `{type: "visual_speech_done", played: false}`,
+  the exact signal `chat.js` already uses (Windows side, "model not warmed yet") to fall back to
+  plain audio -- so a voice reply stays audible instead of `chat.js` hanging on a reply that would
+  otherwise never arrive. `visual_mode_config`/`visual_speech_start/stop/cancel` are no-ops (no
+  native reply is expected for these on Windows either). Still open: tray, hotkey, autostart,
+  always-on-top live verification, and packaging. The wwwroot path still points at the WPF
+  project's own assets; Phase 5 must copy them into the package. The emoji/icon-font gap (📎, 🎙️,
+  etc. render as boxes) is tracked separately -- drawn replacement icons exist outside the repo
+  pending a decision on light-background contrast, not yet wired in beyond the dark-background-only
+  tab-strip hamburger (`linux-shell/icons/menu.png`).
 
 ### Phase 5 -- installer/packaging
 

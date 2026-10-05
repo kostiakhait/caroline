@@ -641,6 +641,19 @@ class Shell:
             self._on_editor_message(tab, msg)
         elif kind == "open_login":
             self._open_login_viewer(tab, msg)
+        elif kind == "visual_speech_audio":
+            # Visual Mode (XcfaRenderer-based talking-head rendering) isn't
+            # ported -- that library is a vendored C# ProjectReference with
+            # no bridge from this Python shell, a separate, large undertaking
+            # (see docs/LINUX_PORT_PLAN.md's Phase 4 section). chat.js
+            # already treats played=false as "fall back to plain audio" for
+            # the exact same reason on Windows (a not-yet-warmed model) --
+            # replying with it immediately here keeps every voice reply
+            # audible instead of chat.js waiting forever for a
+            # visual_speech_done that would otherwise never arrive.
+            self._dispatch(tab, {"type": "visual_speech_done", "requestId": msg.get("requestId"), "played": False})
+        elif kind in ("visual_mode_config", "visual_speech_start", "visual_speech_stop", "visual_speech_cancel"):
+            pass  # no native reply expected for these on Windows either
         else:
             log(f"[page:{tab.id}] unhandled message type={kind!r} (not implemented in the Linux shell yet)")
 
