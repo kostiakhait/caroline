@@ -427,13 +427,27 @@ async def _await_accept(request_path: str) -> None:
         await asyncio.sleep(PHASE1_POLL_INTERVAL_S)
 
 
+async def _poll_result(result_path: str) -> Any | None:
+    """One phase-2 poll. Any SwApiError here means "no result readable right
+    now" -- the phone already accepted the request, so a failed poll must
+    never be reported as the operation failing (that was a false positive
+    seen live: an SMS that went out got reported as "failed at the result
+    phase"). The error is logged, not swallowed silently, and polling keeps
+    going until the phase-2 budget runs out."""
+    try:
+        return await get_mine(result_path)
+    except SwApiError as exc:
+        log_event("plugin:companion", "result_poll_error_retrying", path=result_path, error=str(exc))
+        return None
+
+
 async def _await_result(result_path: str, ack_at: float, report_progress: ReportProgress) -> Any:
     """Phase 2: checks immediately, then follows the 20/40/60.. backoff,
     capped at PHASE2_BUDGET_S counted from `ack_at` (NOT from when this
     coroutine started -- resuming after a restart must not reset the
     clock)."""
     deadline = ack_at + PHASE2_BUDGET_S
-    value = await get_mine(result_path)
+    value = await _poll_result(result_path)
     if value is not None:
         return value
     for delay in _phase2_backoff_delays():
@@ -441,7 +455,7 @@ async def _await_result(result_path: str, ack_at: float, report_progress: Report
         if remaining <= 0:
             break
         await asyncio.sleep(min(delay, remaining))
-        value = await get_mine(result_path)
+        value = await _poll_result(result_path)
         if value is not None:
             return value
         remaining = int(deadline - time.monotonic())
