@@ -3007,12 +3007,25 @@ class ChatSession:
         stays silent rather than invent anything from the conversation."""
         if self.small_model_active:
             return "\n".join(self.small_model_activity[-8:]) or None
+        # Counts only, never tool names: the narrator reports task status to the
+        # user in plain words and must not surface internal machinery.
+        running = len(self._pending_tool_calls)
+        finished = list(self.turn_tool_outcomes.values())
+        if not running and not finished:
+            return None
         lines: list[str] = []
-        for name in self._pending_tool_calls.values():
-            lines.append(f"Running now: {name}")
-        for outcome in self.turn_tool_outcomes.values():
-            lines.append(f"Finished: {outcome.name} -- {'error' if outcome.is_error else 'ok'}")
-        return "\n".join(lines) or None
+        if running:
+            lines.append(f"Steps in progress right now: {running}")
+        if finished:
+            failed = sum(1 for o in finished if o.is_error)
+            lines.append(f"Steps completed so far this turn: {len(finished) - failed} succeeded, {failed} failed")
+        return "\n".join(lines)
+
+    def _narration_task(self) -> str:
+        """The user's request for the current task -- the one thing the narrator
+        needs to say where the task stands. Only the current real user request,
+        never older conversation history."""
+        return (self.last_real_user_question or "").strip()[:600]
 
     def _gather_recent_dialogue_for_narration(self, limit: int = RECENT_DIALOGUE_WINDOW) -> str:
         """Per explicit correction (2026-09-10): the first version of
@@ -3245,6 +3258,7 @@ class ChatSession:
         # until this one returns, slow or not.
         from app.plugins.voice_api import generate_progress_comment
 
+        task = self._narration_task()
         dialogue = ""
         # Bug fix (2026-09-15), per explicit instruction ("Нарратор должен
         # давать сообщения раз в минуту"): confirmed live -- the SMALL
@@ -3269,7 +3283,7 @@ class ChatSession:
             try:
                 comment = await generate_progress_comment(
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
-                    gender=get_persona_gender(self.workspace_dir), activity=activity,
+                    gender=get_persona_gender(self.workspace_dir), activity=activity, task=task,
                     addressee_gender=get_owner_profile(self.workspace_dir).gender,
                 )
             except Exception as exc:

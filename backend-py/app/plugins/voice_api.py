@@ -642,7 +642,7 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
 
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
-    activity: str | None = None, addressee_gender: str | None = None,
+    activity: str | None = None, addressee_gender: str | None = None, task: str | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
@@ -758,21 +758,37 @@ async def generate_progress_comment(
     # The dialogue-based prompt above kept inventing people, dates and
     # intentions out of old chat lines, so it is no longer used at all: no
     # action facts means no narration.
-    if not activity:
+    if not activity or not task:
         return None
     prompt = (
         "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
         "short sentence, no JSON, no markdown, no preamble.\n\n"
-        "You narrate ONLY the actions listed under FACTS below, in one short first-person sentence, present "
-        "tense, saying what is being done right now or what just finished. Use only words and details that "
-        "are literally in FACTS.\n"
-        "Forbidden: naming people, dates, numbers, places or topics that are not in FACTS; guessing why, what "
-        "the user wants, what the result means, or what comes next; any promise or plan; any reference to the "
-        "conversation; any internal machinery beyond the action names themselves.\n"
-        "If FACTS has nothing concrete to report, reply with exactly <narration></narration> and nothing else.\n\n"
+        "You speak to the user about where their request stands right now: how far along the work is, or that "
+        "it's finished. Use first person, plain everyday words, present tense.\n"
+        "Never mention tools, functions, commands, systems, files, processes, session mechanics or any internal "
+        "machinery -- describe the progress of the task itself, in the terms the user used.\n"
+        "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
+        "guess the user's intent or mood; never promise or plan next steps.\n"
+        "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
+        "progress -- describe it that way.\n"
+        "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
+        "nothing else.\n\n"
         "Write in English. A separate step translates it afterward.\n\n"
-        f"FACTS:\n---\n{activity}\n---\n\n"
-        "Reply now, wrapped in the tag, e.g. <narration>Checking the contacts list.</narration>"
+        "Examples of the right kind of reply (copy the style, never the words -- these are unrelated to the "
+        "real task below):\n"
+        "  TASK: plan a three-day trip to the coast. STATUS: Steps in progress right now: 2.\n"
+        "  Good: <narration>Still putting the coast trip plan together, a few more pieces to go.</narration>\n"
+        "  TASK: translate the contract summary. STATUS: Steps completed so far this turn: 4 succeeded, 0 failed.\n"
+        "  Good: <narration>The translation is still in progress, not quite finished yet.</narration>\n"
+        "  TASK: book a table for two. STATUS: Steps completed so far this turn: 2 succeeded, 0 failed. "
+        "Task finished: yes.\n"
+        "  Good: <narration>Your table for two is booked.</narration>\n"
+        "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
+        "  Good: <narration></narration>\n"
+        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n\n"
+        f"TASK (the user's request):\n---\n{task}\n---\n\n"
+        f"STATUS (what is happening, counts only):\n---\n{activity}\n---\n\n"
+        "Reply now, wrapped in the tag."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:
