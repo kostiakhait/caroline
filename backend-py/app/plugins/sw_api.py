@@ -25,6 +25,13 @@ V2_LOGIN_SERVICE_KEY = "fytZDwOTaBo8I173IS2DaY_qgzm0IFvqvnxJGvC5QrE"
 # hardcoded API_KEY). Shared here rather than duplicated per plugin.
 CAROLINE_SW_KEY = "QvR-sujLOgpKWZ-yhSOK5ZNgEe4sgF0EUU7GexQqr4M"
 
+# Issued 2026-10-05 (service_name "caroline-remote-session-check") scoped to
+# EXACTLY user:getSessionUser, nothing broader -- V2_LOGIN_SERVICE_KEY above
+# is only scoped for user:verify, confirmed live ("Key scope/resource ACL
+# does not permit this call" using it for getSessionUser). Used solely by
+# get_session_user below, main.py's remote-auth middleware's one dependency.
+V2_SESSION_LOOKUP_KEY = "rG2-bS_X_cLc0_hx1gvYnK5DSW8mio_oplzQeM3QxSo"
+
 CREDENTIALS_PATH = Path.home() / ".mcp-notes" / "credentials.json"
 
 
@@ -126,6 +133,21 @@ async def call_v2(command: str, **extra: Any) -> dict[str, Any]:
             raise SessionExpiredError(reason)
         raise SwApiError(f'command "{command}" failed: {reason}')
     return envelope
+
+
+async def get_session_user(session: str) -> str | None:
+    """Resolves an arbitrary SW v2 session token to the email it belongs to
+    (API/Api2UserCommands.py's `user:getSessionUser`, same auth scope as
+    `user:verify`) -- the one way to validate a session presented by someone
+    else, since there is no local/offline way to verify a v2 token (see
+    main.py's remote-auth middleware, the only caller of this). Returns None
+    for an invalid/expired/unknown session rather than raising, so a caller
+    can treat "not a real session" and "session valid but somehow userless"
+    the same way: reject."""
+    data = await _post_json({"command": "user:getSessionUser", "key": V2_SESSION_LOOKUP_KEY, "session": session})
+    if data.get(".status") != "ok":
+        return None
+    return data.get("user") or None
 
 
 async def mint_v2_session(email: str, password: str) -> str:

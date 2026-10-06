@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -59,7 +59,7 @@ from app.plugins.companion_sms_store import (
     load_store as companion_load_sms_store,
 )
 from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
-from app.plugins.sw_api import mint_v2_session
+from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
@@ -114,6 +114,54 @@ BACKUP_NUDGE = (
 ensure_recurring_backup(BACKUP_NUDGE)
 
 app = FastAPI()
+
+# Remote control port (2026-10-05): the SAME app/routes as the local,
+# loopback-only PORT above, additionally served on this port bound to
+# 0.0.0.0 (see the bottom of this file) so Caroline is reachable from
+# another device -- every endpoint, deliberately, per explicit instruction
+# ("делай доступ ко всему... полноценная управляемая удаленно Caroline со
+# всей диагностикой"), not a curated subset. The middleware below is what
+# keeps this safe: it only enforces anything for requests that actually
+# arrived on REMOTE_PORT (checked via the ASGI connection's own bound
+# socket, request.scope["server"] -- not a client-suppliable Host header,
+# which could be spoofed) -- the existing 127.0.0.1:PORT listener the WPF/
+# GTK shells already use is completely unaffected, byte-for-byte the same
+# as before this feature existed.
+REMOTE_PORT = int(os.environ.get("CAROLINE_REMOTE_PORT", "48768"))
+
+
+@app.middleware("http")
+async def _require_remote_owner_session(request: Request, call_next):
+    server = request.scope.get("server")
+    if not server or server[1] != REMOTE_PORT:
+        return await call_next(request)  # local port: unchanged, no auth
+
+    owner_email = logged_in_email()
+    if not owner_email:
+        # Caroline herself isn't logged into SW -- there is no account to
+        # compare a remote caller's session against, so nothing can be
+        # proven safe to let through.
+        return JSONResponse({"ok": False, "error": "Caroline is not logged into SquirrelWisdom; remote access is unavailable."}, status_code=503)
+
+    auth_header = request.headers.get("authorization") or ""
+    token = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
+    if not token:
+        return JSONResponse({"ok": False, "error": 'Missing "Authorization: Bearer <SquirrelWisdom session>" header.'}, status_code=401)
+
+    try:
+        caller_email = await get_session_user(token)
+    except Exception as exc:
+        log_event("engine", "remote_auth_sw_lookup_failed", error=str(exc))
+        return JSONResponse({"ok": False, "error": "Could not verify session with SquirrelWisdom right now."}, status_code=502)
+
+    if not caller_email or caller_email.strip().lower() != owner_email.strip().lower():
+        log_event("engine", "remote_auth_rejected", caller_email=caller_email)
+        return JSONResponse({"ok": False, "error": "This SquirrelWisdom session does not belong to this Caroline's own account."}, status_code=403)
+
+    log_event("engine", "remote_auth_ok", caller_email=caller_email, path=request.url.path)
+    return await call_next(request)
+
+
 sessions: dict[str, ChatSession] = {}
 _ratatosk_session: ChatSession | None = None
 # Per explicit instruction: the owner-DM channel must never go silent. A
@@ -1720,14 +1768,14 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
 
 if __name__ == "__main__":
+    # Dead in production -- run_server.py (sys.path-safe under the embeddable
+    # Python's ._pth restrictions, see its own docstring) is the real entry
+    # point SupervisorClient.cs/BackendProcess.cs invokes, and owns the
+    # actual two-listener uvicorn startup (PORT local + REMOTE_PORT remote,
+    # see _require_remote_owner_session above). Kept minimal here so `python
+    # -m app.main` still works for quick local debugging without the
+    # ._pth-sensitive sys.path dance run_server.py exists for.
     import uvicorn
 
-    from app.skills_seed import seed_skills
-
-    log_event("engine", "starting", port=PORT, workspace_dir=WORKSPACE_DIR)
-    seed_skills(WORKSPACE_DIR)
-    # Bug fix (2026-09-27), per explicit instruction: no longer launches
-    # local_tts_server.py as a separate subprocess -- see voice_api.py's
-    # _synthesize_speech_locally for why (in-process app.local_edge_tts now,
-    # this file/launcher was leftover from the old Node.js backend).
+    log_event("engine", "starting", port=PORT, remote_port=REMOTE_PORT, workspace_dir=WORKSPACE_DIR)
     uvicorn.run(app, host="127.0.0.1", port=PORT)
