@@ -969,6 +969,14 @@ async def _sync_tab_list(workspace_dir: str) -> None:
     _tab_list_published_at = time.monotonic()
 
 
+# Message ids already injected into a live tab during this process's lifetime.
+# A delete that hasn't yet shown up in the next inbox read used to let the
+# same phone message be injected again -- confirmed live as two identical
+# deliveries about a second apart. Bounded: only ids still present in a
+# read are ever relevant, so the set is pruned to what the latest read saw.
+_injected_inbox_msg_ids: set[str] = set()
+
+
 async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None:
     # One read per tab's own inbox. Reading the whole `tabs` subtree in one
     # call stopped working once tabs/<id>/history_v2 and tabs/<id>/att/* got
@@ -980,9 +988,15 @@ async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None
         except Exception as exc:  # noqa: BLE001
             log_event("plugin:companion", "inbox_read_failed", tab_id=tab_id, error=str(exc))
             continue
-        if not isinstance(inbox, dict) or not inbox:
+        if not isinstance(inbox, dict):
+            continue
+        _injected_inbox_msg_ids.intersection_update(inbox.keys())
+        if not inbox:
             continue
         for msg_id, msg in list(inbox.items()):
+            if msg_id in _injected_inbox_msg_ids:
+                await _safe_delete(f"tabs/{tab_id}/inbox/{msg_id}")
+                continue
             text = msg.get("text") if isinstance(msg, dict) else None
             raw_attachments = msg.get("attachments") if isinstance(msg, dict) else None
             attachments = raw_attachments if isinstance(raw_attachments, list) and raw_attachments else None
@@ -996,6 +1010,7 @@ async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None
                 log_event("plugin:companion", "inbox_inject_failed", tab_id=tab_id, msg_id=msg_id, error=str(exc))
                 delivered = False
             if delivered:
+                _injected_inbox_msg_ids.add(msg_id)
                 await _safe_delete(f"tabs/{tab_id}/inbox/{msg_id}")
                 log_event("plugin:companion", "inbox_message_injected", tab_id=tab_id, msg_id=msg_id)
 
