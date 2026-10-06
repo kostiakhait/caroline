@@ -166,7 +166,15 @@ class SmsRepository(private val context: Context) {
     /** Live MMS search, same shape/purpose as search() above for SMS -- `address` matches
      * the resolved sender/recipient; MMS has no single indexed body column to LIKE against
      * (text lives in a separate per-part table), so `query` is applied client-side after
-     * each message's text is assembled, not pushed into the content-provider selection. */
+     * each message's text is assembled, not pushed into the content-provider selection.
+     *
+     * Bug fix (2026-10-05), confirmed live: this used to call readMmsRows (resolves BOTH
+     * address and full text for every row) and only check the address filter afterward --
+     * on a phone with many MMS (school/alert threads etc.), narrowing a search to one
+     * address still paid for a part-table read on every non-matching message, genuinely
+     * slow (multi-minute). Address is one query per message; text is the expensive one
+     * (per-part, sometimes a file read) -- resolving address FIRST and skipping the text
+     * read entirely for a non-matching row is what actually saves the time. */
     fun searchMms(query: String?, address: String?, limit: Int): List<Map<String, Any?>> {
         val start = System.currentTimeMillis()
         val out = mutableListOf<Map<String, Any?>>()
@@ -174,13 +182,28 @@ class SmsRepository(private val context: Context) {
         context.contentResolver.query(
             Telephony.Mms.CONTENT_URI, projection, null, null, "${Telephony.Mms.DATE} DESC",
         )?.use { c ->
-            for (row in readMmsRows(c)) {
-                if (out.size >= limit) break
-                val rowAddress = row["address"] as? String
+            val idIdx = c.getColumnIndexOrThrow(Telephony.Mms._ID)
+            val threadIdx = c.getColumnIndexOrThrow(Telephony.Mms.THREAD_ID)
+            val dateIdx = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
+            val boxIdx = c.getColumnIndexOrThrow(Telephony.Mms.MESSAGE_BOX)
+            val readIdx = c.getColumnIndexOrThrow(Telephony.Mms.READ)
+            while (c.moveToNext() && out.size < limit) {
+                val id = c.getLong(idIdx)
+                val type = if (c.getInt(boxIdx) == Telephony.Mms.MESSAGE_BOX_INBOX) "inbox" else "sent"
+                val rowAddress = getMmsAddress(id, type)
                 if (!address.isNullOrBlank() && (rowAddress == null || !rowAddress.contains(address))) continue
-                val body = row["body"] as? String ?: ""
+                val body = getMmsTextBody(id) ?: "[MMS with no text part -- likely a photo/video attachment]"
                 if (!query.isNullOrBlank() && !body.contains(query, ignoreCase = true)) continue
-                out.add(row)
+                out.add(
+                    mapOf(
+                        "threadId" to c.getLong(threadIdx).toString(),
+                        "address" to rowAddress,
+                        "body" to body,
+                        "date" to c.getLong(dateIdx) * 1000L,
+                        "type" to type,
+                        "read" to (c.getInt(readIdx) != 0),
+                    ),
+                )
             }
         }
         Logger.i("SmsRepository.searchMms(query=$query, address=$address, limit=$limit): ${out.size} row(s) in ${System.currentTimeMillis() - start}ms")
