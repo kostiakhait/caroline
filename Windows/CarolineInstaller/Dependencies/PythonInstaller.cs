@@ -92,7 +92,19 @@ internal static class PythonInstaller
          // machine with no CUDA GPU, exactly like transcribe's own requirements.txt.
          // Pinned cudnn version: ctranslate2 is built against the cuDNN 8 ABI,
          // and cudnn 9.x on Windows hangs on the first GPU call.
-         "nvidia-cublas-cu12", "nvidia-cudnn-cu12==8.9.7.29", "nvidia-cuda-runtime-cu12"];
+         "nvidia-cublas-cu12", "nvidia-cudnn-cu12==8.9.7.29", "nvidia-cuda-runtime-cu12",
+         // app/secret_store.py's DPAPI encryption-at-rest (2026-10-06, messenger
+         // integrations plan -- docs/MESSENGER_INTEGRATIONS_PLAN.md). Confirmed
+         // live: already present in the current bundled runtime, but was never
+         // actually in this list -- a fresh install would have been missing it
+         // entirely. win32crypt is the specific module secret_store.py imports;
+         // listed here as the top-level PyPI distribution name, same convention
+         // as every other entry.
+         "pywin32",
+         // app/slack_channel.py's Socket Mode connection (slack_sdk.socket_mode) --
+         // first of the messenger integrations plan's channels. slack_sdk alone
+         // covers Socket Mode without the heavier slack-bolt framework.
+         "slack_sdk"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 

@@ -63,6 +63,7 @@ from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
+from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.subscription_mode import (
     chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
     invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
@@ -405,6 +406,10 @@ async def _start_ratatosk_background_loops() -> None:
     asyncio.create_task(_prune_redundant_archives_in_background())
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
+    # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
+    # 2026-10-06) -- a no-op loop (just rechecks every 30s) until
+    # slack_set_tokens has actually been called once.
+    start_slack_channel(WORKSPACE_DIR, _inject_from_slack)
     # Checked every 20s (plus once immediately, catching anything that came
     # due while the app was closed); a reminder is only marked fired once
     # it's actually been injected into a live session (see _on_reminder_due).
@@ -822,6 +827,20 @@ def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
     asyncio.create_task(_do())
 
 
+def _inject_from_slack(text: str) -> None:
+    """Callback for slack_channel.start_slack_channel -- a new Slack DM/
+    mention is surfaced the same way a background operation's completion
+    already is elsewhere (see visual_model_download_done's own
+    primary_session().inject_proactive() call): into the PRIMARY tab, not
+    a dedicated headless session like Ratatosk's owner channel (Slack has
+    no multi-group bot-identity concept to justify that extra session --
+    it's the user's own single account, closer to the SMS companion's
+    shape than to Ratatosk's)."""
+    primary = primary_session()
+    if primary is not None:
+        primary.inject_proactive(text)
+
+
 def _ratatosk_stop_session() -> bool:
     """Stops whatever the headless Ratatosk session is currently doing.
     ChatSession.stop() itself has no WS dependency at all (see its own
@@ -980,6 +999,10 @@ async def handle_control_request(
         # human (or a script over /api/control) see what it's actually
         # doing without needing to grep caroline.log by hand.
         status = get_ratatosk_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op == "slack_channel_status":
+        # Same diagnostic-only shape as ratatosk_channel_status above.
+        status = get_slack_channel_status()
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
     if op == "ratatosk_own_account_register":
         log_event("engine", "ratatosk_own_account_register")
