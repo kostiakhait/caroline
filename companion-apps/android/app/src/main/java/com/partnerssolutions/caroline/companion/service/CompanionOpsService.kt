@@ -258,7 +258,12 @@ class CompanionOpsService : Service() {
         }
         val since = (request["since"] as? Number)?.toLong()
         Logger.i("companion: syncing SMS since=$since")
-        val messages = smsRepository.dumpMessages(since)
+        // Per explicit instruction (2026-10-05), after a real incident: an MMS (a carrier/
+        // Messages-app delivery choice, not something the sender controls or the same thing
+        // as RCS) never showed up here -- dumpMessages only ever read content://sms. Both
+        // sources share the same thread_id space and the same row shape, so they're just
+        // concatenated; companion_sms_store.py's merge_messages already sorts by date.
+        val messages = smsRepository.dumpMessages(since) + smsRepository.dumpMmsMessages(since)
         Logger.i("companion: SMS sync gathered ${messages.size} message(s) -- writing response")
         repository.setMine("$base/sync_response", mapOf("messages" to messages))
         Logger.i("companion: SMS sync response written")
@@ -346,8 +351,15 @@ class CompanionOpsService : Service() {
             val query = payload["query"] as? String
             val address = payload["address"] as? String
             val limit = (payload["limit"] as? Number)?.toInt()?.coerceIn(1, 200) ?: 50
-            smsRepository.search(query, address, limit)
-                .also { Logger.i("companion: sms_query search(query=$query, address=$address, limit=$limit) -> ${it.size} message(s)") }
+            // Per explicit instruction (2026-10-05): same MMS gap as handleSmsSync -- each
+            // repository call is capped at `limit` on its own, so the combined, re-sorted,
+            // re-capped result can't under-represent MMS just because SMS happens to be
+            // the larger table and filled the cap first.
+            val combined = (smsRepository.search(query, address, limit) + smsRepository.searchMms(query, address, limit))
+                .sortedByDescending { (it["date"] as? Long) ?: 0L }
+                .take(limit)
+            Logger.i("companion: sms_query search(query=$query, address=$address, limit=$limit) -> ${combined.size} message(s)")
+            combined
         }
         else -> {
             Logger.w("companion: unknown sms_query op '$op'")

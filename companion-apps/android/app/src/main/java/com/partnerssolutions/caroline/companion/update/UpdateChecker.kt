@@ -18,6 +18,13 @@ private const val CHECK_INTERVAL_MS = 5 * 60 * 1000L
 private const val APK_FILE_NAME = "caroline-update.apk"
 const val ACTION_UPDATE_READY = "com.partnerssolutions.caroline.companion.UPDATE_READY"
 
+/** Outcome of UpdateChecker.checkNow() -- see its own doc comment. */
+sealed class CheckResult {
+    data class UpToDate(val currentVersion: String) : CheckResult()
+    data class ReadyToInstall(val version: String) : CheckResult()
+    data class Error(val message: String) : CheckResult()
+}
+
 /**
  * Same OTA pattern as ShortNerdCat's own UpdateChecker (snc/android/app/src/
  * main/kotlin/com/shortnerdcat/snc/UpdateChecker.kt): poll the public
@@ -59,7 +66,7 @@ class UpdateChecker(private val context: Context) {
     private fun loop() {
         while (running) {
             try {
-                check()
+                checkNow()
             } catch (_: InterruptedException) {
                 break
             } catch (e: Exception) {
@@ -73,27 +80,40 @@ class UpdateChecker(private val context: Context) {
         }
     }
 
-    private fun check() {
+    /**
+     * Per explicit instruction (2026-10-05): a manual "Check for updates..."
+     * menu entry (same idea as WildCat's), because the periodic loop's own
+     * "already up to date" path (below) logs nothing at all -- with every
+     * prior release installed manually, right after a deploy, the loop's
+     * silent branch is the ONLY one that ever actually ran in practice, so
+     * there was never any log evidence either way of whether the silent
+     * background path genuinely works. This is the SAME logic the loop
+     * calls every 5 minutes, just also returning what happened so a manual
+     * tap can show it, instead of only ever logging it. Blocking network
+     * I/O -- call from a background thread/dispatcher, same as the loop
+     * already does on its own dedicated thread.
+     */
+    fun checkNow(): CheckResult {
         val listings = try {
             runBlocking { NavlinkModule.api.listApps("Caroline", "android") }
         } catch (e: Exception) {
             Logger.w("UpdateChecker: fetch failed", e)
-            return
+            return CheckResult.Error("Couldn't reach the update server: ${e.message}")
         }
         val download = listings.firstOrNull()?.downloads?.firstOrNull { it.platform == "android" }
         if (download == null) {
             Logger.w("UpdateChecker: no android download entry in storefront listing")
-            return
+            return CheckResult.Error("No Android build listed on the server.")
         }
         val version = download.version?.trim().orEmpty()
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (!isValidVersion(version)) {
             Logger.w("UpdateChecker: invalid version string '$version'")
-            return
+            return CheckResult.Error("The server reported an invalid version string ('$version').")
         }
         if (version <= BuildConfig.VERSION_NAME) {
             clearAll(prefs)
-            return
+            return CheckResult.UpToDate(BuildConfig.VERSION_NAME)
         }
 
         // Already downloaded and verified for this exact version -- nothing
@@ -101,14 +121,14 @@ class UpdateChecker(private val context: Context) {
         if (prefs.getString(PREF_READY_VERSION, null) == version &&
             File(prefs.getString(PREF_READY_PATH, "") ?: "").exists()
         ) {
-            return
+            return CheckResult.ReadyToInstall(version)
         }
 
-        Logger.i("UpdateChecker: update available $version (current ${BuildConfig.VERSION_NAME}) -- downloading silently")
+        Logger.i("UpdateChecker: update available $version (current ${BuildConfig.VERSION_NAME}) -- downloading")
         val apk = downloadAndVerify(download.url, download.sha256.orEmpty())
         if (apk == null) {
-            Logger.w("UpdateChecker: silent download/verification failed for $version -- will retry on next check")
-            return
+            Logger.w("UpdateChecker: download/verification failed for $version -- will retry on next check")
+            return CheckResult.Error("Found version $version but the download failed -- will retry automatically.")
         }
         Logger.i("UpdateChecker: update $version downloaded and verified -- ready to install")
         prefs.edit()
@@ -116,6 +136,7 @@ class UpdateChecker(private val context: Context) {
             .putString(PREF_READY_PATH, apk.absolutePath)
             .apply()
         context.sendBroadcast(Intent(ACTION_UPDATE_READY).setPackage(context.packageName))
+        return CheckResult.ReadyToInstall(version)
     }
 
     // Downloads to a stable location in filesDir (survives cache eviction --

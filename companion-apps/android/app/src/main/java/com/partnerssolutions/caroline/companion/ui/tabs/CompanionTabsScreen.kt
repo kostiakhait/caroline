@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
@@ -33,6 +34,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -54,8 +56,12 @@ import com.partnerssolutions.caroline.companion.data.companion.restartCompanionS
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
 import com.partnerssolutions.caroline.companion.ui.chat.ChatScreen
 import com.partnerssolutions.caroline.companion.update.ACTION_UPDATE_READY
+import com.partnerssolutions.caroline.companion.update.CheckResult
 import com.partnerssolutions.caroline.companion.update.UpdateChecker
 import com.partnerssolutions.caroline.companion.util.Logger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * A persistent top tab bar -- matching the DESKTOP app's own tab strip
@@ -80,6 +86,8 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
     // ACTION_UPDATE_READY for an update that finishes downloading while
     // the app is open.
     var updateReady by remember { mutableStateOf(UpdateChecker.readyVersion(context) != null) }
+    var checkingForUpdate by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
@@ -179,6 +187,29 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                                 },
                             )
                         }
+                        DropdownMenuItem(
+                            text = { Text(if (checkingForUpdate) "Checking for updates..." else "Check for updates...") },
+                            enabled = !checkingForUpdate,
+                            onClick = {
+                                menuOpen = false
+                                checkingForUpdate = true
+                                Logger.i("CompanionTabsScreen: 'Check for updates...' tapped")
+                                coroutineScope.launch {
+                                    val result = withContext(Dispatchers.IO) { UpdateChecker(context).checkNow() }
+                                    checkingForUpdate = false
+                                    when (result) {
+                                        is CheckResult.UpToDate ->
+                                            Toast.makeText(context, "You're on the latest version (${result.currentVersion}).", Toast.LENGTH_SHORT).show()
+                                        is CheckResult.ReadyToInstall -> {
+                                            updateReady = true
+                                            Toast.makeText(context, "Update ${result.version} downloaded -- see \"Update ready\" in this menu.", Toast.LENGTH_LONG).show()
+                                        }
+                                        is CheckResult.Error ->
+                                            Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            },
+                        )
                         DropdownMenuItem(
                             text = { Text("Phone companion (SMS/contacts)") },
                             onClick = {

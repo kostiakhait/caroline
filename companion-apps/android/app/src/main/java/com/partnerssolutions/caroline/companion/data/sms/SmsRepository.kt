@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.database.Cursor
+import android.net.Uri
 import android.os.Build
 import android.provider.Telephony
 import android.telephony.SmsManager
@@ -121,6 +122,145 @@ class SmsRepository(private val context: Context) {
             )
         }
         return out
+    }
+
+    // PduHeaders.FROM / PduHeaders.TO from com.google.android.mms.pdu --
+    // not part of the public android.provider.Telephony API, but these
+    // integer values are a stable, long-documented part of the MMS content
+    // provider's own "addr" table contract (content://mms/<id>/addr),
+    // unchanged across Android versions since MMS support was introduced.
+    private val MMS_ADDR_TYPE_FROM = 137
+    private val MMS_ADDR_TYPE_TO = 151
+
+    /**
+     * Real incident (2026-10-05), confirmed live: a message that arrived as
+     * MMS (not SMS -- a carrier/Messages-app choice, not something the
+     * sender controls, and not the same thing as RCS) was invisible to
+     * dumpMessages/search above, which only ever queried content://sms --
+     * Caroline kept reporting "no new messages" while the user was reading
+     * the message with their own eyes in the SAME Google Messages app.
+     * Text-only: an MMS with a photo/video attachment and no text part
+     * comes back with a placeholder body, not the actual media -- Caroline
+     * has no use for rendering an image over this channel, only for
+     * knowing the conversation had something and roughly what/when.
+     *
+     * content://mms's own DATE column is SECONDS since epoch (NOT
+     * milliseconds, unlike content://sms's DATE) -- converted to ms right
+     * here so every row this repository returns, SMS or MMS, is in the
+     * same unit the backend (companion_sms_store.py) already expects.
+     */
+    fun dumpMmsMessages(sinceMs: Long?): List<Map<String, Any?>> {
+        val start = System.currentTimeMillis()
+        val out = mutableListOf<Map<String, Any?>>()
+        val projection = arrayOf(Telephony.Mms._ID, Telephony.Mms.THREAD_ID, Telephony.Mms.DATE, Telephony.Mms.MESSAGE_BOX, Telephony.Mms.READ)
+        val sinceSec = sinceMs?.let { it / 1000 }
+        val selection = if (sinceSec != null) "${Telephony.Mms.DATE} > ?" else null
+        val args = if (sinceSec != null) arrayOf(sinceSec.toString()) else null
+        context.contentResolver.query(
+            Telephony.Mms.CONTENT_URI, projection, selection, args, "${Telephony.Mms.DATE} DESC",
+        )?.use { c -> readMmsRows(c).forEach { out.add(it) } }
+        Logger.i("SmsRepository.dumpMmsMessages(sinceMs=$sinceMs): ${out.size} row(s) in ${System.currentTimeMillis() - start}ms")
+        return out
+    }
+
+    /** Live MMS search, same shape/purpose as search() above for SMS -- `address` matches
+     * the resolved sender/recipient; MMS has no single indexed body column to LIKE against
+     * (text lives in a separate per-part table), so `query` is applied client-side after
+     * each message's text is assembled, not pushed into the content-provider selection. */
+    fun searchMms(query: String?, address: String?, limit: Int): List<Map<String, Any?>> {
+        val start = System.currentTimeMillis()
+        val out = mutableListOf<Map<String, Any?>>()
+        val projection = arrayOf(Telephony.Mms._ID, Telephony.Mms.THREAD_ID, Telephony.Mms.DATE, Telephony.Mms.MESSAGE_BOX, Telephony.Mms.READ)
+        context.contentResolver.query(
+            Telephony.Mms.CONTENT_URI, projection, null, null, "${Telephony.Mms.DATE} DESC",
+        )?.use { c ->
+            for (row in readMmsRows(c)) {
+                if (out.size >= limit) break
+                val rowAddress = row["address"] as? String
+                if (!address.isNullOrBlank() && (rowAddress == null || !rowAddress.contains(address))) continue
+                val body = row["body"] as? String ?: ""
+                if (!query.isNullOrBlank() && !body.contains(query, ignoreCase = true)) continue
+                out.add(row)
+            }
+        }
+        Logger.i("SmsRepository.searchMms(query=$query, address=$address, limit=$limit): ${out.size} row(s) in ${System.currentTimeMillis() - start}ms")
+        return out
+    }
+
+    private fun readMmsRows(c: Cursor): List<Map<String, Any?>> {
+        val out = mutableListOf<Map<String, Any?>>()
+        val idIdx = c.getColumnIndexOrThrow(Telephony.Mms._ID)
+        val threadIdx = c.getColumnIndexOrThrow(Telephony.Mms.THREAD_ID)
+        val dateIdx = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
+        val boxIdx = c.getColumnIndexOrThrow(Telephony.Mms.MESSAGE_BOX)
+        val readIdx = c.getColumnIndexOrThrow(Telephony.Mms.READ)
+        while (c.moveToNext()) {
+            val id = c.getLong(idIdx)
+            val type = if (c.getInt(boxIdx) == Telephony.Mms.MESSAGE_BOX_INBOX) "inbox" else "sent"
+            out.add(
+                mapOf(
+                    "threadId" to c.getLong(threadIdx).toString(),
+                    "address" to getMmsAddress(id, type),
+                    "body" to (getMmsTextBody(id) ?: "[MMS with no text part -- likely a photo/video attachment]"),
+                    "date" to c.getLong(dateIdx) * 1000L,
+                    "type" to type,
+                    "read" to (c.getInt(readIdx) != 0),
+                ),
+            )
+        }
+        return out
+    }
+
+    /** The FROM address for an inbox MMS, or the first TO address for a sent one -- an MMS
+     * can have multiple recipients (group thread); this returns one representative address,
+     * same simplification dumpMessages/search already make for SMS (a single ADDRESS column). */
+    private fun getMmsAddress(mmsId: Long, type: String): String? {
+        val wantType = if (type == "inbox") MMS_ADDR_TYPE_FROM else MMS_ADDR_TYPE_TO
+        val addrUri = Uri.parse("content://mms/$mmsId/addr")
+        return context.contentResolver.query(addrUri, arrayOf("address", "type"), null, null, null)?.use { c ->
+            val addrIdx = c.getColumnIndexOrThrow("address")
+            val typeIdx = c.getColumnIndexOrThrow("type")
+            var fallback: String? = null
+            while (c.moveToNext()) {
+                val addr = c.getString(addrIdx)
+                if (fallback == null) fallback = addr
+                if (c.getInt(typeIdx) == wantType) return@use addr
+            }
+            fallback
+        }
+    }
+
+    /** Concatenates every text/plain part's body -- some devices store the text inline in
+     * the "text" column, others only as a file under content://mms/part/<id>, hence the
+     * inline-then-file fallback. Returns null (not "") when there's genuinely no text part,
+     * so callers can tell "an empty text message" apart from "no text at all" if it matters. */
+    private fun getMmsTextBody(mmsId: Long): String? {
+        val partUri = Telephony.Mms.Part.CONTENT_URI
+        val projection = arrayOf(Telephony.Mms.Part._ID, Telephony.Mms.Part.CONTENT_TYPE, Telephony.Mms.Part.TEXT)
+        val selection = "${Telephony.Mms.Part.MSG_ID} = ?"
+        val args = arrayOf(mmsId.toString())
+        val parts = mutableListOf<String>()
+        context.contentResolver.query(partUri, projection, selection, args, null)?.use { c ->
+            val idIdx = c.getColumnIndexOrThrow(Telephony.Mms.Part._ID)
+            val ctIdx = c.getColumnIndexOrThrow(Telephony.Mms.Part.CONTENT_TYPE)
+            val textIdx = c.getColumnIndexOrThrow(Telephony.Mms.Part.TEXT)
+            while (c.moveToNext()) {
+                if (c.getString(ctIdx) != "text/plain") continue
+                val inlineText = c.getString(textIdx)
+                if (!inlineText.isNullOrEmpty()) {
+                    parts.add(inlineText)
+                    continue
+                }
+                val partId = c.getLong(idIdx)
+                try {
+                    context.contentResolver.openInputStream(Uri.withAppendedPath(Telephony.Mms.Part.CONTENT_URI, partId.toString()))
+                        ?.use { stream -> parts.add(stream.bufferedReader().readText()) }
+                } catch (exc: Exception) {
+                    Logger.w("SmsRepository.getMmsTextBody: failed reading part file for partId=$partId: ${exc.message}")
+                }
+            }
+        }
+        return if (parts.isEmpty()) null else parts.joinToString("\n")
     }
 
     /**
