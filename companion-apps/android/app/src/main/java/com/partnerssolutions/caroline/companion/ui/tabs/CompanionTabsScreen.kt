@@ -7,10 +7,14 @@ import android.content.IntentFilter
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
@@ -23,6 +27,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -87,7 +92,26 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
     // the app is open.
     var updateReady by remember { mutableStateOf(UpdateChecker.readyVersion(context) != null) }
     var checkingForUpdate by remember { mutableStateOf(false) }
+    // Only set by the manual "Check for updates..." flow below -- the EXISTING silent
+    // background-loop path (ACTION_UPDATE_READY, just below) still only flips updateReady,
+    // same as before, so a download that finishes while the user is in the middle of
+    // something doesn't pop an unprompted dialog over it.
+    var updateReadyDialogVersion by remember { mutableStateOf<String?>(null) }
     val coroutineScope = rememberCoroutineScope()
+    val installReadyUpdate = {
+        val apk = UpdateChecker.readyApkFile(context)
+        if (apk == null) {
+            Logger.w("CompanionTabsScreen: readyApkFile returned null despite updateReady=true")
+        } else {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        }
+    }
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
@@ -173,25 +197,24 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                                 onClick = {
                                     menuOpen = false
                                     Logger.i("CompanionTabsScreen: 'Update ready' tapped (version=$readyVersion)")
-                                    val apk = UpdateChecker.readyApkFile(context) ?: run {
-                                        Logger.w("CompanionTabsScreen: readyApkFile returned null despite updateReady=true")
-                                        return@DropdownMenuItem
-                                    }
-                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)
-                                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                                        setDataAndType(uri, "application/vnd.android.package-archive")
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    }
-                                    context.startActivity(intent)
+                                    installReadyUpdate()
                                 },
                             )
                         }
                         DropdownMenuItem(
-                            text = { Text(if (checkingForUpdate) "Checking for updates..." else "Check for updates...") },
+                            text = { Text("Check for updates...") },
                             enabled = !checkingForUpdate,
                             onClick = {
                                 menuOpen = false
+                                // Per explicit instruction (2026-10-05): the menu itself is
+                                // closed the instant a tap registers (same as every other
+                                // item here), so swapping THIS item's own text was never
+                                // actually visible to anyone -- checkingForUpdate instead
+                                // drives the real, always-visible status bar below (same
+                                // bottom-bar convention ChatScreen's own status bar already
+                                // uses for the desktop-mirrored backend/channel state), and
+                                // a ready update surfaces as a modal, not a toast -- same
+                                // shape as WildCat's own update flow.
                                 checkingForUpdate = true
                                 Logger.i("CompanionTabsScreen: 'Check for updates...' tapped")
                                 coroutineScope.launch {
@@ -202,7 +225,7 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                                             Toast.makeText(context, "You're on the latest version (${result.currentVersion}).", Toast.LENGTH_SHORT).show()
                                         is CheckResult.ReadyToInstall -> {
                                             updateReady = true
-                                            Toast.makeText(context, "Update ${result.version} downloaded -- see \"Update ready\" in this menu.", Toast.LENGTH_LONG).show()
+                                            updateReadyDialogVersion = result.version
                                         }
                                         is CheckResult.Error ->
                                             Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
@@ -247,6 +270,24 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
                 },
             )
         },
+        bottomBar = {
+            // Per explicit instruction (2026-10-05): visible regardless of
+            // whether the overflow menu is open -- same bottom-status-bar
+            // convention ChatScreen's own (desktop-mirrored) status bar
+            // already uses, not text buried inside a menu item that closes
+            // the instant it's tapped.
+            if (checkingForUpdate) {
+                Surface(tonalElevation = 2.dp) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Text("Checking for updates...", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        },
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize()) {
             when {
@@ -287,6 +328,27 @@ fun CompanionTabsScreen(onLogout: () -> Unit, onOpenCompanionSetup: () -> Unit, 
             text = { Text("Caroline Companion\nVersion ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})") },
             confirmButton = {
                 TextButton(onClick = { showAboutDialog = false }) { Text("OK") }
+            },
+        )
+    }
+
+    // Per explicit instruction (2026-10-05, "как в Wildcat"): a manual "Check for
+    // updates..." tap that finds and downloads a new version surfaces it as a modal,
+    // not a toast easy to miss -- Install acts right away, Later just leaves the
+    // existing "Update ready" menu item (updateReady is already true by this point).
+    updateReadyDialogVersion?.let { version ->
+        AlertDialog(
+            onDismissRequest = { updateReadyDialogVersion = null },
+            title = { Text("Update ready") },
+            text = { Text("Version $version has been downloaded and verified. Install it now?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    updateReadyDialogVersion = null
+                    installReadyUpdate()
+                }) { Text("Install") }
+            },
+            dismissButton = {
+                TextButton(onClick = { updateReadyDialogVersion = null }) { Text("Later") }
             },
         )
     }
