@@ -145,6 +145,13 @@ internal static class Program
 
         AppPaths.EnsureRootExists();
 
+        // Size-cap sweep of workspace\dehydrated\ -- runs on every install/update,
+        // silent mode included, no UAC needed (the user's own per-user folder).
+        // See WorkspaceCleanup.cs for why this is the one piece of workspace\ the
+        // installer touches at all.
+        window.SetStatus("Cleaning up old data…");
+        await WithStepAsync(ErrorCodes.WorkspaceCleanup, "Cleaning up old data", () => WorkspaceCleanup.RunAsync(ct));
+
         // Windows Defender exclusion for Caroline's own folders -- one UAC prompt, once, never
         // in a --silent-update run, never fails the install. Placed before the heavy
         // downloads/extraction so this very install benefits. See DefenderExclusion.cs.

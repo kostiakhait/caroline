@@ -21,7 +21,14 @@ PROVEN redundant, never on a guess from its name, age or size:
     file matches everywhere; anything rewritten or diverged does not).
 
 An archive with no live source (its session was deleted, e.g. by clear_tab)
-is the only copy of that conversation and is KEPT, whatever its size.
+is the only copy of that conversation and is KEPT, whatever its size --
+UNLESS another archive with no live source proves the same thing a live
+transcript would: see collapse_dead_session_duplicates, added 2026-10-05
+after a stuck session with no live source looped on the old hook for 24h
+and left ~1,000 near-duplicate copies of itself (662 GB) that this file's
+original rule correctly, but unhelpfully, kept forever. A size-cap backstop
+(enforce_dehydrated_dir_cap) runs after both provable prunes, for whatever
+neither one was designed to anticipate.
 """
 
 from __future__ import annotations
@@ -40,6 +47,19 @@ SAMPLE_BYTES = 256 * 1024
 # A file this fresh may still be mid-copy -- leave it for the next pass.
 YOUNG_FILE_SECONDS = 120
 
+# Last-resort backstop (see enforce_dehydrated_dir_cap): unlike every prune
+# above, which only removes a file once it's PROVEN redundant, this one
+# deletes the oldest files in dehydrated/ once the directory exceeds this
+# size, no matter what they are. Exists so a future bug in this subsystem --
+# one this file doesn't yet know how to recognize -- can balloon disk usage
+# by at most this much before being capped, not for weeks before anyone
+# notices (see the 2026-10-05 incident this followed: 662 GB from a single
+# stuck session, found only because the user complained). A real
+# conversation someone might still want back via expand_dehydrated_ref could
+# in principle be evicted here; that tradeoff is deliberate -- unbounded
+# growth is worse.
+MAX_DEHYDRATED_DIR_BYTES = 5 * 1024**3
+
 
 @dataclass
 class PruneReport:
@@ -52,6 +72,7 @@ class PruneReport:
     kept_unverified_bytes: int = 0
     failed: int = 0
     deleted_paths: list[str] = field(default_factory=list)
+    kept_unverified_paths: list[str] = field(default_factory=list)
 
 
 def _head_hash(path: Path) -> str:
@@ -120,6 +141,7 @@ def prune_redundant_compaction_archives(
             if not any(_is_prefix_copy_of(archive, live, st.st_size) for live in candidates):
                 report.kept_unverified += 1
                 report.kept_unverified_bytes += st.st_size
+                report.kept_unverified_paths.append(str(archive))
                 continue
             if not dry_run:
                 archive.unlink()
@@ -134,17 +156,156 @@ def prune_redundant_compaction_archives(
     return report
 
 
+def _archive_session_id(path: Path) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            first_line = f.readline()
+        import json
+
+        return json.loads(first_line).get("sessionId")
+    except Exception:
+        return None
+
+
+def collapse_dead_session_duplicates(
+    kept_unverified_paths: list[str], *, dry_run: bool = False,
+    throttle_s: float = 0.0, should_stop: Callable[[], bool] | None = None,
+) -> PruneReport:
+    """Second pass over whatever prune_redundant_compaction_archives couldn't
+    prove redundant against a LIVE transcript. Groups those archives by the
+    sessionId in their own first line, and within each group of 2+ archives
+    for the same dead session, proves redundancy the same way as the first
+    pass -- same _is_prefix_copy_of check, same three-sample-point rigor --
+    just against the group's own largest member instead of a live file (an
+    append-only transcript copied repeatedly produces copies that are each a
+    prefix of the next, so the largest is a superset of the rest). A group
+    of exactly one archive is a real "only copy" and is left untouched,
+    matching this module's original rule."""
+    report = PruneReport()
+    groups: dict[str, list[Path]] = {}
+    for raw in kept_unverified_paths:
+        if should_stop is not None and should_stop():
+            break
+        p = Path(raw)
+        try:
+            if not p.is_file():
+                continue
+            sid = _archive_session_id(p)
+        except OSError:
+            continue
+        if not sid:
+            continue
+        groups.setdefault(sid, []).append(p)
+
+    for sid, members in groups.items():
+        if should_stop is not None and should_stop():
+            break
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda p: p.stat().st_size, reverse=True)
+        reference = members[0]
+        ref_size = reference.stat().st_size
+        for dup in members[1:]:
+            if should_stop is not None and should_stop():
+                break
+            try:
+                st = dup.stat()
+                report.scanned += 1
+                if not _is_prefix_copy_of(dup, reference, st.st_size):
+                    report.kept_unverified += 1
+                    report.kept_unverified_bytes += st.st_size
+                    continue
+                if not dry_run:
+                    dup.unlink()
+                report.deleted += 1
+                report.deleted_bytes += st.st_size
+                report.deleted_paths.append(str(dup))
+                if throttle_s:
+                    time.sleep(throttle_s)
+            except OSError as exc:
+                report.failed += 1
+                log_event("engine", "archive_collapse_failed", path=str(dup), error=str(exc))
+    return report
+
+
+def enforce_dehydrated_dir_cap(
+    dehydrated_dir: Path, max_bytes: int = MAX_DEHYDRATED_DIR_BYTES, *, dry_run: bool = False,
+) -> PruneReport:
+    """Backstop, run last: if dehydrated/ is still over max_bytes after both
+    provable prunes above, delete the OLDEST files (by mtime) until it
+    isn't. See MAX_DEHYDRATED_DIR_BYTES's own comment for why this one does
+    NOT try to prove redundancy first -- it is insurance against whatever
+    this module doesn't yet know to recognize."""
+    report = PruneReport()
+    if not dehydrated_dir.is_dir():
+        return report
+    now = time.time()
+    entries: list[tuple[Path, int, float]] = []
+    total = 0
+    for p in dehydrated_dir.iterdir():
+        try:
+            if not p.is_file():
+                continue
+            st = p.stat()
+        except OSError:
+            continue
+        entries.append((p, st.st_size, st.st_mtime))
+        total += st.st_size
+    if total <= max_bytes:
+        return report
+    entries.sort(key=lambda e: e[2])  # oldest first
+    for p, size, mtime in entries:
+        if total <= max_bytes:
+            break
+        if now - mtime < YOUNG_FILE_SECONDS:
+            continue
+        try:
+            if not dry_run:
+                p.unlink()
+            report.deleted += 1
+            report.deleted_bytes += size
+            report.deleted_paths.append(str(p))
+            total -= size
+        except OSError as exc:
+            report.failed += 1
+            log_event("engine", "archive_cap_evict_failed", path=str(p), error=str(exc))
+    return report
+
+
 def prune_workspace_archives(workspace_dir: str, *, dry_run: bool = False, throttle_s: float = 0.0,
                              should_stop: Callable[[], bool] | None = None) -> PruneReport:
     """The real entry point: resolves this workspace's own archive and
-    session-transcript directories, prunes, then clears any per-tab
-    continuity pointer whose archive no longer exists."""
+    session-transcript directories, and runs all three prune stages in
+    order -- each one only has to catch what the previous stage left behind:
+      1. prune_redundant_compaction_archives: proven redundant vs. a LIVE transcript.
+      2. collapse_dead_session_duplicates: proven redundant vs. the largest
+         surviving archive of the same DEAD session (see that function).
+      3. enforce_dehydrated_dir_cap: unproven, last-resort size backstop.
+    Then clears any per-tab continuity pointer whose archive no longer exists."""
     from app.durability import claude_project_dir, clear_tab_continuity_archive, dehydrated_dir
 
-    report = prune_redundant_compaction_archives(
-        dehydrated_dir(workspace_dir), claude_project_dir(workspace_dir),
+    dehyd_dir = dehydrated_dir(workspace_dir)
+    stage1 = prune_redundant_compaction_archives(
+        dehyd_dir, claude_project_dir(workspace_dir),
         dry_run=dry_run, throttle_s=throttle_s, should_stop=should_stop,
     )
+    stage2 = collapse_dead_session_duplicates(
+        stage1.kept_unverified_paths, dry_run=dry_run, throttle_s=throttle_s, should_stop=should_stop,
+    )
+    stage3 = enforce_dehydrated_dir_cap(dehyd_dir, dry_run=dry_run)
+
+    report = PruneReport(
+        scanned=stage1.scanned + stage2.scanned,
+        deleted=stage1.deleted + stage2.deleted + stage3.deleted,
+        deleted_bytes=stage1.deleted_bytes + stage2.deleted_bytes + stage3.deleted_bytes,
+        kept_small=stage1.kept_small,
+        kept_young=stage1.kept_young,
+        kept_unverified=stage2.kept_unverified,
+        kept_unverified_bytes=stage2.kept_unverified_bytes,
+        failed=stage1.failed + stage2.failed + stage3.failed,
+        deleted_paths=stage1.deleted_paths + stage2.deleted_paths + stage3.deleted_paths,
+    )
+
     if not dry_run:
         import json
 
@@ -159,5 +320,6 @@ def prune_workspace_archives(workspace_dir: str, *, dry_run: bool = False, throt
         "engine", "archive_prune_done", dry_run=dry_run, scanned=report.scanned, deleted=report.deleted,
         deleted_gb=round(report.deleted_bytes / 1e9, 1), kept_unverified=report.kept_unverified,
         kept_unverified_gb=round(report.kept_unverified_bytes / 1e9, 1), failed=report.failed,
+        cap_evicted=stage3.deleted, cap_evicted_gb=round(stage3.deleted_bytes / 1e9, 1),
     )
     return report

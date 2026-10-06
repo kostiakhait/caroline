@@ -9,7 +9,15 @@ namespace CarolineInstaller;
 ///                      this is what gets overwritten on update
 ///     workspace\       created independently by the backend at runtime
 ///                      (chat history, .mcp.json, persona.json, ...) --
-///                      the installer never touches this
+///                      the installer leaves this alone, with ONE narrow
+///                      exception: workspace\dehydrated\ (a disposable
+///                      compaction-recovery cache, see backend-py's
+///                      app/archive_prune.py) gets a size-cap sweep on
+///                      every install/update -- see WorkspaceCleanup.cs,
+///                      added 2026-10-05 after a stuck session's old
+///                      compaction hook left 662 GB of it on one machine
+///                      with the backend not running often enough to
+///                      prune it away on its own
 ///     runtime\node\    isolated Node.js, used only by Caroline's own
 ///                      backend -- never added to PATH, never conflicts
 ///                      with a system Node.js install
@@ -71,6 +79,10 @@ internal static class AppPaths
     /// (2026-09-26), "зашита в инсталлятор сразу".
     /// </summary>
     public static string WhisperModelDir => Path.Combine(Root, "art", "whisper-model");
+
+    /// <summary>workspace\dehydrated\ -- see WorkspaceCleanup.cs. The only
+    /// part of workspace\ the installer ever touches.</summary>
+    public static string DehydratedDir => Path.Combine(Root, "workspace", "dehydrated");
 
     public static string RuntimeDir => Path.Combine(Root, "runtime");
     public static string NodeDir => Path.Combine(RuntimeDir, "node");

@@ -15,6 +15,7 @@ import re
 import webbrowser
 import mimetypes
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -287,17 +288,57 @@ def _companion_history_snapshot(tab_id: str) -> list[dict[str, Any]] | None:
     return load_visible_transcript(WORKSPACE_DIR, tab_id)
 
 
+ARCHIVE_PRUNE_INTERVAL_S = 6 * 3600.0
+
+# Updated after every prune pass below; read directly (no disk access) by
+# /api/status's workspaceDiskUsage field. Bug fix (2026-10-05), found when a
+# stuck session's dehydration loop grew workspace/dehydrated/ to 662 GB over
+# two weeks with nothing surfacing it anywhere short of the user noticing
+# their disk was full -- see app/archive_prune.py's own module docstring for
+# the full incident and the two new prune stages this now also runs.
+_workspace_disk_usage_cache: dict[str, Any] = {"checkedAtIso": None, "dehydratedMb": None, "workspaceTotalMb": None}
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 async def _prune_redundant_archives_in_background() -> None:
-    """One-time-per-start cleanup of full-transcript copies the old
-    pre-compaction hook left in workspace/dehydrated/ (see app/archive_prune.py
-    for why they're redundant and how each one is PROVEN so before deletion).
-    Runs in a worker thread, a couple of minutes after startup, so it never
-    competes with tabs starting; a no-op once there's nothing left to prune."""
+    """Periodic cleanup of full-transcript copies the old pre-compaction
+    hook left in workspace/dehydrated/ (see app/archive_prune.py for why
+    they're redundant and how each one is PROVEN so before deletion, plus
+    the size-cap backstop for whatever isn't). Runs a couple of minutes
+    after startup, then every ARCHIVE_PRUNE_INTERVAL_S -- not just once per
+    start -- so the cached disk-usage numbers below stay fresh across a
+    long-running session, and so a future leak is caught within hours
+    instead of only at the next restart. A no-op once there's nothing left
+    to prune; still updates the cache every pass."""
     await asyncio.sleep(120)
-    try:
-        await asyncio.to_thread(prune_workspace_archives, WORKSPACE_DIR, throttle_s=0.02)
-    except Exception as exc:
-        log_event("engine", "archive_prune_crashed", error=str(exc))
+    while True:
+        try:
+            await asyncio.to_thread(prune_workspace_archives, WORKSPACE_DIR, throttle_s=0.02)
+        except Exception as exc:
+            log_event("engine", "archive_prune_crashed", error=str(exc))
+        try:
+            from app.durability import dehydrated_dir
+
+            dehyd_mb = await asyncio.to_thread(lambda: _dir_size_bytes(dehydrated_dir(WORKSPACE_DIR)) / 1e6)
+            total_mb = await asyncio.to_thread(lambda: _dir_size_bytes(Path(WORKSPACE_DIR)) / 1e6)
+            _workspace_disk_usage_cache.update({
+                "checkedAtIso": datetime.now(timezone.utc).isoformat(),
+                "dehydratedMb": round(dehyd_mb, 1),
+                "workspaceTotalMb": round(total_mb, 1),
+            })
+        except Exception as exc:
+            log_event("engine", "workspace_disk_usage_check_crashed", error=str(exc))
+        await asyncio.sleep(ARCHIVE_PRUNE_INTERVAL_S)
 
 
 @app.on_event("startup")
@@ -416,6 +457,11 @@ async def get_status() -> JSONResponse:
         "connected": primary is not None,
         **(primary.status() if primary else {}),
         "tabs": [s.status() for s in sessions.values()],
+        # Cached by _prune_redundant_archives_in_background, not computed per
+        # request -- a live recursive size walk here would be far too slow
+        # for an endpoint polled every second or so. null until the first
+        # pass (~2 minutes after startup) completes.
+        "workspaceDiskUsage": dict(_workspace_disk_usage_cache),
     }
     return JSONResponse(body)
 
