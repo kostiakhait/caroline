@@ -3000,6 +3000,20 @@ class ChatSession:
         except asyncio.CancelledError:
             pass
 
+    def _narration_action_facts(self) -> str | None:
+        """The only input the progress narrator is allowed to see: which
+        actions are running right now and which finished this turn (ok or
+        error). None when there are no actions at all -- the narrator then
+        stays silent rather than invent anything from the conversation."""
+        if self.small_model_active:
+            return "\n".join(self.small_model_activity[-8:]) or None
+        lines: list[str] = []
+        for name in self._pending_tool_calls.values():
+            lines.append(f"Running now: {name}")
+        for outcome in self.turn_tool_outcomes.values():
+            lines.append(f"Finished: {outcome.name} -- {'error' if outcome.is_error else 'ok'}")
+        return "\n".join(lines) or None
+
     def _gather_recent_dialogue_for_narration(self, limit: int = RECENT_DIALOGUE_WINDOW) -> str:
         """Per explicit correction (2026-09-10): the first version of
         _check_progress_narration fed generate_progress_comment only the
@@ -3231,13 +3245,7 @@ class ChatSession:
         # until this one returns, slow or not.
         from app.plugins.voice_api import generate_progress_comment
 
-        dialogue = self._gather_recent_dialogue_for_narration()
-        if not dialogue.strip():
-            # Nothing to narrate about yet (first-ever turn, nothing on disk,
-            # no pending text either) -- skip rather than call ai:resolve with
-            # empty context for a comment that couldn't mean anything.
-            return
-        log_event("engine", "progress_narration_context", tab_id=self.tab_id, dialogue_chars=len(dialogue), dialogue_preview=dialogue[-300:])
+        dialogue = ""
         # Bug fix (2026-09-15), per explicit instruction ("Нарратор должен
         # давать сообщения раз в минуту"): confirmed live -- the SMALL
         # model backing generate_progress_comment can fail its own output
@@ -3252,12 +3260,10 @@ class ChatSession:
         # loop gets a real chance to try again within the SAME tick.
         # Narrator sees only real facts about a running small-model turn. No facts -> stay silent
         # (2026-10-03): filler without facts misleads the user.
-        activity: str | None = None
-        if self.small_model_active:
-            activity = "\n".join(self.small_model_activity[-8:]) or None
-            if activity is None:
-                log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
-                return
+        activity = self._narration_action_facts()
+        if activity is None:
+            log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
+            return
         comment: str | None = None
         for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
             try:

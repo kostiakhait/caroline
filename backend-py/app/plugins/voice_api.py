@@ -753,19 +753,27 @@ async def generate_progress_comment(
         "shape as this unrelated example, copy the TAG not the words: "
         f"<narration>{_NARRATION_EXAMPLE_TAG}</narration>"
     )
-    # Bug fix (2026-09-11), per explicit instruction: reverted to "SMALL"
-    # (the openai/gpt5-nano bypass above is no longer needed -- see this
-    # function's own docstring).
-    if activity:
-        conversation_block = f"Conversation (oldest first):\n---\n{recent_dialogue}\n---\n\n"
-        facts_block = (
-            "Facts about what the assistant is doing right now -- the ONLY source of truth for your remark:\n"
-            f"{activity}\n\n"
-            "Rules: react only to these facts. Never guess the user's mood, intentions or state; never describe "
-            "the conversation as confused or repetitive; never claim a step is done or not done unless the facts "
-            "say so; never invent next steps.\n\n"
-        )
-        prompt = prompt.replace(conversation_block, facts_block + conversation_block, 1)
+    # Per explicit instruction (2026-10-06): the narrator comments ONLY on
+    # actions, ONLY within the facts it's given -- never on the conversation.
+    # The dialogue-based prompt above kept inventing people, dates and
+    # intentions out of old chat lines, so it is no longer used at all: no
+    # action facts means no narration.
+    if not activity:
+        return None
+    prompt = (
+        "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
+        "short sentence, no JSON, no markdown, no preamble.\n\n"
+        "You narrate ONLY the actions listed under FACTS below, in one short first-person sentence, present "
+        "tense, saying what is being done right now or what just finished. Use only words and details that "
+        "are literally in FACTS.\n"
+        "Forbidden: naming people, dates, numbers, places or topics that are not in FACTS; guessing why, what "
+        "the user wants, what the result means, or what comes next; any promise or plan; any reference to the "
+        "conversation; any internal machinery beyond the action names themselves.\n"
+        "If FACTS has nothing concrete to report, reply with exactly <narration></narration> and nothing else.\n\n"
+        "Write in English. A separate step translates it afterward.\n\n"
+        f"FACTS:\n---\n{activity}\n---\n\n"
+        "Reply now, wrapped in the tag, e.g. <narration>Checking the contacts list.</narration>"
+    )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:
         body["session"] = session
