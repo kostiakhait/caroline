@@ -635,6 +635,25 @@ def _is_synthetic_history_text(raw_text: str) -> bool:
         return True
     if text.startswith(_SYNTHETIC_TURN_MARKER):
         return True
+    # Bug fix (2026-10-07), confirmed live as the actual cause of a real
+    # incident: an all-Russian conversation got a forced-translation pass
+    # that targeted ENGLISH, because current_language_name's underlying
+    # resolve had flipped to English. Root cause -- _attachment_to_blocks
+    # prepends ATTACHMENT_NOTE_MARKER to EVERY note it generates (see
+    # history.py's own doc comment on that marker, "tags EVERY note block
+    # ... at the single place that creates them"), but this check here
+    # only ever looked for the PREFIX TEXT ("[This image is also saved
+    # at ", ...) at the very start of `text` -- which, for every marked
+    # note, actually starts with the marker's own invisible characters
+    # FIRST, so startswith(_ATTACHMENT_NOTE_PREFIX_TUPLE) was always False
+    # for anything written after the marker existed. Caroline's own
+    # always-English auto-generated attachment note sailed straight into
+    # the "last 5 real user lines" language-detection sample as if the
+    # user had typed it. Strip the marker the same way history.py's own
+    # _extract_attachment_note already does before checking the prefixes
+    # -- the prefix tuple now only matters as the documented bridge for
+    # old, pre-marker entries already on disk.
+    text = text.removeprefix(ATTACHMENT_NOTE_MARKER)
     if text.startswith(_ATTACHMENT_NOTE_PREFIX_TUPLE):
         return True
     return any(p.match(text) for p in _SYNTHETIC_HISTORY_TEXT_PATTERNS)
