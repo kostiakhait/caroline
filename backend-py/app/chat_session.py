@@ -3313,7 +3313,7 @@ class ChatSession:
         # What the user just saw must be something Caroline knows she said. Kept
         # until the next submitted message, where it's handed to the model as a
         # clearly labeled interim note -- nothing here starts a turn of its own.
-        self.pending_interim_notes = (self.pending_interim_notes + [comment])[-5:]
+        self.pending_interim_notes.append(comment)
         wire = {
             "type": "assistant",
             "message": {"role": "assistant", "content": [{"type": "text", "text": comment}], "model": None, "stop_reason": None},
