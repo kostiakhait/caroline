@@ -162,6 +162,26 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
             obj = json.loads(line)
             if obj.get("type") not in ("user", "assistant"):
                 continue
+            # Bug fix (2026-10-07), confirmed live as a real incident: the
+            # Claude Code CLI/SDK marks a "user"-role entry isMeta=true when
+            # IT (not the real human) generated that turn -- confirmed live
+            # for a self-composed English continuation nudge ("Check
+            # operation <id> ... via check_operation_status one final
+            # time. Context: ..."), free-form text with no fixed wording
+            # chat_session.py's own _SYNTHETIC_HISTORY_TEXT_PATTERNS
+            # blocklist could ever hope to match. Three copies of this
+            # (~3100 chars, English) outweighed the user's own two short
+            # Russian messages (~184 chars) in refresh_language_in_
+            # background's "last 5 real user lines" sample, correctly (per
+            # its own "majority language" instructions) resolving English
+            # for an all-Russian conversation. isMeta is the one place the
+            # SDK itself already tells every reader of this transcript
+            # "this wasn't the human talking" -- filtering it here, in the
+            # one shared parser every caller (history, narration, language
+            # detection, the companion mirror) draws from, is structural,
+            # not another wording pattern to keep chasing.
+            if obj.get("isMeta"):
+                continue
             content = (obj.get("message") or {}).get("content")
             # Bug fix (2026-09-10): for "user" entries only, undo a possible
             # multi-submit() merge before doing anything else -- see
