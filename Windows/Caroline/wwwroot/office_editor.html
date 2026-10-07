@@ -28,11 +28,25 @@
     callbackUrl: params.get("callbackUrl") || undefined,
   };
 
+  // Per a real incident (2026-10-07): OnlyOffice's own editor can fail to
+  // open a document (e.g. it couldn't fetch documentUrl) and shows that
+  // failure ONLY inside its own iframe, via showError() below -- nothing
+  // about it ever reached the WPF shell or the backend's log, so a real
+  // failure looked identical to "saved" everywhere except this page's own
+  // DOM, which nobody was looking at after the window closed. postToHost
+  // mirrors it out to DocumentViewerWindow.xaml.cs (OnOfficeWebMessage),
+  // which now also forces the close-time outcome to "error" instead of the
+  // previous blind "saved" -- see that file's own doc comment.
+  function postToHost(msg) {
+    if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(msg);
+  }
+
   function showError(msg) {
     const status = document.getElementById("status");
     status.style.display = "block";
     status.textContent = msg;
     document.getElementById("holder").style.display = "none";
+    postToHost({ type: "office_error", message: msg });
   }
 
   if (!cfg.documentUrl || !cfg.onlyofficeUrl) {
@@ -57,6 +71,12 @@
             mode: cfg.editable ? "edit" : "view",
             callbackUrl: cfg.callbackUrl,
             lang: "en",
+          },
+          events: {
+            onError: (event) => {
+              const detail = event && event.data && (event.data.errorDescription || event.data.errorCode);
+              showError(detail ? String(detail) : "The document editor reported an error.");
+            },
           },
           width: "100%",
           height: "100%",

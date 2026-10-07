@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Media.Imaging;
+using Caroline.Services;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
@@ -37,18 +38,23 @@ public partial class DocumentViewerWindow : Window
 {
     private readonly string _path = "";
     private readonly string _kind; // "image" | "video" | "office" | "login"
-    private readonly Action<ViewerOutcome, string?>? _onDone;
+    private readonly Action<ViewerOutcome, string?, string?>? _onDone;
     private readonly Action<string?, string?, bool, bool, bool>? _onLoginDone;
     private bool _resultReported;
     private WebView2? _officeWebView;
     private string? _pagePayloadJson;
+    // Set by OnOfficeWebMessage the moment OnlyOffice's own iframe reports it
+    // could not open the document -- see office_editor.html's postToHost doc
+    // comment. Report() checks this so OnClosing/OnOfficeDoneClicked can no
+    // longer claim "saved" for a document that was never actually opened.
+    private string? _officeErrorMessage;
 
     /// <summary>
     /// Web-page viewers ("code" = Monaco, "slideshow"): the page is loaded from
     /// wwwroot and receives the backend's open_editor event (payloadJson) once it
     /// has finished loading. path is the file a code view saves back to, or empty.
     /// </summary>
-    public DocumentViewerWindow(string title, string kind, string path, string payloadJson, Action<ViewerOutcome, string?> onDone)
+    public DocumentViewerWindow(string title, string kind, string path, string payloadJson, Action<ViewerOutcome, string?, string?> onDone)
     {
         InitializeComponent();
         _path = path;
@@ -59,7 +65,7 @@ public partial class DocumentViewerWindow : Window
         _ = ShowWebPage(kind == "code" ? "monaco_viewer.html" : "slideshow.html");
     }
 
-    public DocumentViewerWindow(string path, string kind, Action<ViewerOutcome, string?> onDone)
+    public DocumentViewerWindow(string path, string kind, Action<ViewerOutcome, string?, string?> onDone)
     {
         InitializeComponent();
         _path = path;
@@ -109,7 +115,7 @@ public partial class DocumentViewerWindow : Window
     }
 
     /// <summary>Documents: opened via the OnlyOffice flow (see class doc comment above).</summary>
-    public DocumentViewerWindow(string path, OfficeEditorConfig config, Action<ViewerOutcome, string?> onDone)
+    public DocumentViewerWindow(string path, OfficeEditorConfig config, Action<ViewerOutcome, string?, string?> onDone)
     {
         InitializeComponent();
         _path = path;
@@ -334,6 +340,7 @@ public partial class DocumentViewerWindow : Window
                 StatusText.Visibility = Visibility.Collapsed;
                 if (!args.IsSuccess) ShowError($"Could not load document editor (error {args.WebErrorStatus}).");
             };
+            webView.CoreWebView2.WebMessageReceived += OnOfficeWebMessage;
 
             // Virtual host mapping, not file:///... -- same reasoning as
             // MainWindow's chat WebView2 (see its own comment): avoids
@@ -357,6 +364,25 @@ public partial class DocumentViewerWindow : Window
         {
             OfficeHost.Visibility = Visibility.Collapsed;
             ShowError($"Could not start the document editor: {ex.Message}");
+        }
+    }
+
+    /// <summary>office_editor.html's postToHost -- currently only "office_error"
+    /// (OnlyOffice itself failed to open/load the document; see that page's own
+    /// doc comment for the 2026-10-07 incident this fixes).</summary>
+    private void OnOfficeWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(e.WebMessageAsJson);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("type", out var typeEl) || typeEl.GetString() != "office_error") return;
+            _officeErrorMessage = root.TryGetProperty("message", out var msgEl) ? msgEl.GetString() : "OnlyOffice could not open this document.";
+            ShowError(_officeErrorMessage!);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"DocumentViewerWindow: OnOfficeWebMessage failed to parse: {ex}");
         }
     }
 
@@ -386,7 +412,11 @@ public partial class DocumentViewerWindow : Window
         // Closed via the window's own X button rather than a toolbar button --
         // an office session always syncs back whatever OnlyOffice already
         // saved server-side (see server.ts's "editor_result" handler), so
-        // this is "saved" too, same as clicking Done.
+        // this is "saved" too, same as clicking Done -- UNLESS OnlyOffice
+        // itself already reported it never actually opened the document
+        // (_officeErrorMessage, set by OnOfficeWebMessage), in which case
+        // Report() below overrides this to "error" rather than lying that
+        // nonexistent edits were saved.
         Report(_kind == "office" ? ViewerOutcome.Saved : ViewerOutcome.Closed);
     }
 
@@ -394,6 +424,7 @@ public partial class DocumentViewerWindow : Window
     {
         if (_resultReported) return;
         _resultReported = true;
-        _onDone!(outcome, _path);
+        if (_officeErrorMessage != null) outcome = ViewerOutcome.Error;
+        _onDone!(outcome, _path, _officeErrorMessage);
     }
 }

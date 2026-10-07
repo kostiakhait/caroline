@@ -1085,7 +1085,7 @@ public partial class MainWindow : Window
             Logger.Log($"MainWindow: {type} requestId={requestId} path={path}");
             var viewerKey = path.Length > 0 ? path : requestId;
 
-            Action<ViewerOutcome, string?> onDone = (outcome, resultPath) =>
+            Action<ViewerOutcome, string?, string?> onDone = (outcome, resultPath, message) =>
             {
                 Dispatcher.Invoke(() =>
                 {
@@ -1097,7 +1097,8 @@ public partial class MainWindow : Window
                         ViewerOutcome.Closed => "closed",
                         _ => "error",
                     };
-                    var payload = JsonSerializer.Serialize(new { type = "editor_result", requestId, outcome = outcomeStr, path = resultPath });
+                    if (outcome == ViewerOutcome.Error) Logger.Log($"MainWindow: editor_result error requestId={requestId} path={resultPath} message={message}");
+                    var payload = JsonSerializer.Serialize(new { type = "editor_result", requestId, outcome = outcomeStr, path = resultPath, message });
                     webView.CoreWebView2.PostWebMessageAsJson(payload);
                 });
             };
@@ -1249,7 +1250,7 @@ public partial class MainWindow : Window
 
         if (_viewerWindows.TryGetValue(PaymentWindowKey, out var existing)) existing.Close();
 
-        var viewer = new DocumentViewerWindow(checkoutUrl, "payment", (outcome, path) =>
+        var viewer = new DocumentViewerWindow(checkoutUrl, "payment", (outcome, path, _) =>
         {
             Dispatcher.Invoke(() =>
             {

@@ -960,7 +960,7 @@ async def handle_control_request(
         outcome, path = parsed.get("outcome"), parsed.get("path")
         if not request_id or not outcome or not path:
             return {"type": "control_response", "op": op, "ok": False, "stderr": "editor_result requires requestId, outcome, and path", "requestId": request_id}
-        log_event("engine", "editor_result", request_id=request_id, outcome=outcome, path=path)
+        log_event("engine", "editor_result", request_id=request_id, outcome=outcome, path=path, message=parsed.get("message"))
         # Ground truth for "is this viewer window still open" -- fires
         # whether Caroline's own close_viewer triggered it or the user
         # closed the window themselves, so this is the one place a stale
