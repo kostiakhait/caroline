@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from app.event_memory import forget_event_by_reminder_id, remember_event
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
 from app.policies import follow_explicit_parameters_instruction
@@ -183,6 +184,12 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     }
     reminders.append(reminder)
     _save_reminders(reminders)
+    # Per explicit instruction (2026-10-07): every scheduled reminder is also
+    # a durable event-memory record, written automatically here -- not left
+    # to Caroline's own discretion to log it a second time. See
+    # app/event_memory.py's own doc comment for why this is separate from
+    # working_memory.py's "events" category.
+    remember_event(WORKSPACE_DIR, text=args["note"], due_at_iso=due_iso, source="schedule_reminder", reminder_id=reminder["id"])
     rec_text = f", repeats on cron '{cron_text}'" if cron_text else ""
     return {"text": f"Scheduled (id {reminder['id']}) for {due_iso} [{reminder['priority']}{rec_text}]: {args['note']}"}
 
@@ -197,6 +204,8 @@ async def cancel_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     after = [r for r in before if r.get("id") != args["id"]]
     _save_reminders(after)
     removed = len(after) < len(before)
+    if removed:
+        forget_event_by_reminder_id(WORKSPACE_DIR, args["id"])  # it never happened -- don't keep a record of it
     return {"text": f"Cancelled {args['id']}." if removed else f"No pending reminder with id {args['id']}."}
 
 

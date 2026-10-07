@@ -666,6 +666,29 @@ def working_memory_check_first_instruction() -> str:
     )
 
 
+def event_memory_check_first_instruction() -> str:
+    """Per explicit instruction (2026-10-07), after a real incident: asked
+    about a meeting she herself had arranged, Caroline had no durable record
+    of it and resorted to 483 notes_get calls trying to reconstruct it from
+    old notes -- list_reminders hides a reminder the moment it fires, and
+    working_memory.py's "events" category is a small auto-evicting cache
+    never actually instructed for this use. event_memory.py's own records
+    are written automatically by schedule_reminder, so the gap is purely
+    that Caroline doesn't reliably think to check there first. Same shape as
+    recall_memory_check_first_instruction/working_memory_check_first_instruction
+    just above: a short trigger only, always-on so it's never forgotten; the
+    full mechanics stay on-demand via get_tool_instructions, fetched once an
+    event_memory_* tool is actually in play (event_memory_plugin.py's own
+    usage_instructions)."""
+    return (
+        "When the user asks about something YOU arranged yourself -- a meeting, an appointment, anything you "
+        "scheduled a reminder for -- call event_memory_recall FIRST, before searching Notes or trying to "
+        "reconstruct it from old conversation. Unlike list_reminders, it still shows things whose reminder has "
+        "already fired. You don't need to log anything there yourself for reminders -- schedule_reminder already "
+        "does that automatically every time."
+    )
+
+
 def notes_folder_fallback_instruction() -> str:
     """Per explicit instruction (2026-09-22), after a real, concrete
     incident: told to reconnect a mailbox, Caroline checked only
@@ -890,6 +913,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     credentials_check_notes_first_instruction,
     recall_memory_check_first_instruction,
     working_memory_check_first_instruction,
+    event_memory_check_first_instruction,
 )
 
 

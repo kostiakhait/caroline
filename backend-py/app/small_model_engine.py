@@ -93,6 +93,7 @@ from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
     continuity_pointer_instruction,
     credentials_check_notes_first_instruction,
+    event_memory_check_first_instruction,
     learn_from_mistakes_instruction,
     no_internal_mechanics_to_user_instruction,
     no_unauthorized_secret_changes_instruction,
@@ -130,6 +131,7 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     credentials_check_notes_first_instruction,
     recall_memory_check_first_instruction,
     working_memory_check_first_instruction,
+    event_memory_check_first_instruction,
 )
 
 # Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__
