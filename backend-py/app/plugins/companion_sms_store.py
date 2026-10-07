@@ -218,6 +218,37 @@ def list_messages(store: dict[str, Any], thread_key: str) -> list[dict[str, Any]
     ]
 
 
+def search_messages(store: dict[str, Any], query: str | None = None, address: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """Full-text (case-insensitive substring) search over EVERY paired
+    device's already-synced messages -- instant, no phone round trip. Per
+    a real incident (2026-10-07): companion_search_sms (the live, two-phase
+    device query) was the ONLY way to search by content, even though this
+    module's own docstring already said "try the local copy first" --
+    there was simply no local search to try. This is that missing piece;
+    companion_plugin.py's companion_search_sms_local is its tool surface.
+    query alone, address alone, or both narrow the results; neither given
+    returns every message (most recent first), capped at limit."""
+    q = (query or "").strip().lower()
+    addr = (address or "").strip()
+    results: list[dict[str, Any]] = []
+    for device_id, bucket in store["devices"].items():
+        for msg in bucket["messages"]:
+            if q and q not in (msg.get("body") or "").lower():
+                continue
+            if addr and addr not in (msg.get("address") or ""):
+                continue
+            results.append({
+                "threadId": _thread_key(device_id, msg.get("threadId")),
+                "phoneNumber": bucket.get("phoneNumber"),
+                "from": msg.get("address"),
+                "body": msg.get("body"),
+                "date": msg.get("date"),
+                "type": msg.get("type"),
+            })
+    results.sort(key=lambda m: m.get("date") or 0, reverse=True)
+    return results[:limit]
+
+
 def last_synced_at(store: dict[str, Any], device_id: str | None = None) -> str | None:
     """With a device_id, that device's own last sync time. Without one,
     the OLDEST of every paired device's last sync (the honest answer to

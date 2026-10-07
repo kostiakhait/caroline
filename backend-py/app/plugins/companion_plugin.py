@@ -38,15 +38,33 @@ doesn't answer in time). Instant, and correct as of the last successful
 sync regardless of whether the phone happens to be reachable right this
 moment.
 
-companion_search_sms (2026-09-30) is the deliberate THIRD option: a live,
+companion_search_contacts_local (2026-10-07) is the contacts equivalent of
+companion_search_sms_local below -- an automatic background sync
+(companion_api.start_contacts_sync_loop, same ~3-minute cadence as SMS)
+keeps a local copy (companion_contacts_store.py) of every paired phone's
+address book, and this tool searches THAT, instantly, no phone round
+trip. ALWAYS try this before companion_search_contacts (the live version)
+or companion_list_contacts for anything name/number-lookup shaped --
+those remain for the rare case the sync hasn't caught up yet, or a
+feature (like companion_create_contact's write) that genuinely has to
+touch the phone itself.
+
+companion_search_sms_local (2026-10-07) searches the SAME local copy by
+message content/address (companion_sms_store.search_messages) -- instant,
+no phone round trip. This is the "try the local copy first" this module's
+header already called for, but which had no actual search capability
+until now (only thread listing/reading did). ALWAYS try this before
+companion_search_sms below.
+
+companion_search_sms (2026-09-30) is the deliberate FOURTH option: a live,
 two-phase (same shape as the contacts tools) query straight to the
 phone's real SMS table, for exactly the case the local copy can't answer
--- a conversation the periodic sync hasn't reached yet, or one outside
-companion_sms_store's own retained window. Slower (a real phone round
-trip, not instant) and not meant to replace companion_list_sms_threads
-as the default -- try the local copy first, fall back to this when it
-comes up empty and the user's phrasing makes clear the message should
-exist.
+-- a conversation the periodic sync hasn't reached yet (sync runs every
+~3 minutes), or one outside companion_sms_store's own retained window.
+Slower (a real phone round trip, not instant) and not meant to replace
+companion_search_sms_local as the default -- try the local copy first,
+fall back to this when it comes up empty and the user's phrasing makes
+clear the message should exist.
 
 SW-login-gated (needs the user's own SquirrelWisdom account -- the same
 one paired to the Android app). Uses sw_gate.py's shared
@@ -81,7 +99,10 @@ from app.plugins.companion_api import (
     resolve_device,
     send_sms,
 )
-from app.plugins.companion_sms_store import last_synced_at, list_all_threads, list_messages, list_threads, load_store
+from app.plugins.companion_contacts_store import last_synced_at as contacts_last_synced_at
+from app.plugins.companion_contacts_store import load_store as load_contacts_store
+from app.plugins.companion_contacts_store import search_contacts as search_contacts_local
+from app.plugins.companion_sms_store import last_synced_at, list_all_threads, list_messages, list_threads, load_store, search_messages
 from app.plugins.loader import Plugin, PluginTool
 from app.policies import follow_explicit_parameters_instruction
 from app.session_context import get_send, get_tab_id
@@ -225,6 +246,23 @@ async def companion_read_sms_thread(args: dict[str, Any], report_progress: Any) 
     return {"text": _json({"lastSyncedAt": last_synced_at(store), "messages": messages})}
 
 
+async def companion_search_sms_local(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
+    gate_msg = await _gate()
+    if gate_msg:
+        return {"text": gate_msg, "is_error": True}
+    query = args.get("query")
+    address = args.get("address")
+    if not query and not address:
+        return {"text": "Give at least one of 'query' (text to search for) or 'address' (a number to filter to).", "is_error": True}
+    limit = int(args.get("limit") or 50)
+    # Local copy (companion_sms_store.py) -- instant, no phone round trip.
+    # See this module's own header comment for why this is tried BEFORE
+    # companion_search_sms, not the other way round.
+    store = load_store(WORKSPACE_DIR)
+    results = search_messages(store, query=str(query) if query else None, address=str(address) if address else None, limit=limit)
+    return {"text": _json({"lastSyncedAt": last_synced_at(store), "messages": results})}
+
+
 async def companion_list_contacts(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
     gate_msg = await _gate()
     if gate_msg:
@@ -248,6 +286,29 @@ async def companion_search_contacts(args: dict[str, Any], report_progress: Any) 
     except (PhoneUnreachableError, AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
         return {"text": _device_error_text(exc) if not isinstance(exc, PhoneUnreachableError) else str(exc), "is_error": True}
     return {"text": _json(contacts)}
+
+
+async def companion_search_contacts_local(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
+    gate_msg = await _gate()
+    if gate_msg:
+        return {"text": gate_msg, "is_error": True}
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": "'query' is required.", "is_error": True}
+    # Local copy (companion_contacts_store.py), kept fresh automatically by
+    # companion_api.start_contacts_sync_loop -- instant, no phone round
+    # trip. See this module's own header comment for why this is tried
+    # BEFORE companion_search_contacts.
+    store = load_contacts_store(WORKSPACE_DIR)
+    from_number = args.get("fromNumber")
+    device_id = None
+    if from_number:
+        try:
+            device_id = (await resolve_device(str(from_number).strip()))["deviceId"]
+        except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
+            return {"text": _device_error_text(exc), "is_error": True}
+    results = search_contacts_local(store, query, device_id=device_id)
+    return {"text": _json({"lastSyncedAt": contacts_last_synced_at(store), "contacts": results})}
 
 
 async def companion_create_contact(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -467,10 +528,27 @@ PLUGIN = Plugin(
             companion_list_contacts,
         ),
         PluginTool(
+            "companion_search_contacts_local",
+            "Search contacts by name or number substring, in Caroline's own local copy (companion_contacts_"
+            "store, refreshed automatically every ~3 minutes) -- instant, no phone round trip, no waiting. "
+            "ALWAYS try this BEFORE companion_search_contacts/companion_list_contacts (the live, slow, "
+            "phone-round-trip versions below).",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Name or number substring to search for."},
+                    "fromNumber": {"type": "string", "description": "Only search this paired phone's synced contacts. Defaults to every paired phone."},
+                },
+                "required": ["query"],
+            },
+            companion_search_contacts_local,
+        ),
+        PluginTool(
             "companion_search_contacts",
-            "Search contacts by name or number substring. Omit fromNumber to search EVERY paired phone's "
-            "contacts at once (each match tagged with sourceNumber); pass it to search just one phone. May take "
-            "a while -- see get_tool_instructions.",
+            "Search contacts by name or number substring, directly ON THE PHONE, live -- SLOWER than "
+            "companion_search_contacts_local, only use this AFTER that one comes up empty (the sync hasn't "
+            "caught up yet). Omit fromNumber to search EVERY paired phone's contacts at once (each match tagged "
+            "with sourceNumber); pass it to search just one phone. May take a while -- see get_tool_instructions.",
             {
                 "type": "object",
                 "properties": {
@@ -501,10 +579,28 @@ PLUGIN = Plugin(
             companion_create_contact,
         ),
         PluginTool(
+            "companion_search_sms_local",
+            "Search SMS/MMS by content and/or sender, in Caroline's own local copy (companion_sms_store, "
+            "refreshed every ~3 minutes) -- instant, no phone round trip, no waiting. ALWAYS try this BEFORE "
+            "companion_search_sms (the live, slow, phone-round-trip version below) -- only fall back to that "
+            "one if this comes up empty and the user's phrasing makes clear the message should exist. Pass "
+            "query (text to find in the message body), address (a phone number to filter to), or both.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Text to search for in the message body."},
+                    "address": {"type": "string", "description": "A phone number to filter results to."},
+                    "limit": {"type": "integer", "description": "Max messages to return, across all paired phones. Defaults to 50."},
+                },
+                "required": [],
+            },
+            companion_search_sms_local,
+        ),
+        PluginTool(
             "companion_search_sms",
-            "Search for SMS directly ON THE PHONE, live, right now -- unlike companion_list_sms_threads/"
-            "companion_read_sms_thread (Caroline's own local copy, refreshed every ~3 minutes), this asks the "
-            "phone itself, so it finds a message even if the local copy hasn't synced it yet or never reached "
+            "Search for SMS directly ON THE PHONE, live, right now -- SLOWER than companion_search_sms_local "
+            "(a real phone round trip, not instant) -- only use this AFTER that one comes up empty, since it "
+            "finds a message even if the local copy hasn't synced it yet or never reached "
             "it (e.g. an old conversation outside the local copy's own bootstrap window). Pass query (text to "
             "find in the message body), address (a phone number to filter to), or both; omit both only for "
             "'just the most recent messages, period'. Omit fromNumber to search EVERY paired phone at once "

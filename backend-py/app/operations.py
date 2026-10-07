@@ -148,7 +148,7 @@ def _notify_operation_completed(plugin_name: str, op: Operation) -> None:
         "react to it now if it's relevant (e.g. tell the user what happened), rather than "
         "leaving it unmentioned.]"
     )
-    log_event(f"plugin:{plugin_name}", "operation_completion_notified", tool=op.tool_name, operation_id=op.id, status=op.status)
+    log_event(f"plugin:{plugin_name}", "operation_completion_notified", tool=op.tool_name, operation_id=op.id, status=op.status, error=op.error)
 
 
 async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args: dict[str, Any]) -> dict[str, Any]:
@@ -245,7 +245,7 @@ async def check_operation_status(args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": "Unknown or already-completed operation_id."}], "is_error": True}
     body = _operation_to_dict(op)
     if op.status in ("done", "error", "cancelled"):
-        log_event("engine", "check_operation_status_final", operation_id=op.id, tool=op.tool_name, status=op.status)
+        log_event("engine", "check_operation_status_final", operation_id=op.id, tool=op.tool_name, status=op.status, error=op.error)
         REGISTRY.forget(op.id)
     return {"content": [{"type": "text", "text": str(body)}]}
 

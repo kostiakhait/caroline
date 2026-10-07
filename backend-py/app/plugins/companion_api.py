@@ -92,6 +92,9 @@ from typing import Any, Callable
 
 from app.login_api import get_v2_session, is_logged_in
 from app.logging_setup import log_event
+from app.plugins.companion_contacts_store import load_store as load_contacts_store
+from app.plugins.companion_contacts_store import replace_device_contacts
+from app.plugins.companion_contacts_store import save_store as save_contacts_store
 from app.plugins.companion_sms_store import load_store, merge_messages, save_store, since_cursor
 from app.plugins.sw_api import SessionExpiredError, SwApiError, call_v2
 from app.task_supervisor import supervise
@@ -1134,3 +1137,81 @@ def start_sms_sync_loop(workspace_dir: str, interval_s: float = SMS_SYNC_INTERVA
                 log_event("plugin:companion", "sms_sync_tick_failed", error=str(exc))
 
     return supervise("companion_sms_sync", _loop)
+
+
+# --- Contacts local-copy sync loop --------------------------------------------
+#
+# Per explicit instruction (2026-10-07): mirrors the SMS sync loop above --
+# same "a phone isn't reliably reachable live" reasoning, same cadence.
+# Deliberately reuses the EXISTING generic devices/<id>/contacts/requests/
+# {opId} -> responses/{opId} path (the same one companion_list_contacts/
+# companion_search_contacts already use live) instead of a dedicated
+# sync_request/sync_response leaf like SMS has -- the Android app already
+# answers a "list" op there on every ~5s poll tick (CompanionOpsService.
+# kt's handleRequestFamily("contacts")), so this needs NO companion-app
+# change or reinstall to start working. A fresh opId every attempt (not a
+# fixed one) avoids colliding with a real, concurrent model-initiated
+# contacts lookup under the same family.
+
+CONTACTS_SYNC_INTERVAL_S = 180.0  # same cadence as SMS -- a phone's contacts change rarely
+CONTACTS_SYNC_RESPONSE_WAIT_S = 45.0
+CONTACTS_SYNC_POLL_INTERVAL_S = 5.0
+
+
+async def _contacts_sync_tick(workspace_dir: str) -> None:
+    if not is_logged_in():
+        return
+    try:
+        devices = await list_devices()
+    except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
+        log_event("plugin:companion", "contacts_sync_device_list_failed", error=str(exc))
+        return
+    if not devices:
+        return
+    store = load_contacts_store(workspace_dir)
+    changed = False
+    for device in devices:
+        if await _contacts_sync_one_device(store, device["deviceId"], device.get("phoneNumber")):
+            changed = True
+    if changed:
+        save_contacts_store(workspace_dir, store)
+
+
+async def _contacts_sync_one_device(store: dict[str, Any], device_id: str, phone_number: str | None) -> bool:
+    op_id = uuid.uuid4().hex
+    request_path = f"devices/{device_id}/contacts/requests/{op_id}"
+    response_path = f"devices/{device_id}/contacts/responses/{op_id}"
+    await set_mine(request_path, {"op": "list", "status": "accepted"})
+    deadline = time.monotonic() + CONTACTS_SYNC_RESPONSE_WAIT_S
+    response: Any = None
+    while time.monotonic() < deadline:
+        response = await get_mine(response_path)
+        if response is not None:
+            break
+        await asyncio.sleep(CONTACTS_SYNC_POLL_INTERVAL_S)
+    await _safe_delete(request_path)
+    await _safe_delete(response_path)
+    if response is None:
+        log_event("plugin:companion", "contacts_sync_no_response", device_id=device_id)
+        return False
+    if not isinstance(response, list):
+        log_event("plugin:companion", "contacts_sync_malformed_response", device_id=device_id)
+        return False
+    replace_device_contacts(store, device_id, phone_number, response)
+    log_event("plugin:companion", "contacts_sync_ok", device_id=device_id, count=len(response))
+    return True
+
+
+def start_contacts_sync_loop(workspace_dir: str, interval_s: float = CONTACTS_SYNC_INTERVAL_S) -> "asyncio.Task[None]":
+    """Started once from main.py's startup hook, next to start_sms_sync_loop."""
+    log_event("plugin:companion", "contacts_sync_loop_starting", interval_s=interval_s)
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await _contacts_sync_tick(workspace_dir)
+            except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
+                log_event("plugin:companion", "contacts_sync_tick_failed", error=str(exc))
+
+    return supervise("companion_contacts_sync", _loop)

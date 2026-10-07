@@ -49,7 +49,7 @@ from app.plugins.companion_api import (
     resolve_device as companion_resolve_device,
     resume_companion_operations,
     request_tab_list_publish as companion_request_tab_list,
-    load_visible_transcript, save_visible_transcript, start_companion_inbox_loop, start_sms_sync_loop,
+    load_visible_transcript, save_visible_transcript, start_companion_inbox_loop, start_contacts_sync_loop, start_sms_sync_loop,
 )
 from app.plugins.companion_sms_store import (
     last_synced_at as companion_last_synced_at,
@@ -430,6 +430,13 @@ async def _start_ratatosk_background_loops() -> None:
     # 3 seconds) -- see companion_api.py's own SMS-sync header comment for
     # why it must not share the inbox loop's tick.
     start_sms_sync_loop(WORKSPACE_DIR)
+    # Same reasoning, same cadence, for the phone's contacts -- per explicit
+    # instruction (2026-10-07): a per-tool-call save into working_memory
+    # only fires if/when the model happens to call that tool, which,
+    # confirmed live, had never actually happened in this workspace's whole
+    # history. This keeps companion_search_contacts_local's local copy
+    # fresh automatically, independent of any tool call.
+    start_contacts_sync_loop(WORKSPACE_DIR)
     # Resume any companion operation (SMS send, sms/contacts lookup) that
     # was still in flight when the backend last went down -- see
     # companion_api.py's own module docstring for the never-gives-up
