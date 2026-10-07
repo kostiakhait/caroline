@@ -1356,6 +1356,9 @@ class ChatSession:
         self.turn_pending_since: float | None = None
         self._last_known_funds_exhausted_reason: str | None = None
         self.pending_user_text: str | None = None
+        # Progress remarks already shown to the user (see _send_progress_narration),
+        # not yet seen by the model -- delivered with the next submitted message.
+        self.pending_interim_notes: list[str] = []
         self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
 
@@ -2018,6 +2021,14 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        if self.pending_interim_notes:
+            notes = "\n".join(f"- {note}" for note in self.pending_interim_notes)
+            self.pending_interim_notes = []
+            text = (
+                "[Interim messages you already showed the user while working on the previous request, "
+                "marked as progress updates -- your own past words, do not repeat them as news:\n"
+                f"{notes}]\n\n{text}"
+            )
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
             self._route_sw_turn(text, attachments, is_real_user, is_voice)
             return
@@ -3299,6 +3310,10 @@ class ChatSession:
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count += 1
         log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment, consecutive_count=self.consecutive_narration_count)
+        # What the user just saw must be something Caroline knows she said. Kept
+        # until the next submitted message, where it's handed to the model as a
+        # clearly labeled interim note -- nothing here starts a turn of its own.
+        self.pending_interim_notes = (self.pending_interim_notes + [comment])[-5:]
         wire = {
             "type": "assistant",
             "message": {"role": "assistant", "content": [{"type": "text", "text": comment}], "model": None, "stop_reason": None},
