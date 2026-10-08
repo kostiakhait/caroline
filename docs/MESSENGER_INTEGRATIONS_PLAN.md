@@ -1,5 +1,13 @@
 # Caroline: мессенджер-интеграции (Slack, Telegram, Discord, WhatsApp, Signal)
 
+## Статус (2026-10-07)
+
+Все пять реализованы в коде: `secret_store.py`, `sidecar_process.py`, `slack_channel.py`+`slack_plugin.py`, `telegram_channel.py`+`telegram_plugin.py`, `discord_channel.py`+`discord_plugin.py`, `whatsapp_channel.py`+`whatsapp_plugin.py`+`companion-apps/whatsapp-sidecar/`, `signal_channel.py`+`signal_plugin.py`. Инсталлятор дополнен: `pywin32`/`slack_sdk`/`setuptools`/`telethon`/`discord.py`/`qrcode`/`Pillow` в `PythonInstaller.cs`, реактивирован `NodeInstaller.cs`, добавлены `WhatsappSidecarInstaller.cs`, `JavaRuntimeInstaller.cs` (реальный хеш Temurin 17 JRE, проверен загрузкой), `SignalCliInstaller.cs` (реальный хеш signal-cli 0.14.9, проверен загрузкой).
+
+Проверено: синтаксис, полный импорт `app.main` со всеми пятью плагинами одновременно, сборка обоих C#-проектов, логика каждого канала на моках (без реальных аккаунтов) — хранение/шифрование токенов, отказ при отсутствии провижининга, QR рендерится в реальный PNG, безусловный автозапуск нигде не всплывает без явного действия пользователя.
+
+Не проверено (нужны реальные внешние условия, недоступные в этой среде): полный прогон `npm install` для whatsapp-sidecar (пакет `@whiskeysockets/baileys` не устанавливался), сам Baileys и JSON-RPC-поверхность signal-cli 0.14.9 — не исполнялись вживую, писаны по документированным паттернам. Slack/Telegram/Discord/WhatsApp/Signal App/Developer-регистрации — не сделаны (откладывались по ходу сессии, SLACK_CLIENT_ID и TELEGRAM_API_ID/HASH пустые).
+
 ## Context
 
 Пользователь спросил, как оснастить Caroline адаптерами ко всем основным мессенджерам, по аналогии с OpenClaw. Исследование показало, что у OpenClaw нет единого универсального механизма — под каждый мессенджер своя модель доступа (официальный bot-токен, официальный user-токен, либо неофициальная библиотека/CLI с линковкой устройства по QR). План ниже берёт ту же логику и привязывает её к реальной архитектуре Caroline.

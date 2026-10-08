@@ -139,6 +139,10 @@ $(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR
 	mkdir -p "$(OUT)/backend-py/python-scripts"
 	cp "$(BACKEND_DIR)/python-scripts/local_tts_server.py" "$(OUT)/backend-py/python-scripts/local_tts_server.py"
 	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
+	@echo "--- whatsapp-sidecar (Baileys, Node -- see app/whatsapp_channel.py) ---"
+	mkdir -p "$(OUT)/whatsapp-sidecar"
+	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(OUT)/whatsapp-sidecar/package.json"
+	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
 	@echo "--- camerlengo (small-model primary path, see small_model_engine.py's own doc comment) ---"
 	@if git -C "$(CAMERLENGO_REPO)" cat-file -e caroline:AI.py 2>/dev/null; then \
 		mkdir -p "$(OUT)/backend-py/camerlengo"; \

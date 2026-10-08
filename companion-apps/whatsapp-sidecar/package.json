@@ -1,0 +1,12 @@
+{
+  "name": "caroline-whatsapp-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WhatsApp personal-account connection for Caroline (docs/MESSENGER_INTEGRATIONS_PLAN.md) -- runs as a child process of the Python backend (app/whatsapp_channel.py via app/sidecar_process.py), talking newline-delimited JSON over stdio. Uses Baileys (unofficial WhatsApp Web protocol implementation), not an official API -- there isn't one for a personal account.",
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "@hapi/boom": "^10.0.1"
+  }
+}

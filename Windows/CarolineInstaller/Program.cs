@@ -304,6 +304,28 @@ internal static class Program
         // explicit instruction, 2026-09-26: ships with every install regardless of the
         // Settings toggle, which stays off by default. See WhisperModelInstaller's own
         // doc comment.
+        // Step 4c: Node.js runtime + the WhatsApp sidecar's own npm dependencies
+        // (app/whatsapp_channel.py, docs/MESSENGER_INTEGRATIONS_PLAN.md, 2026-10-06).
+        // NodeInstaller was unused since the legacy Node backend was removed --
+        // reactivated here for Baileys, which has no Python equivalent.
+        await WithStepAsync(ErrorCodes.NodeInstall, "Setting up Node.js", () => NodeInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Node.js…", p),
+            ct));
+        await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct));
+
+        // Step 4d: Java runtime + signal-cli (app/signal_channel.py, same plan
+        // as the WhatsApp sidecar above -- Signal has no official bot API at
+        // all, signal-cli is the standard way every such integration talks to it).
+        await WithStepAsync(ErrorCodes.JavaRuntimeInstall, "Setting up Java runtime", () => JavaRuntimeInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Java runtime…", p),
+            ct));
+        await WithStepAsync(ErrorCodes.SignalCliInstall, "Setting up Signal support", () => SignalCliInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Signal support…", p),
+            ct));
+
         await WithStepAsync(ErrorCodes.WhisperModelInstall, "Downloading local speech-recognition model", () => WhisperModelInstaller.InstallAsync(downloader, http,
             s => window.SetStatus(s),
             p => window.SetDownloadProgress("Downloading local speech-recognition model…", p),

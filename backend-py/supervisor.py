@@ -142,6 +142,17 @@ def _child_env() -> dict[str, str]:
         # _ROOT_DIR -- see the Makefile's own publish step), same layout Caroline.exe itself lives
         # at relative to AppContext.BaseDirectory.
         env["CAROLINE_NATIVEHOST_EXE_PATH"] = str(_APP_DIR / "Caroline.NativeHost.exe")
+        # app/whatsapp_channel.py's Baileys sidecar (docs/MESSENGER_INTEGRATIONS_PLAN.md,
+        # 2026-10-06) -- same sibling-of-app-dir convention as every other runtime here.
+        env["CAROLINE_NODE_PATH"] = str(_ROOT_DIR / "runtime" / "node" / "node.exe")
+        # Sibling of backend-py inside the same app-<hash> dir (_APP_DIR, not
+        # _ROOT_DIR) -- same layout CAROLINE_NATIVEHOST_EXE_PATH above uses,
+        # since the Makefile publishes it there too (see its own "whatsapp-sidecar" recipe).
+        env["CAROLINE_WHATSAPP_SIDECAR_DIR"] = str(_APP_DIR / "whatsapp-sidecar")
+        # app/signal_channel.py's signal-cli daemon -- same two-piece
+        # (runtime + tool) shape as Node/whatsapp-sidecar just above.
+        env["CAROLINE_JAVA_HOME"] = str(_ROOT_DIR / "runtime" / "java")
+        env["CAROLINE_SIGNAL_CLI_BAT"] = str(_ROOT_DIR / "runtime" / "signal-cli" / "bin" / "signal-cli.bat")
     else:
         env["CAROLINE_FFMPEG_PATH"] = str(_ROOT_DIR / "runtime" / "ffmpeg" / "ffmpeg")
         env["CAROLINE_CODEX_PATH"] = str(_ROOT_DIR / "runtime" / "codex" / "bin" / "codex-app-server")

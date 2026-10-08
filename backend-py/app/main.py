@@ -58,12 +58,16 @@ from app.plugins.companion_sms_store import (
     list_threads as companion_list_threads,
     load_store as companion_load_sms_store,
 )
-from app.plugins.scheduler_plugin import ensure_recurring_backup, start_due_check_loop
+from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.slack_channel import get_slack_channel_status, start_slack_channel
+from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
+from app.discord_channel import get_discord_channel_status, start_discord_channel
+from app.whatsapp_channel import get_whatsapp_channel_status, start_whatsapp_channel
+from app.signal_channel import get_signal_channel_status, start_signal_channel
 from app.subscription_mode import (
     chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
     invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
@@ -253,14 +257,37 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # AND-latch only ever moves toward "not silent", never back) and (b)
     # had nothing to do with THIS specific reply's own content. Whether
     # this reply is worth showing is now the model's own per-reply call,
-    # via the existing [[NO_UPDATE]] sentinel -- for the recurring backup
-    # reminder specifically, that guidance now lives directly in
-    # BACKUP_NUDGE's own text (the note this reminder carries), so it
-    # doesn't need special-casing here.
+    # via the existing [[NO_UPDATE]] sentinel.
+    #
+    # Per explicit instruction (2026-10-07): every reminder now carries a
+    # general eventType ("service" or "user", see scheduler_plugin.py's
+    # EVENT_TYPES) -- falls back to "service" for the one pre-existing
+    # reminder that predates this field (the recurring vault-backup-hourly
+    # one, identified by its own "kind" tag) rather than requiring that
+    # already-scheduled instance to be hand-edited; any other reminder
+    # missing the field (scheduled before this existed) defaults to "user",
+    # preserving its previous always-report behavior. Neither kind ever
+    # gets live progress-narrator chatter (suppress_narration=True below,
+    # see current_turn_suppress_narration's own doc comment) -- the
+    # difference is only in what the FINAL reply is told to do.
+    event_type = reminder.get("eventType") or ("service" if reminder.get("kind") == BACKUP_KIND else "user")
+    if event_type == "service":
+        instruction = (
+            "Nobody prompted you for this -- it's routine background/service maintenance that doesn't concern "
+            "the user directly. Act on it now, silently. Reply with exactly [[NO_UPDATE]] when done, unless "
+            "something is actually broken and needs the user's attention -- don't narrate or report on routine "
+            "success."
+        )
+    else:
+        instruction = (
+            "Nobody prompted you for this -- it's a self-scheduled follow-up, acting on your own initiative. Act "
+            "on it now. Don't narrate what you're doing while you work (no step-by-step \"now checking X\" "
+            "commentary) -- when you're actually done, tell the user the outcome/result directly, in one clear "
+            "message."
+        )
     delivered = primary.inject_proactive(
-        f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n"
-        "Nobody prompted you for this -- it's a self-scheduled follow-up. Act on it now and tell "
-        "the user proactively, don't wait for them to say anything first."
+        f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n{instruction}",
+        suppress_narration=True,
     )
     if delivered:
         log_event("engine", "reminder_delivered", reminder_id=reminder.get("id"))
@@ -410,6 +437,10 @@ async def _start_ratatosk_background_loops() -> None:
     # 2026-10-06) -- a no-op loop (just rechecks every 30s) until
     # slack_set_tokens has actually been called once.
     start_slack_channel(WORKSPACE_DIR, _inject_from_slack)
+    start_telegram_channel(WORKSPACE_DIR, _inject_from_telegram)
+    start_discord_channel(WORKSPACE_DIR, _inject_from_discord)
+    start_whatsapp_channel(WORKSPACE_DIR, _inject_from_whatsapp)
+    start_signal_channel(WORKSPACE_DIR, _inject_from_signal)
     # Checked every 20s (plus once immediately, catching anything that came
     # due while the app was closed); a reminder is only marked fired once
     # it's actually been injected into a live session (see _on_reminder_due).
@@ -843,6 +874,30 @@ def _inject_from_slack(text: str) -> None:
     no multi-group bot-identity concept to justify that extra session --
     it's the user's own single account, closer to the SMS companion's
     shape than to Ratatosk's)."""
+    _inject_messenger_proactive(text)
+
+
+def _inject_from_telegram(text: str) -> None:
+    """Same shape as _inject_from_slack above, for Telegram."""
+    _inject_messenger_proactive(text)
+
+
+def _inject_from_discord(text: str) -> None:
+    """Same shape as _inject_from_slack above, for Discord."""
+    _inject_messenger_proactive(text)
+
+
+def _inject_from_whatsapp(text: str) -> None:
+    """Same shape as _inject_from_slack above, for WhatsApp."""
+    _inject_messenger_proactive(text)
+
+
+def _inject_from_signal(text: str) -> None:
+    """Same shape as _inject_from_slack above, for Signal."""
+    _inject_messenger_proactive(text)
+
+
+def _inject_messenger_proactive(text: str) -> None:
     primary = primary_session()
     if primary is not None:
         primary.inject_proactive(text)
@@ -1010,6 +1065,18 @@ async def handle_control_request(
     if op == "slack_channel_status":
         # Same diagnostic-only shape as ratatosk_channel_status above.
         status = get_slack_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op == "telegram_channel_status":
+        status = get_telegram_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op == "discord_channel_status":
+        status = get_discord_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op == "whatsapp_channel_status":
+        status = get_whatsapp_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op == "signal_channel_status":
+        status = get_signal_channel_status()
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
     if op == "ratatosk_own_account_register":
         log_event("engine", "ratatosk_own_account_register")

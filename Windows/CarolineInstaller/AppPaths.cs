@@ -87,6 +87,11 @@ internal static class AppPaths
     public static string RuntimeDir => Path.Combine(Root, "runtime");
     public static string NodeDir => Path.Combine(RuntimeDir, "node");
     public static string NodeExe => Path.Combine(NodeDir, "node.exe");
+    // app/signal_channel.py's signal-cli daemon (docs/MESSENGER_INTEGRATIONS_PLAN.md,
+    // 2026-10-06) -- signal-cli is a JVM tool, needs a real JRE.
+    public static string JavaDir => Path.Combine(RuntimeDir, "java");
+    public static string JavaExe => Path.Combine(JavaDir, "bin", "java.exe");
+    public static string SignalCliDir => Path.Combine(RuntimeDir, "signal-cli");
     public static string PythonDir => Path.Combine(RuntimeDir, "python");
     public static string PythonExe => Path.Combine(PythonDir, "python.exe");
     public static string GitDir => Path.Combine(RuntimeDir, "git");

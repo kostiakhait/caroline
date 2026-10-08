@@ -50,6 +50,9 @@ internal static class ErrorCodes
     public const string CodexInstall = "E16";
     public const string WhisperModelInstall = "E17";
     public const string WorkspaceCleanup = "E18";
+    public const string WhatsappSidecarInstall = "E19";
+    public const string JavaRuntimeInstall = "E20";
+    public const string SignalCliInstall = "E21";
     /// <summary>Anything not wrapped by a specific step -- a bug, not a foreseen failure mode.</summary>
     public const string Unexpected = "E99";
 }

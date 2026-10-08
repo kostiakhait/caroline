@@ -104,7 +104,25 @@ internal static class PythonInstaller
          // app/slack_channel.py's Socket Mode connection (slack_sdk.socket_mode) --
          // first of the messenger integrations plan's channels. slack_sdk alone
          // covers Socket Mode without the heavier slack-bolt framework.
-         "slack_sdk"];
+         "slack_sdk",
+         // app/telegram_channel.py's Telethon (MTProto Client API) connection --
+         // second messenger. Confirmed live: telethon's own dependency (pyaes)
+         // ships as an sdist with no wheel, so pip needs a real build backend to
+         // install it -- "setuptools" below is listed BECAUSE of this, not
+         // optional. Order matters here: setuptools must install before telethon
+         // triggers pyaes's build, which PythonPackages' own installation loop
+         // (one pip install per entry, in list order) already guarantees.
+         "setuptools", "telethon",
+         // app/discord_channel.py's gateway connection -- third messenger,
+         // bot-only (see that module's own doc comment for why).
+         "discord.py",
+         // app/whatsapp_channel.py's QR-code rendering (the sidecar hands back
+         // the raw pairing string; this renders it to a PNG the user scans) --
+         // fourth messenger. "Pillow" listed explicitly, not via "qrcode[pil]"
+         // extras syntax (see IsPackageImportable's own doc comment on why
+         // entries here must be plain distribution names) -- qrcode needs it
+         // to actually produce an image, not just the extras-optional default.
+         "qrcode", "Pillow"];
 
     public static bool IsInstalled() => File.Exists(AppPaths.PythonExe);
 
@@ -138,7 +156,16 @@ internal static class PythonInstaller
         // necessarily an exact byte-match of the pin string (pip may add local/build
         // metadata), so this only needs the bare distribution name to glob on.
         var bareName = package.Split("==", 2)[0];
-        var normalizedPrefix = bareName.Replace('-', '_');
+        // Bug fix (2026-10-06), confirmed live: "discord.py" (the real PyPI
+        // distribution name -- "discord" alone is an unrelated, different
+        // package) installs a dist-info directory named "discord_py-*", not
+        // "discord.py-*" -- pip/wheel's own PEP 503 normalization maps BOTH
+        // '-' and '.' (and runs of whitespace) to '_' in the dist-info/wheel
+        // filename, not just '-'. Only replacing '-' left this glob unable to
+        // ever match discord.py's real dist-info dir, which would have made
+        // ArePackagesInstalled() report it missing forever -- failing
+        // InstallAsync's own post-install verification on every fresh install.
+        var normalizedPrefix = bareName.Replace('-', '_').Replace('.', '_');
         foreach (var distInfoDir in Directory.GetDirectories(sitePackagesDir, $"{normalizedPrefix}-*.dist-info"))
         {
             var topLevelPath = Path.Combine(distInfoDir, "top_level.txt");
