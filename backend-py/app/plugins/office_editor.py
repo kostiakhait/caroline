@@ -16,7 +16,17 @@ from app.logging_setup import log_event
 from app.reforce_v2 import ReforceError
 from app.reforce_v2 import call as reforce_call
 
-SQUIRRELWISDOM_ORIGIN = "https://www.squirrelwisdom.com"
+# Bug fix (2026-10-08), confirmed live: this must match the vhost
+# reforce_v2.REFORCE_URL actually sends file:write to (beautysqrl.com),
+# not just "the squirrelwisdom.com domain" in general -- squirrelwisdom.com
+# and beautysqrl.com resolve to the same server IP but are separate nginx
+# vhosts with separate document roots. Left pointed at squirrelwisdom.com
+# (stale since some earlier point, before/independent of reforce_v2's own
+# migration), document:openForEdit built a documentUrl on the WRONG vhost
+# -- the file was really sitting in beautysqrl.com's own caroline_docs/,
+# so OnlyOffice's own fetch of that URL 404'd ("Download failed."),
+# confirmed directly via curl against both.
+SQUIRRELWISDOM_ORIGIN = "https://beautysqrl.com"
 
 _CONFIG_FIELDS = ("documentType", "fileType", "editable", "key", "documentUrl", "onlyofficeUrl", "title", "callbackUrl")
 
