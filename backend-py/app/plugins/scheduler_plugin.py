@@ -27,6 +27,20 @@ from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
 BACKUP_KIND = "vault-backup-hourly"
+
+# Per explicit instruction (2026-10-07), after a real incident: a reminder-
+# driven turn used to always both (a) get live progress-narrator chatter
+# while it ran and (b) be told, unconditionally, to "tell the user
+# proactively" when done -- correct for something the user actually cares
+# about (a mailbox check), completely wrong for Caroline's own routine
+# internal upkeep (a memory backup), which produced unwanted "syncing..."
+# commentary about internal mechanics nobody asked to hear. This is a
+# GENERAL capability of every reminder, not a special case for one of
+# them: "service" never narrates and never reports back (silent unless
+# something is actually broken); "user" never narrates either, but still
+# reports the outcome when done -- see main.py's _on_reminder_due for
+# where this actually changes behavior.
+EVENT_TYPES = ("service", "user")
 _FIELD_RANGES = (("second", 0, 59), ("minute", 0, 59), ("hour", 0, 23), ("day", 1, 31), ("month", 1, 12), ("weekday", 0, 7))
 
 
@@ -173,6 +187,9 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             due_iso = args["due_at_iso"]
     except ValueError as exc:
         return {"text": f"Invalid schedule: {exc}", "is_error": True}
+    event_type = args.get("event_type") or "user"
+    if event_type not in EVENT_TYPES:
+        return {"text": f'Invalid event_type "{event_type}" -- must be one of {", ".join(EVENT_TYPES)}.', "is_error": True}
     reminder = {
         "id": uuid.uuid4().hex,
         "dueAtIso": due_iso,
@@ -181,6 +198,7 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         "fired": False,
         "priority": args.get("priority") or "priority",
         "cron": cron_text if cron else None,
+        "eventType": event_type,
     }
     reminders.append(reminder)
     _save_reminders(reminders)
@@ -273,6 +291,7 @@ def ensure_recurring_backup(note: str) -> None:
         "fired": False,
         "cron": cron,
         "kind": BACKUP_KIND,
+        "eventType": "service",
     })
     _save_reminders(reminders)
 
@@ -300,10 +319,15 @@ PLUGIN = Plugin(
             "for a one-off time. For a repeating task pass cron (6 fields: second minute hour day month weekday, local "
             "time, Sunday=0) instead -- the one reminder keeps repeating. priority controls what happens if it comes "
             "due mid-conversation: 'priority' (default) fires regardless; 'background' waits until there is no live "
-            "back-and-forth -- use it for routine chores.",
+            "back-and-forth -- use it for routine chores. event_type controls how it's delivered: 'user' (default) "
+            "is for anything whose OUTCOME the user cares about (a mailbox check, a scheduled follow-up) -- no "
+            "live progress chatter while it runs, but you still report the result when done. 'service' is for your "
+            "own routine upkeep that doesn't concern the user at all (e.g. a memory/notes backup) -- also no "
+            "progress chatter, AND stays completely silent afterward (reply [[NO_UPDATE]]) unless something is "
+            "actually broken.",
             {
                 "due_at_iso": str | None, "note": str, "priority": str | None, "cron": str | None,
-                "recurring": str | None, "recurring_every_minutes": float | None,
+                "recurring": str | None, "recurring_every_minutes": float | None, "event_type": str | None,
             }, schedule_reminder,
         ),
         PluginTool(

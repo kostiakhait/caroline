@@ -1380,6 +1380,18 @@ class ChatSession:
         self.pending_interim_notes: list[str] = []
         self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
+        # Per explicit instruction (2026-10-07): a reminder-driven turn
+        # (service or user event, see scheduler_plugin.py's EVENT_TYPES)
+        # never gets progress-narrator chatter -- see _check_progress_
+        # narration's own gate. Recomputed fresh by submit() ONLY when
+        # starting a genuinely NEW turn (mirrors pending_is_real_user's own
+        # "never downgrade an already-pending turn" guard) -- deliberately
+        # NOT a session-wide latch like the removed silent_turn flag (see
+        # inject_proactive's own docstring for why that one was deleted
+        # outright rather than patched again): this is recomputed every
+        # single new turn from that call's own argument, so it can never
+        # leak into or silence an unrelated later turn.
+        self.current_turn_suppress_narration: bool = False
 
         # Per explicit instruction (2026-09-13), after a real incident: a
         # PROACTIVE turn (a scheduled mailbox check, here) can complete
@@ -2032,7 +2044,7 @@ class ChatSession:
 
     # --------------------------------------------------------------- submit --
 
-    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None) -> None:
+    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False) -> None:
         # Per standing instruction ("ВЕЗДЕ логируем и ВСЁ"): this is the
         # single choke point EVERY turn goes through -- real user messages,
         # every proactive/internal nudge (inject_proactive already logs
@@ -2109,6 +2121,12 @@ class ChatSession:
         # user message still always wins immediately either way.
         if is_real_user or not self.turn_pending:
             self.pending_is_real_user = is_real_user
+        # Same "only a genuinely new turn" guard as pending_is_real_user
+        # just above -- see current_turn_suppress_narration's own __init__
+        # comment for why this must never retroactively silence narration
+        # on a turn that was already in flight.
+        if not self.turn_pending:
+            self.current_turn_suppress_narration = suppress_narration
         self.pending_attachments = attachments
         self.turn_pending = True
         self.last_activity = time.monotonic()
@@ -2389,7 +2407,7 @@ class ChatSession:
         # That check now lives entirely inside run_small_model_turn() itself
         # (small_model_engine.py), using Camerlengo/OpenRouter models only.
 
-    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None) -> bool:
+    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
         showing is now decided ENTIRELY by the model's own reply content
@@ -2410,7 +2428,7 @@ class ChatSession:
         # Internal turns follow the same chat-mode gate as real ones (2026-10-03):
         # in "sw" mode they run through the small-model cascade; everything else
         # (other modes, attachments, pending_text replays) keeps the SDK path.
-        self.submit(text, attachments, False, is_voice, pending_text=pending_text)
+        self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration)
         return True
 
     def stop(self) -> None:
@@ -3243,6 +3261,22 @@ class ChatSession:
         # connected -- recovering/limited/restarting/billing_blocked all
         # mean there's genuinely nothing to narrate about right now.
         if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
+            return
+        # Per explicit instruction (2026-10-07) -- NOT a revival of the
+        # whole-category gate reverted just below on 2026-10-03: this is
+        # narrower and opt-in per turn (current_turn_suppress_narration,
+        # see its own __init__ comment), set only by scheduler-fired
+        # reminders (main.py's _on_reminder_due, both "service" and "user"
+        # event types -- see scheduler_plugin.py's EVENT_TYPES), not every
+        # proactive turn. A real incident: the narrator was producing
+        # mid-task "syncing"-style commentary for Caroline's OWN routine
+        # reminders (a memory backup, a periodic mailbox check) -- chatter
+        # about internal mechanics the user never asked to hear, on a
+        # schedule Caroline set for herself. The FINAL reply still happens
+        # as before (a service-type reminder stays silent via its own
+        # [[NO_UPDATE]] instruction; a user-type one still reports the
+        # outcome) -- only this cosmetic mid-task aside is suppressed.
+        if self.current_turn_suppress_narration:
             return
         # Reverted (2026-10-03), explicit direct instruction: the 2026-09-15 gate
         # below used to skip narration entirely for a proactive/scheduled turn
