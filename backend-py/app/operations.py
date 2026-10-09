@@ -103,15 +103,21 @@ class OperationRegistry:
     def forget(self, operation_id: str) -> None:
         self._ops.pop(operation_id, None)
 
-    def cancel_for_tab(self, tab_id: str) -> int:
+    def cancel_for_tab(self, tab_id: str, keep_tools: frozenset[str] = frozenset()) -> int:
         """Cancels every still-running operation tagged with this tab_id --
         called from ChatSession.stop() alongside client.interrupt() so
         Stop actually reaches a tool call that already crossed dispatch()'s
         fast-path window and became a detached background task (interrupt()
         alone only stops the model's own generation stream, not that
-        task). Returns how many were actually cancelled, for logging."""
+        task). Returns how many were actually cancelled, for logging.
+
+        `keep_tools`: tool names whose operations are left to finish. A
+        write into memory is one: half of it may already be on the server,
+        so it is allowed to complete whatever else Stop tears down."""
         cancelled = 0
         for op in self._ops.values():
+            if op.tool_name in keep_tools:
+                continue
             if op.tab_id == tab_id and op.status == "running" and op.task is not None and not op.task.done():
                 op.task.cancel()
                 cancelled += 1

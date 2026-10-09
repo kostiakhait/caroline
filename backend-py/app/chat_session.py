@@ -206,6 +206,9 @@ API_RETRY_INTERVAL_MS = 90_000
 # Connection states that exist only because a retry loop is waiting on them;
 # an explicit Stop cancels that loop, so it clears these states too.
 STOP_RESETS_CONN_STATES = ("limited", "billing_blocked")
+# Stop tears down the main model and everything it launched through tools --
+# except a write into memory already under way, which is left to finish.
+STOP_KEEPS_TOOLS = frozenset({"save_info", "owner_profile_remember"})
 # Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
 # API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
 # is "keep retrying forever because the operation never even started" (a
@@ -2538,7 +2541,34 @@ class ChatSession:
         if self.conn_state.get("kind") in STOP_RESETS_CONN_STATES:
             self._set_conn_state("connected")
         if not self.turn_pending:
-            log_event("engine", "user_stop_between_turns", tab_id=self.tab_id, cancelled_retry=had_retry)
+            # Bug fix (2026-10-09), per explicit instruction: "основная модель
+            # и все, что ей запущено из инструментов должно полностью
+            # прерываться" -- also when the click lands between two turns.
+            # No turn is in flight then, but what earlier turns launched may
+            # well be: a tool call running as a background operation, a
+            # subagent or a background shell inside the engine's own process.
+            # Each of those wakes the model up again when it finishes, which
+            # from the user's side is "I pressed Stop and she kept going".
+            cancelled = REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
+            try:
+                agents = agent_registry.running(self.workspace_dir, self.tab_id)
+            except Exception as exc:  # noqa: BLE001 -- a Stop must never fail on bookkeeping
+                log_event("engine", "user_stop_agent_registry_unreadable", tab_id=self.tab_id, error=str(exc))
+                agents = {"unknown": {}}   # cannot tell: stop the engine to be safe
+            killed_engine = False
+            if agents and self.client and not self.small_model_active:
+                # They live inside the engine process; the only way to stop
+                # them is to stop it. The next message starts it again.
+                killed_engine = True
+                # Flagged like a Stop during a turn, so the run loop treats the
+                # engine going away as the user's doing (and tells the model
+                # so), not as a crash to recover from.
+                self.user_stop_requested = True
+                asyncio.create_task(self._force_stop_client())
+            log_event(
+                "engine", "user_stop_between_turns", tab_id=self.tab_id, cancelled_retry=had_retry,
+                cancelled_operations=cancelled, running_agents=len(agents), killed_engine=killed_engine,
+            )
             return
         log_event("engine", "user_stop", tab_id=self.tab_id, cancelled_retry=had_retry)
         self.user_stop_requested = True
@@ -2575,7 +2605,7 @@ class ChatSession:
         # reached it, so it kept running to completion regardless. This
         # cancels exactly THIS tab's own still-running background
         # operations alongside the interrupt.
-        cancelled = REGISTRY.cancel_for_tab(self.tab_id)
+        cancelled = REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
         if cancelled:
             log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
         # (api_retry_timer/one_shot_followup_timer are cleared at the top of
