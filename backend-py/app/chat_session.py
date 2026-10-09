@@ -203,6 +203,9 @@ MAX_RESTARTS_PER_WINDOW = 5
 RESTART_WINDOW_MS = 10 * 60_000
 RESTART_BACKOFF_MS = 60_000
 API_RETRY_INTERVAL_MS = 90_000
+# Connection states that exist only because a retry loop is waiting on them;
+# an explicit Stop cancels that loop, so it clears these states too.
+STOP_RESETS_CONN_STATES = ("limited", "billing_blocked")
 # Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
 # API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
 # is "keep retrying forever because the operation never even started" (a
@@ -2511,14 +2514,34 @@ class ChatSession:
         # A request queued behind a proactive turn (see small_model_queued_real_turns)
         # must not run right after an explicit Stop -- that's the opposite of what Stop means.
         self.small_model_queued_real_turns = []
-        if not self.turn_pending:
-            log_event("engine", "user_stop_between_turns", tab_id=self.tab_id)
-            return
-        log_event("engine", "user_stop", tab_id=self.tab_id)
-        self.user_stop_requested = True
         # An explicit Stop must also cancel any pending "resumed question needs a visible answer" re-ask,
         # or the abandoned turn would start again on its own.
         self.resumed_unanswered_question = None
+        # Bug fix (2026-10-09), confirmed live: these two timers used to be
+        # cleared only at the very end of this method, AFTER the "nothing is
+        # pending" early return just below. A tab stuck on a usage cap spends
+        # almost all of its time BETWEEN turns -- each retry turn is rejected
+        # within seconds, then 90s of waiting for the next one -- so Stop
+        # nearly always landed between turns, returned early, and the retry
+        # loop kept re-submitting every 90s as if the user had never stepped
+        # in ("я жал стоп, но состояние не сбросилось"). Stop is the absolute
+        # switch for this tab whether or not a turn happens to be in flight at
+        # the instant of the click: every background recovery attempt is
+        # silenced first, unconditionally.
+        had_retry = bool(self.api_retry_timer or self.one_shot_followup_timer)
+        self._clear_api_retry_timer()
+        self._clear_one_shot_followup_timer()
+        # ...and the state those retries were holding goes with them: with
+        # nothing left to retry, "limited"/"billing_blocked" would otherwise
+        # sit on the status bar forever. The next message the user sends
+        # simply tries again and reports whatever is true then.
+        if self.conn_state.get("kind") in STOP_RESETS_CONN_STATES:
+            self._set_conn_state("connected")
+        if not self.turn_pending:
+            log_event("engine", "user_stop_between_turns", tab_id=self.tab_id, cancelled_retry=had_retry)
+            return
+        log_event("engine", "user_stop", tab_id=self.tab_id, cancelled_retry=had_retry)
+        self.user_stop_requested = True
         if self.small_model_active:
             # No SDK client/query() is involved in this path at all -- the
             # only thing to stop is the background task running
@@ -2555,18 +2578,10 @@ class ChatSession:
         cancelled = REGISTRY.cancel_for_tab(self.tab_id)
         if cancelled:
             log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
-        # Bug fix (2026-09-14), per explicit instruction ("не понимает, что
-        # её прерывали и ход тем самым завершён"): confirmed live -- Stop
-        # never touched api_retry_timer/one_shot_followup_timer, so a
-        # pending auto-recovery nudge (scheduled while THIS turn was still
-        # struggling -- a rate-limit retry, a usage-cap follow-up) fired
-        # anyway, later, as if the user had never stepped in at all. From
-        # the user's side that reads as "I stopped her and she just kept
-        # going" -- an explicit Stop should silence every background
-        # recovery attempt tied to this now-abandoned turn, not just the
-        # turn itself.
-        self._clear_api_retry_timer()
-        self._clear_one_shot_followup_timer()
+        # (api_retry_timer/one_shot_followup_timer are cleared at the top of
+        # this method -- see the 2026-10-09 note there; the 2026-09-14 fix
+        # that first added the clearing had put it here, after the early
+        # return, where a Stop between turns never reached it.)
 
     async def _force_stop_client(self) -> None:
         """Per explicit instruction (2026-09-15): "Кнопка стоп это
@@ -2765,7 +2780,20 @@ class ChatSession:
             self.api_retry_timer.cancel()
             self.api_retry_timer = None
 
+    def _stopped_by_user(self, what: str, reason: str) -> bool:
+        """True after an explicit Stop, until the user's next real message
+        (the same latch that halts post-turn checks). A retry turn that was
+        already in flight at the moment of the click can still deliver its
+        "limit" reply a moment later; without this, that late reply re-armed
+        the very retry loop Stop had just cancelled."""
+        if self._post_turn_checks_halted:
+            log_event("engine", f"{what}_not_scheduled_after_stop", tab_id=self.tab_id, reason=reason)
+            return True
+        return False
+
     def _schedule_api_retry(self, reason: str, is_voice: bool) -> None:
+        if self._stopped_by_user("api_retry", reason):
+            return
         if self.api_retry_timer:
             log_event("engine", "api_retry_already_pending", tab_id=self.tab_id, reason=reason)
             return
@@ -2824,6 +2852,8 @@ class ChatSession:
         this method again -- and now simply re-arms, exactly like every
         other flat retry in this codebase, until a real answer (anything
         other than another cap report) comes through."""
+        if self._stopped_by_user("one_shot_followup", reason):
+            return
         if self.one_shot_followup_timer:
             log_event("engine", "one_shot_followup_already_pending", tab_id=self.tab_id, reason=reason)
             return
