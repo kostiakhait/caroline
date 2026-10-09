@@ -27,11 +27,17 @@ import kotlin.coroutines.resume
  */
 class SmsRepository(private val context: Context) {
 
-    // How many messages a single sync answer can carry -- applies to a
-    // bootstrap sync (since=null, the very first one) where "everything"
-    // could otherwise mean a phone's entire multi-year SMS history in one
-    // var:setMine call. An incremental sync (since set) is realistically
-    // always far under this on a 3-minute cadence.
+    // How many messages a single sync answer can carry. Applied unconditionally
+    // (not just on a since=null bootstrap sync) -- confirmed live 2026-10-09: a
+    // caller-side bug upstream of here (telemost-login's -sms-readtest) sent a
+    // `since` of -120000 (meant as "no lower bound", landed as a literal
+    // near-epoch value instead), and an unbounded limit on the since != null
+    // path turned that into a 7812-row dump of this phone's ENTIRE SMS
+    // history in one var:setMine call, stalling the whole companion app for
+    // the better part of a minute. A well-formed incremental sync (since set,
+    // ~3-minute cadence) is realistically always far under this cap anyway --
+    // it only bites a malformed `since`, which is exactly the case worth
+    // defending against here, not in every caller that could ever construct one.
     private val BOOTSTRAP_LIMIT = 2000
 
     /**
@@ -49,7 +55,7 @@ class SmsRepository(private val context: Context) {
         )
         val selection = if (since != null) "${Telephony.Sms.DATE} > ?" else null
         val args = if (since != null) arrayOf(since.toString()) else null
-        val limit = if (since != null) Int.MAX_VALUE else BOOTSTRAP_LIMIT
+        val limit = BOOTSTRAP_LIMIT
         val cursorFound = context.contentResolver.query(
             Telephony.Sms.CONTENT_URI, projection, selection, args, "${Telephony.Sms.DATE} DESC",
         )?.use { c -> readRows(c, limit).forEach { out.add(it) }; true } ?: false
@@ -158,7 +164,7 @@ class SmsRepository(private val context: Context) {
         val args = if (sinceSec != null) arrayOf(sinceSec.toString()) else null
         context.contentResolver.query(
             Telephony.Mms.CONTENT_URI, projection, selection, args, "${Telephony.Mms.DATE} DESC",
-        )?.use { c -> readMmsRows(c).forEach { out.add(it) } }
+        )?.use { c -> readMmsRows(c, BOOTSTRAP_LIMIT).forEach { out.add(it) } }
         Logger.i("SmsRepository.dumpMmsMessages(sinceMs=$sinceMs): ${out.size} row(s) in ${System.currentTimeMillis() - start}ms")
         return out
     }
@@ -210,14 +216,14 @@ class SmsRepository(private val context: Context) {
         return out
     }
 
-    private fun readMmsRows(c: Cursor): List<Map<String, Any?>> {
+    private fun readMmsRows(c: Cursor, limit: Int): List<Map<String, Any?>> {
         val out = mutableListOf<Map<String, Any?>>()
         val idIdx = c.getColumnIndexOrThrow(Telephony.Mms._ID)
         val threadIdx = c.getColumnIndexOrThrow(Telephony.Mms.THREAD_ID)
         val dateIdx = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
         val boxIdx = c.getColumnIndexOrThrow(Telephony.Mms.MESSAGE_BOX)
         val readIdx = c.getColumnIndexOrThrow(Telephony.Mms.READ)
-        while (c.moveToNext()) {
+        while (c.moveToNext() && out.size < limit) {
             val id = c.getLong(idIdx)
             val type = if (c.getInt(boxIdx) == Telephony.Mms.MESSAGE_BOX_INBOX) "inbox" else "sent"
             out.add(
