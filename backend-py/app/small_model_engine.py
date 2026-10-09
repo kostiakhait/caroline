@@ -88,6 +88,7 @@ from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
+from app.memory_topics import memory_topics_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
@@ -95,17 +96,16 @@ from app.policies import (
     credentials_check_notes_first_instruction,
     event_memory_check_first_instruction,
     learn_from_mistakes_instruction,
+    memory_check_first_instruction,
     no_internal_mechanics_to_user_instruction,
     no_unauthorized_secret_changes_instruction,
     no_unbounded_filesystem_scans_instruction,
     prefer_own_backend_tools_instruction,
     proactive_context_recovery_instruction,
-    recall_memory_check_first_instruction,
     recent_dialogue_history_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     timestamp_awareness_instruction,
-    working_memory_check_first_instruction,
 )
 
 # Per explicit instruction (2026-09-13), after a real capability audit
@@ -129,8 +129,7 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     credentials_check_notes_first_instruction,
-    recall_memory_check_first_instruction,
-    working_memory_check_first_instruction,
+    memory_check_first_instruction,
     event_memory_check_first_instruction,
 )
 
@@ -1295,6 +1294,7 @@ async def run_small_model_turn(
         _persona_system_message(persona),
         owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
         working_memory_system_prompt_clause(load_working_memory(workspace_dir)),
+        memory_topics_system_prompt_clause(workspace_dir),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
     ])

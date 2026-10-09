@@ -40,6 +40,7 @@ SW_GATED_FEATURES: list[SwGatedFeature] = [
     SwGatedFeature("office-editor", ["open_in_viewer"], "Editing Office documents (docx/xlsx/pptx) via OnlyOffice"),
     SwGatedFeature("notes", ["notes_*"], "Notes"),
     SwGatedFeature("email", ["email_*"], "Email (read/send via a registered mailbox)"),
+    SwGatedFeature("memory", ["save_info", "request_info"], "Memory (facts, topics, credentials -- the microagent memory service)"),
 ]
 
 
