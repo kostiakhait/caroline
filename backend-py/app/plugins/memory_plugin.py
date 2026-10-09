@@ -39,7 +39,7 @@ from app.memory_topics import is_stale, replace_topics, update_topic
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager
 from app.plugins.sw_api import API_URL, CAROLINE_SW_KEY, SessionExpiredError, SwApiError
-from app.session_context import get_send
+from app.session_context import get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -84,6 +84,17 @@ async def _memory(command: str, **params: Any) -> dict[str, Any]:
     return await _sessions.with_session(
         lambda session: _post({"command": command, "key": CAROLINE_SW_KEY, "session": session, **params})
     )
+
+
+def _language() -> str | None:
+    """The language of the conversation in the calling tab, as Caroline
+    already tracks it. Fact memory works in English inside and translates
+    what it found into this language on the way out."""
+    tab_id = get_tab_id()
+    if not tab_id:
+        return None
+    from app.chat_session import current_language_name  # late: chat_session loads the plugins
+    return current_language_name(tab_id)
 
 
 def _build_material(raw: Any, index: int) -> dict[str, Any]:
@@ -179,7 +190,7 @@ async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         materials = [_build_material(raw, index) for index, raw in enumerate(args.get("materials") or [])]
     except MemoryInputError as exc:
         return {"text": f"Nothing was saved: {exc}", "is_error": True}
-    params: dict[str, Any] = {"text": text, "traceId": uuid.uuid4().hex}
+    params: dict[str, Any] = {"text": text, "traceId": uuid.uuid4().hex, "language": _language()}
     if materials:
         params["materials"] = materials
     reply = await _memory("memory:save", **params)
@@ -207,7 +218,7 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     query = (args.get("query") or "").strip()
     if not query:
         return {"text": 'request_info needs "query": what you want to recall.', "is_error": True}
-    params: dict[str, Any] = {"query": query, "traceId": uuid.uuid4().hex}
+    params: dict[str, Any] = {"query": query, "traceId": uuid.uuid4().hex, "language": _language()}
     if args.get("history"):
         params["history"] = int(args["history"])
     reply = await _memory("memory:request", **params)
