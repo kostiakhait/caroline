@@ -662,7 +662,9 @@ def memory_check_first_instruction() -> str:
         "now waiting on someone), call save_info right then, in your own words; you decide "
         "what goes in and you pass it yourself, nothing is collected for you. The older memory tools "
         "(recall_memory, working_memory_*, topic_upsert/topics_list/topic_close) are deprecated "
-        "and read-only: they can still be read, nothing is written through them. Call get_tool_instructions on save_info once for the details."
+        "and read-only: they can still be read, nothing is written through them. Anything about your OWNER "
+        "themselves goes to owner_profile_remember and is found with owner_profile_recall, not through "
+        "save_info/request_info. Call get_tool_instructions on save_info once for the details."
     )
 
 

@@ -232,6 +232,41 @@ async def _gate() -> dict[str, Any] | None:
     return None if gate.ok else {"text": gate.message, "is_error": True}
 
 
+async def save_owner_profile_text(text: str) -> dict[str, Any]:
+    """memory:saveProfile -- used by owner_profile_plugin.py's owner_profile_remember.
+    The owner's profile is never reached through save_info: it is chosen on purpose."""
+    refused = await _gate()
+    if refused:
+        return refused
+    text = (text or "").strip()
+    if not text:
+        return {"text": 'owner_profile_remember needs "text": what to keep about the owner.', "is_error": True}
+    reply = await _memory("memory:saveProfile", text=text, traceId=uuid.uuid4().hex, language=_language())
+    reaction = await _react_to_status(reply)
+    failure = _failure_text(reply, "Saving to the owner's profile")
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    return {"text": _reply_text(reply)}
+
+
+async def request_owner_profile(query: str) -> dict[str, Any]:
+    """memory:requestProfile -- used by owner_profile_plugin.py's owner_profile_recall."""
+    refused = await _gate()
+    if refused:
+        return refused
+    query = (query or "").strip()
+    if not query:
+        return {"text": 'owner_profile_recall needs "query": what you want to know about the owner.', "is_error": True}
+    reply = await _memory("memory:requestProfile", query=query, traceId=uuid.uuid4().hex, language=_language())
+    reaction = await _react_to_status(reply)
+    failure = _failure_text(reply, "Reading the owner's profile")
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    if reply.get("status") == STATUS_EMPTY:
+        return {"text": f'The owner\'s profile holds nothing about "{query}".'}
+    return {"text": _reply_text(reply)}
+
+
 async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     refused = await _gate()
     if refused:
@@ -317,8 +352,11 @@ _USAGE_INSTRUCTIONS = (
     "save_info(text, materials?): \"text\" is what to remember, in your own words, complete enough to make sense "
     "on its own later (full names, not pronouns; dates, not \"tomorrow\"). One call may mix kinds of things; "
     "memory sorts them itself: lasting facts about people, organizations and things; the course of a topic you "
-    "are discussing or working on (what happened, what was decided, what is open); credentials; the owner's own "
-    "preferences. Save right when you learn something, not at the end of the conversation.\n"
+    "are discussing or working on (what happened, what was decided, what is open); credentials. Save right when "
+    "you learn something, not at the end of the conversation.\n"
+    "What concerns your OWNER themselves -- who they are, their preferences, their personal details -- does NOT "
+    "go through save_info and is not found by request_info: it has tools of its own, owner_profile_remember and "
+    "owner_profile_recall. Choose them deliberately when, and only when, the thing is about your owner.\n"
     "\"materials\" (optional) are the letters, messages and documents of the topic, kept WHOLE alongside its "
     "summary -- pass them when the exact wording may be needed later. Each is an object: {\"kind\": \"message\", "
     "\"source\": \"email\"|\"sms\"|\"telegram\"|..., \"ref\": the message's own id, \"ts\": when it was sent, "
@@ -327,7 +365,7 @@ _USAGE_INSTRUCTIONS = (
     "is stored too. Always give \"source\" and \"ref\" when the thing has them: the same letter sent again is "
     "then kept once.\n"
     "request_info(query): ask in plain words what you want to recall. The reply lists what each memory found, "
-    "marked by \"source\" (facts, topics, notes.vault, notes.profile, ...); combine them yourself. A fact comes "
+    "marked by \"source\" (facts, topics, notes.vault, ...); combine them yourself. A fact comes "
     "with \"people\": the gender of the people it names, where memory knows it -- use it to speak of them "
     "correctly (he/she, the endings your language needs); for a person not listed there the gender is not "
     "known, do not guess it from the name. A fact may be "
@@ -351,7 +389,8 @@ PLUGIN = Plugin(
         PluginTool(
             "save_info",
             "Remembers something for later: a fact, where a topic you are discussing or working on stands, a "
-            "credential, a preference of the owner. \"text\" is what to remember, in your own words; optional "
+            "credential. NOT for facts about your owner themselves -- use owner_profile_remember for those. "
+            "\"text\" is what to remember, in your own words; optional "
             "\"materials\" are the whole letters/messages/documents of the topic (see this tool's usage "
             "instructions for their shape). You decide what to save and pass it yourself -- nothing is fetched "
             "for you.",
@@ -360,7 +399,7 @@ PLUGIN = Plugin(
         PluginTool(
             "request_info",
             "Recalls from your memory: facts, topics (summary, decisions, open questions, their letters and "
-            "documents), credentials, the owner's profile. Give \"query\" in plain words; or \"topic\" and "
+            "documents), credentials. Not the owner's profile -- that is owner_profile_recall. Give \"query\" in plain words; or \"topic\" and "
             "\"material\" ids from an earlier reply to read one letter/document in full. Call this before "
             "searching Notes or mail for something you may already know.",
             {
