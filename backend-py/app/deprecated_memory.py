@@ -2,13 +2,12 @@
 
 Memory is now save_info / request_info (plugins/memory_plugin.py, see
 docs/MICROAGENTS_PLAN.md). The tools that came before it -- recall_memory,
-working_memory_*, topic_upsert/topics_list/topic_close, event_memory_* --
-are all kept, so nothing they hold is lost, but for the model they are
+working_memory_*, topic_upsert/topics_list/topic_close -- are all kept, so nothing they hold is lost, but for the model they are
 read-only: the reading ones still work and say they are deprecated, the
 writing ones refuse and point at save_info.
 
-Only the model-facing tools are affected. Code that keeps these stores on
-its own (schedule_reminder writing event memory) works as before.
+event_memory_* is NOT among them: it is the scheduler's record of what was
+arranged and for when, not memory, and it works as it always did.
 """
 
 from __future__ import annotations

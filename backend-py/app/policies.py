@@ -649,9 +649,8 @@ def memory_check_first_instruction() -> str:
     Replaces the two triggers that stood here for recall_memory and for
     working_memory: those stores are deprecated and read-only for the model
     now (see app/deprecated_memory.py). event_memory_check_first_instruction
-    stays always-on next to this one: reminders are still recorded in event
-    memory by code and nowhere else, so that is still where to look for
-    them. Same shape as the old triggers: a short trigger only,
+    is unrelated and stays as it was: event memory is the scheduler's record
+    of what was arranged, not part of this memory. Same shape as the old triggers: a short trigger only,
     so it is never forgotten; the mechanics (what "materials" are, how to
     read one in full, what the reply's sources mean) stay on-demand via
     get_tool_instructions."""
@@ -662,7 +661,7 @@ def memory_check_first_instruction() -> str:
         "learn something worth keeping, or a topic you are working on moves (progress, a decision, something "
         "now waiting on someone), call save_info right then, in your own words; you decide "
         "what goes in and you pass it yourself, nothing is collected for you. The older memory tools "
-        "(recall_memory, working_memory_*, topic_upsert/topics_list/topic_close, event_memory_*) are deprecated "
+        "(recall_memory, working_memory_*, topic_upsert/topics_list/topic_close) are deprecated "
         "and read-only: they can still be read, nothing is written through them. Call get_tool_instructions on save_info once for the details."
     )
 

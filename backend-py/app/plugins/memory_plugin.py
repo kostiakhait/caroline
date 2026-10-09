@@ -268,8 +268,8 @@ _USAGE_INSTRUCTIONS = (
     "it as \"offset\"); add \"save_file_to\": <path> to also get a document's file written there.\n"
     "Call request_info BEFORE searching Notes, mail or old conversation for something you may already know, and "
     "before asking the user to repeat it.\n"
-    "The older memory tools -- recall_memory, working_memory_*, topic_upsert/topics_list/topic_close, "
-    "event_memory_* -- are deprecated and read-only: what they hold can still be read, nothing new is written "
+    "The older memory tools -- recall_memory, working_memory_*, topic_upsert/topics_list/topic_close -- are "
+    "deprecated and read-only: what they hold can still be read, nothing new is written "
     "through them. notes_* tools work as before for notes the user asks about by name."
 )
 
