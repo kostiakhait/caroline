@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from app import memory_turns
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
@@ -285,6 +286,9 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
             "commentary) -- when you're actually done, tell the user the outcome/result directly, in one clear "
             "message."
         )
+    # Nobody's message is behind this turn: for the memory service's money
+    # rules it is a turn of its own (memory_turns.py).
+    memory_turns.start_service_turn(primary.tab_id)
     delivered = primary.inject_proactive(
         f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n{instruction}",
         suppress_narration=True,

@@ -16,7 +16,11 @@ code adds is the bytes of a document whose path the model named explicitly
 -- a tool argument cannot carry a binary file.
 
 Requires the user's SquirrelWisdom account (same gate as every other
-SW-backed tool). Charging and the balance gate are not wired in yet.
+SW-backed tool). Memory costs money (the server charges the wallet per
+request): when the wallet is empty the top-up window opens by itself on the
+first refusal; when the service's own provider is out of money the turn is
+stopped and started again from the user's message once it is back (see
+memory_turns.py and ChatSession._on_memory_upstream_no_funds).
 
 The local short-term copy of topics (memory_topics.py, shown in the system
 prompt) is kept current from here: every save_info reply updates the topic it
@@ -34,6 +38,7 @@ from typing import Any
 
 import httpx
 
+from app import memory_turns
 from app.logging_setup import log_event
 from app.memory_topics import is_stale, replace_topics, update_topic
 from app.plugins.loader import Plugin, PluginTool
@@ -80,7 +85,11 @@ async def _post(body: dict[str, Any]) -> dict[str, Any]:
 
 async def _memory(command: str, **params: Any) -> dict[str, Any]:
     """One memory: command for the logged-in user. Returns the service's
-    reply: {status, output, error?, usage, traceId}."""
+    reply: {status, output, error?, usage, traceId, chargedPia}. Every
+    request carries the id of the turn it belongs to (memory_turns.py)."""
+    turn_id = memory_turns.current_turn_id(get_tab_id())
+    if turn_id:
+        params.setdefault("turnId", turn_id)
     return await _sessions.with_session(
         lambda session: _post({"command": command, "key": CAROLINE_SW_KEY, "session": session, **params})
     )
@@ -144,15 +153,59 @@ def _build_material(raw: Any, index: int) -> dict[str, Any]:
     return material
 
 
+# The top-up window is opened by itself on the FIRST refusal for an empty
+# wallet, then not again until memory has worked once more -- same manners as
+# sw_gate's login window.
+_topup_window_shown = False
+
+
+async def _open_topup_window() -> bool:
+    """True when the window was opened by this call."""
+    global _topup_window_shown
+    if _topup_window_shown:
+        return False
+    _topup_window_shown = True
+    try:
+        from app.subscription_mode import create_topup_checkout_url, invalidate_sw_status
+        checkout_url = await create_topup_checkout_url()
+        invalidate_sw_status()  # the balance is about to change on purpose
+        await get_send()({"type": "open_payment", "requestId": uuid.uuid4().hex, "checkoutUrl": checkout_url})
+        log_event("plugin:memory", "topup_window_opened")
+        return True
+    except Exception as exc:
+        log_event("plugin:memory", "topup_window_failed", error=str(exc))
+        return False
+
+
+async def _react_to_status(reply: dict[str, Any]) -> str | None:
+    """What Caroline itself does about a money refusal, beyond telling the
+    model; returns a sentence to add to the message for the model."""
+    global _topup_window_shown
+    status = reply.get("status")
+    if status in (STATUS_OK, STATUS_EMPTY):
+        _topup_window_shown = False
+        return None
+    if status == STATUS_NO_FUNDS_USER:
+        if await _open_topup_window():
+            return "I've opened the top-up window for the user -- tell them, and continue once they have topped up."
+        return "The top-up window was already opened for this; point the user to Settings -> Account & Billing."
+    if status == STATUS_NO_FUNDS_UPSTREAM:
+        reason = (reply.get("error") or {}).get("message") or "the memory service's provider is out of funds"
+        if memory_turns.notify_upstream_no_funds(get_tab_id(), reason):
+            return ("This turn is being stopped now and will be started again from the user's message by itself "
+                    "once the service has funds; do nothing more in this turn.")
+    return None
+
+
 def _failure_text(reply: dict[str, Any], doing: str) -> str | None:
     """A message for the model when the whole request failed, else None."""
     status = reply.get("status")
     if status in (STATUS_OK, STATUS_EMPTY):
         return None
     if status == STATUS_NO_FUNDS_USER:
-        return f"{doing} was refused: the user's SquirrelWisdom balance is too low. Tell the user; do not retry."
+        return f"{doing} was refused: the user's SquirrelWisdom balance is too low. Memory is unavailable until they top up; do not retry."
     if status == STATUS_NO_FUNDS_UPSTREAM:
-        return f"{doing} could not run: the memory service itself is out of funds on its provider's side. Tell the user; retrying will not help."
+        return f"{doing} could not run: the memory service itself is out of funds on its provider's side. Retrying will not help."
     error = reply.get("error") or {}
     return f"{doing} failed ({error.get('code') or status}): {error.get('message') or 'no details'}"
 
@@ -194,13 +247,14 @@ async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if materials:
         params["materials"] = materials
     reply = await _memory("memory:save", **params)
+    reaction = await _react_to_status(reply)
     for result in (reply.get("output") or {}).get("results") or []:
         if result.get("source") == SOURCE_TOPICS and result.get("status") == STATUS_OK:
             update_topic(WORKSPACE_DIR, (result.get("output") or {}).get("topic") or {})
     await _refresh_topics_if_stale()
     failure = _failure_text(reply, "Saving")
     if failure:
-        return {"text": failure + ("\n" + _reply_text(reply) if reply.get("output") else ""), "is_error": True}
+        return {"text": " ".join(filter(None, [failure, reaction])) + ("\n" + _reply_text(reply) if reply.get("output") else ""), "is_error": True}
     if reply.get("status") == STATUS_EMPTY:
         return {"text": "Nothing in this text was judged worth remembering, so nothing was saved."}
     return {"text": _reply_text(reply)}
@@ -222,10 +276,11 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if args.get("history"):
         params["history"] = int(args["history"])
     reply = await _memory("memory:request", **params)
+    reaction = await _react_to_status(reply)
     await _refresh_topics_if_stale()
     failure = _failure_text(reply, "The memory request")
     if failure:
-        return {"text": failure + ("\n" + _reply_text(reply) if reply.get("output") else ""), "is_error": True}
+        return {"text": " ".join(filter(None, [failure, reaction])) + ("\n" + _reply_text(reply) if reply.get("output") else ""), "is_error": True}
     if reply.get("status") == STATUS_EMPTY:
         return {"text": f'Memory holds nothing relevant to "{query}".'}
     return {"text": _reply_text(reply)}
@@ -238,9 +293,10 @@ async def _read_material(topic: str, material: str, offset: Any, save_file_to: A
     if save_file_to:
         params["file"] = True
     reply = await _memory("memory:material", **params)
+    reaction = await _react_to_status(reply)
     failure = _failure_text(reply, "Reading the material")
     if failure:
-        return {"text": failure, "is_error": True}
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
     output = dict(reply.get("output") or {})
     content = output.pop("content_b64", None)
     if save_file_to:
@@ -271,7 +327,10 @@ _USAGE_INSTRUCTIONS = (
     "is stored too. Always give \"source\" and \"ref\" when the thing has them: the same letter sent again is "
     "then kept once.\n"
     "request_info(query): ask in plain words what you want to recall. The reply lists what each memory found, "
-    "marked by \"source\" (facts, topics, notes.vault, notes.profile, ...); combine them yourself. A fact may be "
+    "marked by \"source\" (facts, topics, notes.vault, notes.profile, ...); combine them yourself. A fact comes "
+    "with \"people\": the gender of the people it names, where memory knows it -- use it to speak of them "
+    "correctly (he/she, the endings your language needs); for a person not listed there the gender is not "
+    "known, do not guess it from the name. A fact may be "
     "marked doubtful or denied when something saved later contradicted it -- say so rather than stating it as "
     "certain. A topic comes with its summary, results, open questions and a list of its materials without their "
     "text; add \"history\": N to also get its last N episodes. To read one material in full call "

@@ -132,7 +132,8 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
-from app.plugins.sw_api import get_funds_exhausted_reason
+from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
+from app import memory_turns
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
@@ -1354,6 +1355,11 @@ class ChatSession:
         self.tab_id = tab_id
         self.workspace_dir = workspace_dir
         self.send = send
+        # See _on_memory_upstream_no_funds: the turn to start again once the
+        # memory service's provider has money, and the flat timer checking for that.
+        self._memory_replay: dict[str, Any] | None = None
+        self._memory_replay_timer: asyncio.TimerHandle | None = None
+        memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
 
         self.client: AgentEngine | None = None
         # Which engine the current/next query() runs on: "openai" only while the
@@ -2053,6 +2059,11 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        if is_real_user:
+            # A real message begins a turn for the memory service's money rules
+            # (memory_turns.py) and supersedes a turn still waiting to be replayed.
+            self._cancel_memory_replay()
+            memory_turns.start_turn(self.tab_id, text, attachments, is_voice)
         if self.pending_interim_notes:
             notes = "\n".join(f"- {note}" for note in self.pending_interim_notes)
             self.pending_interim_notes = []
@@ -2432,7 +2443,67 @@ class ChatSession:
         self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration)
         return True
 
+    def _cancel_memory_replay(self) -> None:
+        self._memory_replay = None
+        if self._memory_replay_timer:
+            self._memory_replay_timer.cancel()
+            self._memory_replay_timer = None
+
+    def _on_memory_upstream_no_funds(self, reason: str) -> None:
+        """The memory service could not run because ITS provider (OpenRouter,
+        our own cost) is out of money -- nothing the user's wallet can fix.
+        Per the agreed rule (docs/MICROAGENTS_PLAN.md, section 4): the turn is
+        reset to its start. It is stopped exactly as the Stop button stops
+        it, the status bar says why, and once the provider answers again the
+        user's message that began the turn is submitted anew. What the turn
+        already did (a letter sent) is not undone.
+
+        Called from inside a tool call of the very turn being stopped, so the
+        stop itself is deferred to the loop."""
+        turn = memory_turns.current_turn(self.tab_id)
+        log_event("engine", "memory_upstream_no_funds", tab_id=self.tab_id, reason=reason, replayable=bool(turn and turn.get("text")))
+        mark_funds_exhausted(reason)
+        replay = dict(turn) if turn and turn.get("text") else None
+
+        def _stop_and_wait() -> None:
+            if self.ended:
+                return
+            self.stop()                      # also clears any earlier replay
+            self._memory_replay = replay
+            if replay:
+                self._arm_memory_replay_timer()
+            asyncio.create_task(self._publish_status())
+
+        asyncio.get_event_loop().call_soon(_stop_and_wait)
+
+    def _arm_memory_replay_timer(self) -> None:
+        """Flat interval, forever, like every other retry here."""
+        def _fire() -> None:
+            self._memory_replay_timer = None
+            if not self.ended and self._memory_replay:
+                asyncio.create_task(self._check_memory_replay())
+
+        self._memory_replay_timer = asyncio.get_event_loop().call_later(API_RETRY_INTERVAL_MS / 1000, _fire)
+
+    async def _check_memory_replay(self) -> None:
+        """One cheap call that goes through the same provider: sw_api clears
+        its funds-exhausted mark on any call that succeeds and sets it again
+        on a 402, so the mark itself is the answer."""
+        from app.plugins.voice_api import detect_language
+        await detect_language("ping")
+        replay = self._memory_replay
+        if not replay or self.ended:
+            return
+        if get_funds_exhausted_reason():
+            self._arm_memory_replay_timer()
+            return
+        log_event("engine", "memory_replay_resubmitting", tab_id=self.tab_id, turn_id=replay["id"])
+        self._memory_replay = None
+        self.submit(replay["text"], replay["attachments"], is_real_user=True, is_voice=replay["is_voice"])
+
     def stop(self) -> None:
+        # An explicit Stop also drops a turn waiting to be replayed.
+        self._cancel_memory_replay()
         # Latched before the turn_pending check below: between turns nothing is
         # pending, yet the post-turn check is what re-arms the loop, so Stop must
         # still halt it. Cleared only by the next real user message.
