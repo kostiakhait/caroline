@@ -134,6 +134,7 @@ from app.process_activity import ProcessActivityMonitor
 from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
+from app.process_kill import kill_process_tree
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
@@ -1364,6 +1365,8 @@ class ChatSession:
         # See _on_memory_upstream_no_funds: the turn to start again once the
         # memory service's provider has money, and the flat timer checking for that.
         self._memory_replay: dict[str, Any] | None = None
+        # Set by stop() when it kills an engine that was idle between turns; read by the run loop.
+        self._stop_killed_idle_engine = False
         self._memory_replay_timer: asyncio.TimerHandle | None = None
         memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
 
@@ -2550,24 +2553,21 @@ class ChatSession:
             # Each of those wakes the model up again when it finishes, which
             # from the user's side is "I pressed Stop and she kept going".
             cancelled = REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
-            try:
-                agents = agent_registry.running(self.workspace_dir, self.tab_id)
-            except Exception as exc:  # noqa: BLE001 -- a Stop must never fail on bookkeeping
-                log_event("engine", "user_stop_agent_registry_unreadable", tab_id=self.tab_id, error=str(exc))
-                agents = {"unknown": {}}   # cannot tell: stop the engine to be safe
-            killed_engine = False
-            if agents and self.client and not self.small_model_active:
-                # They live inside the engine process; the only way to stop
-                # them is to stop it. The next message starts it again.
-                killed_engine = True
-                # Flagged like a Stop during a turn, so the run loop treats the
-                # engine going away as the user's doing (and tells the model
-                # so), not as a crash to recover from.
-                self.user_stop_requested = True
+            # Stop is the absolute kill switch: the engine's whole process
+            # tree goes, unconditionally -- no asking a registry whether an
+            # agent is "supposed" to be running. Whatever earlier turns left
+            # behind inside the engine (subagents, background shells, anything
+            # they launched) dies with it. The run loop starts a fresh, idle
+            # engine afterwards; _stop_killed_idle_engine tells it that this
+            # was the user's doing and that no turn is to be started over it.
+            killed = 0
+            if self.client and not self.small_model_active:
+                self._stop_killed_idle_engine = True
+                killed = self._kill_engine_process_tree("Stop between turns")
                 asyncio.create_task(self._force_stop_client())
             log_event(
                 "engine", "user_stop_between_turns", tab_id=self.tab_id, cancelled_retry=had_retry,
-                cancelled_operations=cancelled, running_agents=len(agents), killed_engine=killed_engine,
+                cancelled_operations=cancelled, killed_processes=killed,
             )
             return
         log_event("engine", "user_stop", tab_id=self.tab_id, cancelled_retry=had_retry)
@@ -2596,6 +2596,9 @@ class ChatSession:
             # direct OS-process kill if disconnect() itself throws -- see
             # its own docstring for the SDK bug that makes that fallback
             # necessary).
+            # The whole process tree, right now and synchronously -- before
+            # anything asynchronous below even gets scheduled.
+            self._kill_engine_process_tree("Stop during a turn")
             asyncio.create_task(self._force_stop_client())
         # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
         # only stops the model's own generation stream. A tool call that
@@ -2612,6 +2615,20 @@ class ChatSession:
         # this method -- see the 2026-10-09 note there; the 2026-09-14 fix
         # that first added the clearing had put it here, after the early
         # return, where a Stop between turns never reached it.)
+
+    def _kill_engine_process_tree(self, why: str) -> int:
+        """Kills the engine process (claude.exe / codex) and every process
+        under it, immediately. Returns how many processes were in the tree."""
+        pid = self._cli_process_pid
+        if not pid:
+            try:
+                pid = self.client.process_pid() if self.client else None
+            except Exception:  # noqa: BLE001
+                pid = None
+        if not pid:
+            log_event("engine", "user_stop_no_engine_pid", tab_id=self.tab_id, why=why)
+            return 0
+        return kill_process_tree(pid, why=f"{why} (tab {self.tab_id})")
 
     async def _force_stop_client(self) -> None:
         """Per explicit instruction (2026-09-15): "Кнопка стоп это
@@ -5186,6 +5203,19 @@ class ChatSession:
             except Exception as exc:  # noqa: BLE001 -- must classify, not swallow
                 if self.ended:
                     return
+
+                if self._stop_killed_idle_engine:
+                    # Stop pressed between turns killed an idle engine (see
+                    # stop()). Nothing was in flight, so there is nothing to
+                    # tell the model and no turn to start: just come back up
+                    # with a fresh engine and wait for the user.
+                    self._stop_killed_idle_engine = False
+                    self.user_stop_requested = False
+                    log_event("engine", "restarting_engine_after_stop_between_turns", tab_id=self.tab_id)
+                    self.turn_pending = False
+                    self.pending_user_text = None
+                    self.pending_attachments = []
+                    continue
 
                 if self.user_stop_requested:
                     self.user_stop_requested = False

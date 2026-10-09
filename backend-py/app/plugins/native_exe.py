@@ -41,7 +41,12 @@ async def run_exe(exe: Path, args: list[str]) -> str:
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         creationflags=_NO_WINDOW,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        from app.process_kill import kill_process_tree
+        kill_process_tree(proc.pid, why="tool call cancelled (Stop)")
+        raise
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode(errors="replace").strip() or f"{exe.name} exited with code {proc.returncode}")
     return stdout.decode(errors="replace").strip()
