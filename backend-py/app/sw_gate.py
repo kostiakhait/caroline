@@ -41,6 +41,7 @@ SW_GATED_FEATURES: list[SwGatedFeature] = [
     SwGatedFeature("notes", ["notes_*"], "Notes"),
     SwGatedFeature("email", ["email_*"], "Email (read/send via a registered mailbox)"),
     SwGatedFeature("memory", ["save_info", "request_info"], "Memory (facts, topics, credentials -- the microagent memory service)"),
+    SwGatedFeature("speech", ["speech_to_text", "text_to_speech"], "Speech recognition and synthesis on files"),
 ]
 
 
