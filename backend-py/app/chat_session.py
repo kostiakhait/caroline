@@ -3367,6 +3367,11 @@ class ChatSession:
                 block["text"] = translated
         return wire
 
+    def _narration_turn_marker(self) -> Any:
+        """Identifies the turn a narration remark is being written for: the
+        text that started it. A new turn always sets a new pending text."""
+        return id(self.pending_user_text), self.pending_user_text
+
     async def _check_progress_narration(self) -> None:
         """Per explicit instruction (2026-09-10): the user must see SOME
         comment from Caroline at least once a minute while a real turn of
@@ -3491,8 +3496,32 @@ class ChatSession:
         if activity is None:
             log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
             return
+        # Bug fix (2026-10-09), confirmed live: everything above is checked
+        # BEFORE the remark is generated, and generating it (a network call,
+        # retried) takes up to a minute. In that time the turn can finish and
+        # the model's own final report go out -- and the stale remark was then
+        # sent after it ("нарратор вылезает за пределы финального доклада":
+        # 4 of 13 remarks in one evening landed 30-66 s after their turn had
+        # ended). The remark is a stand-in for silence DURING a turn, so it is
+        # only sent if, once it is ready, this is still the same silent turn.
+        silence_marker = self.last_visible_output_at
+        turn_marker = self._narration_turn_marker()
+
+        def _stale() -> str | None:
+            if self.ended or not self.turn_pending:
+                return "turn_ended"
+            if self._narration_turn_marker() != turn_marker:
+                return "another_turn"
+            if self.last_visible_output_at != silence_marker:
+                return "model_spoke"
+            if self.current_turn_suppress_narration:
+                return "narration_suppressed"
+            return None
+
         comment: str | None = None
         for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
+            if _stale():
+                break
             try:
                 comment = await generate_progress_comment(
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
@@ -3505,6 +3534,10 @@ class ChatSession:
             if comment:
                 break
             log_event("engine", "progress_narration_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
+        stale = _stale()
+        if stale:
+            log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, had_comment=bool(comment))
+            return
         if not comment:
             self.last_narration_failed_at = time.monotonic()
             return

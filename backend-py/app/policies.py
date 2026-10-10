@@ -653,18 +653,39 @@ def memory_check_first_instruction() -> str:
     of what was arranged, not part of this memory. Same shape as the old triggers: a short trigger only,
     so it is never forgotten; the mechanics (what "materials" are, how to
     read one in full, what the reply's sources mean) stay on-demand via
-    get_tool_instructions."""
+    get_tool_instructions.
+
+    Strengthened 2026-10-09, per explicit instruction, after the first evening
+    on the live build: with the tools available and the earlier, milder
+    wording, Caroline called save_info once and request_info not at all in
+    six user messages and 115 service turns -- and wrote eight notes with
+    notes_create instead. The wording now makes both calls a duty of every
+    turn and names notes_create as not being memory."""
     return (
-        "Your memory is two tools: save_info and request_info. Before re-deriving, searching Notes or mail, "
-        "digging through old conversation, or asking the user to repeat something you may already know -- a "
-        "fact, a credential, a contact, what was decided on a topic -- call request_info first. The moment you "
-        "learn something worth keeping, or a topic you are working on moves (progress, a decision, something "
-        "now waiting on someone), call save_info right then, in your own words; you decide "
-        "what goes in and you pass it yourself, nothing is collected for you. The older memory tools "
-        "(recall_memory, working_memory_*, topic_upsert/topics_list/topic_close) are deprecated "
-        "and read-only: they can still be read, nothing is written through them. Anything about your OWNER "
-        "themselves goes to owner_profile_remember and is found with owner_profile_recall, not through "
-        "save_info/request_info. Call get_tool_instructions on save_info once for the details."
+        "MEMORY IS NOT OPTIONAL. Your memory is two tools, save_info and request_info, and using them is part "
+        "of every turn, not something for special occasions. Nothing you learn survives this conversation "
+        "unless you save it, and nothing you saved comes back unless you ask for it.\n"
+        "SAVE: every time you learn a new fact, call save_info right then, before you go on -- from the user's "
+        "message, from a letter, a message, a document, a web page, the result of a tool, or your own work. A "
+        "fact is anything that may matter later: who someone is and how to reach them, a name, a number, a "
+        "date, an address, an account, a price, what was agreed or decided, what the user wants or prefers, "
+        "what you did and what came of it, what is now waiting on someone. Do not weigh whether it is "
+        "important enough: if it is new and specific, save it. Do not put it off to the end of the turn or "
+        "batch it for later -- a turn can be cut short. Save in your own words, complete enough to make sense "
+        "alone (full names, real dates). When a topic you are working on moves -- progress, a decision, a "
+        "blocker -- that is a new fact too: save it.\n"
+        "ASK: before you answer, act, or look anything up elsewhere, call request_info for what the turn is "
+        "about -- the people, organizations, things and topics the user's message names. Do it at the start "
+        "of every turn that concerns anything specific, and again whenever something new comes up mid-turn "
+        "that you might already know. Only after request_info found nothing do you search Notes, mail or old "
+        "conversation, or ask the user -- never before. Never tell the user you do not know or do not "
+        "remember something without having called request_info for it in this turn.\n"
+        "Writing a note with notes_create is NOT saving to memory: use notes_* only when the user asks for a "
+        "note, or for a document they will read themselves. What you want to remember goes to save_info. "
+        "Anything about your OWNER themselves goes to owner_profile_remember and is found with "
+        "owner_profile_recall instead. The older memory tools (recall_memory, working_memory_*, "
+        "topic_upsert/topics_list/topic_close) are deprecated and read-only. Call get_tool_instructions on "
+        "save_info once for the details."
     )
 
 

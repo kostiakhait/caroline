@@ -388,6 +388,8 @@ PLUGIN = Plugin(
     tools=[
         PluginTool(
             "save_info",
+            "Call this EVERY time you learn a new fact, right then: who someone is, a name, number, date, "
+            "address, account, what was agreed or decided, what the user wants, what you did and its result. "
             "Remembers something for later: a fact, where a topic you are discussing or working on stands, a "
             "credential. NOT for facts about your owner themselves -- use owner_profile_remember for those. "
             "\"text\" is what to remember, in your own words; optional "
@@ -398,6 +400,8 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "request_info",
+            "Call this at the START of every turn that concerns anything specific, before answering, acting "
+            "or searching elsewhere, and before ever saying you do not know or remember something. "
             "Recalls from your memory: facts, topics (summary, decisions, open questions, their letters and "
             "documents), credentials. Not the owner's profile -- that is owner_profile_recall. Give \"query\" in plain words; or \"topic\" and "
             "\"material\" ids from an earlier reply to read one letter/document in full. Call this before "
