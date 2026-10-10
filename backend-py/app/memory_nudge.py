@@ -20,7 +20,7 @@ CALLS_BEFORE_REMINDER = 10
 SAVE_TOOLS = frozenset({"save_info"})
 # Tools that are part of remembering, not of the work: they neither count
 # towards the reminder nor make anything "unsaved".
-MEMORY_TOOLS = frozenset({"request_info", "owner_profile_remember", "owner_profile_recall"})
+MEMORY_TOOLS = frozenset({"request_info", "save_document", "owner_profile_remember", "owner_profile_recall"})
 
 REMINDER_TEXT = (
     f"[Memory: {CALLS_BEFORE_REMINDER} tool calls since your last save_info. If you have learned anything new "

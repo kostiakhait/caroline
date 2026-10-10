@@ -210,7 +210,7 @@ API_RETRY_INTERVAL_MS = 90_000
 STOP_RESETS_CONN_STATES = ("limited", "billing_blocked")
 # Stop tears down the main model and everything it launched through tools --
 # except a write into memory already under way, which is left to finish.
-STOP_KEEPS_TOOLS = frozenset({"save_info", "owner_profile_remember"})
+STOP_KEEPS_TOOLS = frozenset({"save_info", "save_document", "owner_profile_remember"})
 # Shown to the model with the user's first message after a Stop, as its own block.
 STOP_NOTE_TEXT = (
     "[Note: the user pressed Stop during your previous turn, and everything it was running was killed. "

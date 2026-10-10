@@ -26,6 +26,13 @@ The local short-term copy of topics (memory_topics.py, shown in the system
 prompt) is kept current from here: every save_info reply updates the topic it
 touched, and the whole list is refreshed from the server when it is stale.
 
+Documents are a memory of their own (docs/MICROAGENTS_PLAN.md, section 2.9):
+save_document(path, note?) hands a whole file to the server, which keeps it,
+reads its text itself (scans too), indexes it and puts its facts into fact
+memory. The model chooses to do that; nothing saves a document on its own.
+A found document comes back from request_info like everything else, and a
+part of it is read in full with request_info(document, section).
+
 Neither tool keeps the model waiting long:
   - save_info hands the text to a background task and returns at once -- the
     model has the facts in the conversation already. The save goes on even
@@ -353,6 +360,8 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         if not topic:
             return {"text": 'To read a material in full give both "topic" and "material" (their ids from an earlier request_info reply).', "is_error": True}
         return await _read_material(topic, material, args.get("offset"), args.get("save_file_to"))
+    if args.get("document"):
+        return await _read_document(args["document"], args.get("section"), args.get("offset"), args.get("save_file_to"))
     query = (args.get("query") or "").strip()
     if not query:
         return {"text": 'request_info needs "query": what you want to recall.', "is_error": True}
@@ -419,13 +428,14 @@ class _Read:
 
 def _merge_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The parts of an answer as the reply of a whole request: one entry per
-    source, the facts of all its portions together."""
+    source, the facts (or the documents) of all its portions together."""
     merged: dict[str, dict[str, Any]] = {}
     for part in parts:
         source, output = part.get("source"), dict(part.get("output") or {})
         known = merged.get(source)
-        if known is not None and isinstance(known.get("facts"), list) and isinstance(output.get("facts"), list):
-            known["facts"] = known["facts"] + output["facts"]
+        listed = next((name for name in ("facts", "documents") if isinstance(output.get(name), list)), None)
+        if known is not None and listed and isinstance(known.get(listed), list):
+            known[listed] = known[listed] + output[listed]
             for flag in ("incomplete", "untranslated"):
                 known[flag] = bool(known.get(flag)) or bool(output.get(flag))
         else:
@@ -472,6 +482,83 @@ def _continue_in_background(read: _Read) -> None:
             OPERATIONS.forget(op.id)
 
     op.task = asyncio.create_task(run())
+
+
+async def save_document(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Hands a whole file to document memory. Returns at once: the upload and
+    everything after it run in the background, like save_info."""
+    refused = await _gate()
+    if refused:
+        return refused
+    path = Path(str(args.get("path") or "")).expanduser()
+    if not path.is_file():
+        return {"text": f"Nothing was saved: there is no file at {args.get('path')}.", "is_error": True}
+    size = path.stat().st_size
+    if size == 0:
+        return {"text": f"Nothing was saved: {path} is empty.", "is_error": True}
+    if size > MAX_FILE_BYTES:
+        return {"text": f"Nothing was saved: {path} is {size} bytes, larger than the {MAX_FILE_BYTES} allowed.", "is_error": True}
+    params: dict[str, Any] = {
+        "name": path.name, "content": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "source": "file", "ref": str(path), "traceId": uuid.uuid4().hex, "language": _language(),
+    }
+    guessed, _encoding = mimetypes.guess_type(path.name)
+    if guessed:
+        params["mime"] = guessed
+    note = (args.get("note") or "").strip()
+    if note:
+        params["note"] = note
+    task = asyncio.create_task(_save_document_in_background(params, get_inject_proactive()))
+    _background_saves.add(task)
+    task.add_done_callback(_background_saves.discard)
+    log_event("plugin:memory", "document_save_started", trace_id=params["traceId"], name=path.name, bytes=size)
+    return {"text": f"{path.name} is being put into document memory in the background: its text is read (scans too), indexed, and "
+                    "its facts go into your memory. This takes from a minute to much longer for a long document; carry on. "
+                    "You will be told only if it could not be stored."}
+
+
+async def _save_document_in_background(params: dict[str, Any], inject: Any) -> None:
+    try:
+        reply = await _memory("memory:saveDocument", **params)
+    except Exception as exc:  # noqa: BLE001 -- reported to the model below
+        reply = {"status": "error", "error": {"code": "exception", "message": str(exc)}}
+    try:
+        reaction = await _react_to_status(reply) if reply.get("status") in (STATUS_OK, STATUS_EMPTY, STATUS_NO_FUNDS_USER) else None
+    except Exception as exc:  # noqa: BLE001
+        reaction = None
+        log_event("plugin:memory", "document_save_aftermath_failed", error=str(exc))
+    document = ((reply.get("output") or {}).get("document")) or {}
+    log_event("plugin:memory", "document_save_finished", trace_id=params["traceId"], status=reply.get("status"),
+              document=document.get("id"), duplicate=bool((reply.get("output") or {}).get("duplicate")))
+    failure = _failure_text(reply, "Putting the document into memory")
+    if failure and inject is not None:
+        inject(
+            f"[Service message: the save_document you called earlier for {params['ref']} did not go through. "
+            + " ".join(filter(None, [failure, reaction])) + " Tell the user only if it matters to them.]"
+        )
+
+
+async def _read_document(document: str, section: Any, offset: Any, save_file_to: Any) -> dict[str, Any]:
+    params: dict[str, Any] = {"document": str(document)}
+    if section not in (None, ""):
+        params["section"] = str(section)
+    if offset:
+        params["offset"] = int(offset)
+    if save_file_to:
+        params["file"] = True
+    reply = await _memory("memory:document", **params)
+    reaction = await _react_to_status(reply)
+    failure = _failure_text(reply, "Reading the document")
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    output = dict(reply.get("output") or {})
+    content = output.pop("content_b64", None)
+    if save_file_to:
+        target = Path(str(save_file_to)).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(content or ""))
+        output["file"] = f"saved to {target}"
+    return {"text": json.dumps(output, ensure_ascii=False)}
 
 
 async def _read_material(topic: str, material: str, offset: Any, save_file_to: Any) -> dict[str, Any]:
@@ -532,6 +619,20 @@ _USAGE_INSTRUCTIONS = (
     "it as \"offset\"); add \"save_file_to\": <path> to also get a document's file written there.\n"
     "Call request_info BEFORE searching Notes, mail or old conversation for something you may already know, and "
     "before asking the user to repeat it.\n"
+    "DOCUMENTS. save_document(path, note?) puts a whole FILE into your document memory: a contract, a resume, a "
+    "report, a manual, a scan, a photo of a page. You do NOT read it first and you do not pass its text: the "
+    "file itself is kept, its text is read for you (PDF, DOCX, HTML, FB2, plain text, source code; scanned "
+    "pages and pictures are recognized), it is indexed part by part, and the facts it states go into your "
+    "memory on their own. Use it for any document worth coming back to -- one the user gave you, one you "
+    "downloaded or received for a task -- instead of retelling it in save_info. \"note\" is one line of your "
+    "own on what it is and why it is kept. It returns at once; indexing a long document takes minutes and "
+    "costs in proportion to its length. The same file saved twice is kept once.\n"
+    "A request_info(query) reply may carry the source \"documents\": each found document with its title, "
+    "synopsis and the parts that answer -- every part with its \"id\", a synopsis and an \"excerpt\" of the "
+    "document's own text. To read a part in full call request_info(document=<document id>, section=<part "
+    "id>); request_info(document=<id>) alone gives the card and the outline of all parts; add \"save_file_to\" "
+    "to get the file itself written to a path. A fact may carry \"documents\": [{\"document\", \"section\"}] -- "
+    "the place it was read from; open it the same way when the exact wording matters.\n"
     "The older memory tools -- recall_memory, working_memory_*, topic_upsert/topics_list/topic_close -- are "
     "deprecated and read-only: what they hold can still be read, nothing new is written "
     "through them. notes_* tools work as before for notes the user asks about by name."
@@ -560,13 +661,24 @@ PLUGIN = Plugin(
             "or searching elsewhere, and before ever saying you do not know or remember something. "
             "Recalls from your memory: facts, topics (summary, decisions, open questions, their letters and "
             "documents), credentials. Not the owner's profile -- that is owner_profile_recall. Give \"query\" in plain words; or \"topic\" and "
-            "\"material\" ids from an earlier reply to read one letter/document in full. Call this before "
-            "searching Notes or mail for something you may already know.",
+            "\"material\" ids from an earlier reply to read one letter/document in full; or \"document\" (and "
+            "\"section\") ids to read a kept document's outline or one part of it. Call this before searching "
+            "Notes or mail for something you may already know.",
             {
                 "query": str | None, "history": int | None, "topic": str | None, "material": str | None,
-                "offset": int | None, "save_file_to": str | None,
+                "document": str | None, "section": str | None, "offset": int | None, "save_file_to": str | None,
             },
             request_info,
+        ),
+        PluginTool(
+            "save_document",
+            "Puts a whole document FILE into your document memory -- a contract, resume, report, manual, a scan "
+            "or a photo of a page. Give its \"path\"; do not read it or retell it first: the file is kept, its "
+            "text is read for you (scans are recognized), indexed, and its facts go into your memory. Optional "
+            "\"note\": one line on what it is. Use it for every document worth coming back to. Found later with "
+            "request_info; a part is read in full with request_info(document, section).",
+            {"path": str, "note": str | None},
+            save_document,
         ),
     ],
 )
