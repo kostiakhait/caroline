@@ -4372,7 +4372,20 @@ class ChatSession:
             # had been stuck. self._cli_process_pid is captured at spawn time
             # (win_subprocess_patch.py's pid sink) -- just never surfaced.
             "cliProcessPid": self._cli_process_pid,
+            # How long the CLI process itself has shown no sign of work
+            # (CPU/RSS/IO, see process_activity.py) -- the same signal
+            # _check_hang judges hangs by; None when it cannot be read.
+            # lastActivityMs above only counts SDK messages, and a model
+            # writing one long reply sends none for minutes (bug fix
+            # 2026-10-10: the supervisor killed exactly such a turn).
+            "processIdleMs": self._process_idle_ms(),
         }
+
+    def _process_idle_ms(self) -> int | None:
+        monitor = self._process_activity_monitor
+        if monitor is None or not monitor.available:
+            return None
+        return round(monitor.seconds_since_last_activity() * 1000)
 
     # ------------------------------------------------------------- run loop --
 
