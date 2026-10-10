@@ -1440,6 +1440,10 @@ async def run_small_model_turn(
         log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
         return verified, False
 
+    # A real fact from the first second (2026-10-10): picking the starting tier is itself
+    # a model call (~10s live), and until a tier starts the narrator had nothing to
+    # draft from -- the first spoken remark of a voice turn came ~30s after the question.
+    emit("Запрос получен, работа над ним началась.")
     start_index = await _start_tier_index(ai, cfg, user_text)
     final_text = ""
     for index, model in enumerate(tiers):

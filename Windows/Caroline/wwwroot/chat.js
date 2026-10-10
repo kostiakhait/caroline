@@ -1102,9 +1102,58 @@
     speak(text, btn);
   }
 
-  function speak(text, btn) {
-    speechQueue.push({ text, btn });
+  // opts.narration (2026-10-09): a progress-narrator remark (the backend's isNarration).
+  // A real reply arriving while one still waits in the queue drops it -- read out after
+  // the answer it would describe a state that's already over (see dropQueuedNarration).
+  function speak(text, btn, opts) {
+    const narration = !!opts?.narration;
+    if (!narration && !btn) dropQueuedNarration();
+    // opts.audioBase64: a narration remark the backend already synthesized (2026-10-10).
+    speechQueue.push({ text, btn, narration, prefetched: opts?.audioBase64 || undefined });
+    // Arriving while something is already playing: start its synthesis now, not when
+    // its turn comes (see prefetchSpeech).
+    if (speechQueueRunning) prefetchSpeech(speechQueue[0]);
     runSpeechQueue();
+  }
+
+  // Only items still WAITING are dropped -- the one playing now finishes its sentence,
+  // so replies never overlap and never cut off mid-word.
+  function dropQueuedNarration() {
+    const before = speechQueue.length;
+    speechQueue = speechQueue.filter((item) => !item.narration);
+    if (speechQueue.length !== before) clog(`dropped ${before - speechQueue.length} queued narration remark(s): a real reply arrived`);
+  }
+
+  // Tells the backend when this queue starts playing and when it runs dry (2026-10-09)
+  // -- voice narration waits for that before showing its next remark, so remarks
+  // neither pile up behind each other nor leave dead air in between. Sent on change only.
+  let reportedSpeaking = null;
+  function reportSpeechState(speaking, force) {
+    if (!force && reportedSpeaking === speaking) return;
+    reportedSpeaking = speaking;
+    sendControl("speech_state", { speaking });
+  }
+
+  // Starts synthesis for a queued item early (2026-10-09), while the item ahead of it is
+  // still playing: each synthesis is a backend round trip (language detection, speech
+  // cleanup, edge-tts), and starting it only once the previous item ENDED put exactly
+  // that latency as dead air between every two spoken lines. Times out like transcribe()
+  // does, so a reply lost to a reconnect can't stall the queue forever.
+  const TTS_PREFETCH_TIMEOUT_MS = 45_000;
+  function prefetchSpeech(item) {
+    if (!item || item.prefetched || item.ttsPromise) return;
+    const requestId = `tts-${++ttsRequestSeq}`;
+    item.ttsPromise = new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingTtsRequests.delete(requestId);
+        resolve({ ok: false, audioBase64: null, err: "timed out" });
+      }, TTS_PREFETCH_TIMEOUT_MS);
+      pendingTtsRequests.set(requestId, (ok, audioBase64, err) => {
+        clearTimeout(timer);
+        resolve({ ok, audioBase64, err });
+      });
+      sendControl("tts", { text: item.text, requestId });
+    });
   }
 
   // Backend-synthesized audio pushed by the play_speech tool (see
@@ -1132,12 +1181,17 @@
   async function runSpeechQueue() {
     if (speechQueueRunning) return;
     speechQueueRunning = true;
+    reportSpeechState(true);
     while (speechQueue.length > 0) {
       await waitForVoiceInputIdle();
       const item = speechQueue.shift();
-      await playOneSpeech(item);
+      if (!item) continue; // emptied (Stop, or a dropped remark) while waiting
+      const playing = playOneSpeech(item);
+      prefetchSpeech(speechQueue[0]);
+      await playing;
     }
     speechQueueRunning = false;
+    reportSpeechState(false);
   }
 
   // Per explicit correction (2026-09-03): Visual Mode now applies to BOTH the
@@ -1150,7 +1204,7 @@
     return visualModeState.enabled && visualModeState.available && !!window.chrome?.webview;
   }
 
-  function playOneSpeech({ text, btn, prefetched, forceVisual }) {
+  function playOneSpeech({ text, btn, prefetched, forceVisual, ttsPromise }) {
     return new Promise((resolve) => {
       const useVisual = forceVisual ? !!window.chrome?.webview : shouldUseVisualMode(btn);
       const requestId = `tts-${++ttsRequestSeq}`;
@@ -1184,6 +1238,8 @@
       };
       if (prefetched) {
         onAudio(true, prefetched);
+      } else if (ttsPromise) {
+        ttsPromise.then(({ ok, audioBase64, err }) => onAudio(ok, audioBase64, err));
       } else {
         pendingTtsRequests.set(requestId, onAudio);
         sendControl("tts", { text, requestId });
@@ -1374,6 +1430,7 @@
 
     ws.addEventListener("open", () => {
       wsConnected = true;
+      reportSpeechState(speechQueueRunning, true);
       // carolineStatus itself is left as whatever it last was -- main.py
       // sends a fresh {type:"status"} the moment this connection is
       // registered (see its own initial-connect _publish_status() call),
@@ -1633,7 +1690,7 @@
           // sdk_message (backend chat_session.py), not just "result" -- same
           // authoritative, crash/restart-stable source as before.
           if (evt.isVoice) {
-            speak(block.text);
+            speak(block.text, null, { narration: !!evt.isNarration, audioBase64: evt.audioBase64 });
             if (turn) turn.spoken = true;
           }
         } else if (block.type === "tool_use") {

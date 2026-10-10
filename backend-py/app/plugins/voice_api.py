@@ -472,6 +472,22 @@ def _normalized_overlap(text: str, other: str) -> bool:
     return norm_text in norm_other or norm_other in norm_text
 
 
+def _is_repeat(text: str, previous: str) -> bool:
+    """Same remark in other words (2026-10-09). _normalized_overlap only catches
+    near-verbatim containment; "я всё ещё проверяю прогноз..." vs "я все еще ищу
+    прогноз..." differ in one verb and a letter. Word-set overlap catches those while
+    a remark with genuinely new content shares few words with the old one."""
+    if _normalized_overlap(text, previous):
+        return True
+    def words(s: str) -> set[str]:
+        s = s.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
+        return set(re.findall(r"\w+", s))
+    a, b = words(text), words(previous)
+    if len(a) < 3 or len(b) < 3:
+        return False
+    return len(a & b) / len(a | b) >= 0.6
+
+
 def _is_echo_of_dialogue(text: str, recent_dialogue: str) -> bool:
     """A genuine narration REACTS to the conversation -- it doesn't quote it
     back. Confirmed live (2026-09-13): even with the <narration>-tag
@@ -536,6 +552,10 @@ _NARRATION_EXAMPLE_THIRDPERSON_GOOD = "Regenerated it and reopened it for you to
 # longer in the prompt text itself.
 _NARRATION_COMBINED_BAD = "The user asks Caroline to check the invoice, and Caroline says she'll email accounting once she confirms the numbers."
 _NARRATION_COMBINED_GOOD = "Invoice math like this always takes longer than it looks like it should."
+# sw-mode work-log examples (2026-10-09) -- see generate_progress_comment's STATUS rules.
+_NARRATION_WORKLOG_GOOD = "I've found two emails from Anna about the invoice."
+_NARRATION_WORKLOG_BAD = "Running the mail search on the first tier now."
+_NARRATION_DEADEND_GOOD = "The web search didn't give me the timetable, and my notes have nothing on it either."
 
 
 def _is_echo_of_prompt_example(text: str) -> bool:
@@ -545,6 +565,7 @@ def _is_echo_of_prompt_example(text: str) -> bool:
             _NARRATION_EXAMPLE_BAD, _NARRATION_EXAMPLE_GOOD, _NARRATION_EXAMPLE_TAG,
             _NARRATION_EXAMPLE_THIRDPERSON_BAD, _NARRATION_EXAMPLE_THIRDPERSON_GOOD,
             _NARRATION_COMBINED_BAD, _NARRATION_COMBINED_GOOD,
+            _NARRATION_WORKLOG_GOOD, _NARRATION_WORKLOG_BAD, _NARRATION_DEADEND_GOOD,
         )
     )
 
@@ -640,9 +661,25 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
     return stripped
 
 
+def _already_said_block(already_said: list[str] | None) -> str:
+    """Voice narration (2026-10-09) speaks every few seconds, not once a minute -- without
+    its own earlier remarks in view the model restates the same status each time, which
+    is the \"talking to herself\" stream chat_session.py's consecutive_narration_count
+    describes. Empty for the 60s path, which never passes it."""
+    if not already_said:
+        return ""
+    lines = "\n".join(f"- {remark}" for remark in already_said[-6:])
+    return (
+        "ALREADY SAID to the user during this request (they heard these; never repeat or rephrase them -- say "
+        "only what STATUS adds beyond them, or reply with exactly <narration></narration> if it adds nothing):\n"
+        f"---\n{lines}\n---\n\n"
+    )
+
+
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
     activity: str | None = None, addressee_gender: str | None = None, task: str | None = None,
+    already_said: list[str] | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
@@ -771,6 +808,12 @@ async def generate_progress_comment(
         "guess the user's intent or mood; never promise or plan next steps.\n"
         "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
         "progress -- describe it that way.\n"
+        "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
+        "arguments and results. Never repeat any of that machinery. But when a result in it is a real piece of "
+        "the task -- something found, counted or done that the user asked about -- say THAT, in plain words, as "
+        "progress so far, never as the final answer.\n"
+        "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
+        "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\".\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n\n"
         "Write in English. A separate step translates it afterward.\n\n"
@@ -785,9 +828,18 @@ async def generate_progress_comment(
         "  Good: <narration>Your table for two is booked.</narration>\n"
         "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
         "  Good: <narration></narration>\n"
-        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n\n"
+        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n"
+        "  TASK: find Anna's email about the invoice. STATUS: Работает уровень 1. Вызов инструмента mail_search "
+        "(аргументы: {\"from\": \"Anna\"}); результат: 2 messages: 'Invoice March', 'Re: invoice'\n"
+        f"  Good: <narration>{_NARRATION_WORKLOG_GOOD}</narration>\n"
+        f"  Bad (names the machinery): <narration>{_NARRATION_WORKLOG_BAD}</narration>\n"
+        "  TASK: find train times to Lviv for Friday. STATUS: Вызов инструмента web_search (аргументы: "
+        "{\"question\": \"Lviv trains Friday\"}); результат: I don't have access to live timetables. Вызов "
+        "инструмента request_info (аргументы: {\"query\": \"Lviv trains\"}); результат: Memory holds nothing relevant.\n"
+        f"  Good: <narration>{_NARRATION_DEADEND_GOOD}</narration>\n\n"
         f"TASK (the user's request):\n---\n{task}\n---\n\n"
-        f"STATUS (what is happening, counts only):\n---\n{activity}\n---\n\n"
+        f"STATUS (what is happening):\n---\n{activity}\n---\n\n"
+        f"{_already_said_block(already_said)}"
         "Reply now, wrapped in the tag."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
@@ -801,6 +853,13 @@ async def generate_progress_comment(
     if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
         log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))
         return None
+    if re.fullmatch(r"\s*<narration>\s*</narration>\s*", data["result"]):
+        # The prompt's own "nothing new to say" reply (2026-10-09): a deliberate answer,
+        # not a broken one -- "" lets the voice loop wait for new facts instead of
+        # re-asking the same question three times in a row (seen live: 9 such retries
+        # in one turn). Still falsy, so the 60s path treats it exactly as before.
+        log_event("plugin:voice", "generate_progress_comment_nothing_new")
+        return ""
     text = _extract_tagged_text(data["result"], "narration")
     if not text:
         log_event("plugin:voice", "generate_progress_comment_unextractable", raw=data["result"][:300])
@@ -840,6 +899,11 @@ async def generate_progress_comment(
     final_text = translated or text
     if translated is None:
         log_event("plugin:voice", "generate_progress_comment_translate_failed_using_original", text=text[:300])
+    if already_said and any(_is_repeat(final_text, prev) for prev in already_said):
+        # The ALREADY SAID block is only an ask -- seen live, the small model said
+        # "I'm still checking the forecast" five times in one turn regardless.
+        log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=final_text[:300])
+        return ""
     log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=final_text)
     return final_text
 
@@ -876,12 +940,16 @@ async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str 
     return data["result"]  # base64 MP3
 
 
-async def synthesize_speech(text: str, voice: str = "Nova", session: str | None = None) -> str:
+async def synthesize_speech(text: str, voice: str = "Nova", session: str | None = None, language: str | None = None) -> str:
     """Prefers the local edge-tts server over Camerlengo's ai:tts -- purely
     a latency optimization (no Camerlengo round trip), tried FIRST
     regardless of session, falling back to Camerlengo whenever the local
     attempt fails for any reason (never a hard new dependency)."""
-    language = await detect_language(text)
+    # `language` (ISO 639-1, 2026-10-10): a caller that already knows it skips the
+    # ai:detectLanguage round trip -- voice narration does, since every remark is
+    # already translated into the tab's own language.
+    if language is None:
+        language = await detect_language(text)
     edge_voice = _edge_tts_voice_for(voice, language)
     try:
         audio = await _synthesize_speech_locally(text, edge_voice)

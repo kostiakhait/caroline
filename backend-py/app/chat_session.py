@@ -248,6 +248,9 @@ SILENT_USER_WAIT_NUDGE_MS = 90_000
 # actual cosmetic-comment mechanism this drives.
 PROGRESS_NARRATION_INTERVAL_MS = 60_000
 
+# How submit() opens the interim-notes prefix -- _narration_task strips it back off.
+_INTERIM_NOTES_HEADER = "[Interim messages you already showed the user "
+
 # Bug fix (2026-09-14): see consecutive_narration_count's own __init__
 # comment for the incident this caps -- a turn genuinely stuck for many
 # minutes doesn't need a fresh paraphrase of the same stale context every
@@ -288,6 +291,36 @@ NARRATION_NETWORK_TIMEOUT_S = 30.0
 # left with a full extra silent minute on top of the one that already
 # produced nothing.
 NARRATION_FAILURE_RETRY_S = 15.0
+
+# Voice narration (2026-10-09), per explicit instruction ("непрерывный диалог, чтобы
+# реплики не накладывались одна на другую, но при этом между ними не было значимых
+# пауз. И чтобы они были осмысленными"): for an sw-mode VOICE turn (TTS or Visual
+# Mode) the once-a-minute cadence above is a minute of silence on a live call. Those
+# turns get their own loop (_voice_narration_loop) instead: the next remark is drafted
+# while the previous one is still being spoken, and shown once chat.js reports its
+# speech queue quiet (speech_state, see on_client_speech_state). Text-only turns and
+# SDK-path turns keep PROGRESS_NARRATION_INTERVAL_MS unchanged.
+VOICE_NARRATION_TICK_S = 1.0
+# No remark before this much of a turn has passed -- a quick turn answers on its own.
+VOICE_NARRATION_FIRST_S = 5.0
+# Drafting starts this early so the first remark is ready by VOICE_NARRATION_FIRST_S.
+VOICE_NARRATION_PREPARE_FROM_S = 1.5
+# Breath between the end of one spoken line and the start of the next.
+VOICE_NARRATION_AFTER_SPEECH_GAP_S = 1.2
+# With no new facts since the last remark, at most one remark per this long -- a new
+# fact is what makes a remark worth saying; without one this is the longest silence
+# allowed, not a cadence (see consecutive_narration_count's "talking to herself").
+VOICE_NARRATION_STALE_S = 15.0
+# A drafted remark not yet shown by then describes a state that has moved on.
+VOICE_NARRATION_MAX_AGE_S = 20.0
+# Shorter than NARRATION_FAILURE_RETRY_S: on a live call, 15s is itself the gap.
+VOICE_NARRATION_FAILURE_RETRY_S = 5.0
+# Only used when chat.js never reported speech_state (an older client): a rough
+# speaking rate to guess when the last remark finished playing.
+VOICE_NARRATION_EST_CHARS_PER_S = 14.0
+# A "speaking" report older than this is not trusted: a dropped connection would
+# otherwise leave the client looking busy forever and silence narration for good.
+VOICE_NARRATION_CLIENT_SPEAKING_STALE_S = 120.0
 
 # Per explicit instruction (2026-09-13/2026-09-14): was a process-wide kill
 # switch (SMALL_MODEL_ENABLED, always False) while the small-model path's
@@ -1693,6 +1726,25 @@ class ChatSession:
         # thing it exists to cap.
         self.consecutive_narration_count = 0
 
+        # Voice narration (see VOICE_NARRATION_TICK_S). turn_seq ties a drafting task to
+        # the turn it was started for, so a draft finishing after its turn ended is dropped.
+        self._voice_narration_task: asyncio.Task[None] | None = None
+        self._voice_narration_wake = asyncio.Event()
+        self._narration_turn_seq = 0
+        self._narration_turn_started_at: float | None = None
+        self._narration_draft_task: asyncio.Task[None] | None = None
+        self._prepared_narration: tuple[str, float, str | None] | None = None
+        self._narration_facts_at_last_draft: str | None = None
+        self._narration_last_draft_at: float | None = None
+        self._voice_narration_failed_at: float | None = None
+        # What this turn's narration already said -- handed to the next draft so it moves on.
+        self.turn_narration_remarks: list[str] = []
+        # chat.js's own speech queue (speech_state control op). None until it first reports.
+        self._client_speaking: bool | None = None
+        self._client_quiet_since: float | None = None
+        self._client_speech_reported_at: float | None = None
+        self._last_narration_est_speech_s = 0.0
+
         # restart budget
         self.restart_timestamps: list[float] = []
 
@@ -1813,12 +1865,16 @@ class ChatSession:
         # this one -- see its own module docstring.
         self._run_loop_task = supervise("run_loop", self._run_loop, self.tab_id)
         self._watchdog_task = supervise("watchdog", self._watchdog_loop, self.tab_id)
+        self._voice_narration_task = supervise("voice_narration", self._voice_narration_loop, self.tab_id)
 
     def dispose(self) -> None:
         log_event("engine", "dispose", tab_id=self.tab_id)
         self.ended = True
         if self._watchdog_task:
             self._watchdog_task.cancel()
+        if self._voice_narration_task:
+            self._voice_narration_task.cancel()
+        self._reset_voice_narration()
         self._clear_api_retry_timer()
         self._clear_one_shot_followup_timer()
         self._clear_mcp_reconnect_timers()
@@ -2115,7 +2171,7 @@ class ChatSession:
             notes = "\n".join(f"- {note}" for note in self.pending_interim_notes)
             self.pending_interim_notes = []
             text = (
-                "[Interim messages you already showed the user while working on the previous request, "
+                f"{_INTERIM_NOTES_HEADER}while working on the previous request, "
                 "marked as progress updates -- your own past words, do not repeat them as news:\n"
                 f"{notes}]\n\n{text}"
             )
@@ -2302,6 +2358,8 @@ class ChatSession:
                 log_event("engine", "small_model_real_turn_queued_behind_proactive", tab_id=self.tab_id, text_len=len(text))
                 self.small_model_queued_real_turns.append((text, attachments, is_voice))
                 return
+            if is_real_user:
+                self.turn_is_voice = self.turn_is_voice or is_voice
             log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
             self.small_model_pending_comments.append(text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}")
             return
@@ -2309,6 +2367,10 @@ class ChatSession:
 
     def _start_small_model_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
         self.small_model_turn_is_real_user = is_real_user
+        # Bug fix (2026-10-09): turn_is_voice was only ever set by _input_stream, which an
+        # sw-mode turn never goes through -- so every narration remark of an sw turn went
+        # out with isVoice=False and was never spoken or animated, voice turn or not.
+        self.turn_is_voice = is_voice
         log_event("engine", "small_model_turn_attempting", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
         model_text = text
         if attachments:
@@ -2349,10 +2411,14 @@ class ChatSession:
         self.small_model_active = True
         self.small_model_live_dialogue = None
         self.small_model_activity = []
+        self._reset_voice_narration()
+        self._narration_turn_started_at = time.monotonic()
         self._small_model_task = asyncio.create_task(self._run_small_model_turn(model_text, is_voice, is_real_user))
 
     def _end_small_model_turn(self, start_queued_real_turn: bool = True) -> None:
         self.small_model_active = False
+        self.turn_is_voice = False
+        self._reset_voice_narration()
         self.small_model_live_dialogue = None
         self.small_model_pending_comments = []
         self._small_model_task = None
@@ -2378,7 +2444,15 @@ class ChatSession:
             self.small_model_pending_comments = []
             return comments
 
+        # This turn's own list (_start_small_model_turn just made it). Seen live
+        # (2026-10-10): after Stop, the cancelled turn's worker kept calling tools for
+        # another ~30s, and its failures landed in the NEXT turn's facts -- the narrator
+        # then told the user about a search the new request never made.
+        turn_activity = self.small_model_activity
+
         def on_activity(line: str) -> None:
+            if self.small_model_activity is not turn_activity:
+                return
             self.small_model_activity.append(line[:300])
             del self.small_model_activity[:-20]
             # Bug fix (2026-10-03), explicit instruction: status is push-on-CHANGE
@@ -2453,6 +2527,7 @@ class ChatSession:
             log_event("engine", "small_model_translate_applied", tab_id=self.tab_id, original_len=len(text), translated_len=len(translated))
             text = translated
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
+        self._reset_voice_narration()
         _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
         assistant_wire = {
             "type": "assistant",
@@ -2466,7 +2541,10 @@ class ChatSession:
             "parent_tool_use_id": None,
         }
         if not silent:
-            await self.send({"type": "sdk_message", "message": assistant_wire})
+            # isVoice here too (2026-10-09): see _start_small_model_turn's turn_is_voice fix --
+            # chat.js treats a turn as already spoken once a voiced narration remark of it
+            # played, so without this the final answer itself would go unspoken.
+            await self.send({"type": "sdk_message", "message": assistant_wire, "isVoice": is_voice})
             result_wire = {
                 "type": "result",
                 "subtype": "success",
@@ -3321,7 +3399,12 @@ class ChatSession:
         """The user's request for the current task -- the one thing the narrator
         needs to say where the task stands. Only the current real user request,
         never older conversation history."""
-        return (self.last_real_user_question or "").strip()[:600]
+        question = (self.last_real_user_question or "").strip()
+        if question.startswith(_INTERIM_NOTES_HEADER):
+            end = question.find("]\n\n")
+            if end != -1:
+                question = question[end + 3:].strip()
+        return question[:600]
 
     def _gather_recent_dialogue_for_narration(self, limit: int = RECENT_DIALOGUE_WINDOW) -> str:
         """Per explicit correction (2026-09-10): the first version of
@@ -3515,6 +3598,9 @@ class ChatSession:
         # mean there's genuinely nothing to narrate about right now.
         if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
             return
+        # sw-mode voice turns are _voice_narration_loop's (2026-10-09, see VOICE_NARRATION_TICK_S).
+        if self._voice_narration_applies():
+            return
         # Per explicit instruction (2026-10-07) -- NOT a revival of the
         # whole-category gate reverted just below on 2026-10-03: this is
         # narrower and opt-in per turn (current_turn_suppress_narration,
@@ -3641,7 +3727,32 @@ class ChatSession:
             self.last_narration_failed_at = time.monotonic()
             return
         self.last_narration_failed_at = None
+        await self._send_narration_remark(comment)
+
+    async def _synthesize_narration_audio(self, comment: str) -> str | None:
+        """Same pipeline as main.py's "tts" control op. None on any failure -- chat.js
+        then synthesizes on its own, exactly as before."""
+        from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, voice_for_gender
+
+        try:
+            cleaned = await clean_text_for_speech(comment)
+            iso = {"Russian": "ru", "English": "en"}.get(current_language_name(self.tab_id))
+            return await synthesize_speech(cleaned, voice_for_gender(get_persona_gender(self.workspace_dir)), language=iso)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log_event("engine", "voice_narration_tts_failed", tab_id=self.tab_id, error=str(exc))
+            return None
+
+    async def _send_narration_remark(self, comment: str, audio_base64: str | None = None) -> None:
+        """Shows one narration remark -- shared by the 60s path above and the voice
+        loop. isNarration (2026-10-09) lets chat.js drop a remark still waiting in its
+        speech queue once the real answer arrives, instead of reading it out after."""
         self.last_visible_output_at = time.monotonic()
+        self.turn_narration_remarks.append(comment)
+        # Only the voice loop resets this per turn; SDK-path turns would grow it forever.
+        del self.turn_narration_remarks[:-20]
+        self._last_narration_est_speech_s = len(comment) / VOICE_NARRATION_EST_CHARS_PER_S
         self.consecutive_narration_count += 1
         log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment, consecutive_count=self.consecutive_narration_count)
         # What the user just saw must be something Caroline knows she said. Kept
@@ -3662,7 +3773,182 @@ class ChatSession:
         # narrating about was itself voice-started. Uses self.turn_is_voice, same as the
         # other real send sites, so narration follows the SAME voice/silent choice the
         # turn it's commenting on already made.
-        await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
+        envelope: dict[str, Any] = {"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice, "isNarration": True}
+        if audio_base64:
+            envelope["audioBase64"] = audio_base64
+        await self.send(envelope)
+
+    # ------------------------------------------------------- voice narration --
+
+    def _voice_narration_applies(self) -> bool:
+        """True while _voice_narration_loop owns narration: an sw-mode turn (the
+        only path whose narrator sees real facts, see _narration_action_facts) that
+        is a voice turn. _narration_turn_started_at is cleared the moment the final
+        answer starts going out, which closes narration for the rest of the turn."""
+        return self.small_model_active and self.turn_is_voice and self._narration_turn_started_at is not None
+
+    def _reset_voice_narration(self) -> None:
+        """Drops everything the voice loop holds for the current turn -- a drafted
+        remark nobody has heard yet must never surface in a later turn."""
+        self._narration_turn_seq += 1
+        self._narration_turn_started_at = None
+        if self._narration_draft_task is not None and not self._narration_draft_task.done():
+            self._narration_draft_task.cancel()
+        self._narration_draft_task = None
+        self._prepared_narration = None
+        self._narration_facts_at_last_draft = None
+        self._narration_last_draft_at = None
+        self._voice_narration_failed_at = None
+        self.turn_narration_remarks = []
+
+    def on_client_speech_state(self, speaking: bool) -> None:
+        """chat.js's speech queue started an item (True) or ran dry (False) -- see its
+        reportSpeechState. Wakes the loop so the next remark follows the last spoken
+        line by VOICE_NARRATION_AFTER_SPEECH_GAP_S, not by up to a whole tick more."""
+        was = self._client_speaking
+        self._client_speaking = speaking
+        self._client_speech_reported_at = time.monotonic()
+        if not speaking and was is not False:
+            self._client_quiet_since = time.monotonic()
+        self._voice_narration_wake.set()
+
+    def _client_quiet_for(self, now: float) -> float:
+        """How long chat.js has had nothing to say. A client that never reported
+        speech_state (older chat.js) gets an estimate: the last remark's length at an
+        ordinary speaking rate, counted from when it was sent."""
+        if self._client_speaking is not None:
+            if self._client_speaking:
+                reported = self._client_speech_reported_at
+                if reported is not None and now - reported > VOICE_NARRATION_CLIENT_SPEAKING_STALE_S:
+                    return now - reported - VOICE_NARRATION_CLIENT_SPEAKING_STALE_S
+                return 0.0
+            return now - self._client_quiet_since if self._client_quiet_since is not None else float("inf")
+        if self.last_visible_output_at is None:
+            return float("inf")
+        return now - (self.last_visible_output_at + self._last_narration_est_speech_s)
+
+    async def _voice_narration_loop(self) -> None:
+        """Runs for the tab's lifetime; acts only while _voice_narration_applies().
+        Each pass is quick (drafting runs in its own task), so a speech_state event is
+        acted on as soon as it arrives."""
+        try:
+            while not self.ended:
+                try:
+                    await asyncio.wait_for(self._voice_narration_wake.wait(), timeout=VOICE_NARRATION_TICK_S)
+                except asyncio.TimeoutError:
+                    pass
+                self._voice_narration_wake.clear()
+                if self.ended:
+                    return
+                try:
+                    await self._step_voice_narration()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- same rule as _watchdog_loop: log, keep ticking
+                    log_event("engine", "voice_narration_tick_failed", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
+        except asyncio.CancelledError:
+            pass
+
+    async def _step_voice_narration(self) -> None:
+        if not self._voice_narration_applies():
+            return
+        if not self.turn_pending or self.conn_state.get("kind") != "connected" or self.current_turn_suppress_narration:
+            return
+        now = time.monotonic()
+        started = self._narration_turn_started_at or now
+
+        # 1. A drafted remark goes out as soon as the client has finished speaking.
+        if self._prepared_narration is not None:
+            comment, drafted_at, audio = self._prepared_narration
+            if now - drafted_at > VOICE_NARRATION_MAX_AGE_S:
+                log_event("engine", "voice_narration_draft_expired", tab_id=self.tab_id, age_s=round(now - drafted_at, 1))
+                self._prepared_narration = None
+            elif now - started >= VOICE_NARRATION_FIRST_S and self._client_quiet_for(now) >= VOICE_NARRATION_AFTER_SPEECH_GAP_S:
+                self._prepared_narration = None
+                log_event("engine", "voice_narration_sent", tab_id=self.tab_id, comment=comment, waited_s=round(now - drafted_at, 1), turn_s=round(now - started, 1))
+                await self._send_narration_remark(comment, audio)
+                # The client reports speaking for this remark shortly; until then it
+                # must not look quiet, or the next remark could be shown on top of it.
+                if self._client_speaking is not None:
+                    self._client_speaking = True
+                    self._client_speech_reported_at = time.monotonic()
+                return
+            else:
+                return
+
+        # 2. Otherwise draft the next one ahead of time -- while the previous one is
+        # still being spoken, so it is ready the moment the client goes quiet.
+        if self._narration_draft_task is not None:
+            return
+        if now - started < VOICE_NARRATION_PREPARE_FROM_S:
+            return
+        if self._voice_narration_failed_at is not None and now - self._voice_narration_failed_at < VOICE_NARRATION_FAILURE_RETRY_S:
+            return
+        facts = self._narration_action_facts()
+        if facts is None:
+            return
+        if facts == self._narration_facts_at_last_draft:
+            # Nothing new happened: at most one remark per VOICE_NARRATION_STALE_S,
+            # counted from the later of the last draft and the end of the last speech.
+            last = self._narration_last_draft_at or started
+            if now - last < VOICE_NARRATION_STALE_S or self._client_quiet_for(now) < VOICE_NARRATION_STALE_S:
+                return
+        self._narration_facts_at_last_draft = facts
+        self._narration_last_draft_at = now
+        self._narration_draft_task = asyncio.create_task(
+            self._draft_voice_narration(self._narration_turn_seq, facts, self._narration_task(), list(self.turn_narration_remarks))
+        )
+
+    async def _draft_voice_narration(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
+        try:
+            await self._draft_voice_narration_body(turn_seq, facts, task, already_said)
+        finally:
+            if turn_seq == self._narration_turn_seq:
+                self._narration_draft_task = None
+
+    async def _draft_voice_narration_body(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
+        from app.plugins.voice_api import generate_progress_comment
+
+        comment: str | None = None
+        for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
+            try:
+                comment = await generate_progress_comment(
+                    "", current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
+                    gender=get_persona_gender(self.workspace_dir), activity=facts, task=task,
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender, already_said=already_said,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log_event("engine", "voice_narration_draft_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))
+                comment = None
+            if comment or comment == "":
+                break  # "" = nothing new to say (see generate_progress_comment), not a failure
+            log_event("engine", "voice_narration_draft_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
+        if turn_seq != self._narration_turn_seq:
+            # The turn ended (or a new one started) while drafting -- this remark is about a
+            # state nobody is waiting on any more.
+            log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=bool(comment))
+            return
+        if comment == "":
+            # Nothing new (or only a repeat). No cooldown needed: the next draft already
+            # waits for new facts or VOICE_NARRATION_STALE_S, see _step_voice_narration.
+            log_event("engine", "voice_narration_nothing_new", tab_id=self.tab_id)
+            return
+        if not comment:
+            self._voice_narration_failed_at = time.monotonic()
+            return
+        self._voice_narration_failed_at = None
+        # Synthesized here, while the previous remark is still playing (2026-10-10): seen
+        # live, synthesis took 4-7s per remark -- every one of them dead air when the
+        # client only asked for the audio once the remark had arrived.
+        audio = await self._synthesize_narration_audio(comment)
+        if turn_seq != self._narration_turn_seq:
+            log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=True)
+            return
+        self._prepared_narration = (comment, time.monotonic(), audio)
+        log_event("engine", "voice_narration_drafted", tab_id=self.tab_id, comment=comment)
+        self._voice_narration_wake.set()
 
     def _check_user_wait_nudge(self) -> None:
         """Separate from hang-detection above -- that guards against a

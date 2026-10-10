@@ -971,6 +971,12 @@ async def handle_control_request(
     if op == "client_diag":
         log_event("engine", "client_diag", **{k: v for k, v in parsed.items() if k not in ("op", "requestId")})
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "speech_state":
+        # chat.js's speech queue started an item or ran dry (2026-10-09) -- paces voice
+        # narration, see ChatSession.on_client_speech_state. No reply payload needed.
+        if session is not None:
+            session.on_client_speech_state(bool(parsed.get("speaking")))
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "visible_transcript_set":
         entries = parsed.get("entries")
         if isinstance(entries, list) and session is not None:
