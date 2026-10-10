@@ -82,6 +82,14 @@ REQUEST_TIMEOUT_S = 330.0
 SOFT_READ_TIMEOUT_S = 30.0
 POLL_WAIT_S = 20.0                      # one memory:requestPoll waits at most this (the server's own cap)
 LATE_READ_LIMIT_S = 400.0               # the server gives up on a request after 300 s
+# A save runs on the server as a background job that is polled (memory:saveStart
+# / memory:savePoll): one long request was cut off by the front server at 120 s
+# while the save itself succeeded, and the model, told it had failed, saved the
+# same text again -- up to four times (seen live 2026-10-10).
+SAVE_WAIT_LIMIT_S = 400.0               # a save is given up on as "outcome unknown" after this
+SAVE_POLL_RETRIES = 5                   # consecutive failed polls tolerated (flat pause between them)
+SAVE_POLL_RETRY_PAUSE_S = 3.0
+OUTCOME_UNKNOWN = "outcome_unknown"
 LATE_FACTS_HEADER = "[Additional facts from memory"
 LATE_READ_TOOL = "request_info (continued)"   # its operation is cancelled by Stop like any tool call
 MAX_FILE_BYTES = 25 * 1024 * 1024       # the server refuses larger documents
@@ -123,6 +131,34 @@ async def _memory(command: str, **params: Any) -> dict[str, Any]:
     return await _sessions.with_session(
         lambda session: _post({"command": command, "key": CAROLINE_SW_KEY, "session": session, **params})
     )
+
+
+async def _save_job(start_command: str, **params: Any) -> dict[str, Any]:
+    """Starts a save on the server and waits for its outcome with short
+    polls. Returns the service's reply, as a plain memory:save would -- or
+    the refusal the start gave, or an error with code OUTCOME_UNKNOWN when
+    the outcome could not be learned (never to be taken for "not saved")."""
+    started = await _memory(start_command, **params)
+    job_id = started.get("jobId")
+    if not job_id:
+        return started
+    deadline = time.monotonic() + SAVE_WAIT_LIMIT_S
+    failures = 0
+    while time.monotonic() < deadline:
+        try:
+            reply = await _memory("memory:savePoll", jobId=job_id, wait=POLL_WAIT_S)
+        except Exception as exc:  # noqa: BLE001 -- a lost poll is not a lost save
+            if "No such memory request" in str(exc):
+                return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": "the server no longer knows this save (it may have restarted)"}}
+            failures += 1
+            if failures > SAVE_POLL_RETRIES:
+                return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": f"the server stopped answering about this save: {exc}"}}
+            await asyncio.sleep(SAVE_POLL_RETRY_PAUSE_S)
+            continue
+        failures = 0
+        if reply.get("done"):
+            return reply
+    return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": f"the save did not report its outcome within {int(SAVE_WAIT_LIMIT_S)} s"}}
 
 
 def _language() -> str | None:
@@ -237,6 +273,10 @@ def _failure_text(reply: dict[str, Any], doing: str) -> str | None:
     if status == STATUS_NO_FUNDS_UPSTREAM:
         return f"{doing} could not run: the memory service itself is out of funds on its provider's side. Retrying will not help."
     error = reply.get("error") or {}
+    if error.get("code") == OUTCOME_UNKNOWN:
+        return (f"{doing}: it is NOT KNOWN whether it went through ({error.get('message') or 'no details'}). Do not "
+                "simply do it again -- that would store the same thing twice. If it matters, check with request_info "
+                "first, and repeat only what is really missing.")
     return f"{doing} failed ({error.get('code') or status}): {error.get('message') or 'no details'}"
 
 
@@ -271,7 +311,7 @@ async def save_owner_profile_text(text: str) -> dict[str, Any]:
     text = (text or "").strip()
     if not text:
         return {"text": 'owner_profile_remember needs "text": what to keep about the owner.', "is_error": True}
-    reply = await _memory("memory:saveProfile", text=text, traceId=uuid.uuid4().hex, language=_language())
+    reply = await _save_job("memory:saveProfileStart", text=text, traceId=uuid.uuid4().hex, language=_language())
     reaction = await _react_to_status(reply)
     failure = _failure_text(reply, "Saving to the owner's profile")
     if failure:
@@ -326,7 +366,7 @@ _background_saves: set[asyncio.Task[Any]] = set()   # strong references: a bare 
 async def _save_in_background(params: dict[str, Any], inject: Any) -> None:
     started = time.monotonic()
     try:
-        reply = await _memory("memory:save", **params)
+        reply = await _save_job("memory:saveStart", **params)
     except Exception as exc:  # noqa: BLE001 -- reported to the model below, never raised into nothing
         reply = {"status": "error", "error": {"code": "exception", "message": str(exc)}}
     try:
@@ -346,7 +386,7 @@ async def _save_in_background(params: dict[str, Any], inject: Any) -> None:
     failure = _failure_text(reply, "Saving to memory in the background")
     if failure and inject is not None:
         inject(
-            "[Service message: a save_info you called earlier did not go through. " + " ".join(filter(None, [failure, reaction]))
+            "[Service message about a save_info you called earlier. " + " ".join(filter(None, [failure, reaction]))
             + f"\nWhat was to be saved: {params['text'][:2000]}\nTell the user only if it matters to them.]"
         )
 
