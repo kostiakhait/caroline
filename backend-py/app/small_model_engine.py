@@ -1273,10 +1273,19 @@ _COMPLEXITY_PROMPT = (
 # it runs, and it may act). Off by FAST_LANE_ENABLED = False.
 
 FAST_LANE_ENABLED = True
-# A strong model without extended thinking: closest to "answers in a couple of
-# seconds" among the configured ones. One constant, so it is easy to compare others.
-FAST_LANE_MODEL_ATTR = "AI_MODEL_ALTERNATE"
+# Picked by benchmark (2026-10-10, same prompt/persona/key as the app, 8 questions:
+# 3 to answer, 5 that need tools). Median latency / correct decisions:
+#   claude-haiku-4.5 1.8s 8/8 | claude-sonnet-5 2.6s 8/8 (2x the price)
+#   gemini-2.5-flash 1.5s 7/8 -- made up the time ("Сейчас 16:35")
+#   gpt-4.1-mini 1.6s 6/8 -- made up memory ("ты мне вчера ничего не говорил")
+#   gpt-5-nano/minimal 1.8s 4/8 -- asked for details instead of handing tasks on
+#   gemini-2.5-flash-lite 1.5s 2/4 -- "Я проверила вашу почту", an invented email
+# Cheaper than Haiku only meant confident wrong answers -- worse than a slow one.
+FAST_LANE_MODEL = "anthropic/claude-haiku-4.5"
 FAST_LANE_TIMEOUT_S = 15.0
+# Only for a reasoning model in the fast lane (e.g. {"effort": "minimal"} for
+# gpt-5-nano) -- left at its default such a model thinks for seconds first.
+FAST_LANE_REASONING: dict[str, str] | None = None
 FAST_LANE_DECLINE = "[[NEEDS_TOOLS]]"
 _FAST_LANE_DIALOGUE_LINES = 12
 
@@ -1328,7 +1337,7 @@ async def try_fast_answer(
         if not api_key:
             return None
         ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
-        model = getattr(camerlengo_ai.Config, FAST_LANE_MODEL_ATTR)
+        model = FAST_LANE_MODEL
         system = "\n\n".join([
             _persona_system_message(persona),
             owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
@@ -1339,7 +1348,7 @@ async def try_fast_answer(
             messages.append({"role": "assistant" if line.startswith("Caroline:") else "user", "content": line.split(":", 1)[-1].strip()})
         messages.append({"role": "user", "content": user_text})
         raw = await asyncio.wait_for(
-            asyncio.to_thread(ai.resolve_agentic, messages, None, None, model=model, max_iterations=1),
+            asyncio.to_thread(ai.resolve_agentic, messages, None, None, model=model, max_iterations=1, reasoning=FAST_LANE_REASONING),
             timeout=FAST_LANE_TIMEOUT_S,
         )
     except Exception as exc:  # noqa: BLE001 -- the cascade is always there to fall back on
