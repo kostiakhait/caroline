@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from app.http_tls import ssl_context
 from app.plugins.sw_api import API_URL, mint_v2_session
 
 # Scoped key for the email:create v2 command (see reforce's
@@ -55,7 +56,7 @@ def own_ratatosk_email(workspace_dir: str) -> str | None:
 
 
 async def _create_mailbox(address: str, password: str) -> tuple[bool, str | None]:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=30.0) as client:
         res = await client.post(API_URL, json={
             "command": "email:create", "key": EMAIL_CREATE_KEY, "address": address, "password": password, ".msgid": uuid.uuid4().hex,
         })
@@ -66,7 +67,7 @@ async def _create_mailbox(address: str, password: str) -> tuple[bool, str | None
 
 
 async def _register_account_only(email: str, password: str) -> tuple[bool, str | None]:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=30.0) as client:
         res = await client.post(API_URL, json={"command": "user:add", "path": "/users", "user": email, "password": password})
         data = res.json()
     if data.get(".status") != "ok" or not data.get("session"):

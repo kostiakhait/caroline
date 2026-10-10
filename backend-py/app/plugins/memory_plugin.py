@@ -52,6 +52,7 @@ from typing import Any
 
 import httpx
 
+from app.http_tls import ssl_context
 from app import memory_turns
 from app.logging_setup import log_event
 from app.memory_topics import is_stale, replace_topics, update_topic
@@ -92,7 +93,7 @@ class MemoryInputError(Exception):
 
 
 async def _post(body: dict[str, Any]) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=REQUEST_TIMEOUT_S) as client:
         response = await client.post(API_URL, json=body)
     if response.status_code >= 400:
         raise SwApiError(f'SquirrelWisdom API HTTP {response.status_code} for command "{body.get("command")}"')

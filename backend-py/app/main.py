@@ -437,6 +437,9 @@ async def _start_ratatosk_background_loops() -> None:
     # Logs the stack of whatever blocks this loop for more than 2 s (see app/loop_watchdog.py).
     from app import loop_watchdog
     loop_watchdog.start(asyncio.get_running_loop())
+    # The one TLS context every httpx client shares, built off the loop (see app/http_tls.py).
+    from app import http_tls
+    asyncio.create_task(http_tls.warm_up())
     asyncio.create_task(_prune_redundant_archives_in_background())
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
