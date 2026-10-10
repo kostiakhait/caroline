@@ -212,9 +212,12 @@ STOP_RESETS_CONN_STATES = ("limited", "billing_blocked")
 STOP_KEEPS_TOOLS = frozenset({"save_info", "owner_profile_remember"})
 # Shown to the model with the user's first message after a Stop, as its own block.
 STOP_NOTE_TEXT = (
-    "[Note: the user pressed Stop during your previous turn and everything it was running was killed. "
-    "Whatever action was in progress may be incomplete or partially applied -- do not assume it finished, "
-    "and do not resume it unless the user asks you to.]"
+    "[Note: the user pressed Stop during your previous turn, and everything it was running was killed. "
+    "Pressing Stop usually means the user did not like what you were doing or how you were doing it: they "
+    "may well expect you to change your behavior, not to carry on. Whatever action was in progress may be "
+    "incomplete or partially applied -- do not assume it finished, and do not resume it or repeat it unless "
+    "the user asks you to. Read their message below with that in mind, and if it is not clear what they want "
+    "done differently, ask.]"
 )
 # Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
 # API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
@@ -2358,7 +2361,7 @@ class ChatSession:
             raise
         except Exception as exc:  # noqa: BLE001 -- this path must never wedge the session
             log_event("engine", "small_model_turn_unexpected_error", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
-            result = {"status": "answered", "text": "Сейчас не получается ответить на это — попробуй ещё раз чуть позже."}
+            result = {"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         await self._finish_small_model_turn_answered(question_text, result["text"], is_voice)
@@ -4654,12 +4657,14 @@ class ChatSession:
                                 )
                                 continue
                             log_event("engine", "classifier_refusal_recurred", tab_id=self.tab_id, category=category)
+                            # English like every text in the code: this becomes an
+                            # assistant message, which _translate_wire_visible_text
+                            # puts into the conversation's language before sending.
                             explanation = (
-                                "Не смогла ответить на предыдущее сообщение: сработал внутренний фильтр безопасности "
-                                "Anthropic" + (f" (категория «{category}»)" if category else "") +
-                                ", похоже на ложное срабатывание — с содержанием разговора это не связано. Повторная "
-                                "попытка тоже не прошла. Попробуйте переформулировать сообщение или повторить чуть "
-                                "позже."
+                                "I couldn't answer the previous message: Anthropic's internal safety filter was "
+                                "triggered" + (f" (category \"{category}\")" if category else "") +
+                                ", most likely a false positive unrelated to what we were discussing. The retry "
+                                "failed too. Please rephrase the message or try again a little later."
                             )
                             for block in message.content:
                                 if isinstance(block, TextBlock):

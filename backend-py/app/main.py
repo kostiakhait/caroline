@@ -808,9 +808,18 @@ async def _notify_owner_ratatosk_turn_had_no_reply(missing_group_ids: list[str])
             return
         session = await get_own_v2_session(WORKSPACE_DIR)
         notice = (
-            "⚠️ Не смогла нормально ответить на предыдущее сообщение (сбой или лимит) -- напишите ещё раз, если "
-            "это всё ещё актуально."
+            "⚠️ I couldn't properly answer the previous message (a failure or a usage limit) -- please write "
+            "again if it still matters."
         )
+        # English like every text in the code, translated into the owner's language for sending.
+        try:
+            from app.plugins.voice_api import translate_text
+            primary = primary_session()
+            language = current_language_name(primary.tab_id) if primary else None
+            if language:
+                notice = await translate_text(notice, language) or notice
+        except Exception as exc:  # noqa: BLE001 -- an untranslated notice is still better than none
+            log_event("engine", "ratatosk_failure_notice_translate_failed", error=str(exc))
         targets = missing_group_ids or [await find_or_create_dm(session, caroline_email, owner_email)]
         for group_id in targets:
             await send_message(session, group_id, caroline_email, notice)
