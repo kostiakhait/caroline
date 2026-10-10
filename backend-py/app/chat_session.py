@@ -388,6 +388,11 @@ _RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
 # connect()+generator wiring, content-as-block-list included, not just the
 # SDK's query(str) convenience path).
 FORCED_COMPACTION_HOURLY_MS = 3_600_000
+# Per explicit instruction (2026-10-10): messages the user sends one after
+# another are one message for the model. A user message waits this long;
+# every further one within the window joins it and restarts the wait. The
+# chat window still shows each bubble as it was typed.
+USER_MESSAGE_MERGE_WINDOW_S = 5.0
 # Per explicit instruction (2026-10-10): a compaction loses whatever the
 # model learned and never saved, so an hourly/growth compaction is preceded
 # by a service turn asking it to save first (see _check_forced_compaction).
@@ -1405,6 +1410,9 @@ class ChatSession:
         # queue / turn plumbing
         self.queue: list[dict[str, Any]] = []
         self._queue_event = asyncio.Event()
+        # User messages waiting out USER_MESSAGE_MERGE_WINDOW_S (see submit_or_try_small_model).
+        self._held_user_messages: list[tuple[str, list[Any], bool]] = []
+        self._held_user_flush: asyncio.TimerHandle | None = None
         self.turn_is_voice = False
         self.classifier_refusal_retry_count = 0
         # Backing field for the turn_pending property (defined below,
@@ -2251,9 +2259,38 @@ class ChatSession:
         self._push_message(wire_text, attachments, is_voice)
 
     def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, is_real_user: bool = True) -> None:
-        """Compatibility entry point for existing callers. In "sw" mode submit()
-        itself routes every turn to the small-model path, so this just delegates."""
-        self.submit(text, attachments, is_real_user, is_voice)
+        """The entry point for what the USER sends (the chat window, the
+        REST /api/message, the phone). In "sw" mode submit() itself routes
+        every turn to the small-model path.
+
+        Per explicit instruction (2026-10-10): consecutive user messages go
+        to the model as ONE. Seen live: four short messages typed one after
+        another reached the Claude CLI as four separate user messages, each
+        cutting into the work the previous one had started. A user message
+        is held for USER_MESSAGE_MERGE_WINDOW_S; each further one within
+        that time joins it and restarts the wait; then they are submitted
+        together. Internal turns and replays call submit() directly and are
+        never held."""
+        if not is_real_user:
+            self.submit(text, attachments, is_real_user, is_voice)
+            return
+        self._held_user_messages.append((text, list(attachments or []), is_voice))
+        if self._held_user_flush is not None:
+            self._held_user_flush.cancel()
+        self._held_user_flush = asyncio.get_running_loop().call_later(USER_MESSAGE_MERGE_WINDOW_S, self._flush_held_user_messages)
+        log_event("engine", "user_message_held", tab_id=self.tab_id, held=len(self._held_user_messages), text_len=len(text))
+
+    def _flush_held_user_messages(self) -> None:
+        held, self._held_user_messages = self._held_user_messages, []
+        self._held_user_flush = None
+        if not held or self.ended:
+            return
+        text = "\n\n".join(item_text for item_text, _attachments, _voice in held if item_text)
+        attachments = [attachment for _text, item_attachments, _voice in held for attachment in item_attachments]
+        is_voice = any(voice for _text, _attachments, voice in held)
+        if len(held) > 1:
+            log_event("engine", "user_messages_merged", tab_id=self.tab_id, count=len(held), text_len=len(text))
+        self.submit(text, attachments, True, is_voice)
 
     def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
         """Every turn in "sw" mode goes here, never to the Claude SDK (2026-10-03):
