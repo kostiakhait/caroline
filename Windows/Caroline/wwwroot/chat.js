@@ -2374,6 +2374,11 @@
     if (e.dataTransfer?.files?.length) handleFilesSelected(e.dataTransfer.files);
   });
 
+  // What speech recognition produced for the text now in the input box (2026-10-10),
+  // sent alongside the message so the backend can learn from the user's own edits
+  // to it -- see backend-py/app/stt_adaptation.py.
+  let pendingVoiceTranscript = null;
+
   function send(voiceOrigin, overrideText) {
     const text = (overrideText !== undefined ? overrideText : inputEl.value).trim();
     if (!text && pendingAttachments.length === 0) return;
@@ -2389,7 +2394,9 @@
     // wait for the previous turn just to queue up the next one.
     turnQueue.push({ isVoice: !!voiceOrigin, assistantText: "", spoken: false });
     addBubble("user", text, pendingAttachments);
-    ws.send(JSON.stringify({ type: "user_message", text, attachments: pendingAttachments, voice: !!voiceOrigin }));
+    const voiceTranscript = voiceOrigin ? undefined : pendingVoiceTranscript || undefined;
+    pendingVoiceTranscript = null;
+    ws.send(JSON.stringify({ type: "user_message", text, attachments: pendingAttachments, voice: !!voiceOrigin, voiceTranscript }));
     inputEl.value = "";
     pendingAttachments = [];
     renderPendingAttachments();
@@ -2494,6 +2501,7 @@
           if (voiceAutoSend.checked) {
             send(true, text.trim());
           } else {
+            pendingVoiceTranscript = pendingVoiceTranscript ? `${pendingVoiceTranscript} ${text.trim()}` : text.trim();
             inputEl.value = inputEl.value ? `${inputEl.value} ${text.trim()}` : text.trim();
             autoGrow();
             inputEl.focus();

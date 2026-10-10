@@ -28,6 +28,7 @@ from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
+from app.stt_adaptation import apply_adaptation, observe_user_message
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
@@ -1017,6 +1018,8 @@ async def handle_control_request(
             except Exception as exc:
                 log_event("engine", "stt_failed", request_id=request_id, error=str(exc))
                 return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
+        # Learned per-user mishearings (2026-10-10) -- see stt_adaptation.py.
+        text = apply_adaptation(WORKSPACE_DIR, text)
         log_event("engine", "stt_done", request_id=request_id, text_len=len(text))
         return {"type": "control_response", "op": op, "ok": True, "stdout": text, "requestId": request_id}
     if op == "local_stt_get":
@@ -1868,6 +1871,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             # fix for why). Cheap, always-useful visibility going forward.
             log_event("ws", "message_received", tab_id=tab_id, msg_type=msg_type, op=data.get("op") if msg_type == "control_request" else None)
             if msg_type == "user_message":
+                observe_user_message(WORKSPACE_DIR, tab_id, data.get("text", ""), bool(data.get("voice")), data.get("voiceTranscript"))
                 session.submit_or_try_small_model(data.get("text", ""), data.get("attachments") or [], bool(data.get("voice")))
             elif msg_type == "interrupt":
                 session.stop()
