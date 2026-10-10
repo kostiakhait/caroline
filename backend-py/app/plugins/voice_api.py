@@ -666,8 +666,18 @@ def _already_said_block(already_said: list[str] | None) -> str:
     its own earlier remarks in view the model restates the same status each time, which
     is the \"talking to herself\" stream chat_session.py's consecutive_narration_count
     describes. Empty for the 60s path, which never passes it."""
-    if not already_said:
+    if already_said is None:
         return ""
+    if not already_said:
+        # Seen live (2026-10-10): with only "the request was received, work started" in
+        # STATUS the model answered "nothing concrete" four times running, and a voice
+        # user sat through a minute of silence. That the work on THEIR request has
+        # started is a real fact -- the one thing worth saying first.
+        return (
+            "Nothing has been said to the user about this request yet. If STATUS shows the work has started, "
+            "say so in one short present-tense sentence in the user's own terms (what you're looking into) -- "
+            "that is a fact, not a promise.\n\n"
+        )
     lines = "\n".join(f"- {remark}" for remark in already_said[-6:])
     return (
         "ALREADY SAID to the user during this request (they heard these; never repeat or rephrase them -- say "
@@ -814,6 +824,8 @@ async def generate_progress_comment(
         "progress so far, never as the final answer.\n"
         "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
         "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\".\n"
+        "STATUS may end with how long the request has been running. If nothing new has happened for a long "
+        "while, you may say once, plainly, that this one is taking a while -- never guess how long is left.\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n\n"
         "Write in English. A separate step translates it afterward.\n\n"

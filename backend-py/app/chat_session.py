@@ -3895,8 +3895,11 @@ class ChatSession:
                 return
         self._narration_facts_at_last_draft = facts
         self._narration_last_draft_at = now
+        # Elapsed time is a real fact too ("this one is taking a while"), but only for the
+        # model: kept out of the comparison above, it would make every draft look new.
+        facts_for_model = f"{facts}\nВремя работы над запросом: {int(now - started)} с."
         self._narration_draft_task = asyncio.create_task(
-            self._draft_voice_narration(self._narration_turn_seq, facts, self._narration_task(), list(self.turn_narration_remarks))
+            self._draft_voice_narration(self._narration_turn_seq, facts_for_model, self._narration_task(), list(self.turn_narration_remarks))
         )
 
     async def _draft_voice_narration(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
