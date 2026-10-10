@@ -434,6 +434,9 @@ async def _start_ratatosk_background_loops() -> None:
     # scratch) and every tab's session start reads it instead of spawning
     # its own. See app/account_state.py.
     asyncio.create_task(run_account_state_refresher())
+    # Logs the stack of whatever blocks this loop for more than 2 s (see app/loop_watchdog.py).
+    from app import loop_watchdog
+    loop_watchdog.start(asyncio.get_running_loop())
     asyncio.create_task(_prune_redundant_archives_in_background())
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)

@@ -131,6 +131,7 @@ from app.policies import (
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
+from app import memory_nudge
 from app.session_context import register_inject_proactive, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
@@ -387,6 +388,15 @@ _RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
 # connect()+generator wiring, content-as-block-list included, not just the
 # SDK's query(str) convenience path).
 FORCED_COMPACTION_HOURLY_MS = 3_600_000
+# Per explicit instruction (2026-10-10): a compaction loses whatever the
+# model learned and never saved, so an hourly/growth compaction is preceded
+# by a service turn asking it to save first (see _check_forced_compaction).
+MEMORY_FLUSH_BEFORE_COMPACTION_TEXT = (
+    "[Your context is about to be compacted: much of the detail of what you have done and learned since your "
+    "last save_info will be gone afterwards. Save to memory now, with save_info, everything new and specific "
+    "from that work that may matter later -- people, contacts, links, numbers, file locations, what was decided "
+    "or done and its result, what is still open. Then reply with exactly [[NO_UPDATE]].]"
+)
 # Bug fix (2026-09-15): replaced the old byte-based growth threshold (see
 # tokens_at_last_forced_compaction's own __init__ comment for why bytes was
 # the wrong signal) -- this is real context tokens, checked against
@@ -1378,6 +1388,8 @@ class ChatSession:
         self._stop_killed_idle_engine = False
         # Set by stop(); the user's next real message carries a note (its own block) that the previous turn was killed.
         self._stop_note_pending = False
+        # Set while a forced compaction waits for the save-to-memory turn it asked for.
+        self._memory_flushed_for_compaction = False
         self._stop_note_in_next_push = False
         self._memory_replay_timer: asyncio.TimerHandle | None = None
         memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
@@ -3911,6 +3923,18 @@ class ChatSession:
                 self.needs_startup_compaction = False
                 self.last_forced_compaction_at = now
                 return
+
+        # Save first (per explicit instruction, 2026-10-10): one service turn
+        # asking the model to save what it learned; the compaction itself
+        # runs on a later tick, once that turn is over (turn_pending gates
+        # this whole method). Not for "startup" (nothing was learned in this
+        # process yet) nor "post_limit" (the turn would hit the cap again).
+        if reason in ("hourly", "growth") and memory_nudge.has_unsaved_work(self.tab_id) and not self._memory_flushed_for_compaction:
+            self._memory_flushed_for_compaction = True
+            log_event("engine", "memory_flush_before_compaction", tab_id=self.tab_id, reason=reason)
+            self.inject_proactive(MEMORY_FLUSH_BEFORE_COMPACTION_TEXT, suppress_narration=True)
+            return
+        self._memory_flushed_for_compaction = False
 
         self.needs_startup_compaction = False
         self.last_forced_compaction_at = now

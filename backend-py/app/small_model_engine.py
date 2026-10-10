@@ -968,6 +968,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
             return "Unknown or already-completed operation_id."
         body = _operation_to_dict(op)
         if op.status in ("done", "error", "cancelled"):
+            op.collected = True  # no completion notice repeating it (operations._notify_unless_collected)
             OPERATIONS_REGISTRY.forget(op.id)
             tracker.pending_operation_ids.discard(op.id)
         return str(body)
@@ -1084,10 +1085,11 @@ def _make_executor_fn(
 
         envelope = asyncio.run_coroutine_threadsafe(_run(), main_loop).result()
         log_event("engine", "small_model_tool_result", tab_id=tab_id, tool=name, status=envelope.get("status"))
+        note = f"\n{envelope['memory_note']}" if envelope.get("memory_note") else ""
         if envelope.get("status") == "error":
-            return f"ERROR: {envelope.get('error')}"
+            return f"ERROR: {envelope.get('error')}{note}"
         if envelope.get("status") == "cancelled":
-            return "ERROR: this tool call was cancelled before it finished."
+            return f"ERROR: this tool call was cancelled before it finished.{note}"
         if envelope.get("status") == "running":
             # Genuinely normal (a slow tool call, e.g. a network-bound
             # plugin) -- NOT a signal of anything wrong. resolve_agentic()
@@ -1104,7 +1106,7 @@ def _make_executor_fn(
                 tracker.pending_operation_ids.add(op_id)
             return f"Operation {op_id} is still running."
         result = envelope.get("result")
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        return (result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)) + note
 
     return executor_fn
 
