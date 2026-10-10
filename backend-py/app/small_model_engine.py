@@ -72,6 +72,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -1201,6 +1202,26 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
 _UNAVAILABLE_ANSWER = "I can't answer this right now -- please try again a little later."
 
 
+# The verifier is told its reply IS the final message to the user. Seen live
+# (2026-10-10, three turns in a row): the cheap verifier model instead wrote a
+# review OF the reply -- "Ответ, который вы получили, полностью покрывает запрос...",
+# "Ответ удовлетворяет всем условиям...", "Проверила, ответ подробный и
+# соответствует задаче, дополнительных действий не требуется" -- and that review is
+# what the user heard instead of a 1657-char real answer. Only replies that talk
+# ABOUT "the reply" are caught: "Задача выполнена: письмо отправлено" is a real
+# answer and must pass.
+_VERDICT_PATTERNS = (
+    re.compile(r"\b(ответ|reply|response)\w*\b.{0,80}\b(удовлетвор|соответству|покрыва|корректн|полност|"
+               r"meets|satisf|covers|is complete|fully|correct)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bдополнительн\w* (работ|действи|шаг)\w* не требу", re.IGNORECASE),
+    re.compile(r"\bno (further|additional) (work|action|steps?) (is |are )?(needed|required)", re.IGNORECASE),
+)
+
+
+def _looks_like_verdict(text: str) -> bool:
+    return len(text) < 400 and any(p.search(text) for p in _VERDICT_PATTERNS)
+
+
 def _usable(text: str) -> bool:
     return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
 
@@ -1437,6 +1458,9 @@ async def run_small_model_turn(
         if can_escalate and ESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=verified.replace(ESCALATION_SENTINEL, "").strip()[:200])
             return verified, True
+        if _looks_like_verdict(verified) and _usable(candidate_text):
+            log_event("engine", "small_model_verification_verdict_replaced", tab_id=tab_id, verdict=verified, candidate_len=len(candidate_text))
+            return candidate_text, False
         log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
         return verified, False
 
