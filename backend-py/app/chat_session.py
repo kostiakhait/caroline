@@ -210,6 +210,12 @@ STOP_RESETS_CONN_STATES = ("limited", "billing_blocked")
 # Stop tears down the main model and everything it launched through tools --
 # except a write into memory already under way, which is left to finish.
 STOP_KEEPS_TOOLS = frozenset({"save_info", "owner_profile_remember"})
+# Shown to the model with the user's first message after a Stop, as its own block.
+STOP_NOTE_TEXT = (
+    "[Note: the user pressed Stop during your previous turn and everything it was running was killed. "
+    "Whatever action was in progress may be incomplete or partially applied -- do not assume it finished, "
+    "and do not resume it unless the user asks you to.]"
+)
 # Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
 # API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
 # is "keep retrying forever because the operation never even started" (a
@@ -1367,6 +1373,9 @@ class ChatSession:
         self._memory_replay: dict[str, Any] | None = None
         # Set by stop() when it kills an engine that was idle between turns; read by the run loop.
         self._stop_killed_idle_engine = False
+        # Set by stop(); the user's next real message carries a note (its own block) that the previous turn was killed.
+        self._stop_note_pending = False
+        self._stop_note_in_next_push = False
         self._memory_replay_timer: asyncio.TimerHandle | None = None
         memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
 
@@ -2068,6 +2077,12 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        if is_real_user and self._stop_note_pending:
+            # Delivered by _push_message as its own, machine-marked block --
+            # not glued into the user's words, so language detection and the
+            # history readers keep seeing exactly what the user wrote.
+            self._stop_note_pending = False
+            self._stop_note_in_next_push = True
         if is_real_user:
             # A real message begins a turn for the memory service's money rules
             # (memory_turns.py) and supersedes a turn still waiting to be replayed.
@@ -2520,6 +2535,18 @@ class ChatSession:
         # A request queued behind a proactive turn (see small_model_queued_real_turns)
         # must not run right after an explicit Stop -- that's the opposite of what Stop means.
         self.small_model_queued_real_turns = []
+        # Bug fix (2026-10-09), confirmed live ("дважды жал стоп -- нихуя не
+        # остановилось"): input already queued for the engine but not yet
+        # taken by it (a nudge, a reminder, a follow-up, an earlier message)
+        # survived Stop and was fed to the fresh engine the moment it came
+        # back up. Everything queued before the click goes; what the user
+        # sends AFTER it is a new instruction and is kept.
+        dropped_inputs = len(self.queue)
+        self.queue.clear()
+        self.compaction_queued_turns = []
+        # The model learns about the Stop with the user's next message (see
+        # submit()), never through a turn of its own.
+        self._stop_note_pending = True
         # An explicit Stop must also cancel any pending "resumed question needs a visible answer" re-ask,
         # or the abandoned turn would start again on its own.
         self.resumed_unanswered_question = None
@@ -2600,6 +2627,11 @@ class ChatSession:
             # anything asynchronous below even gets scheduled.
             self._kill_engine_process_tree("Stop during a turn")
             asyncio.create_task(self._force_stop_client())
+        # Idle at once: the run loop only notices the dead engine when its
+        # stream breaks, which was seen to take 20-55 s; the status bar and
+        # the next message must not wait for that.
+        self.turn_pending = False
+        log_event("engine", "user_stop_dropped_queued_input", tab_id=self.tab_id, count=dropped_inputs)
         # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
         # only stops the model's own generation stream. A tool call that
         # already crossed dispatch()'s fast-path window (app/operations.py)
@@ -2615,6 +2647,18 @@ class ChatSession:
         # this method -- see the 2026-10-09 note there; the 2026-09-14 fix
         # that first added the clearing had put it here, after the early
         # return, where a Stop between turns never reached it.)
+
+    def _reset_after_stop(self) -> None:
+        """The run loop's side of a Stop, once the killed engine's stream has
+        broken. A message the user sent AFTER the click is already queued
+        and is a new instruction: it keeps its turn and runs on the fresh
+        engine. Otherwise the tab is simply idle."""
+        if self.queue:
+            log_event("engine", "after_stop_keeping_new_user_input", tab_id=self.tab_id, count=len(self.queue))
+            return
+        self.turn_pending = False
+        self.pending_user_text = None
+        self.pending_attachments = []
 
     def _kill_engine_process_tree(self, why: str) -> int:
         """Kills the engine process (claude.exe / codex) and every process
@@ -2745,6 +2789,9 @@ class ChatSession:
             sent_line += ", via voice input -- may contain transcription errors"
         sent_line += "]"
         content: list[dict[str, Any]] = [{"type": "text", "text": sent_line}]
+        if self._stop_note_in_next_push:
+            self._stop_note_in_next_push = False
+            content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + STOP_NOTE_TEXT})
         for attachment in attachments:
             content.extend(_attachment_to_blocks(attachment))
         if text:
@@ -5245,29 +5292,19 @@ class ChatSession:
                     self._stop_killed_idle_engine = False
                     self.user_stop_requested = False
                     log_event("engine", "restarting_engine_after_stop_between_turns", tab_id=self.tab_id)
-                    self.turn_pending = False
-                    self.pending_user_text = None
-                    self.pending_attachments = []
+                    self._reset_after_stop()
                     continue
 
                 if self.user_stop_requested:
                     self.user_stop_requested = False
-                    # Bug fix (2026-09-11): no more explicit "stopped"
-                    # wire message -- setting turn_pending below (via the
-                    # property setter) already auto-publishes the correct
-                    # status (READY, since nothing else is pending yet at
-                    # this exact instant), and the imminent resubmit()
-                    # right after auto-publishes WORKING again. Two states
-                    # correctly represented, no special-cased message type.
-                    self.turn_pending = False
-                    self.pending_user_text = None
-                    self.pending_attachments = []
-                    self.submit(
-                        "[The user just stopped what you were doing. Whatever action was in progress may be "
-                        "incomplete or partially applied -- don't assume it finished. Wait for their next "
-                        "instruction.]",
-                        [], False,
-                    )
+                    # Bug fix (2026-10-09), confirmed live: this used to
+                    # submit a "[The user just stopped what you were doing...]"
+                    # note as a turn of its own -- so every Stop started a new
+                    # turn 20-55 s later, the moment the engine came back up,
+                    # and the model went on working. Now nothing is started:
+                    # the note rides on the user's next real message instead
+                    # (see _stop_note_pending in submit()).
+                    self._reset_after_stop()
                     continue
 
                 if self.restart_pending:
