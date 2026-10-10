@@ -308,6 +308,13 @@ ABSOLUTE_TURN_TIMEOUT_S = 1800
 # practice once this path is re-enabled.
 REASONING_EFFORT = {"effort": "high"}
 
+# Per tier (2026-10-10) -- live evidence for the "reconsider" note above. At "high",
+# gpt-5-nano spent 24-34s and 3.5-5.3k completion tokens on EVERY agentic step of a
+# plain "what can you do" turn: 117s of a 164s voice turn. The cheap tiers run at
+# low/medium; a weak first attempt is still caught -- the verifier escalates an
+# unfinished answer to the next tier -- and the last tier keeps REASONING_EFFORT.
+TIER_REASONING_EFFORT = ({"effort": "low"}, {"effort": "medium"}, REASONING_EFFORT)
+
 # Per explicit instruction (2026-09-13): OpenRouter's "middle-out" transform
 # (enabled by default inside OpenRouterAdapter._resolve() for every OTHER
 # caller) silently compresses the MIDDLE of a long message list once it
@@ -1484,7 +1491,7 @@ async def run_small_model_turn(
                     messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
                     model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                     get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                    reasoning=REASONING_EFFORT, on_usage=on_usage,
+                    reasoning=TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)], on_usage=on_usage,
                 ),
                 tab_id, emit,
             )
