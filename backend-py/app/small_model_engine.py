@@ -1260,6 +1260,104 @@ _COMPLEXITY_PROMPT = (
 )
 
 
+# ------------------------------------------------------------------ fast lane --
+#
+# Prototype (2026-10-10), per explicit request ("нужно очень быстро... с твоей
+# скоростью"): a question that needs no tools -- "what can you do", "explain
+# fractions" -- went through the whole cascade anyway: tier pick, a reasoning model,
+# the verifier, then a forced translation of an answer already in the right language.
+# Measured live: 50-160s for exactly such questions. One plain call to a fast model
+# answers them directly; anything needing live data, the user's own data or an action
+# is declined with FAST_LANE_DECLINE and goes through the cascade exactly as before
+# (sequentially -- never in parallel: a cascade worker can't be reliably stopped once
+# it runs, and it may act). Off by FAST_LANE_ENABLED = False.
+
+FAST_LANE_ENABLED = True
+# A strong model without extended thinking: closest to "answers in a couple of
+# seconds" among the configured ones. One constant, so it is easy to compare others.
+FAST_LANE_MODEL_ATTR = "AI_MODEL_ALTERNATE"
+FAST_LANE_TIMEOUT_S = 15.0
+FAST_LANE_DECLINE = "[[NEEDS_TOOLS]]"
+_FAST_LANE_DIALOGUE_LINES = 12
+
+
+def _fast_lane_instructions(language: str, is_voice: bool) -> str:
+    style = (
+        "This is a spoken conversation: your reply will be read aloud. Plain sentences only -- no markdown, no "
+        "lists, no emoji. Keep it short and natural, like a person answering out loud (2-5 sentences), unless "
+        "the user asked for detail."
+        if is_voice
+        else "Keep it concise and to the point."
+    )
+    return (
+        f"Reply in {language}.\n{style}\n\n"
+        "Answer the user's last message directly ONLY if you can do it fully and correctly from this conversation "
+        "and general knowledge alone. If answering needs ANYTHING else -- current or live information (weather, "
+        "news, prices, dates, schedules), the user's own data (mail, notes, files, contacts, calendar, anything "
+        "remembered about them beyond this conversation), looking something up, or doing anything (sending, "
+        "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else. "
+        "When unsure, decline. Never claim to have done, checked or saved anything, and never promise to."
+    )
+
+
+def fast_answer_is_in_language(text: str, language: str) -> bool:
+    """Whether the forced translation pass can be skipped for a fast-lane answer:
+    only for the two languages it can be told apart cheaply and safely. Russian
+    must not contain Ukrainian-only letters (a Russian/Ukrainian mix-up is exactly
+    what the translation pass exists to catch)."""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 10:
+        return False
+    cyrillic = sum(1 for c in letters if "\u0400" <= c <= "\u04ff") / len(letters)
+    if language == "Russian":
+        return cyrillic >= 0.85 and not any(c in "іїєґІЇЄҐ" for c in text)
+    if language == "English":
+        return cyrillic == 0 and sum(1 for c in letters if c.isascii()) / len(letters) >= 0.95
+    return False
+
+
+async def try_fast_answer(
+    workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
+) -> str | None:
+    """The fast-lane answer, or None to run the full cascade. Never raises."""
+    if not FAST_LANE_ENABLED or camerlengo_ai is None:
+        return None
+    started = time.monotonic()
+    try:
+        api_key = await get_model_provider_key()
+        if not api_key:
+            return None
+        ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
+        model = getattr(camerlengo_ai.Config, FAST_LANE_MODEL_ATTR)
+        system = "\n\n".join([
+            _persona_system_message(persona),
+            owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
+            _fast_lane_instructions(language, is_voice),
+        ])
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+        for line in recent_dialogue_lines[-_FAST_LANE_DIALOGUE_LINES:]:
+            messages.append({"role": "assistant" if line.startswith("Caroline:") else "user", "content": line.split(":", 1)[-1].strip()})
+        messages.append({"role": "user", "content": user_text})
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(ai.resolve_agentic, messages, None, None, model=model, max_iterations=1),
+            timeout=FAST_LANE_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the cascade is always there to fall back on
+        log_event("engine", "fast_lane_failed", error=str(exc)[:300], error_type=type(exc).__name__,
+                  ms=int((time.monotonic() - started) * 1000))
+        return None
+    text = str(raw or "").strip()
+    ms = int((time.monotonic() - started) * 1000)
+    if not text or text.startswith("Agent error"):
+        log_event("engine", "fast_lane_failed", error=text[:300], error_type="agent_error", ms=ms)
+        return None
+    if FAST_LANE_DECLINE in text:
+        log_event("engine", "fast_lane_declined", ms=ms)
+        return None
+    log_event("engine", "fast_lane_answered", ms=ms, model=model, text_len=len(text), text=text)
+    return text
+
+
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
     """Pre-assessment: a complex multi-step tool task starts directly at the second
     tier (mini) instead of the first (nano). AI_MODEL_SMALL is used only for this

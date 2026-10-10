@@ -116,7 +116,7 @@ from app.failure_classification import (
 from app.logging_setup import log_event
 from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
-from app.small_model_engine import run_small_model_turn
+from app.small_model_engine import fast_answer_is_in_language, run_small_model_turn, try_fast_answer
 from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
@@ -2467,13 +2467,23 @@ class ChatSession:
             # until the turn itself actually ends, not just until the first tick.
             asyncio.create_task(self._publish_status())
 
+        translate_answer = True
         try:
-            result = await run_small_model_turn(
-                tab_id=self.tab_id, workspace_dir=self.workspace_dir, persona=persona, user_text=text,
-                recent_dialogue_lines=recent_dialogue_lines, language=language,
-                send=self.send, on_live_dialogue_update=on_live_dialogue_update,
-                get_new_user_comments=get_new_user_comments, on_activity=on_activity,
-            )
+            fast = None
+            # Fast lane (2026-10-10 prototype, see small_model_engine.try_fast_answer):
+            # real user questions only, and not with attachments (those need tools).
+            if is_real_user and "[The user attached these files" not in text:
+                fast = await try_fast_answer(self.workspace_dir, persona, text, recent_dialogue_lines, language, is_voice)
+            if fast is not None:
+                result = {"status": "answered", "text": fast}
+                translate_answer = not fast_answer_is_in_language(fast, language)
+            else:
+                result = await run_small_model_turn(
+                    tab_id=self.tab_id, workspace_dir=self.workspace_dir, persona=persona, user_text=text,
+                    recent_dialogue_lines=recent_dialogue_lines, language=language,
+                    send=self.send, on_live_dialogue_update=on_live_dialogue_update,
+                    get_new_user_comments=get_new_user_comments, on_activity=on_activity,
+                )
         except asyncio.CancelledError:
             # Stop button -- see stop()'s own small_model_active branch. Never starts a
             # queued real turn -- an explicit Stop means stop, not run the next thing.
@@ -2487,9 +2497,9 @@ class ChatSession:
             result = {"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
-        await self._finish_small_model_turn_answered(question_text, result["text"], is_voice)
+        await self._finish_small_model_turn_answered(question_text, result["text"], is_voice, translate=translate_answer)
 
-    async def _finish_small_model_turn_answered(self, question_text: str, text: str, is_voice: bool) -> None:
+    async def _finish_small_model_turn_answered(self, question_text: str, text: str, is_voice: bool, translate: bool = True) -> None:
         """Synthesizes the same {assistant} + {result} wire pair a normal
         SDK turn's completion sends (see wire.py's message_to_wire), so
         chat.js needs no changes at all to render a small-model answer --
@@ -2515,11 +2525,15 @@ class ChatSession:
         # Same rule as the SDK path (_strip_no_update_from_wire): a silent
         # [[NO_UPDATE]] reply never reaches the visible dialog.
         silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
+        # translate=False: a fast-lane answer already checked to be in the tab's language
+        # (fast_answer_is_in_language) -- the pass took 4-20s live and changed nothing.
+        translated = None
         try:
-            translated = await translate_text(
-                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                addressee_gender=get_owner_profile(self.workspace_dir).gender,
-            )
+            if translate:
+                translated = await translate_text(
+                    text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                )
         except Exception as exc:
             log_event("engine", "small_model_translate_failed", tab_id=self.tab_id, error=str(exc))
             translated = None
