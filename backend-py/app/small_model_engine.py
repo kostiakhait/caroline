@@ -311,9 +311,15 @@ REASONING_EFFORT = {"effort": "high"}
 # Per tier (2026-10-10) -- live evidence for the "reconsider" note above. At "high",
 # gpt-5-nano spent 24-34s and 3.5-5.3k completion tokens on EVERY agentic step of a
 # plain "what can you do" turn: 117s of a 164s voice turn. The cheap tiers run at
-# low/medium; a weak first attempt is still caught -- the verifier escalates an
+# low; a weak first attempt is still caught -- the verifier escalates an
 # unfinished answer to the next tier -- and the last tier keeps REASONING_EFFORT.
-TIER_REASONING_EFFORT = ({"effort": "low"}, {"effort": "medium"}, REASONING_EFFORT)
+TIER_REASONING_EFFORT = ({"effort": "low"}, {"effort": "low"}, REASONING_EFFORT)
+# The verifier only checks a finished candidate against facts it is handed; at "high"
+# it was another 7-10s on the end of every turn.
+VERIFIER_REASONING_EFFORT = {"effort": "low"}
+# One-word SIMPLE/COMPLEX call (_start_tier_index): with no reasoning parameter at
+# all it ran at the model's default and took ~10s live before any real work began.
+COMPLEXITY_REASONING_EFFORT = {"effort": "minimal"}
 
 # Per explicit instruction (2026-09-13): OpenRouter's "middle-out" transform
 # (enabled by default inside OpenRouterAdapter._resolve() for every OTHER
@@ -1261,9 +1267,15 @@ async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
     tool-free and in isolation."""
     try:
         raw = await asyncio.wait_for(
-            asyncio.to_thread(ai.resolve, _COMPLEXITY_PROMPT + user_text[:2000], model=cfg.AI_MODEL_SMALL, no_fallback=True),
+            asyncio.to_thread(
+                ai.resolve_agentic, [{"role": "user", "content": _COMPLEXITY_PROMPT + user_text[:2000]}], None, None,
+                model=cfg.AI_MODEL_SMALL, max_iterations=1, reasoning=COMPLEXITY_REASONING_EFFORT,
+            ),
             timeout=COMPLEXITY_TIMEOUT_S,
         )
+        if str(raw or "").startswith("Agent error"):
+            # resolve_agentic reports a failed call as text, not an exception.
+            log_event("engine", "small_model_complexity_failed", error=str(raw)[:300], error_type="agent_error")
         verdict = str(raw or "").strip().upper()
         start = 1 if verdict.startswith("COMPLEX") else 0
     except Exception as exc:  # noqa: BLE001 -- classification must never block the turn
@@ -1434,7 +1446,7 @@ async def run_small_model_turn(
                 messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
                 model=cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                reasoning=REASONING_EFFORT, on_usage=on_usage,
+                reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage,
             ),
             tab_id, emit,
         )
