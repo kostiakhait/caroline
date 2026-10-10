@@ -1105,9 +1105,45 @@
   // opts.narration (2026-10-09): a progress-narrator remark (the backend's isNarration).
   // A real reply arriving while one still waits in the queue drops it -- read out after
   // the answer it would describe a state that's already over (see dropQueuedNarration).
+  // A long reply is read out in pieces (2026-10-10): synthesizing it whole put the full
+  // synthesis time -- 9s for 121 chars live, plus a separate model call whenever the
+  // text has digits -- as silence before its first word. The first piece is a single
+  // sentence so it starts fast; the rest are synthesized while earlier ones play (see
+  // prefetchSpeech). Visual Mode keeps whole replies: each piece would restart the
+  // talking-head render, and that path hasn't been tried with pieces yet.
+  const SPEECH_PIECE_MAX_CHARS = 240;
+  function splitForSpeech(text) {
+    const sentences = text
+      .split(/\n+/)
+      // List markers would be read out: the backend only strips markdown from a piece
+      // that also has digits (see voice_api.py's _NEEDS_TTS_CLEANUP).
+      .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, ""))
+      .flatMap((line) => line.split(/(?<=[.!?…])\s+/))
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const pieces = [];
+    for (const sentence of sentences) {
+      const last = pieces[pieces.length - 1];
+      if (pieces.length > 1 && last.length + 1 + sentence.length <= SPEECH_PIECE_MAX_CHARS) {
+        pieces[pieces.length - 1] = `${last} ${sentence}`;
+      } else {
+        pieces.push(sentence);
+      }
+    }
+    return pieces.length ? pieces : [text];
+  }
+
   function speak(text, btn, opts) {
     const narration = !!opts?.narration;
     if (!narration && !btn) dropQueuedNarration();
+    if (!btn && !narration && !opts?.audioBase64 && !shouldUseVisualMode(btn) && text.length > SPEECH_PIECE_MAX_CHARS) {
+      const pieces = splitForSpeech(text);
+      clog(`speaking reply in ${pieces.length} piece(s), ${text.length} chars`);
+      for (const piece of pieces) speechQueue.push({ text: piece, btn: null, narration: false });
+      if (speechQueueRunning) prefetchSpeech(speechQueue[0]);
+      runSpeechQueue();
+      return;
+    }
     // opts.audioBase64: a narration remark the backend already synthesized (2026-10-10).
     speechQueue.push({ text, btn, narration, prefetched: opts?.audioBase64 || undefined });
     // Arriving while something is already playing: start its synthesis now, not when
