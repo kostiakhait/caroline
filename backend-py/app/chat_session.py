@@ -131,7 +131,7 @@ from app.policies import (
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
-from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import register_inject_proactive, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -4380,6 +4380,7 @@ class ChatSession:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)
         set_inject_proactive(lambda text: self.inject_proactive(text))
+        register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:

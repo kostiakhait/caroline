@@ -157,11 +157,23 @@ def _notify_operation_completed(plugin_name: str, op: Operation) -> None:
     log_event(f"plugin:{plugin_name}", "operation_completion_notified", tool=op.tool_name, operation_id=op.id, status=op.status, error=op.error)
 
 
-async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args: dict[str, Any]) -> dict[str, Any]:
+async def dispatch(
+    plugin_name: str, tool_name: str, handler: ToolHandler, args: dict[str, Any], wait_to_end: bool = False,
+) -> dict[str, Any]:
     """Runs one tool call through the uniform start/status/stop contract.
     Always logs call/result/error/duration at the engine level (see
     plugins/loader.py's wrap_tool, which calls this) -- individual plugins
-    never implement their own polling/cancellation plumbing."""
+    never implement their own polling/cancellation plumbing.
+
+    `wait_to_end`: the caller waits for the call's real outcome instead of
+    getting "running" after FAST_PATH_TIMEOUT_S. For the small-model
+    engine, whose tool loop runs in a worker thread and has no polling of
+    its own: a "running" answer there only gave the model an internal
+    operation id to talk about -- it told the user about "operation ...
+    still running" -- and a later "[Internal: a background operation ...]"
+    turn to narrate. The operation stays registered while it runs, so Stop
+    (REGISTRY.cancel_for_tab) still cancels it; the envelope's status is
+    then "cancelled"."""
     op = REGISTRY.create(tool_name, tab_id=get_tab_id())
 
     def report_progress(data: Any) -> None:
@@ -207,6 +219,8 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         REGISTRY.forget(op.id)
         return {"operation_id": op.id, "status": "done", "result": result}
     except asyncio.TimeoutError:
+        if wait_to_end:
+            return await _wait_to_end(plugin_name, tool_name, op)
         op.notify_on_completion = True
         # Per explicit instruction (2026-09-15): see durability.py's own
         # "per-tab in-flight background operations" section for why this
@@ -223,6 +237,29 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         log_event(f"plugin:{plugin_name}", "operation_error", tool=tool_name, operation_id=op.id, duration_ms=duration_ms, error=str(exc))
         REGISTRY.forget(op.id)
         return {"operation_id": op.id, "status": "error", "error": str(exc)}
+
+
+async def _wait_to_end(plugin_name: str, tool_name: str, op: Operation) -> dict[str, Any]:
+    """dispatch()'s wait_to_end case, past the fast-path window."""
+    assert op.task is not None
+    log_event(f"plugin:{plugin_name}", "operation_awaited", tool=tool_name, operation_id=op.id)
+    try:
+        result = await asyncio.shield(op.task)
+    except asyncio.CancelledError:
+        if not op.task.cancelled():
+            raise  # the caller itself was cancelled, not the tool call
+        REGISTRY.forget(op.id)
+        log_event(f"plugin:{plugin_name}", "operation_cancelled_while_awaited", tool=tool_name, operation_id=op.id)
+        return {"operation_id": op.id, "status": "cancelled"}
+    except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()
+        REGISTRY.forget(op.id)
+        log_event(f"plugin:{plugin_name}", "operation_error", tool=tool_name, operation_id=op.id,
+                  duration_ms=round((time.monotonic() - op.started_at) * 1000, 1), error=str(exc))
+        return {"operation_id": op.id, "status": "error", "error": str(exc)}
+    REGISTRY.forget(op.id)
+    log_event(f"plugin:{plugin_name}", "operation_done_awaited", tool=tool_name, operation_id=op.id,
+              duration_ms=round((time.monotonic() - op.started_at) * 1000, 1))
+    return {"operation_id": op.id, "status": "done", "result": result}
 
 
 def _operation_to_dict(op: Operation) -> dict[str, Any]:

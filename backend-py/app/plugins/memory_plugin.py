@@ -25,13 +25,27 @@ memory_turns.py and ChatSession._on_memory_upstream_no_funds).
 The local short-term copy of topics (memory_topics.py, shown in the system
 prompt) is kept current from here: every save_info reply updates the topic it
 touched, and the whole list is refreshed from the server when it is stale.
+
+Neither tool keeps the model waiting long:
+  - save_info hands the text to a background task and returns at once -- the
+    model has the facts in the conversation already. The save goes on even
+    if the user presses Stop (half of it may already be on the server); only
+    if it fails is the model told, by a service message.
+  - request_info has a SOFT timeout (SOFT_READ_TIMEOUT_S). The server sends
+    the answer in parts as it finds them (memory:requestStart /
+    memory:requestPoll); whatever arrived by the timeout is the tool's reply,
+    and the read goes on in the background: every later part is handed to
+    the model as soon as it arrives, as a service message starting with
+    LATE_FACTS_HEADER. Stop ends such a read like any other tool call.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -41,10 +55,11 @@ import httpx
 from app import memory_turns
 from app.logging_setup import log_event
 from app.memory_topics import is_stale, replace_topics, update_topic
+from app.operations import REGISTRY as OPERATIONS
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager
 from app.plugins.sw_api import API_URL, CAROLINE_SW_KEY, SessionExpiredError, SwApiError
-from app.session_context import get_send, get_tab_id
+from app.session_context import get_inject_proactive, get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -54,6 +69,13 @@ _sessions = SessionManager()
 # budget is five minutes. Exactly ONE attempt, never a retry on timeout: a
 # save that was received but answered late would otherwise be saved twice.
 REQUEST_TIMEOUT_S = 330.0
+# request_info: what memory found within this time is the tool's reply; the
+# read goes on, and what it finds later reaches the model as a service message.
+SOFT_READ_TIMEOUT_S = 30.0
+POLL_WAIT_S = 20.0                      # one memory:requestPoll waits at most this (the server's own cap)
+LATE_READ_LIMIT_S = 400.0               # the server gives up on a request after 300 s
+LATE_FACTS_HEADER = "[Additional facts from memory"
+LATE_READ_TOOL = "request_info (continued)"   # its operation is cancelled by Stop like any tool call
 MAX_FILE_BYTES = 25 * 1024 * 1024       # the server refuses larger documents
 MATERIAL_KINDS = ("message", "document")
 MATERIAL_TEXT_FIELDS = ("source", "ref", "ts", "from", "subject", "name", "mime", "text")
@@ -281,18 +303,44 @@ async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     params: dict[str, Any] = {"text": text, "traceId": uuid.uuid4().hex, "language": _language()}
     if materials:
         params["materials"] = materials
-    reply = await _memory("memory:save", **params)
-    reaction = await _react_to_status(reply)
-    for result in (reply.get("output") or {}).get("results") or []:
-        if result.get("source") == SOURCE_TOPICS and result.get("status") == STATUS_OK:
-            update_topic(WORKSPACE_DIR, (result.get("output") or {}).get("topic") or {})
-    await _refresh_topics_if_stale()
-    failure = _failure_text(reply, "Saving")
-    if failure:
-        return {"text": " ".join(filter(None, [failure, reaction])) + ("\n" + _reply_text(reply) if reply.get("output") else ""), "is_error": True}
-    if reply.get("status") == STATUS_EMPTY:
-        return {"text": "Nothing in this text was judged worth remembering, so nothing was saved."}
-    return {"text": _reply_text(reply)}
+    # Not awaited: the model has what it saves in the conversation already.
+    # A plain task, not an operation of the tab, so Stop does not cancel it.
+    task = asyncio.create_task(_save_in_background(params, get_inject_proactive()))
+    _background_saves.add(task)
+    task.add_done_callback(_background_saves.discard)
+    log_event("plugin:memory", "save_started", trace_id=params["traceId"], materials=len(materials))
+    return {"text": "Saving to memory in the background; you do not need to wait for it. You will be told only if it fails."}
+
+
+_background_saves: set[asyncio.Task[Any]] = set()   # strong references: a bare task may be collected mid-way
+
+
+async def _save_in_background(params: dict[str, Any], inject: Any) -> None:
+    started = time.monotonic()
+    try:
+        reply = await _memory("memory:save", **params)
+    except Exception as exc:  # noqa: BLE001 -- reported to the model below, never raised into nothing
+        reply = {"status": "error", "error": {"code": "exception", "message": str(exc)}}
+    try:
+        # Only the top-up window: the turn that called save_info may be long
+        # over, so an upstream no-funds must not stop and replay it (the
+        # model is told below that the save failed).
+        reaction = await _react_to_status(reply) if reply.get("status") in (STATUS_OK, STATUS_EMPTY, STATUS_NO_FUNDS_USER) else None
+        for result in (reply.get("output") or {}).get("results") or []:
+            if result.get("source") == SOURCE_TOPICS and result.get("status") == STATUS_OK:
+                update_topic(WORKSPACE_DIR, (result.get("output") or {}).get("topic") or {})
+        await _refresh_topics_if_stale()
+    except Exception as exc:  # noqa: BLE001
+        reaction = None
+        log_event("plugin:memory", "save_aftermath_failed", error=str(exc))
+    log_event("plugin:memory", "save_finished", trace_id=params["traceId"], status=reply.get("status"),
+              ms=round((time.monotonic() - started) * 1000))
+    failure = _failure_text(reply, "Saving to memory in the background")
+    if failure and inject is not None:
+        inject(
+            "[Service message: a save_info you called earlier did not go through. " + " ".join(filter(None, [failure, reaction]))
+            + f"\nWhat was to be saved: {params['text'][:2000]}\nTell the user only if it matters to them.]"
+        )
 
 
 async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -310,15 +358,119 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     params: dict[str, Any] = {"query": query, "traceId": uuid.uuid4().hex, "language": _language()}
     if args.get("history"):
         params["history"] = int(args["history"])
-    reply = await _memory("memory:request", **params)
-    reaction = await _react_to_status(reply)
+    started = await _memory("memory:requestStart", **params)
+    if not started.get("jobId"):  # refused before it ran: no funds
+        reaction = await _react_to_status(started)
+        failure = _failure_text(started, "The memory request") or f"The memory request did not start: {json.dumps(started)}"
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    read = _Read(started["jobId"], query)
+    deadline = time.monotonic() + SOFT_READ_TIMEOUT_S
+    try:
+        while read.final is None and (left := deadline - time.monotonic()) > 0:
+            await read.poll(min(left, POLL_WAIT_S))
+    except Exception as exc:  # noqa: BLE001 -- what was already found is still worth giving
+        log_event("plugin:memory", "request_poll_failed", error=str(exc))
+        found = _merge_parts(read.parts)
+        return {"text": f"The memory request failed while reading: {exc}" + (f"\nFound before that: {json.dumps({'results': found}, ensure_ascii=False)}" if found else ""),
+                "is_error": True}
     await _refresh_topics_if_stale()
-    failure = _failure_text(reply, "The memory request")
+    results = _merge_parts(read.parts)
+    if read.final is None:
+        _continue_in_background(read)
+        log_event("plugin:memory", "request_soft_timeout", parts=len(read.parts))
+        later = (f'Memory is still being searched. Anything more it finds will be given to you as soon as it is found, '
+                 f'in a service message starting with "{LATE_FACTS_HEADER}". Do not ask request_info the same again; go on '
+                 "with what you have.")
+        if not results:
+            return {"text": f'Nothing found yet for "{query}" within {int(SOFT_READ_TIMEOUT_S)} s. {later}'}
+        return {"text": json.dumps({"status": "partial", "results": results}, ensure_ascii=False) + "\n" + later}
+    final = read.final
+    reaction = await _react_to_status(final)
+    failure = _failure_text(final, "The memory request")
     if failure:
-        return {"text": " ".join(filter(None, [failure, reaction])) + ("\n" + _reply_text(reply) if reply.get("output") else ""), "is_error": True}
-    if reply.get("status") == STATUS_EMPTY:
+        return {"text": " ".join(filter(None, [failure, reaction])) + ("\n" + json.dumps({"results": results}, ensure_ascii=False) if results else ""),
+                "is_error": True}
+    if not results:
         return {"text": f'Memory holds nothing relevant to "{query}".'}
-    return {"text": _reply_text(reply)}
+    return {"text": json.dumps({"status": final.get("status"), "results": results}, ensure_ascii=False)}
+
+
+class _Read:
+    """One background memory request (memory:requestStart), followed by polling."""
+
+    def __init__(self, job_id: str, query: str) -> None:
+        self.job_id = job_id
+        self.query = query
+        self.parts: list[dict[str, Any]] = []
+        self.cursor = 0
+        self.final: dict[str, Any] | None = None
+
+    async def poll(self, wait: float) -> list[dict[str, Any]]:
+        """The parts that arrived since the last poll; sets `final` once the request is done."""
+        reply = await _memory("memory:requestPoll", jobId=self.job_id, cursor=self.cursor, wait=round(max(0.0, wait), 1))
+        new = list(reply.get("parts") or [])
+        self.parts.extend(new)
+        self.cursor = int(reply.get("cursor") or self.cursor + len(new))
+        if reply.get("done"):
+            self.final = reply
+        return new
+
+
+def _merge_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The parts of an answer as the reply of a whole request: one entry per
+    source, the facts of all its portions together."""
+    merged: dict[str, dict[str, Any]] = {}
+    for part in parts:
+        source, output = part.get("source"), dict(part.get("output") or {})
+        known = merged.get(source)
+        if known is not None and isinstance(known.get("facts"), list) and isinstance(output.get("facts"), list):
+            known["facts"] = known["facts"] + output["facts"]
+            for flag in ("incomplete", "untranslated"):
+                known[flag] = bool(known.get(flag)) or bool(output.get(flag))
+        else:
+            merged[source] = output
+    return [{"source": source, "output": output} for source, output in merged.items()]
+
+
+def _late_text(query: str, parts: list[dict[str, Any]]) -> str:
+    return (
+        f'{LATE_FACTS_HEADER} for your earlier request_info("{query}") -- found after its reply was given:\n'
+        + json.dumps({"results": _merge_parts(parts)}, ensure_ascii=False)
+        + "\nIf this changes or completes what you told the user, or what you are doing, act on it; if it adds "
+        "nothing that matters now, reply with exactly [[NO_UPDATE]].]"
+    )
+
+
+def _continue_in_background(read: _Read) -> None:
+    """Goes on polling a request whose soft timeout passed. Every part that
+    arrives is handed to the model at once. Registered as an operation of
+    the tab, so that Stop cancels it."""
+    inject = get_inject_proactive()
+    op = OPERATIONS.create(LATE_READ_TOOL, tab_id=get_tab_id())
+
+    async def run() -> None:
+        until = time.monotonic() + LATE_READ_LIMIT_S
+        try:
+            while read.final is None and time.monotonic() < until:
+                new = await read.poll(POLL_WAIT_S)
+                if new and inject is not None:
+                    inject(_late_text(read.query, new))
+                    log_event("plugin:memory", "late_facts_injected", parts=len(new))
+            if read.final is not None and read.final.get("status") == STATUS_NO_FUNDS_USER:
+                await _react_to_status(read.final)
+            log_event("plugin:memory", "late_read_finished", status=(read.final or {}).get("status"), parts=len(read.parts))
+            op.status = "done"
+        except asyncio.CancelledError:
+            op.status = "cancelled"
+            log_event("plugin:memory", "late_read_cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the main answer was given already; a lost tail is only logged
+            op.status = "error"
+            log_event("plugin:memory", "late_read_failed", error=str(exc))
+        finally:
+            OPERATIONS.forget(op.id)
+
+    op.task = asyncio.create_task(run())
 
 
 async def _read_material(topic: str, material: str, offset: Any, save_file_to: Any) -> dict[str, Any]:
@@ -364,8 +516,11 @@ _USAGE_INSTRUCTIONS = (
     "\"text\": the document's text as you read it, \"path\": the local file} -- with \"path\" the file itself "
     "is stored too. Always give \"source\" and \"ref\" when the thing has them: the same letter sent again is "
     "then kept once.\n"
+    "save_info returns at once and saves in the background: carry on, you are told only if it fails.\n"
     "request_info(query): ask in plain words what you want to recall. The reply lists what each memory found, "
-    "marked by \"source\" (facts, topics, notes.vault, ...); combine them yourself. A fact comes "
+    "marked by \"source\" (facts, topics, notes.vault, ...); combine them yourself. A search that takes long "
+    f"answers with what was found in its first {int(SOFT_READ_TIMEOUT_S)} seconds (status \"partial\"); the rest "
+    f"reaches you later in a service message starting with \"{LATE_FACTS_HEADER}\" -- use it then. A fact comes "
     "with \"people\": the gender of the people it names, where memory knows it -- use it to speak of them "
     "correctly (he/she, the endings your language needs); for a person not listed there the gender is not "
     "known, do not guess it from the name. A fact may be "

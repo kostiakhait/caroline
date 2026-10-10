@@ -1077,12 +1077,17 @@ def _make_executor_fn(
             session_context.set_tab_id(tab_id)
             if send is not None:
                 session_context.set_send(send)
-            return await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args)
+            # Waits for the real outcome (see dispatch()'s wait_to_end): this
+            # thread blocks on the result anyway, and a "running" answer only
+            # handed the model an internal operation to narrate to the user.
+            return await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args, wait_to_end=True)
 
         envelope = asyncio.run_coroutine_threadsafe(_run(), main_loop).result()
         log_event("engine", "small_model_tool_result", tab_id=tab_id, tool=name, status=envelope.get("status"))
         if envelope.get("status") == "error":
             return f"ERROR: {envelope.get('error')}"
+        if envelope.get("status") == "cancelled":
+            return "ERROR: this tool call was cancelled before it finished."
         if envelope.get("status") == "running":
             # Genuinely normal (a slow tool call, e.g. a network-bound
             # plugin) -- NOT a signal of anything wrong. resolve_agentic()
