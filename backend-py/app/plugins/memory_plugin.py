@@ -108,16 +108,32 @@ class MemoryInputError(Exception):
 
 
 async def _post(body: dict[str, Any]) -> dict[str, Any]:
-    async with httpx.AsyncClient(verify=ssl_context(), timeout=REQUEST_TIMEOUT_S) as client:
-        response = await client.post(API_URL, json=body)
+    # Per explicit instruction (2026-10-10), after two silent save_info failures
+    # (120.8s and 70.9s) whose own cause was never logged -- only the final
+    # {"status": "error"} survived, the real reason only reached the model as
+    # an injected chat message (its length logged, never its text). This is
+    # the ONE choke point every memory: command goes through, so logging the
+    # reason right here, before it is turned into an exception that a given
+    # call site may or may not log on its way up, catches every cause (a
+    # transient 502, an expired session, a malformed command) regardless of
+    # which higher-level path loses or truncates it.
+    command = body.get("command")
+    try:
+        async with httpx.AsyncClient(verify=ssl_context(), timeout=REQUEST_TIMEOUT_S) as client:
+            response = await client.post(API_URL, json=body)
+    except Exception as exc:  # noqa: BLE001 -- logged here, re-raised for the caller to handle as before
+        log_event("plugin:memory", "api_call_failed", command=command, reason=f"transport error: {exc}")
+        raise
     if response.status_code >= 400:
-        raise SwApiError(f'SquirrelWisdom API HTTP {response.status_code} for command "{body.get("command")}"')
+        log_event("plugin:memory", "api_call_failed", command=command, http_status=response.status_code, body=response.text[:500])
+        raise SwApiError(f'SquirrelWisdom API HTTP {response.status_code} for command "{command}"')
     envelope = response.json()
     if envelope.get(".status") != "ok":
         reason = envelope.get(".reason", json.dumps(envelope))
+        log_event("plugin:memory", "api_call_failed", command=command, reason=reason)
         if isinstance(reason, str) and "session" in reason.lower():
             raise SessionExpiredError(reason)
-        raise SwApiError(f'command "{body.get("command")}" failed: {reason}')
+        raise SwApiError(f'command "{command}" failed: {reason}')
     return envelope
 
 
@@ -382,7 +398,7 @@ async def _save_in_background(params: dict[str, Any], inject: Any) -> None:
         reaction = None
         log_event("plugin:memory", "save_aftermath_failed", error=str(exc))
     log_event("plugin:memory", "save_finished", trace_id=params["traceId"], status=reply.get("status"),
-              ms=round((time.monotonic() - started) * 1000))
+              ms=round((time.monotonic() - started) * 1000), error=reply.get("error"))
     failure = _failure_text(reply, "Saving to memory in the background")
     if failure and inject is not None:
         inject(
@@ -410,6 +426,7 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         params["history"] = int(args["history"])
     started = await _memory("memory:requestStart", **params)
     if not started.get("jobId"):  # refused before it ran: no funds
+        log_event("plugin:memory", "request_refused", trace_id=params["traceId"], status=started.get("status"), error=started.get("error"))
         reaction = await _react_to_status(started)
         failure = _failure_text(started, "The memory request") or f"The memory request did not start: {json.dumps(started)}"
         return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
@@ -435,6 +452,7 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             return {"text": f'Nothing found yet for "{query}" within {int(SOFT_READ_TIMEOUT_S)} s. {later}'}
         return {"text": json.dumps({"status": "partial", "results": results}, ensure_ascii=False) + "\n" + later}
     final = read.final
+    log_event("plugin:memory", "request_finished", trace_id=params["traceId"], status=final.get("status"), error=final.get("error"))
     reaction = await _react_to_status(final)
     failure = _failure_text(final, "The memory request")
     if failure:
@@ -569,7 +587,7 @@ async def _save_document_in_background(params: dict[str, Any], inject: Any) -> N
         log_event("plugin:memory", "document_save_aftermath_failed", error=str(exc))
     document = ((reply.get("output") or {}).get("document")) or {}
     log_event("plugin:memory", "document_save_finished", trace_id=params["traceId"], status=reply.get("status"),
-              document=document.get("id"), duplicate=bool((reply.get("output") or {}).get("duplicate")))
+              document=document.get("id"), duplicate=bool((reply.get("output") or {}).get("duplicate")), error=reply.get("error"))
     failure = _failure_text(reply, "Putting the document into memory")
     if failure and inject is not None:
         inject(
