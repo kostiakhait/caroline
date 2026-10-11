@@ -2547,7 +2547,11 @@ class ChatSession:
         def on_activity(line: str) -> None:
             if self.small_model_activity is not turn_activity:
                 return
-            self.small_model_activity.append(line[:300])
+            # One fact, one line: a tool result can span several (web_search's list of
+            # pages does), and both the narrator's "what is new" and its masking of figures
+            # in results go line by line. Live (2026-10-11) "High 62°F" on a result's second
+            # line got past the mask and was narrated as "шестьдесят два градуса".
+            self.small_model_activity.append(" ".join(line.split())[:300])
             del self.small_model_activity[:-20]
             # A new fact is what the narrator waits for: drafting starts now, not at the
             # loop's next tick (up to a second later).
