@@ -26,12 +26,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import time
 
 from cryptography.fernet import Fernet, InvalidToken
 
 from app.login_api import get_v2_session
 from app.logging_setup import log_event
-from app.plugins.sw_api import CAROLINE_SW_KEY, call_v2
+from app.plugins.sw_api import CAROLINE_SW_KEY, call_v2, load_credentials
 
 # Must match reforce's API/Api2AICommands.py's own _derive_fernet_key exactly --
 # both sides derive the same key from the same session token independently.
@@ -39,6 +40,17 @@ _KDF_PREFIX = "caroline-model-key-v1:"
 
 _cached_key: str | None = None
 _cached_for_session: str | None = None
+# The cache above never hit (2026-10-11, live): it is keyed by the session, and
+# get_v2_session() logs in afresh on every call, so every call had a new session and
+# fetched the key again -- two round trips to SquirrelWisdom, 1.2s typically and once
+# 5.8s, in front of EVERY model call of the small-model path: the fast lane, each
+# narrator draft, each tier ("v2_session_refreshed" 12 times and "model_key_fetched" 10
+# times in one turn's log). A key fetched for the same account less than this long ago
+# is reused without asking. Short on purpose: a key the server has stopped handing out
+# (logout elsewhere, an account change) is dropped within a minute.
+MODEL_KEY_REUSE_S = 60.0
+_cached_for_account: str | None = None
+_cached_at: float | None = None
 
 
 def _derive_fernet_key(session: str) -> bytes:
@@ -61,7 +73,17 @@ async def get_model_provider_key() -> str | None:
     a real answer). Mirrors the Android companion's own retryOnce: one
     extra try, not a general retry policy -- a real logout still fails
     the second attempt exactly as it should."""
-    global _cached_key, _cached_for_session
+    global _cached_key, _cached_for_session, _cached_for_account, _cached_at
+    try:
+        creds = load_credentials()
+    except Exception:  # noqa: BLE001 -- an unreadable file is "not logged in", handled below
+        creds = None
+    account = creds.get("email") if creds else None
+    if (
+        _cached_key and account and _cached_for_account == account
+        and _cached_at is not None and time.monotonic() - _cached_at < MODEL_KEY_REUSE_S
+    ):
+        return _cached_key
     session: str | None = None
     for attempt in (1, 2):
         try:
@@ -74,6 +96,7 @@ async def get_model_provider_key() -> str | None:
             await asyncio.sleep(0.8)
 
     if _cached_key and _cached_for_session == session:
+        _cached_for_account, _cached_at = account, time.monotonic()
         return _cached_key
 
     try:
@@ -95,5 +118,6 @@ async def get_model_provider_key() -> str | None:
 
     _cached_key = key
     _cached_for_session = session
+    _cached_for_account, _cached_at = account, time.monotonic()
     log_event("engine", "model_key_fetched", provider=envelope.get("provider"))
     return key
