@@ -1300,7 +1300,8 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
     style = (
         "This is a spoken conversation: your reply will be read aloud. Plain sentences only -- no markdown, no "
         "lists, no emoji. Keep it short and natural, like a person answering out loud (2-5 sentences); if the "
-        "user asked for detail, explain fully -- still in plain spoken sentences."
+        "user asked for detail, explain fully -- still in plain spoken sentences. Write numbers, formulas and "
+        "symbols out in words, as they would be said aloud (\"углекислый газ\", not \"CO2\")."
         if is_voice
         else "Keep it concise and to the point."
     )
