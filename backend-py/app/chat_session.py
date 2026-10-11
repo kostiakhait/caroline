@@ -310,7 +310,9 @@ VOICE_NARRATION_AFTER_SPEECH_GAP_S = 1.2
 # With no new facts since the last remark, at most one remark per this long -- a new
 # fact is what makes a remark worth saying; without one this is the longest silence
 # allowed, not a cadence (see consecutive_narration_count's "talking to herself").
-VOICE_NARRATION_STALE_S = 15.0
+# 10s, not 15 (2026-10-10): live, 15s left a 20s silence while the model thought
+# with no new step -- one more chance to say "this one is taking a while".
+VOICE_NARRATION_STALE_S = 10.0
 # A drafted remark not yet shown by then describes a state that has moved on.
 VOICE_NARRATION_MAX_AGE_S = 20.0
 # Shorter than NARRATION_FAILURE_RETRY_S: on a live call, 15s is itself the gap.
@@ -1866,6 +1868,18 @@ class ChatSession:
         self._run_loop_task = supervise("run_loop", self._run_loop, self.tab_id)
         self._watchdog_task = supervise("watchdog", self._watchdog_loop, self.tab_id)
         self._voice_narration_task = supervise("voice_narration", self._voice_narration_loop, self.tab_id)
+        if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+            asyncio.create_task(self._prewarm_model_key())
+
+    async def _prewarm_model_key(self) -> None:
+        """Fetches the provider key now rather than on the first question (2026-10-10):
+        live, the first fast-lane call after a start took 4.9s instead of ~1.8s, the
+        difference being this fetch. Cached for the process; a failure here is harmless."""
+        try:
+            from app.model_key_provisioning import get_model_provider_key
+            await get_model_provider_key()
+        except Exception as exc:  # noqa: BLE001
+            log_event("engine", "model_key_prewarm_failed", tab_id=self.tab_id, error=str(exc))
 
     def dispose(self) -> None:
         log_event("engine", "dispose", tab_id=self.tab_id)
@@ -3934,10 +3948,18 @@ class ChatSession:
                 # set 14/16 at 2.5s vs 11/16 at 7.3s for the SMALL-draft-plus-translation
                 # route, with names kept right ("от Анны", not "от Anna") and no leaked
                 # machinery. That route stays the fallback when this one can't run at all.
-                comment = await generate_progress_comment_direct(
-                    task, facts, already_said, language, resolve_narration_prompt,
-                    gender=get_persona_gender(self.workspace_dir), addressee_gender=get_owner_profile(self.workspace_dir).gender,
-                )
+                # Any failure of the direct route -- even an unexpected exception -- must
+                # still reach the fallback, not cost the whole attempt.
+                try:
+                    comment = await generate_progress_comment_direct(
+                        task, facts, already_said, language, resolve_narration_prompt,
+                        gender=get_persona_gender(self.workspace_dir), addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log_event("engine", "voice_narration_direct_failed", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
+                    comment = None
                 if comment is None:
                     comment = await generate_progress_comment(
                         "", language, timeout=NARRATION_NETWORK_TIMEOUT_S,
