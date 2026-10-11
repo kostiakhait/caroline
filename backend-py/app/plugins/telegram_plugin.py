@@ -42,11 +42,13 @@ from app.telegram_channel import (
     app_configured,
     block_user,
     delete_contact,
+    download_attachment,
     get_live_client,
     is_valid_account,
     login_finish,
     login_start,
     resolve_or_add_contact,
+    send_file,
     unblock_user,
 )
 from app.workspace_dir import WORKSPACE_DIR
@@ -260,6 +262,48 @@ async def telegram_unblock_user(args: dict[str, Any], _rp: Any) -> dict[str, Any
     return {"text": f'Unblocked {chat_id} on the "{account}" account.'}
 
 
+async def telegram_download_attachment(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    try:
+        chat_id = int(args["chat"])
+        message_id = int(args["messageId"])
+    except (TypeError, ValueError, KeyError):
+        return {"text": "telegram_download_attachment needs the numeric chat and messageId from a proactive Telegram notification.", "is_error": True}
+    save_path = str(args.get("savePath") or "").strip() or None
+    try:
+        path = await download_attachment(client, chat_id, message_id, save_path)
+    except TelegramLoginError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Saved to {path}."}
+
+
+async def telegram_send_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    chat_id, error = await _resolve_chat(client, str(args["chat"]))
+    if error:
+        return error
+    path = str(args.get("path") or "").strip()
+    if not path:
+        return {"text": 'telegram_send_file needs "path".', "is_error": True}
+    try:
+        await send_file(client, chat_id, path, args.get("caption"))
+    except TelegramLoginError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f'Sent {path} to {chat_id} (account="{account}").'}
+
+
 def _usage_instructions() -> str:
     return (
         "TWO separate Telegram accounts, chosen with \"account\" on every tool: \"self\" (the default -- your "
@@ -279,7 +323,13 @@ def _usage_instructions() -> str:
         "telegram_add_contact first only when you want the contact added without sending anything yet, or to "
         "learn the chat id ahead of time. Either way, when Telegram has no account reachable at that number "
         "(not registered, or hidden by privacy settings -- these look the same from here), tell the user plainly "
-        "rather than retrying."
+        "rather than retrying.\n"
+        "Attachments: a proactive notification for an incoming photo/video/document/voice message says so "
+        "(\"Attached: ...\") and gives its messageId -- download it with telegram_download_attachment(chat, "
+        "messageId, account) before using it; omit savePath to let it pick a default location and return the "
+        "resulting path. telegram_send_file(chat, path, caption, account) sends a local file the same way "
+        "telegram_send_message sends text, including the same phone-number auto-resolve and the same "
+        "owner-account permission rule."
     )
 
 
@@ -356,6 +406,23 @@ PLUGIN = Plugin(
             "Reverses telegram_block_user. `chat` is their numeric chat id. `account`: \"self\" (default) or "
             "\"owner\".",
             {"chat": str, "account": str | None}, telegram_unblock_user,
+        ),
+        PluginTool(
+            "telegram_download_attachment",
+            "Downloads a Telegram message's attached media (photo/video/document/voice/...) to a local file. "
+            "`chat` and `messageId` come from a proactive Telegram notification (\"Attached: ...\"). `savePath` "
+            "is optional -- omit it to save under a default Caroline folder and get the resulting path back; "
+            "give it only when you want a specific destination. `account`: \"self\" (default) or \"owner\".",
+            {"chat": str, "messageId": int, "savePath": str | None, "account": str | None}, telegram_download_attachment,
+        ),
+        PluginTool(
+            "telegram_send_file",
+            "Sends a local file as a Telegram attachment (photo/video/document/voice -- Telegram infers the "
+            "right kind from the file itself). `chat` is the numeric chat id, or a phone number for a first "
+            "message (resolved the same way telegram_send_message does). Optional `caption`. `account` "
+            "(default \"self\") picks which account sends it -- same owner-impersonation rule as "
+            "telegram_send_message: only send as \"owner\" when explicitly asked, for this specific message.",
+            {"chat": str, "path": str, "caption": str | None, "account": str | None}, telegram_send_file,
         ),
     ],
 )

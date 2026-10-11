@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from telethon import TelegramClient, events, utils
@@ -50,6 +51,7 @@ from telethon.tl.types import InputPhoneContact
 from app.logging_setup import log_event
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
 from app.task_supervisor import supervise
+from app.workspace_dir import WORKSPACE_DIR
 
 TELEGRAM_API_ID = 33974656
 TELEGRAM_API_HASH = "4b0c8b70111e8830ca4be9a698870ad5"
@@ -188,6 +190,68 @@ async def unblock_user(client: TelegramClient, chat_id: int) -> None:
     await client(UnblockRequest(id=entity))
 
 
+# Attachments (2026-10-11, after the deliberate choice to notify on every
+# incoming media message, not just captioned ones -- see _describe_media/
+# _on_new below). Telethon talks MTProto directly, so both directions move
+# a local file path straight through -- no base64/HTTP hop the way email's
+# and notes' attachment tools need, matching this codebase's general
+# "local path in, local path out" convention for file tools.
+TELEGRAM_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "telegram_downloads"
+
+
+async def download_attachment(client: TelegramClient, chat_id: int, message_id: int, save_path: str | None = None) -> str:
+    """Downloads a message's attached media to a local file via Telethon's
+    own client.download_media. When save_path is omitted, picks a default
+    name under TELEGRAM_DOWNLOADS_DIR and returns the resulting path --
+    unlike a file the model is already holding (where it picks the
+    destination itself), it usually has no good default for a Telegram
+    attachment it has not seen yet."""
+    message = await client.get_messages(chat_id, ids=message_id)
+    if message is None or not message.media:
+        raise TelegramLoginError(f"Message {message_id} in chat {chat_id} has no downloadable attachment.")
+    if save_path:
+        target: str | Path = save_path
+    else:
+        name = (message.file.name if message.file else None) or f"{message_id}{(message.file.ext if message.file else '') or ''}"
+        TELEGRAM_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        target = TELEGRAM_DOWNLOADS_DIR / f"{chat_id}_{message_id}_{name}"
+    result = await client.download_media(message, file=str(target))
+    if not result:
+        raise TelegramLoginError(f"Telegram returned no file for message {message_id} in chat {chat_id}.")
+    return result
+
+
+async def send_file(client: TelegramClient, chat_id: int, path: str, caption: str | None = None) -> None:
+    if not Path(path).is_file():
+        raise TelegramLoginError(f"No such local file: {path}")
+    await client.send_file(chat_id, path, caption=caption)
+
+
+def _describe_media(event: events.NewMessage.Event) -> str | None:
+    """A short human label for an incoming message's attachment, if any --
+    checked specific-to-general since Telethon's event.document also
+    matches video/audio/gif/voice/sticker (they're all Telegram documents
+    under the hood; the narrower properties tell those apart)."""
+    if event.photo:
+        return "photo"
+    if event.voice:
+        return "voice message"
+    if event.video_note:
+        return "video note"
+    if event.video:
+        return "video"
+    if event.audio:
+        return "audio"
+    if event.gif:
+        return "GIF"
+    if event.sticker:
+        return "sticker"
+    if event.document:
+        name = getattr(event.file, "name", None) if event.file else None
+        return f'file "{name}"' if name else "file"
+    return None
+
+
 @dataclass
 class TelegramChannelStatus:
     account: str = ""
@@ -241,19 +305,28 @@ async def _start_background(workspace_dir: str, account: str, inject_proactive: 
         if not (event.is_private or event.mentioned or event.is_reply):
             return
         text = (event.raw_text or "").strip()
-        if not text:
+        media = _describe_media(event)
+        # A media message with no caption used to be dropped here entirely
+        # (empty raw_text) -- decision 2026-10-11: notify on it too, same as
+        # a captioned one, so a bare photo/file is never silently invisible.
+        if not text and not media:
             return
         sender = await event.get_sender()
         name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or str(event.sender_id)
         kind = "DM" if event.is_private else "group mention"
         status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        log_event("plugin:telegram", "message_received", account=account, kind=kind, chat_id=event.chat_id)
+        log_event("plugin:telegram", "message_received", account=account, kind=kind, chat_id=event.chat_id, has_media=bool(media))
         if inject_proactive is None:
             return
         note = (
             f'[New Telegram {kind} in {_ACCOUNT_LABEL[account]} Telegram account, from "{name}" '
-            f'(chat_id={event.chat_id}, account="{account}"):\n{text}'
+            f'(chat_id={event.chat_id}, message_id={event.id}, account="{account}"):\n{text or "(no caption)"}'
         )
+        if media:
+            note += (
+                f'\nAttached: {media}. Use telegram_download_attachment(chat="{event.chat_id}", '
+                f'messageId={event.id}, account="{account}") to save it locally first.'
+            )
         if account == "self":
             note += f'\nReply with telegram_send_message(chat="{event.chat_id}", text=..., account="self") if it needs a response.]'
         else:
