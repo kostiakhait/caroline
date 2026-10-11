@@ -1039,9 +1039,11 @@ public partial class MainWindow : Window
             {
                 var visReqId = root.GetProperty("requestId").GetString()!;
                 var audioBytes = Convert.FromBase64String(root.GetProperty("audioBase64").GetString()!);
+                // "more": chat.js has further speech queued behind this clip (absent from an older chat.js).
+                var moreToCome = root.TryGetProperty("more", out var moreProp) && moreProp.ValueKind == JsonValueKind.True;
                 _ = RunVisualModeAsync(async () =>
                 {
-                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes);
+                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes, moreToCome);
                     // playOneSpeech (chat.js) awaits this to advance the speech queue.
                     // played=false tells it to fall back to plain audio playback instead
                     // of silently moving on with nothing having been heard (see

@@ -245,7 +245,7 @@ public sealed class VisualModeManager
     /// reply comes in, and this used to just close the window with nothing audible at
     /// all -- worse than not having Visual Mode.
     /// </summary>
-    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes)
+    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes, bool moreToCome = false)
     {
         Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} bytes={audioBytes.Length}");
         var ahead = TakeRenderAhead(requestId);
@@ -349,6 +349,7 @@ public sealed class VisualModeManager
         {
             Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} playback starting");
             window.SetVisuallyHidden(false);
+            window.MoreToCome = moreToCome; // see VisualModeWindow.MoreToCome: the controls bar from the first piece on
             await window.PlayVideoAsync(outputPath);
             await playbackEnded.Task;
             played = true;

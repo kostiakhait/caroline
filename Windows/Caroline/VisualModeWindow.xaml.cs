@@ -1,7 +1,10 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Threading;
 using Caroline.Services;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
@@ -36,6 +39,41 @@ public partial class VisualModeWindow : Window
     /// stopped (VisualModeManager passes it on in visual_speech_done).</summary>
     public bool StoppedByUser { get; private set; }
 
+    /// <summary>Set before each clip: more speech is queued behind it. A reply is read in
+    /// pieces and its first piece is always a short one, so by ControlsMinDurationSeconds
+    /// alone a minute-long reply began with ten seconds in which there was nothing to
+    /// stop it with (2026-10-11, live: "нету кнопки отменить!!"). "Not worth showing
+    /// controls for something that short" is about a short utterance, not about the short
+    /// opening of a long one.</summary>
+    public bool MoreToCome { get; set; }
+    private bool _controlsShown;
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private const uint SwpNoSize = 0x0001, SwpNoMove = 0x0002, SwpNoActivate = 0x0010;
+
+    // Bug fix (2026-10-11), confirmed live ("если на модельку случайно нажать, она
+    // пропадёт и тупо не отменишь"): this window and the main chat window are BOTH
+    // Topmost, and among topmost windows the one activated last is on top. A click on
+    // the model -- or anywhere in the chat window, which sits right behind it -- left
+    // the chat window in front: this one was still alive and still speaking, but
+    // covered, its Stop button with it. Measured after one click on the model: the chat
+    // window was the foreground window and one place above this one in the z-order.
+    // Re-asserting the topmost position (without taking the focus) puts it back on top:
+    // at once when either window is activated, and on a timer for anything else that
+    // could get in front of it.
+    private readonly DispatcherTimer _stayOnTopTimer = new() { Interval = TimeSpan.FromMilliseconds(300) };
+    private readonly System.Collections.Generic.List<Window> _otherWindows = new();
+
+    private void StayOnTop()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero) SetWindowPos(hwnd, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    private void OnOtherWindowActivated(object? sender, EventArgs e) => StayOnTop();
+
     public VisualModeWindow()
     {
         InitializeComponent();
@@ -44,6 +82,23 @@ public partial class VisualModeWindow : Window
         {
             Logger.Log($"VisualModeWindow: Loaded event -- IsVisible={IsVisible} ActualWidth={ActualWidth} ActualHeight={ActualHeight}");
             PositionBottomRight();
+            _stayOnTopTimer.Start();
+        };
+        _stayOnTopTimer.Tick += (_, _) => StayOnTop();
+        Deactivated += (_, _) => StayOnTop();
+        if (System.Windows.Application.Current != null)
+        {
+            foreach (Window other in System.Windows.Application.Current.Windows)
+            {
+                if (other == this) continue;
+                other.Activated += OnOtherWindowActivated;
+                _otherWindows.Add(other);
+            }
+        }
+        Closed += (_, _) =>
+        {
+            _stayOnTopTimer.Stop();
+            foreach (var other in _otherWindows) other.Activated -= OnOtherWindowActivated;
         };
     }
 
@@ -155,8 +210,11 @@ public partial class VisualModeWindow : Window
                 else if (type == "duration")
                 {
                     var seconds = doc.RootElement.GetProperty("seconds").GetDouble();
-                    Logger.Log($"VisualModeWindow: duration={seconds:F1}s -- {(seconds < ControlsMinDurationSeconds ? "hiding" : "showing")} controls bar");
-                    ControlsBar.Visibility = seconds < ControlsMinDurationSeconds ? Visibility.Collapsed : Visibility.Visible;
+                    // Once shown, the bar stays for the clips that follow in this window: it
+                    // must not vanish under the cursor for a short last piece.
+                    _controlsShown = _controlsShown || MoreToCome || seconds >= ControlsMinDurationSeconds;
+                    Logger.Log($"VisualModeWindow: duration={seconds:F1}s moreToCome={MoreToCome} -- {(_controlsShown ? "showing" : "hiding")} controls bar");
+                    ControlsBar.Visibility = _controlsShown ? Visibility.Visible : Visibility.Collapsed;
                 }
             }
             catch (Exception ex)
