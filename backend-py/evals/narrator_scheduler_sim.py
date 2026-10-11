@@ -56,12 +56,14 @@ voice_api.voice_for_gender = lambda g: "Nova"
 async def generate_progress_comment_direct(task, activity, already_said, language, resolve, **kw):
     return await generate_progress_comment('', language, activity=activity, task=task, already_said=already_said)
 voice_api.generate_progress_comment_direct = generate_progress_comment_direct
+async def draft_narration_remark(task, facts, already_said, language, **kw):
+    return await generate_progress_comment('', language, activity=facts, task=task, already_said=already_said)
 sys.modules["app"] = types.ModuleType("app"); sys.modules["app.plugins"] = types.ModuleType("app.plugins")
 sys.modules["app.plugins.voice_api"] = voice_api
 
 ns = {"asyncio": asyncio, "time": time, "log_event": log_event,
       "current_language_name": lambda tab: "Russian", "get_persona_gender": lambda d: "female",
-      "get_owner_profile": lambda d: types.SimpleNamespace(gender=None), "Any": object, "resolve_narration_prompt": None, **consts}
+      "get_owner_profile": lambda d: types.SimpleNamespace(gender=None), "Any": object, "draft_narration_remark": draft_narration_remark, **consts}
 for k, v in list(consts.items()):  # scale every time constant
     if k == "VOICE_NARRATION_EST_CHARS_PER_S":
         ns[k] = v / SCALE  # a rate, not a duration

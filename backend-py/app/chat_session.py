@@ -117,7 +117,7 @@ from app.logging_setup import log_event
 from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
 from app.small_model_engine import (
-    CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE, answer_is_in_language, resolve_narration_prompt, run_small_model_turn,
+    CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE, answer_is_in_language, draft_narration_remark, run_small_model_turn,
     try_fast_answer,
 )
 from app.task_supervisor import supervise
@@ -4090,7 +4090,7 @@ class ChatSession:
                 self._narration_draft_task = None
 
     async def _draft_voice_narration_body(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
-        from app.plugins.voice_api import generate_progress_comment, generate_progress_comment_direct
+        from app.plugins.voice_api import generate_progress_comment
 
         language = current_language_name(self.tab_id)
         comment: str | None = None
@@ -4103,8 +4103,8 @@ class ChatSession:
                 # Any failure of the direct route -- even an unexpected exception -- must
                 # still reach the fallback, not cost the whole attempt.
                 try:
-                    comment = await generate_progress_comment_direct(
-                        task, facts, already_said, language, resolve_narration_prompt,
+                    comment = await draft_narration_remark(
+                        task, facts, already_said, language,
                         gender=get_persona_gender(self.workspace_dir), addressee_gender=get_owner_profile(self.workspace_dir).gender,
                     )
                 except asyncio.CancelledError:

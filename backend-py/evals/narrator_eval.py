@@ -1,6 +1,7 @@
 r"""Runs the narrator golden set (narrator_golden.py) against one narrator route:
   MODE=current  generate_progress_comment (SMALL draft in English + forced translation)
   MODE=direct   generate_progress_comment_direct (NARRATOR_MODEL, drafted in Russian)
+  MODE=ladder   draft_narration_remark (NARRATOR_FIRST_MODEL, then NARRATOR_MODEL) -- what the app runs
 
 Run with Caroline's own Python, pointing at a backend-py tree and the shipped Camerlengo:
   set CAROLINE_APP=<...>\backend-py
@@ -20,8 +21,17 @@ import app.plugins.voice_api as v  # noqa: E402
 import app.small_model_engine as eng  # noqa: E402
 
 v.log_event = lambda *a, **k: None
+drafted_by = []
+eng.log_event = lambda comp, ev, **k: drafted_by.append(k.get("by")) if ev == "narration_drafted" else None
 MODE = os.environ.get("MODE", "current")
 RUNS = int(os.environ.get("RUNS", "2"))
+# NARRATOR_MODEL=<slug> [NARRATOR_REASONING=minimal] tries another model through the direct route.
+_MODEL = os.environ.get("NARRATOR_MODEL")
+_REASONING = {"effort": os.environ["NARRATOR_REASONING"]} if os.environ.get("NARRATOR_REASONING") else None
+
+
+async def RESOLVE(prompt):
+    return await eng.resolve_narration_prompt(prompt, model=_MODEL, reasoning=_REASONING)
 
 
 async def main():
@@ -31,9 +41,11 @@ async def main():
             activity = "\n".join(case["status"])
             t0 = time.monotonic()
             try:
-                if MODE == "direct":
+                if MODE == "ladder":  # what the app does: the cheap model first, the fast one when it is silent
+                    text = await eng.draft_narration_remark(case["task"], activity, list(case["said"]), "Russian", gender="female")
+                elif MODE == "direct":
                     text = await v.generate_progress_comment_direct(
-                        case["task"], activity, list(case["said"]), "Russian", eng.resolve_narration_prompt,
+                        case["task"], activity, list(case["said"]), "Russian", RESOLVE,
                         gender="female", addressee_gender=None)
                 else:
                     text = await v.generate_progress_comment(
@@ -47,7 +59,10 @@ async def main():
             ok, why = check(case, text)
             results.append((ok, ms))
             print(f"{'PASS' if ok else 'FAIL'} {ms:>6} ms  {case['name']:14} {why:16} | {text or '(empty)'}", flush=True)
-    print(f"\n{MODE.upper()} narrator: {sum(r[0] for r in results)}/{len(results)} passed, median {int(statistics.median(r[1] for r in results))} ms")
+    print(f"\n{MODE.upper()} narrator ({_MODEL or eng.NARRATOR_MODEL}): {sum(r[0] for r in results)}/{len(results)} passed, "
+          f"median {int(statistics.median(r[1] for r in results))} ms")
+    if drafted_by:
+        print(f"the first model alone: {drafted_by.count('first')} of {len(drafted_by)} drafts; the second was asked for {drafted_by.count('second')}")
 
 
 asyncio.run(main())

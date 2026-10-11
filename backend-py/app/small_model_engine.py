@@ -1471,6 +1471,104 @@ def _first_remark_from_decline(text: str) -> str | None:
     return remark
 
 
+def _first_remark_clause(language: str) -> str:
+    # Voice only (2026-10-11): the model that has just read the request can say in one
+    # sentence what the work is, at no extra cost -- live, the narrator's own first remark
+    # was heard 12.9s after the question. Checked by _first_remark_from_decline.
+    return (
+        "One exception to \"nothing else\": the user is listening, and hears nothing while the work goes on. "
+        f"After the marker, on the same line, add ONE short sentence in {language}, in your own voice, saying "
+        "what you are now doing for them, as work already under way -- \"Ищу прогноз погоды на завтра в "
+        "Киеве.\" It names their task in plain words. It is not a promise (\"сейчас посмотрю\", \"I'll check\"), "
+        "not a question, not a greeting; it says nothing of tools, models or steps, claims no result, and has no "
+        "digits. "
+    )
+
+
+# Per explicit instruction (2026-10-11): the fast model is not called on every message.
+# The cheapest model goes first and only decides whether the fast lane's level is
+# needed at all -- can this be answered without tools? -- and only after its yes is
+# FAST_LANE_MODEL asked for the answer. A request that needs tools never reaches the
+# fast model: the gate itself hands it to the cascade, with the starting tier and, for
+# voice, the first spoken remark. The gate errs towards yes: FAST_LANE_MODEL can still
+# decline, while a wrong no costs the user the whole cascade for a question that needed
+# two seconds. Any failure of the gate also just means the fast model is asked.
+FAST_LANE_GATE_ENABLED = True
+FAST_LANE_GATE_MODEL = "google/gemini-2.5-flash-lite"
+FAST_LANE_GATE_REASONING: dict[str, str] | None = None
+FAST_LANE_GATE_TIMEOUT_S = 6.0
+FAST_LANE_ANSWERABLE = "[[ANSWER]]"
+
+
+def _fast_lane_gate_instructions(language: str, is_voice: bool) -> str:
+    return (
+        "You are the first and cheapest step in front of the assistant. You do NOT answer the user. Decide one "
+        "thing about their last message: can it be answered fully and correctly from this conversation and "
+        "general knowledge alone?\n"
+        "Reply with exactly " + FAST_LANE_ANSWERABLE + " and nothing else if it can: explaining, defining, "
+        "calculating, translating, writing, editing or checking a text, advice, small talk -- however long or "
+        "detailed the answer has to be.\n"
+        "Reply with exactly " + FAST_LANE_DECLINE + " and nothing else if it needs ANYTHING more: current or live "
+        "information (weather, news, prices, the time or the date, schedules), the user's own data (mail, notes, "
+        "files, contacts, calendar, anything about the user themselves or about what they said before this "
+        "conversation), looking something up, or doing anything (sending, saving, opening, scheduling, reminding, "
+        "changing). Reply with exactly " + FAST_LANE_DECLINE_COMPLEX + " instead when that takes several dependent "
+        "tool steps (check, then act, then verify).\n"
+        "The message may be several messages joined by blank lines: if even one of them needs more, the whole "
+        "message does.\n"
+        + (_first_remark_clause(language) + "This applies to the two NEEDS_TOOLS replies only.\n" if is_voice else "")
+        + "When you cannot tell, reply " + FAST_LANE_ANSWERABLE + ": the next step can still decline."
+    )
+
+
+def _fast_lane_messages(
+    workspace_dir: str, persona: Persona, instructions: str, recent_dialogue_lines: list[str], user_text: str,
+) -> list[dict[str, Any]]:
+    system = "\n\n".join([
+        _persona_system_message(persona),
+        owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
+        instructions,
+    ])
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for line in recent_dialogue_lines[-_FAST_LANE_DIALOGUE_LINES:]:
+        messages.append({"role": "assistant" if line.startswith("Caroline:") else "user", "content": line.split(":", 1)[-1].strip()})
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+async def _fast_lane_gate(
+    ai: Any, workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
+) -> tuple[bool, int | None, str | None] | None:
+    """(needs tools?, start tier, first remark), or None when the gate gave no usable
+    verdict -- the caller then asks the fast model as if there were no gate."""
+    started = time.monotonic()
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(
+                ai.resolve_agentic,
+                _fast_lane_messages(workspace_dir, persona, _fast_lane_gate_instructions(language, is_voice), recent_dialogue_lines, user_text),
+                None, None, model=FAST_LANE_GATE_MODEL, max_iterations=1, reasoning=FAST_LANE_GATE_REASONING,
+            ),
+            timeout=FAST_LANE_GATE_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "fast_lane_gate_failed", error=str(exc)[:200], error_type=type(exc).__name__,
+                  ms=int((time.monotonic() - started) * 1000))
+        return None
+    text = str(raw or "").strip()
+    ms = int((time.monotonic() - started) * 1000)
+    if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
+        start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
+        first_remark = _first_remark_from_decline(text) if is_voice else None
+        log_event("engine", "fast_lane_gate", verdict="tools", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
+        return True, start_tier, first_remark
+    if FAST_LANE_ANSWERABLE in text:
+        log_event("engine", "fast_lane_gate", verdict="answer", ms=ms)
+        return False, None, None
+    log_event("engine", "fast_lane_gate_failed", error=text[:200], error_type="unparseable", ms=ms)
+    return None
+
+
 def _fast_lane_instructions(language: str, is_voice: bool) -> str:
     style = (
         "This is a spoken conversation: your reply will be read aloud. Plain sentences only -- no markdown, no "
@@ -1480,19 +1578,7 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         if is_voice
         else "Keep it concise and to the point."
     )
-    # Voice only (2026-10-11): the model that has just read the request can say in one
-    # sentence what the work is, at no extra cost -- live, the narrator's own first remark
-    # was heard 12.9s after the question. Checked by _first_remark_from_decline.
-    first_remark = (
-        "One exception to \"nothing else\": the user is listening, and hears nothing while the work goes on. "
-        f"After the marker, on the same line, add ONE short sentence in {language}, in your own voice, saying "
-        "what you are now doing for them, as work already under way -- \"Ищу прогноз погоды на завтра в "
-        "Киеве.\" It names their task in plain words. It is not a promise (\"сейчас посмотрю\", \"I'll check\"), "
-        "not a question, not a greeting; it says nothing of tools, models or steps, claims no result, and has no "
-        "digits. "
-        if is_voice
-        else ""
-    )
+    first_remark = _first_remark_clause(language) if is_voice else ""
     return (
         f"Reply in {language}.\n{style}\n{_SEVERAL_REQUESTS_INSTRUCTION} If even one of several requests needs "
         "anything beyond this conversation and general knowledge, decline the whole message as described below -- "
@@ -1557,16 +1643,14 @@ async def try_fast_answer(
         if not api_key:
             return None, None, None
         ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
+        if FAST_LANE_GATE_ENABLED:
+            gate = await _fast_lane_gate(ai, workspace_dir, persona, user_text, recent_dialogue_lines, language, is_voice)
+            if gate is not None and gate[0]:
+                log_event("engine", "fast_lane_declined", ms=int((time.monotonic() - started) * 1000), start_tier=gate[1],
+                          first_remark=gate[2], by="gate")
+                return None, gate[1], gate[2]
         model = FAST_LANE_MODEL
-        system = "\n\n".join([
-            _persona_system_message(persona),
-            owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
-            _fast_lane_instructions(language, is_voice),
-        ])
-        messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
-        for line in recent_dialogue_lines[-_FAST_LANE_DIALOGUE_LINES:]:
-            messages.append({"role": "assistant" if line.startswith("Caroline:") else "user", "content": line.split(":", 1)[-1].strip()})
-        messages.append({"role": "user", "content": user_text})
+        messages = _fast_lane_messages(workspace_dir, persona, _fast_lane_instructions(language, is_voice), recent_dialogue_lines, user_text)
         raw = await asyncio.wait_for(
             asyncio.to_thread(ai.resolve_agentic, messages, None, None, model=model, max_iterations=1, reasoning=FAST_LANE_REASONING),
             timeout=FAST_LANE_TIMEOUT_S,
@@ -1595,9 +1679,18 @@ async def try_fast_answer(
 # Same model as the fast lane, for the same reason: on a narrator golden set it beat
 # the SMALL-draft-plus-translation route (see generate_progress_comment_direct).
 NARRATOR_MODEL = FAST_LANE_MODEL
+# Per explicit instruction (2026-10-11): what runs on every turn must not go straight to
+# the fast model. The narrator drafts with the cheapest model first, and NARRATOR_MODEL
+# is asked only when that one has nothing to say or its remark is rejected by the checks
+# (draft_narration_remark). On the golden set, 36 runs, the cheap model alone: 29 right
+# at 0.56s median, and all 7 misses were silences where a remark was due -- never a wrong
+# remark. Its neighbours were worse in the way that matters: gpt-4.1-nano said "Новых
+# писем от Анны не найдено" about three found letters, gpt-5-nano announced the work
+# finished and slipped into Ukrainian.
+NARRATOR_FIRST_MODEL = "google/gemini-2.5-flash-lite"
 
 
-async def resolve_narration_prompt(prompt: str) -> str:
+async def resolve_narration_prompt(prompt: str, model: str | None = None, reasoning: dict[str, str] | None = None) -> str:
     """Raw reply of NARRATOR_MODEL to one narrator prompt; raises if the engine or
     the provider key is unavailable (the caller then falls back)."""
     if camerlengo_ai is None:
@@ -1608,9 +1701,31 @@ async def resolve_narration_prompt(prompt: str) -> str:
     ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
     return await asyncio.wait_for(
         asyncio.to_thread(ai.resolve_agentic, [{"role": "user", "content": prompt}], None, None,
-                          model=NARRATOR_MODEL, max_iterations=1),
+                          model=model or NARRATOR_MODEL, max_iterations=1, reasoning=reasoning),
         timeout=FAST_LANE_TIMEOUT_S,
     )
+
+
+async def draft_narration_remark(
+    task: str, facts: str, already_said: list[str], language: str, gender: str | None = None, addressee_gender: str | None = None,
+) -> str | None:
+    """One narration remark by the ladder: NARRATOR_FIRST_MODEL, then NARRATOR_MODEL when
+    the first has nothing or is rejected. Same contract as
+    generate_progress_comment_direct: the remark, "" for nothing new, None on failure."""
+    from app.plugins.voice_api import generate_progress_comment_direct
+
+    async def first(prompt: str) -> str:
+        return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
+
+    remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender)
+    if remark:
+        log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
+        return remark
+    remark = await generate_progress_comment_direct(
+        task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
+    )
+    log_event("engine", "narration_drafted", by="second", model=NARRATOR_MODEL, said=bool(remark))
+    return remark
 
 
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:

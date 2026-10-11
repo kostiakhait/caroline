@@ -81,4 +81,5 @@ async def main():
           f"breaking a narrator rule: {sum(1 for r in remarks if r[2])}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
