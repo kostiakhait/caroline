@@ -1241,6 +1241,32 @@ def _looks_like_verdict(text: str) -> bool:
     return len(text) < 400 and any(p.search(text) for p in _VERDICT_PATTERNS)
 
 
+# The verifier also writes the final text, and sometimes opens it with its opinion of the
+# candidate (2026-10-11, live, read aloud to someone who had only asked about the weather:
+# "Похоже, прогноз верный: завтра в Киеве ожидается ..."). Unlike a whole-text verdict
+# (_looks_like_verdict) the answer is all there after the colon, so only the opening
+# clause goes. It counts as the verifier's own addition only when the candidate did not
+# open the same way: "Решение верное: ..." in reply to "check my solution" stays.
+_VERDICT_PREFACE = re.compile(
+    r"^[^:.!?\n]{0,60}\b(?:вер(?:ен|на|но|ны|ный|ная|ное|ные)|правил(?:ен|ьна|ьно|ьны|ьный|ьная|ьное|ьные)|"
+    r"коррект(?:ен|на|но|ны|ный|ная|ное|ные)|подтвержд(?:аю|ается|ён|ен|ено|ена)|проверен[оаы]?|"
+    r"correct|accurate|verified|confirmed|checks out)\b[^:.!?\n]{0,30}:\s+(?=\S)",
+    re.IGNORECASE,
+)
+VERDICT_PREFACE_MIN_REST_CHARS = 40
+
+
+def _strip_verdict_preface(verified: str, candidate: str) -> str:
+    text = verified.lstrip()
+    match = _VERDICT_PREFACE.match(text)
+    if not match or _VERDICT_PREFACE.match(candidate.lstrip()):
+        return verified
+    rest = text[match.end():]
+    if len(rest) < VERDICT_PREFACE_MIN_REST_CHARS:
+        return verified
+    return rest[0].upper() + rest[1:]
+
+
 def _usable(text: str) -> bool:
     return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
 
@@ -1673,6 +1699,10 @@ async def run_small_model_turn(
         if _looks_like_verdict(verified) and _usable(candidate_text):
             log_event("engine", "small_model_verification_verdict_replaced", tab_id=tab_id, verdict=verified, candidate_len=len(candidate_text))
             return candidate_text, False
+        without_preface = _strip_verdict_preface(verified, candidate_text)
+        if without_preface != verified:
+            log_event("engine", "small_model_verification_preface_stripped", tab_id=tab_id, verified=verified[:200])
+            verified = without_preface
         log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
         return verified, False
 
