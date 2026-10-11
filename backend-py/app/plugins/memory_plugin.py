@@ -664,7 +664,7 @@ _USAGE_INSTRUCTIONS = (
     "then kept once.\n"
     "save_info returns at once and saves in the background: carry on, you are told only if it fails.\n"
     "request_info(query): ask in plain words what you want to recall. The reply lists what each memory found, "
-    "marked by \"source\" (facts, topics, notes.vault, ...); combine them yourself. A search that takes long "
+    "marked by \"source\" (facts, topics, documents, contacts -- the address book --, notes.vault, ...); combine them yourself. A search that takes long "
     f"answers with what was found in its first {int(SOFT_READ_TIMEOUT_S)} seconds (status \"partial\"); the rest "
     f"reaches you later in a service message starting with \"{LATE_FACTS_HEADER}\" -- use it then. A fact comes "
     "with \"people\": the gender of the people it names, where memory knows it -- use it to speak of them "

@@ -5,6 +5,16 @@ module predating v2 entirely), there's no separate older-protocol client to
 maintain here, so this one file covers what notes_api.py + notes_plugin.py
 together cover for Notes.
 
+Searching, creating and updating go through the microagent address book on
+the server (contact:find / contact:put, apps/microagents/AddressBook.py; see
+docs/MICROAGENTS_PLAN.md, section 2.11): names are brought to their normal
+form when written and when looked for, a search compares softly by meaning
+-- any case, a diminutive, a transliteration, a swapped order, a person
+described instead of named -- and the same person written again is merged
+into their contact instead of becoming a second one. Those calls cost money
+like memory does. Listing, reading, deleting and photos stay plain storage
+calls.
+
 Caroline is a PRIMARY user of this service, not just a passive UI backend --
 see this module's own usage instructions below: every contact detail she
 learns anywhere (email, SMS, conversation) gets written here unprompted, and
@@ -18,6 +28,7 @@ import json
 import secrets
 import string
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -70,31 +81,6 @@ async def list_contacts(session: str, tag: str | None = None, include_deleted: b
         for cid, c in index.items()
         if (include_deleted or not c.get("deleted"))
         and (tag is None or tag in (c.get("tags") or []))
-    ]
-    entries.sort(key=lambda e: (e.get("name") or "").lower())
-    return entries
-
-
-async def search_contacts(session: str, query: str, tag: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
-    q = query.lower()
-
-    def _matches(c: dict[str, Any]) -> bool:
-        haystack = " ".join([
-            c.get("name") or "", c.get("company") or "", c.get("title") or "", c.get("notes") or "",
-            " ".join(c.get("tags") or []),
-            " ".join(e.get("value", "") for e in (c.get("emails") or [])),
-            " ".join(p.get("value", "") for p in (c.get("phones") or [])),
-            " ".join(a.get("value", "") for a in (c.get("addresses") or [])),
-        ]).lower()
-        return q in haystack
-
-    index = await _list_index(session)
-    entries = [
-        {"id": cid, **c}
-        for cid, c in index.items()
-        if (include_deleted or not c.get("deleted"))
-        and (tag is None or tag in (c.get("tags") or []))
-        and _matches(c)
     ]
     entries.sort(key=lambda e: (e.get("name") or "").lower())
     return entries
@@ -208,9 +194,35 @@ async def contact_list(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)}
 
 
+async def _address_book(command: str, doing: str, **params: Any) -> dict[str, Any]:
+    """One microagent address-book command through the memory plugin's own
+    helpers: the same key, turn id, money rules and reactions (the top-up
+    window) as memory. Returns the service's reply, or a tool error."""
+    from app.plugins import memory_plugin as memory
+    refused = await memory._gate()
+    if refused:
+        return refused
+    reply = await memory._memory(command, traceId=uuid.uuid4().hex, language=memory._language(), **params)
+    reaction = await memory._react_to_status(reply)
+    failure = memory._failure_text(reply, doing)
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    return reply
+
+
 async def contact_search(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    entries = await _sessions.with_session(lambda s: search_contacts(s, args["query"], tag=args.get("tag"), include_deleted=bool(args.get("includeDeleted"))))
-    return {"text": json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)}
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"text": 'contact_search needs "query": who you are looking for.', "is_error": True}
+    if args.get("tag"):
+        query += f" (tag: {args['tag']})"
+    reply = await _address_book("contact:find", "Searching the address book", query=query)
+    if reply.get("is_error"):
+        return reply
+    if reply.get("status") == "empty":
+        return {"text": f'No contact in the address book fits "{args["query"]}".'}
+    contacts = (reply.get("output") or {}).get("contacts") or []
+    return {"text": json.dumps([_summarize(contact) for contact in contacts], indent=2, ensure_ascii=False)}
 
 
 async def contact_get(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -218,19 +230,38 @@ async def contact_get(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": json.dumps(contact, indent=2, ensure_ascii=False)}
 
 
+_CONTACT_FIELDS = ("name", "emails", "phones", "addresses", "company", "title", "birthday", "notes", "tags")
+
+
+def _put_result(reply: dict[str, Any]) -> dict[str, Any]:
+    output = reply.get("output") or {}
+    contact = output.get("contact") or {}
+    summary = _summarize(contact) if contact else {}
+    action = output.get("action")
+    if action == "merged":
+        lead = f'This person was already in the address book as "{contact.get("name")}" -- the new details were added to that contact.'
+    elif action == "updated":
+        lead = "Updated."
+    else:
+        lead = "Created."
+    duplicates = output.get("possible_duplicates") or []
+    if duplicates:
+        names = ", ".join(f'"{entry.get("name")}" ({entry.get("id")})' for entry in duplicates)
+        lead += (f" It may be the same person as {names}; it was not merged because that was not certain. Check, and "
+                 "if it is, move the details over with contact_update and delete one of the two.")
+    return {"text": lead + "\n" + json.dumps(summary, indent=2, ensure_ascii=False)}
+
+
 async def contact_create(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    contact = await _sessions.with_session(lambda s: create_contact(
-        s, args["name"], emails=args.get("emails"), phones=args.get("phones"), addresses=args.get("addresses"),
-        company=args.get("company"), title=args.get("title"), birthday=args.get("birthday"),
-        notes=args.get("notes"), tags=args.get("tags"),
-    ))
-    return {"text": json.dumps(_summarize(contact), indent=2, ensure_ascii=False)}
+    contact = {field: args.get(field) for field in _CONTACT_FIELDS if args.get(field) is not None}
+    reply = await _address_book("contact:put", "Writing the contact", contact=contact)
+    return reply if reply.get("is_error") else _put_result(reply)
 
 
 async def contact_update(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    fields = {k: args.get(k) for k in ("name", "emails", "phones", "addresses", "company", "title", "birthday", "notes", "tags")}
-    contact = await _sessions.with_session(lambda s: update_contact(s, args["id"], **fields))
-    return {"text": json.dumps(_summarize(contact), indent=2, ensure_ascii=False)}
+    contact = {field: args.get(field) for field in _CONTACT_FIELDS if args.get(field) is not None}
+    reply = await _address_book("contact:put", "Updating the contact", id=args["id"], contact=contact)
+    return reply if reply.get("is_error") else _put_result(reply)
 
 
 async def contact_delete(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -294,10 +325,12 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "contact_search",
-            "Case-insensitive substring search over a contact's name/company/title/notes/tags/emails/phones/"
-            "addresses, optionally filtered to one tag. Check here BEFORE asking the user for someone's "
-            "contact info.",
-            {"query": str, "tag": str | None, "includeDeleted": bool | None}, contact_search,
+            "Finds people (or organizations) in the address book by meaning, not by spelling: a name in any "
+            "case, a diminutive (Оля, Костя), another script or transliteration (Olga Petrova), first and last "
+            "name swapped, part of a name, a typo, or a description (\"the lawyer from Acme\"). Ask it the way "
+            "you would ask a person. Optional \"tag\" narrows it. Check here BEFORE asking the user for "
+            "someone's contact info. Costs a little, like memory.",
+            {"query": str, "tag": str | None}, contact_search,
         ),
         PluginTool(
             "contact_get",
@@ -306,8 +339,11 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "contact_create",
-            "Creates a new contact. Save anything you learn about a real person here unprompted -- see this "
-            "plugin's own usage instructions.",
+            "Writes a contact. Save anything you learn about a real person here unprompted -- see this plugin's "
+            "own usage instructions. Do not search first to avoid duplicates: if the same person is already in "
+            "the book under any spelling, the new details are merged into their contact (nothing is lost) and "
+            "the reply says so; when that is not certain, a new contact is made and the reply names the "
+            "possible duplicate.",
             {
                 "type": "object",
                 "properties": {
@@ -324,9 +360,9 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "contact_update",
-            "Updates a contact. Only provided fields are changed; array fields (emails/phones/addresses/tags) "
-            "are replaced wholesale, not merged -- fetch the current record with contact_get first if you need "
-            "to add to an existing list rather than overwrite it.",
+            "Updates the contact with this id. Only provided fields are changed; array fields (emails/phones/"
+            "addresses/tags) are replaced wholesale, not merged -- to just ADD details about a person, "
+            "contact_create merges them for you; use this to correct or remove something.",
             {
                 "type": "object",
                 "properties": {
