@@ -476,12 +476,16 @@ def _is_repeat(text: str, previous: str) -> bool:
     """Same remark in other words (2026-10-09). _normalized_overlap only catches
     near-verbatim containment; "я всё ещё проверяю прогноз..." vs "я все еще ищу
     прогноз..." differ in one verb and a letter. Word-set overlap catches those while
-    a remark with genuinely new content shares few words with the old one."""
+    a remark with genuinely new content shares few words with the old one.
+
+    Words of one or two letters don't count (2026-10-11): "Нашла прогноз на завтра в
+    Киеве." after "Ищу прогноз погоды на завтра в Киеве." is the news itself -- the
+    search is over -- and was dropped as a repeat on the strength of "на" and "в"."""
     if _normalized_overlap(text, previous):
         return True
     def words(s: str) -> set[str]:
         s = s.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
-        return set(re.findall(r"\w+", s))
+        return {w for w in re.findall(r"\w+", s) if len(w) > 2}
     a, b = words(text), words(previous)
     if len(a) < 3 or len(b) < 3:
         return False
@@ -556,6 +560,10 @@ _NARRATION_COMBINED_GOOD = "Invoice math like this always takes longer than it l
 _NARRATION_WORKLOG_GOOD = "I've found two emails from Anna about the invoice."
 _NARRATION_WORKLOG_BAD = "Running the mail search on the first tier now."
 _NARRATION_DEADEND_GOOD = "The web search didn't give me the timetable, and my notes have nothing on it either."
+_NARRATION_STEP_START_GOOD = "I'm checking what I already have on the Lisbon flights."
+_NARRATION_FOUND_GOOD = "I've found a forecast for Oslo and I'm going through it."
+_NARRATION_FOUND_BAD = "Tomorrow in Oslo it will be sunny, up to seventy-five degrees."
+_NARRATION_STILL_GOING_GOOD = "Still working through the quarterly numbers."
 
 
 def _is_echo_of_prompt_example(text: str) -> bool:
@@ -566,6 +574,7 @@ def _is_echo_of_prompt_example(text: str) -> bool:
             _NARRATION_EXAMPLE_THIRDPERSON_BAD, _NARRATION_EXAMPLE_THIRDPERSON_GOOD,
             _NARRATION_COMBINED_BAD, _NARRATION_COMBINED_GOOD,
             _NARRATION_WORKLOG_GOOD, _NARRATION_WORKLOG_BAD, _NARRATION_DEADEND_GOOD,
+            _NARRATION_STEP_START_GOOD, _NARRATION_STILL_GOING_GOOD, _NARRATION_FOUND_GOOD, _NARRATION_FOUND_BAD,
         )
     )
 
@@ -681,7 +690,8 @@ def _already_said_block(already_said: list[str] | None) -> str:
     lines = "\n".join(f"- {remark}" for remark in already_said[-6:])
     return (
         "ALREADY SAID to the user during this request (they heard these; never repeat or rephrase them -- say "
-        "only what STATUS adds beyond them, or reply with exactly <narration></narration> if it adds nothing):\n"
+        "only what STATUS adds beyond them, or reply with exactly <narration></narration> if it adds nothing "
+        "and STATUS does not say the user has heard nothing for a while):\n"
         f"---\n{lines}\n---\n\n"
     )
 
@@ -699,11 +709,29 @@ def _draft_language_line(draft_language: str | None) -> str:
             "exactly as they would be spoken.")
 
 
+# The engine's fact line for a finished tool call: "Tool call NAME (arguments: ...); result: ...".
+_TOOL_RESULT_IN_STATUS = re.compile(r"(\); result: )(.*)")
+
+
+def _without_result_figures(activity: str) -> str:
+    """STATUS as the narrator gets it: numbers inside tool results replaced by "N".
+    A result is raw. Live (2026-10-11) a forecast that came back in Fahrenheit was
+    narrated as "максимум шестьдесят градусов" for Kyiv in October, half a minute
+    before the answer converted it; a prompt rule against reading figures out did not
+    hold on the golden set (0 of 3). So the narrator sees that there is a number, not
+    which one -- what was found it can still say, the figures are the answer's."""
+    return "\n".join(
+        _TOOL_RESULT_IN_STATUS.sub(lambda m: m.group(1) + re.sub(r"\d+(?:[.,:]\d+)*", "N", m.group(2)), line)
+        for line in activity.splitlines()
+    )
+
+
 def _progress_comment_prompt(
     task: str, activity: str, already_said: list[str] | None, draft_language: str | None, gender_clause: str = "",
 ) -> str:
     """The narrator's prompt (2026-10-06 actions-only version), shared by the
     English-draft path below and generate_progress_comment_direct."""
+    activity = _without_result_figures(activity)
     return (
         "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
         "short sentence, no JSON, no markdown, no preamble.\n\n"
@@ -719,12 +747,20 @@ def _progress_comment_prompt(
         "arguments and results. Never repeat any of that machinery. But when a result in it is a real piece of "
         "the task -- something found, counted or done that the user asked about -- say THAT, in plain words, as "
         "progress so far, never as the final answer.\n"
+        "When what was found IS the answer the user is waiting for -- a forecast, a price, a time, a "
+        "definition -- say only that it has been found. Its content and figures are the final reply's to give: "
+        "a result in STATUS is raw, and the reply may still convert or correct it (seen live: a forecast found "
+        "in Fahrenheit was read out as \"sixty degrees\" for an autumn day, half a minute before the answer).\n"
         "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
         "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\". "
         "Each different place that gave nothing is its own new fact: the web, the notes or memory, the mail -- "
         "\"nothing on the web\" being already said does not cover \"nothing in the notes either\".\n"
-        "STATUS may end with how long the request has been running. If nothing new has happened for a long "
-        "while, you may say once, plainly, that this one is taking a while -- never guess how long is left.\n"
+        "A step that has only just started is news as well: where the work is now -- your own memory, the web, "
+        "the mail, the notes -- said once, in plain words, when it is a new place.\n"
+        "STATUS may end with how long the request has been running, and with a line saying the user has heard "
+        "nothing for a while. When that line is there and nothing else is new, do not stay silent -- on a live "
+        "call silence sounds like a hang: say in one short sentence, in words different from anything already "
+        "said, that the work on their request is still going on. Never guess how long is left.\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n\n"
         f"{_draft_language_line(draft_language)}{(' ' + gender_clause) if gender_clause else ''}\n\n"
@@ -740,14 +776,25 @@ def _progress_comment_prompt(
         "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
         "  Good: <narration></narration>\n"
         "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n"
-        "  TASK: find Anna's email about the invoice. STATUS: Работает уровень 1. Вызов инструмента mail_search "
-        "(аргументы: {\"from\": \"Anna\"}); результат: 2 messages: 'Invoice March', 'Re: invoice'\n"
+        "  TASK: find Anna's email about the invoice. STATUS: Tier 1 (openai/gpt-5-nano) is working. Tool call "
+        "mail_search (arguments: {\"from\": \"Anna\"}); result: 2 messages: 'Invoice March', 'Re: invoice'\n"
         f"  Good: <narration>{_NARRATION_WORKLOG_GOOD}</narration>\n"
         f"  Bad (names the machinery): <narration>{_NARRATION_WORKLOG_BAD}</narration>\n"
-        "  TASK: find train times to Lviv for Friday. STATUS: Вызов инструмента web_search (аргументы: "
-        "{\"question\": \"Lviv trains Friday\"}); результат: I don't have access to live timetables. Вызов "
-        "инструмента request_info (аргументы: {\"query\": \"Lviv trains\"}); результат: Memory holds nothing relevant.\n"
-        f"  Good: <narration>{_NARRATION_DEADEND_GOOD}</narration>\n\n"
+        "  TASK: find train times to Lviv for Friday. STATUS: Tool call web_search (arguments: "
+        "{\"question\": \"Lviv trains Friday\"}); result: I don't have access to live timetables. Tool call "
+        "request_info (arguments: {\"query\": \"Lviv trains\"}); result: Memory holds nothing relevant.\n"
+        f"  Good: <narration>{_NARRATION_DEADEND_GOOD}</narration>\n"
+        "  TASK: when do the Lisbon flights leave. STATUS: Tool call request_info started (plugin \"memory\"; "
+        "arguments: {\"query\": \"Lisbon flights\"}).\n"
+        f"  Good: <narration>{_NARRATION_STEP_START_GOOD}</narration>\n"
+        "  TASK: what will the weather be in Oslo tomorrow. STATUS: Tool call web_search (arguments: "
+        "{\"question\": \"Oslo weather tomorrow\"}); result: Tomorrow in Oslo: sunny, high 75 F, low 61 F.\n"
+        f"  Good: <narration>{_NARRATION_FOUND_GOOD}</narration>\n"
+        f"  Bad (reads the raw result out as the answer): <narration>{_NARRATION_FOUND_BAD}</narration>\n"
+        "  TASK: sum up the quarterly numbers. STATUS: Tier 2 (openai/gpt-5.1-codex-mini) is working. Time spent "
+        "on the request so far: 31 s. Nothing new has happened since the last remark, and the user has heard "
+        "nothing for about 10 s.\n"
+        f"  Good: <narration>{_NARRATION_STILL_GOING_GOOD}</narration>\n\n"
         f"TASK (the user's request):\n---\n{task}\n---\n\n"
         f"STATUS (what is happening):\n---\n{activity}\n---\n\n"
         f"{_already_said_block(already_said)}"

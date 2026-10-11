@@ -12,7 +12,11 @@ import app.small_model_engine as e  # noqa: E402
 from app.persona import get_persona  # noqa: E402
 from app.workspace_dir import WORKSPACE_DIR  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from narrator_golden import FORBIDDEN  # noqa: E402 -- the narrator's own forbidden outputs
+
 events = []
+remarks = []
 e.log_event = lambda comp, ev, **kw: events.append((ev, kw))
 
 MODELS = [
@@ -55,17 +59,26 @@ async def main():
         e.FAST_LANE_REASONING = reasoning
         for expect, q in QUESTIONS:
             events.clear()
-            text, start_tier = await e.try_fast_answer(WORKSPACE_DIR, persona, q, [], "Russian", True)
+            text, start_tier, first_remark = await e.try_fast_answer(WORKSPACE_DIR, persona, q, [], "Russian", True)
             ev, kw = events[-1] if events else ("none", {})
             got = "answer" if text else ("decline" if ev == "fast_lane_declined" else "FAIL")
             ok = got == expect
-            rows.append((model, q, expect, got, kw.get("ms"), ok, (text or kw.get("error") or "")[:150].replace("\n", " ")))
-            print(f"{model:30} {kw.get('ms', 0):>6} ms  {'ok ' if ok else 'BAD'} {got:8} | {q[:40]:40} | {(text or kw.get('error') or '')[:400].replace(chr(10), ' ')}", flush=True)
+            shown = text or kw.get("error") or ""
+            if got == "decline":
+                # What the user hears first while the cascade works: the remark the decline
+                # came with, already past the engine's own checks; and what the model wrote.
+                bad = [label for label, rx in FORBIDDEN if first_remark and rx.search(first_remark)]
+                remarks.append((q, first_remark, bad))
+                shown = f"REMARK: {first_remark!r}{' FORBIDDEN ' + str(bad) if bad else ''}  (raw: {kw.get('raw', '')!r})"
+            rows.append((model, q, expect, got, kw.get("ms"), ok, shown[:150].replace("\n", " ")))
+            print(f"{model:30} {kw.get('ms', 0):>6} ms  {'ok ' if ok else 'BAD'} {got:8} | {q[:40]:40} | {shown[:400].replace(chr(10), ' ')}", flush=True)
     print("\nSUMMARY (median ms, correct decisions):")
     for model, _ in MODELS:
         mine = [r for r in rows if r[0] == model]
         ms = [r[4] for r in mine if r[4] is not None]
         print(f"  {model:30} median {int(statistics.median(ms)) if ms else -1:>6} ms   correct {sum(r[5] for r in mine)}/{len(mine)}")
+    print(f"  declines that came with a first remark: {sum(1 for r in remarks if r[1])}/{len(remarks)}, "
+          f"breaking a narrator rule: {sum(1 for r in remarks if r[2])}")
 
 
 asyncio.run(main())

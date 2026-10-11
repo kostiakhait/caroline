@@ -3,41 +3,72 @@ cases with required and forbidden outputs, deterministic checks, run against a
 narrator implementation, reporting pass rate and latency."""
 import re
 
-ACTIVITY_START = "Запрос получен, работа над ним началась."
+# The engine's own fact lines, as small_model_engine.py emits them.
+ACTIVITY_START = "The request has been received and work on it has started."
+TIER_1 = "Tier 1 (openai/gpt-5-nano) is working."
+TIER_2 = "Tier 2 (openai/gpt-5.1-codex-mini) is working."
+HEARD_NOTHING = "Nothing new has happened since the last remark, and the user has heard nothing for about 10 s."
 
 CASES = [
     dict(name="start", task="Найди погоду в Киеве на выходные.",
          status=[ACTIVITY_START], said=[], expect="say", need=["погод", "киев"]),
     dict(name="web dead end", task="Найди погоду в Киеве на выходные.",
-         status=[ACTIVITY_START, "Работает уровень 1 (openai/gpt-5-nano).",
-                 'Вызов инструмента web_search (аргументы: {"question": "Kyiv weekend weather forecast"}); результат: '
+         status=[ACTIVITY_START, TIER_1,
+                 'Tool call web_search (arguments: {"question": "Kyiv weekend weather forecast"}); result: '
                  "I don't have access to live or future-specific weather data, so I can't give an exact forecast."],
          said=["Смотрю погоду в Киеве на выходные."], expect="say", need=["интернет", "поиск", "не наш", "не наход", "не дал", "не удалось", "нет данных", "нет прогноза", "нет доступ", "не могу"]),
     dict(name="memory empty", task="Найди погоду в Киеве на выходные.",
          status=[ACTIVITY_START,
-                 'Вызов инструмента request_info (аргументы: {"query": "Kyiv weekend weather"}); результат: '
+                 'Tool call request_info (arguments: {"query": "Kyiv weekend weather"}); result: '
                  '{"text": "Memory holds nothing relevant to \\"Kyiv weekend weather\\"."}'],
          said=["Смотрю погоду в Киеве на выходные.", "Поиск в интернете прогноза не дал."],
          expect="say", need=["замет", "памят", "сохран", "записях", "ничего"]),
     dict(name="found mail", task="Есть ли новые письма от Анны?",
          status=[ACTIVITY_START,
-                 'Вызов инструмента mail_search (аргументы: {"from": "Anna", "unread": true}); результат: '
+                 'Tool call mail_search (arguments: {"from": "Anna", "unread": true}); result: '
                  "3 messages: 'Счёт за март', 'Re: счёт', 'Встреча в пятницу'"],
          said=["Проверяю почту от Анны."], expect="say", need=["три", "письм"]),
     dict(name="note saved", task="Сохрани заметку: встреча с Олегом в пятницу в десять.",
          status=[ACTIVITY_START,
-                 'Вызов инструмента notes_create (аргументы: {"title": "Встреча с Олегом"}); результат: created note "Встреча с Олегом" in folder Caroline:Notes'],
+                 'Tool call notes_create (arguments: {"title": "Встреча с Олегом"}); result: created note "Встреча с Олегом" in folder Caroline:Notes'],
          said=[], expect="say", need=["замет", "олег", "встреч"]),
     dict(name="nothing new", task="Найди погоду в Киеве на выходные.",
-         status=[ACTIVITY_START, "Работает уровень 1 (openai/gpt-5-nano)."],
+         status=[ACTIVITY_START, TIER_1],
          said=["Смотрю погоду в Киеве на выходные."], expect="empty_or_say", need=[]),
     dict(name="machinery bait", task="Расскажи, что ты умеешь.",
-         status=[ACTIVITY_START, "Работает уровень 2 (openai/gpt-5.1-codex-mini).",
-                 "Уровень 2 (openai/gpt-5.1-codex-mini) дал ответ, переходим к проверке.", "Проверка результата (без инструментов)."],
-         said=["Рассказываю, что я умею."], expect="empty_or_say", need=[]),
+         status=[ACTIVITY_START, TIER_2,
+                 "Tier 2 (openai/gpt-5.1-codex-mini) produced an answer; moving on to checking it.", "Checking the result (no tools)."],
+         said=["Рассказываю, что я умею."], expect="empty_or_say", need=[], forbid=["закончил", "готов", "заверш"]),
     dict(name="long wait", task="Составь план поездки во Львов на три дня.",
-         status=[ACTIVITY_START, "Работает уровень 1 (openai/gpt-5-nano).", "Время работы над запросом: 48 с."],
+         status=[ACTIVITY_START, TIER_1, "Time spent on the request so far: 48 s."],
          said=["Составляю план поездки во Львов."], expect="empty_or_say", need=[]),
+    # 2026-10-11, live: a memory lookup started and the narrator stayed silent -- the
+    # tool's name says nothing, the plugin's does.
+    dict(name="memory start", task="Какая погода будет завтра в Киеве?",
+         status=[ACTIVITY_START, TIER_2,
+                 'Tool call request_info started (plugin "memory"; arguments: {"query": "Какая погода будет завтра в Киеве?"}).',
+                 "Time spent on the request so far: 7 s.", "NEW since your last remark:",
+                 'Tool call request_info started (plugin "memory"; arguments: {"query": "Какая погода будет завтра в Киеве?"}).'],
+         said=["Ищу прогноз погоды на завтра в Киеве."], expect="say", need=["памят", "запис", "замет", "сохран", "помню", "знаю", "известн", "у меня"]),
+    # 2026-10-11, live: 21s of silence while a search ran -- three drafts in a row came
+    # back empty. Told the user has heard nothing, the narrator must say something.
+    dict(name="heard nothing", task="Какая погода будет завтра в Киеве?",
+         status=[ACTIVITY_START, TIER_2,
+                 'Tool call web_search started (arguments: {"question": "weather forecast Kyiv tomorrow"}).',
+                 "Time spent on the request so far: 24 s.", HEARD_NOTHING],
+         said=["Ищу прогноз погоды на завтра в Киеве.", "Ищу прогноз в интернете."], expect="say", need=[]),
+    # 2026-10-11, live: the narrator read a raw result out as the answer -- "максимум
+    # шестьдесят градусов" (60 F) for Kyiv in October. That something was found is
+    # progress; the figures are the answer's to give, converted.
+    dict(name="raw figures", task="Какая погода будет завтра в Киеве?",
+         status=[ACTIVITY_START, TIER_2,
+                 'Tool call web_search (arguments: {"question": "weather forecast Kyiv tomorrow"}); result: '
+                 "Tomorrow in Kyiv: cloudy with rain in the morning, high 60 F, low 52 F, wind 9 mph.",
+                 "Time spent on the request so far: 41 s.", "NEW since your last remark:",
+                 'Tool call web_search (arguments: {"question": "weather forecast Kyiv tomorrow"}); result: '
+                 "Tomorrow in Kyiv: cloudy with rain in the morning, high 60 F, low 52 F, wind 9 mph."],
+         said=["Ищу прогноз погоды на завтра в Киеве.", "Ищу прогноз в интернете."], expect="say",
+         need=["наш", "прогноз", "есть"], forbid=["шестьдесят", "пятьдесят", "градус", "девят"]),
 ]
 
 FORBIDDEN = [
@@ -58,6 +89,7 @@ def norm(s):
 
 def is_repeat(a, b):
     wa, wb = set(norm(a)), set(norm(b))
+    wa, wb = {w for w in wa if len(w) > 2}, {w for w in wb if len(w) > 2}  # as voice_api._is_repeat
     return len(wa) >= 3 and len(wb) >= 3 and len(wa & wb) / len(wa | wb) >= 0.6
 
 
@@ -72,6 +104,9 @@ def check(case, text):
     for label, rx in FORBIDDEN:
         if rx.search(text):
             return False, label
+    for word in case.get("forbid", ()):
+        if word in text.lower().replace("ё", "е"):
+            return False, f"says {word!r}"
     for prev in case["said"]:
         if is_repeat(text, prev):
             return False, "repeat"

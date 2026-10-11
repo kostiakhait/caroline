@@ -316,6 +316,9 @@ VOICE_NARRATION_AFTER_SPEECH_GAP_S = 1.2
 # 10s, not 15 (2026-10-10): live, 15s left a 20s silence while the model thought
 # with no new step -- one more chance to say "this one is taking a while".
 VOICE_NARRATION_STALE_S = 10.0
+# Drafting for that case starts this much sooner (2026-10-11): a draft plus its audio
+# takes 4-6s, and started only once the 10s were up it made the silence 14-15s.
+VOICE_NARRATION_STALE_LEAD_S = 5.0
 # A drafted remark not yet shown by then describes a state that has moved on.
 VOICE_NARRATION_MAX_AGE_S = 20.0
 # Shorter than NARRATION_FAILURE_RETRY_S: on a live call, 15s is itself the gap.
@@ -431,6 +434,15 @@ FORCED_COMPACTION_HOURLY_MS = 3_600_000
 # every further one within the window joins it and restarts the wait. The
 # chat window still shows each bubble as it was typed.
 USER_MESSAGE_MERGE_WINDOW_S = 5.0
+# Experiment (2026-10-11): the fast lane starts on a held VOICE message while the merge
+# window is still running. The window is 5s in which nothing else happens, and live the
+# fast lane then took another 1.8-5s: 12.9s from the question to the first spoken word
+# of a tool turn. Now its answer -- or its decline, with the first spoken remark already
+# synthesized -- is ready when the window closes. The window itself is untouched: a
+# further message within it restarts this on the joined text, at the price of one
+# wasted fast-lane call. Typed messages are left out, they are the ones that come in
+# bursts. False runs the fast lane after the window, as before.
+FAST_LANE_DURING_MERGE_WINDOW = True
 # Per explicit instruction (2026-10-10): a compaction loses whatever the
 # model learned and never saved, so an hourly/growth compaction is preceded
 # by a service turn asking it to save first (see _check_forced_compaction).
@@ -1451,6 +1463,9 @@ class ChatSession:
         # User messages waiting out USER_MESSAGE_MERGE_WINDOW_S (see submit_or_try_small_model).
         self._held_user_messages: list[tuple[str, list[Any], bool]] = []
         self._held_user_flush: asyncio.TimerHandle | None = None
+        # The fast lane already running on what is held (see _start_fast_lane_ahead):
+        # what it was asked, and the task answering it.
+        self._fast_lane_ahead: tuple[tuple[Any, ...], asyncio.Task[Any]] | None = None
         self.turn_is_voice = False
         self.classifier_refusal_retry_count = 0
         # Backing field for the turn_pending property (defined below,
@@ -1739,6 +1754,13 @@ class ChatSession:
         self._narration_turn_started_at: float | None = None
         self._narration_draft_task: asyncio.Task[None] | None = None
         self._prepared_narration: tuple[str, float, str | None] | None = None
+        # The remark the fast lane's decline came with (see _say_first_voice_remark). Set
+        # as soon as it is known, before it is synthesized, so that the loop doesn't
+        # draft a "work has started" of its own beside it.
+        self._first_voice_remark: str | None = None
+        self._first_voice_remark_covers_start = False
+        self._first_voice_remark_task: asyncio.Task[None] | None = None
+        self._prepared_narration_is_first = False
         self._narration_facts_at_last_draft: str | None = None
         self._narration_last_draft_at: float | None = None
         self._voice_narration_failed_at: float | None = None
@@ -2185,13 +2207,8 @@ class ChatSession:
             self._cancel_memory_replay()
             memory_turns.start_turn(self.tab_id, text, attachments, is_voice)
         if self.pending_interim_notes:
-            notes = "\n".join(f"- {note}" for note in self.pending_interim_notes)
+            text = self._with_interim_notes(text)
             self.pending_interim_notes = []
-            text = (
-                f"{_INTERIM_NOTES_HEADER}while working on the previous request, "
-                "marked as progress updates -- your own past words, do not repeat them as news:\n"
-                f"{notes}]\n\n{text}"
-            )
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
             self._route_sw_turn(text, attachments, is_real_user, is_voice)
             return
@@ -2352,6 +2369,66 @@ class ChatSession:
             self._held_user_flush.cancel()
         self._held_user_flush = asyncio.get_running_loop().call_later(USER_MESSAGE_MERGE_WINDOW_S, self._flush_held_user_messages)
         log_event("engine", "user_message_held", tab_id=self.tab_id, held=len(self._held_user_messages), text_len=len(text))
+        self._start_fast_lane_ahead()
+
+    def _with_interim_notes(self, text: str) -> str:
+        """`text` as submit() hands it on: led by the narration remarks of the previous
+        request, when there were any."""
+        if not self.pending_interim_notes:
+            return text
+        notes = "\n".join(f"- {note}" for note in self.pending_interim_notes)
+        return (
+            f"{_INTERIM_NOTES_HEADER}while working on the previous request, "
+            "marked as progress updates -- your own past words, do not repeat them as news:\n"
+            f"{notes}]\n\n{text}"
+        )
+
+    def _start_fast_lane_ahead(self) -> None:
+        """See FAST_LANE_DURING_MERGE_WINDOW. Asks the fast lane exactly what
+        _run_small_model_turn will ask if nothing changes before the window closes;
+        _fast_lane_for_turn uses the result only if that is still the question."""
+        if self._fast_lane_ahead is not None:
+            self._fast_lane_ahead[1].cancel()
+            self._fast_lane_ahead = None
+        if not FAST_LANE_DURING_MERGE_WINDOW or self.ended or self.small_model_active:
+            return
+        held = self._held_user_messages
+        if any(attachments for _text, attachments, _voice in held) or not any(voice for _text, _attachments, voice in held):
+            return
+        if load_chat_mode(self.workspace_dir, self.tab_id) != "sw":
+            return
+        text = self._with_interim_notes("\n\n".join(item_text for item_text, _attachments, _voice in held if item_text))
+        lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW)
+        language = current_language_name(self.tab_id)
+        log_event("engine", "fast_lane_ahead_started", tab_id=self.tab_id, text_len=len(text), held=len(held))
+        task = asyncio.create_task(self._fast_lane_ahead_body(get_persona(self.workspace_dir), text, lines, language))
+        self._fast_lane_ahead = ((text, language, tuple(lines)), task)
+
+    async def _fast_lane_ahead_body(
+        self, persona: Any, text: str, lines: list[str], language: str,
+    ) -> tuple[str | None, int | None, str | None, asyncio.Task[str | None] | None]:
+        fast, start_tier, first_remark = await try_fast_answer(self.workspace_dir, persona, text, lines, language, True)
+        # The remark's audio too, while the window is still running -- in a task of its
+        # own: a turn that starts meanwhile must not wait for it before it gets to work.
+        audio = asyncio.create_task(self._synthesize_narration_audio(first_remark)) if first_remark else None
+        return fast, start_tier, first_remark, audio
+
+    async def _fast_lane_for_turn(
+        self, persona: Any, text: str, lines: list[str], language: str, is_voice: bool,
+    ) -> tuple[str | None, int | None, str | None, asyncio.Task[str | None] | None]:
+        """try_fast_answer for the turn starting now -- taken from the call made ahead
+        during the merge window when that one asked exactly this question of exactly
+        this dialogue; otherwise asked now."""
+        ahead, self._fast_lane_ahead = self._fast_lane_ahead, None
+        if ahead is not None:
+            key, task = ahead
+            if is_voice and key == (text, language, tuple(lines)):
+                log_event("engine", "fast_lane_ahead_used", tab_id=self.tab_id, ready=task.done())
+                return await task
+            log_event("engine", "fast_lane_ahead_discarded", tab_id=self.tab_id)
+            task.cancel()
+        fast, start_tier, first_remark = await try_fast_answer(self.workspace_dir, persona, text, lines, language, is_voice)
+        return fast, start_tier, first_remark, None
 
     def _flush_held_user_messages(self) -> None:
         held, self._held_user_messages = self._held_user_messages, []
@@ -2472,6 +2549,9 @@ class ChatSession:
                 return
             self.small_model_activity.append(line[:300])
             del self.small_model_activity[:-20]
+            # A new fact is what the narrator waits for: drafting starts now, not at the
+            # loop's next tick (up to a second later).
+            self._voice_narration_wake.set()
             # Bug fix (2026-10-03), explicit instruction: status is push-on-CHANGE
             # (turn_pending flips true once, _publish_status fires once, then nothing
             # republishes it) -- fine for the SDK path, where real SDK stream messages
@@ -2491,7 +2571,15 @@ class ChatSession:
             # Fast lane (2026-10-10 prototype, see small_model_engine.try_fast_answer):
             # real user questions only, and not with attachments (those need tools).
             if is_real_user and "[The user attached these files" not in text:
-                fast, start_tier = await try_fast_answer(self.workspace_dir, persona, text, recent_dialogue_lines, language, is_voice)
+                fast, start_tier, first_remark, first_audio = await self._fast_lane_for_turn(
+                    persona, text, recent_dialogue_lines, language, is_voice,
+                )
+                if fast is None and first_remark and self._voice_narration_applies():
+                    self._first_voice_remark = first_remark
+                    self._first_voice_remark_covers_start = True
+                    self._first_voice_remark_task = asyncio.create_task(
+                        self._say_first_voice_remark(self._narration_turn_seq, first_remark, first_audio)
+                    )
             if fast is not None:
                 result = {"status": "answered", "text": fast}
                 translate_answer = not answer_is_in_language(fast, language)
@@ -3830,7 +3918,13 @@ class ChatSession:
         if self._narration_draft_task is not None and not self._narration_draft_task.done():
             self._narration_draft_task.cancel()
         self._narration_draft_task = None
+        if self._first_voice_remark_task is not None and not self._first_voice_remark_task.done():
+            self._first_voice_remark_task.cancel()
+        self._first_voice_remark_task = None
+        self._first_voice_remark = None
+        self._first_voice_remark_covers_start = False
         self._prepared_narration = None
+        self._prepared_narration_is_first = False
         self._narration_facts_at_last_draft = None
         self._narration_last_draft_at = None
         self._voice_narration_failed_at = None
@@ -3898,8 +3992,13 @@ class ChatSession:
             if now - drafted_at > VOICE_NARRATION_MAX_AGE_S:
                 log_event("engine", "voice_narration_draft_expired", tab_id=self.tab_id, age_s=round(now - drafted_at, 1))
                 self._prepared_narration = None
-            elif now - started >= VOICE_NARRATION_FIRST_S and self._client_quiet_for(now) >= VOICE_NARRATION_AFTER_SPEECH_GAP_S:
+                self._prepared_narration_is_first = False
+            elif (
+                (self._prepared_narration_is_first or now - started >= VOICE_NARRATION_FIRST_S)
+                and self._client_quiet_for(now) >= VOICE_NARRATION_AFTER_SPEECH_GAP_S
+            ):
                 self._prepared_narration = None
+                self._prepared_narration_is_first = False
                 log_event("engine", "voice_narration_sent", tab_id=self.tab_id, comment=comment, waited_s=round(now - drafted_at, 1), turn_s=round(now - started, 1))
                 await self._send_narration_remark(comment, audio)
                 # The client reports speaking for this remark shortly; until then it
@@ -3922,20 +4021,62 @@ class ChatSession:
         facts = self._narration_action_facts()
         if facts is None:
             return
-        if facts == self._narration_facts_at_last_draft:
+        if self._first_voice_remark_covers_start:
+            # Once per turn: the facts as they stand when the loop first looks say only
+            # that the work has begun (the request was received, a tier is working), and
+            # the remark the fast lane's decline came with says it (see
+            # _say_first_voice_remark). They count as drafted; until a new fact, only the
+            # stale rule below can speak.
+            self._first_voice_remark_covers_start = False
+            self._narration_facts_at_last_draft = facts
+            self._narration_last_draft_at = now
+        nothing_new = facts == self._narration_facts_at_last_draft
+        seen = set((self._narration_facts_at_last_draft or "").splitlines())
+        new_lines = [line for line in facts.splitlines() if line not in seen]
+        if nothing_new:
             # Nothing new happened: at most one remark per VOICE_NARRATION_STALE_S,
             # counted from the later of the last draft and the end of the last speech.
             last = self._narration_last_draft_at or started
-            if now - last < VOICE_NARRATION_STALE_S or self._client_quiet_for(now) < VOICE_NARRATION_STALE_S:
+            wait = VOICE_NARRATION_STALE_S - VOICE_NARRATION_STALE_LEAD_S
+            if now - last < wait or self._client_quiet_for(now) < wait:
                 return
         self._narration_facts_at_last_draft = facts
         self._narration_last_draft_at = now
         # Elapsed time is a real fact too ("this one is taking a while"), but only for the
         # model: kept out of the comparison above, it would make every draft look new.
-        facts_for_model = f"{facts}\nВремя работы над запросом: {int(now - started)} с."
+        facts_for_model = f"{facts}\nTime spent on the request so far: {int(now - started)} s."
+        if new_lines and len(new_lines) < len(facts.splitlines()):
+            # Which lines are new is known here exactly; left to work it out from ALREADY
+            # SAID, the model answered "nothing new" to a step that had just begun.
+            facts_for_model += "\nNEW since your last remark:\n" + "\n".join(new_lines)
+        if nothing_new:
+            # Said outright (2026-10-11): left to judge "a long while" by the elapsed time
+            # alone, the model stayed silent three drafts running, 21s on a live call.
+            facts_for_model += (
+                "\nNothing new has happened since the last remark, and the user has heard nothing for about "
+                f"{int(VOICE_NARRATION_STALE_S)} s."
+            )
+        already_said = list(self.turn_narration_remarks)
+        if self._first_voice_remark is not None and self._first_voice_remark not in already_said:
+            already_said.append(self._first_voice_remark)  # known already, even if not out yet
         self._narration_draft_task = asyncio.create_task(
-            self._draft_voice_narration(self._narration_turn_seq, facts_for_model, self._narration_task(), list(self.turn_narration_remarks))
+            self._draft_voice_narration(self._narration_turn_seq, facts_for_model, self._narration_task(), already_said)
         )
+
+    async def _say_first_voice_remark(self, turn_seq: int, remark: str, audio_task: asyncio.Task[str | None] | None) -> None:
+        """The remark the fast lane's decline came with (2026-10-11, see try_fast_answer):
+        the model that read the request has already put into one sentence what the work
+        is. Handed to the loop as a finished draft that needn't wait out
+        VOICE_NARRATION_FIRST_S -- that wait is for turns that may answer within
+        seconds, and a decline says this one won't. Live before this, the first remark
+        was heard 12.9s after the question."""
+        audio = await audio_task if audio_task is not None else await self._synthesize_narration_audio(remark)
+        if turn_seq != self._narration_turn_seq or self._prepared_narration is not None or self.turn_narration_remarks:
+            return  # the turn is over, or the loop has a remark of its own by now
+        self._prepared_narration = (remark, time.monotonic(), audio)
+        self._prepared_narration_is_first = True
+        log_event("engine", "voice_narration_drafted", tab_id=self.tab_id, comment=remark, first=True)
+        self._voice_narration_wake.set()
 
     async def _draft_voice_narration(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
         try:

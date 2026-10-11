@@ -917,6 +917,9 @@ async def _run_parallel_stage(
     return "\n".join(lines)
 
 
+_WEB_SEARCH_TOOL_NAMES = frozenset(t["function"]["name"] for t in _WEB_SEARCH_TOOL_DEFS)
+
+
 @dataclass
 class ToolRegistry:
     tool_defs: list[dict[str, Any]]
@@ -1342,10 +1345,40 @@ _FAST_LANE_NO_HISTORY = re.compile(
     r"не (встречал|общал|знаком|разговаривал)|"
     r"(не знаю|не помню) (вашего|твоего|вашe|твоё|твое)? ?(имени|имя)|"
     r"(ничего|ещё|еще) (мне )?не (говорил|рассказывал|писал)|"
-    r"haven'?t (met|talked|spoken)|don'?t know your name|you (haven'?t|didn'?t) (tell|told|mention)",
+    # 2026-10-11, "Что я тебе вчера говорил про проект?" -> "Мы с вами только что начали
+    # разговор -- у меня нет записей о том, что вы говорили вчера", and on the next run
+    # "Я не помню предыдущих разговоров". "I don't remember" from a lane that has no
+    # memory to look in is never the answer -- the cascade has one.
+    r"только что (начали (разговор|общение|беседу|диалог|общаться|разговаривать)|познакомились)|"
+    r"нет (записей|сведений|данных|информации|воспоминаний|памяти) о (том|наш|ваш|тво|вчераш|предыдущ|прошл)|"
+    r"\bне (помню|запоминаю|сохраняю)\b|нет доступа к (предыдущ|прошл|истори|памят)|"
+    r"haven'?t (met|talked|spoken)|don'?t know your name|you (haven'?t|didn'?t) (tell|told|mention)|"
+    r"\bwe(('ve| have)? (only )?just (started|begun|met))|\bno (record|memory|recollection) of (what|our|your|you)|"
+    r"(don'?t|do not|can'?t|cannot) (remember|recall)|don'?t have (access to|a record of|any record of) (previous|past|earlier|our)",
     re.IGNORECASE,
 )
 _FAST_LANE_DIALOGUE_LINES = 12
+# The sentence a voice decline comes with (see _fast_lane_instructions) is read aloud
+# as the turn's first narration remark, so it is held to the narrator's own rules by
+# code, not by the prompt alone: no question, no digits, no promise, no machinery. One
+# that fails is dropped -- the narrator then drafts the first remark itself, as before.
+_FIRST_REMARK_FORBIDDEN = re.compile(
+    r"[?\d\[\]]"
+    r"|\b(сделаю|проверю|посмотрю|найду|поищу|узнаю|уточню|гляну|отправлю|сообщу|напишу|вернусь|попробую|постараюсь)\b"
+    r"|\bскоро\b|\bI('ll| will| am going to)\b|\blet me\b"
+    r"|инструмент|модел|уровень|уровн[яе]|\btools?\b|\bmodels?\b|\btier\b",
+    re.IGNORECASE,
+)
+_FIRST_REMARK_MIN_CHARS = 8
+_FIRST_REMARK_MAX_CHARS = 140
+
+
+def _first_remark_from_decline(text: str) -> str | None:
+    lines = text[text.rindex("]]") + 2:].strip().splitlines()
+    remark = lines[0].strip().strip("\"«»") if lines else ""
+    if not _FIRST_REMARK_MIN_CHARS <= len(remark) <= _FIRST_REMARK_MAX_CHARS or _FIRST_REMARK_FORBIDDEN.search(remark):
+        return None
+    return remark
 
 
 def _fast_lane_instructions(language: str, is_voice: bool) -> str:
@@ -1357,6 +1390,19 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         if is_voice
         else "Keep it concise and to the point."
     )
+    # Voice only (2026-10-11): the model that has just read the request can say in one
+    # sentence what the work is, at no extra cost -- live, the narrator's own first remark
+    # was heard 12.9s after the question. Checked by _first_remark_from_decline.
+    first_remark = (
+        "One exception to \"nothing else\": the user is listening, and hears nothing while the work goes on. "
+        f"After the marker, on the same line, add ONE short sentence in {language}, in your own voice, saying "
+        "what you are now doing for them, as work already under way -- \"Ищу прогноз погоды на завтра в "
+        "Киеве.\" It names their task in plain words. It is not a promise (\"сейчас посмотрю\", \"I'll check\"), "
+        "not a question, not a greeting; it says nothing of tools, models or steps, claims no result, and has no "
+        "digits. "
+        if is_voice
+        else ""
+    )
     return (
         f"Reply in {language}.\n{style}\n\n"
         "Answer the user's last message directly ONLY if you can do it fully and correctly from this conversation "
@@ -1365,12 +1411,14 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         "remembered about them beyond this conversation), looking something up, or doing anything (sending, "
         "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else, or "
         "with exactly " + FAST_LANE_DECLINE_COMPLEX + " if it needs several dependent tool steps (check, then act, "
-        "then verify). "
+        "then verify). " + first_remark +
         "Writing, drafting, editing, checking or translating text is yours to do here -- only SENDING, saving "
         "or otherwise acting on it needs tools (seen live: \"help me write a polite letter to my teacher\" was "
         "declined). Anything about the user themselves that your instructions above don't state -- their name, "
-        "history, preferences -- may be in their notes or memory: decline; never answer that you don't know them "
-        "or haven't met (seen live: \"Как меня зовут?\" -> \"Мы ещё не встречались\"). "
+        "history, preferences, what they said or did before this conversation -- may be in their notes or "
+        "memory: decline; never answer that you don't know them, haven't met or don't remember (seen live: "
+        "\"Как меня зовут?\" -> \"Мы ещё не встречались\"; \"Что я тебе вчера говорил?\" -> \"Я не помню "
+        "предыдущих разговоров\"). "
         "When unsure, decline. Length or depth is never a reason to decline: a detailed explanation from general "
         "knowledge is still yours to give (seen live: \"Объясни подробно, как растения делают фотосинтез\" was "
         "declined, the same question without \"подробно\" answered). Never claim to have done, checked or saved "
@@ -1403,17 +1451,19 @@ def answer_is_in_language(text: str, language: str) -> bool:
 
 async def try_fast_answer(
     workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
-) -> tuple[str | None, int | None]:
-    """(answer, None) when the fast lane answered; (None, start tier) when it declined
-    -- 1 for a COMPLEX request, else 0, for run_small_model_turn's start_tier; (None,
-    None) when it couldn't run, and the cascade picks its tier itself. Never raises."""
+) -> tuple[str | None, int | None, str | None]:
+    """(answer, None, None) when the fast lane answered; (None, start tier, first
+    remark) when it declined -- the tier is 1 for a COMPLEX request, else 0, for
+    run_small_model_turn's start_tier; the remark, voice only and possibly None, is
+    what to say first while the cascade works. (None, None, None) when it couldn't
+    run, and the cascade picks its tier itself. Never raises."""
     if not FAST_LANE_ENABLED or camerlengo_ai is None:
-        return None, None
+        return None, None, None
     started = time.monotonic()
     try:
         api_key = await get_model_provider_key()
         if not api_key:
-            return None, None
+            return None, None, None
         ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
         model = FAST_LANE_MODEL
         system = "\n\n".join([
@@ -1432,21 +1482,22 @@ async def try_fast_answer(
     except Exception as exc:  # noqa: BLE001 -- the cascade is always there to fall back on
         log_event("engine", "fast_lane_failed", error=str(exc)[:300], error_type=type(exc).__name__,
                   ms=int((time.monotonic() - started) * 1000))
-        return None, None
+        return None, None, None
     text = str(raw or "").strip()
     ms = int((time.monotonic() - started) * 1000)
     if not text or text.startswith("Agent error"):
         log_event("engine", "fast_lane_failed", error=text[:300], error_type="agent_error", ms=ms)
-        return None, None
+        return None, None, None
     if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
         start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
-        log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier)
-        return None, start_tier
+        first_remark = _first_remark_from_decline(text) if is_voice else None
+        log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
+        return None, start_tier, first_remark
     if _FAST_LANE_NO_HISTORY.search(text):
         log_event("engine", "fast_lane_declined", ms=ms, start_tier=0, reason="claims_no_history", text=text[:200])
-        return None, 0
+        return None, 0, None
     log_event("engine", "fast_lane_answered", ms=ms, model=model, text_len=len(text), text=text)
-    return text, None
+    return text, None, None
 
 
 # Same model as the fast lane, for the same reason: on a narrator golden set it beat
@@ -1587,7 +1638,15 @@ async def run_small_model_turn(
     # web search plus the model's thinking around it left the narrator nothing to say
     # for ~16s. `emit` is defined below; this closure only runs once calls happen.
     def on_tool_start(name: str, args: dict[str, Any]) -> None:
-        emit(f"Начат вызов инструмента {name} (аргументы: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
+        # Only calls that do the user's work -- the plan and operation bookkeeping is not
+        # news. A plugin's name ("memory", "email") tells the narrator in a plain word
+        # where the work is now, which a tool name like request_info does not: live
+        # (2026-10-11) a memory lookup started and the narrator found nothing to say.
+        plugin = registry.lookup[name][0] if name in registry.lookup else None
+        if plugin is None and name not in _WEB_SEARCH_TOOL_NAMES:
+            return
+        where = f'plugin "{plugin}"; ' if plugin else ""
+        emit(f"Tool call {name} started ({where}arguments: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
 
     executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage,
                                     on_tool_start=on_tool_start)
@@ -1709,7 +1768,7 @@ async def run_small_model_turn(
     # A real fact from the first second (2026-10-10): picking the starting tier is itself
     # a model call (~10s live), and until a tier starts the narrator had nothing to
     # draft from -- the first spoken remark of a voice turn came ~30s after the question.
-    emit("Запрос получен, работа над ним началась.")
+    emit("The request has been received and work on it has started.")
     if start_tier is not None:
         start_index = start_tier  # already decided by the fast lane's decline
         log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
