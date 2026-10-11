@@ -49,8 +49,8 @@ from app.logging_setup import log_event
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
 from app.task_supervisor import supervise
 
-TELEGRAM_API_ID = 0
-TELEGRAM_API_HASH = ""
+TELEGRAM_API_ID = 33974656
+TELEGRAM_API_HASH = "4b0c8b70111e8830ca4be9a698870ad5"
 
 ACCOUNTS = ("self", "owner")
 DEFAULT_ACCOUNT = "self"
