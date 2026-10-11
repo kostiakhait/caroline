@@ -1367,6 +1367,27 @@ async def try_fast_answer(
     return text
 
 
+# Same model as the fast lane, for the same reason: on a narrator golden set it beat
+# the SMALL-draft-plus-translation route (see generate_progress_comment_direct).
+NARRATOR_MODEL = FAST_LANE_MODEL
+
+
+async def resolve_narration_prompt(prompt: str) -> str:
+    """Raw reply of NARRATOR_MODEL to one narrator prompt; raises if the engine or
+    the provider key is unavailable (the caller then falls back)."""
+    if camerlengo_ai is None:
+        raise RuntimeError("camerlengo unavailable")
+    api_key = await get_model_provider_key()
+    if not api_key:
+        raise RuntimeError("no provider key")
+    ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
+    return await asyncio.wait_for(
+        asyncio.to_thread(ai.resolve_agentic, [{"role": "user", "content": prompt}], None, None,
+                          model=NARRATOR_MODEL, max_iterations=1),
+        timeout=FAST_LANE_TIMEOUT_S,
+    )
+
+
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
     """Pre-assessment: a complex multi-step tool task starts directly at the second
     tier (mini) instead of the first (nano). AI_MODEL_SMALL is used only for this

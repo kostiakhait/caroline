@@ -116,7 +116,7 @@ from app.failure_classification import (
 from app.logging_setup import log_event
 from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
-from app.small_model_engine import fast_answer_is_in_language, run_small_model_turn, try_fast_answer
+from app.small_model_engine import fast_answer_is_in_language, resolve_narration_prompt, run_small_model_turn, try_fast_answer
 from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
@@ -3924,16 +3924,23 @@ class ChatSession:
                 self._narration_draft_task = None
 
     async def _draft_voice_narration_body(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
-        from app.plugins.voice_api import generate_progress_comment
+        from app.plugins.voice_api import generate_progress_comment, generate_progress_comment_direct
 
+        language = current_language_name(self.tab_id)
         comment: str | None = None
         for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
             try:
-                comment = await generate_progress_comment(
-                    "", current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
-                    gender=get_persona_gender(self.workspace_dir), activity=facts, task=task,
-                    addressee_gender=get_owner_profile(self.workspace_dir).gender, already_said=already_said,
-                )
+                # One call, drafted in the tab's language (2026-10-10): on the narrator golden
+                # set 14/16 at 2.5s vs 11/16 at 7.3s for the SMALL-draft-plus-translation
+                # route, with names kept right ("от Анны", not "от Anna") and no leaked
+                # machinery. That route stays the fallback when this one can't run at all.
+                comment = await generate_progress_comment_direct(task, facts, already_said, language, resolve_narration_prompt)
+                if comment is None:
+                    comment = await generate_progress_comment(
+                        "", language, timeout=NARRATION_NETWORK_TIMEOUT_S,
+                        gender=get_persona_gender(self.workspace_dir), activity=facts, task=task,
+                        addressee_gender=get_owner_profile(self.workspace_dir).gender, already_said=already_said,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001

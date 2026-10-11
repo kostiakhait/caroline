@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json
@@ -686,6 +686,68 @@ def _already_said_block(already_said: list[str] | None) -> str:
     )
 
 
+def _draft_language_line(draft_language: str | None) -> str:
+    if draft_language is None:
+        return "Write in English. A separate step translates it afterward."
+    # Direct drafting (2026-10-10): a strong model writes the tab's language itself --
+    # the English-draft-then-translate route left names untranslated ("встреча с
+    # Oleg") and cost a second round trip.
+    return (f"Write in {draft_language}, the language of the conversation. Keep people's names in the form "
+            f"{draft_language} speakers would use.")
+
+
+def _progress_comment_prompt(task: str, activity: str, already_said: list[str] | None, draft_language: str | None) -> str:
+    """The narrator's prompt (2026-10-06 actions-only version), shared by the
+    English-draft path below and generate_progress_comment_direct."""
+    return (
+        "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
+        "short sentence, no JSON, no markdown, no preamble.\n\n"
+        "You speak to the user about where their request stands right now: how far along the work is, or that "
+        "it's finished. Use first person, plain everyday words, present tense.\n"
+        "Never mention tools, functions, commands, systems, files, processes, session mechanics or any internal "
+        "machinery -- describe the progress of the task itself, in the terms the user used.\n"
+        "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
+        "guess the user's intent or mood; never promise or plan next steps.\n"
+        "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
+        "progress -- describe it that way.\n"
+        "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
+        "arguments and results. Never repeat any of that machinery. But when a result in it is a real piece of "
+        "the task -- something found, counted or done that the user asked about -- say THAT, in plain words, as "
+        "progress so far, never as the final answer.\n"
+        "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
+        "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\".\n"
+        "STATUS may end with how long the request has been running. If nothing new has happened for a long "
+        "while, you may say once, plainly, that this one is taking a while -- never guess how long is left.\n"
+        "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
+        "nothing else.\n\n"
+        f"{_draft_language_line(draft_language)}\n\n"
+        "Examples of the right kind of reply (copy the style, never the words -- these are unrelated to the "
+        "real task below):\n"
+        "  TASK: plan a three-day trip to the coast. STATUS: Steps in progress right now: 2.\n"
+        "  Good: <narration>Still putting the coast trip plan together, a few more pieces to go.</narration>\n"
+        "  TASK: translate the contract summary. STATUS: Steps completed so far this turn: 4 succeeded, 0 failed.\n"
+        "  Good: <narration>The translation is still in progress, not quite finished yet.</narration>\n"
+        "  TASK: book a table for two. STATUS: Steps completed so far this turn: 2 succeeded, 0 failed. "
+        "Task finished: yes.\n"
+        "  Good: <narration>Your table for two is booked.</narration>\n"
+        "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
+        "  Good: <narration></narration>\n"
+        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n"
+        "  TASK: find Anna's email about the invoice. STATUS: Работает уровень 1. Вызов инструмента mail_search "
+        "(аргументы: {\"from\": \"Anna\"}); результат: 2 messages: 'Invoice March', 'Re: invoice'\n"
+        f"  Good: <narration>{_NARRATION_WORKLOG_GOOD}</narration>\n"
+        f"  Bad (names the machinery): <narration>{_NARRATION_WORKLOG_BAD}</narration>\n"
+        "  TASK: find train times to Lviv for Friday. STATUS: Вызов инструмента web_search (аргументы: "
+        "{\"question\": \"Lviv trains Friday\"}); результат: I don't have access to live timetables. Вызов "
+        "инструмента request_info (аргументы: {\"query\": \"Lviv trains\"}); результат: Memory holds nothing relevant.\n"
+        f"  Good: <narration>{_NARRATION_DEADEND_GOOD}</narration>\n\n"
+        f"TASK (the user's request):\n---\n{task}\n---\n\n"
+        f"STATUS (what is happening):\n---\n{activity}\n---\n\n"
+        f"{_already_said_block(already_said)}"
+        "Reply now, wrapped in the tag."
+    )
+
+
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
     activity: str | None = None, addressee_gender: str | None = None, task: str | None = None,
@@ -807,53 +869,7 @@ async def generate_progress_comment(
     # action facts means no narration.
     if not activity or not task:
         return None
-    prompt = (
-        "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
-        "short sentence, no JSON, no markdown, no preamble.\n\n"
-        "You speak to the user about where their request stands right now: how far along the work is, or that "
-        "it's finished. Use first person, plain everyday words, present tense.\n"
-        "Never mention tools, functions, commands, systems, files, processes, session mechanics or any internal "
-        "machinery -- describe the progress of the task itself, in the terms the user used.\n"
-        "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
-        "guess the user's intent or mood; never promise or plan next steps.\n"
-        "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
-        "progress -- describe it that way.\n"
-        "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
-        "arguments and results. Never repeat any of that machinery. But when a result in it is a real piece of "
-        "the task -- something found, counted or done that the user asked about -- say THAT, in plain words, as "
-        "progress so far, never as the final answer.\n"
-        "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
-        "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\".\n"
-        "STATUS may end with how long the request has been running. If nothing new has happened for a long "
-        "while, you may say once, plainly, that this one is taking a while -- never guess how long is left.\n"
-        "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
-        "nothing else.\n\n"
-        "Write in English. A separate step translates it afterward.\n\n"
-        "Examples of the right kind of reply (copy the style, never the words -- these are unrelated to the "
-        "real task below):\n"
-        "  TASK: plan a three-day trip to the coast. STATUS: Steps in progress right now: 2.\n"
-        "  Good: <narration>Still putting the coast trip plan together, a few more pieces to go.</narration>\n"
-        "  TASK: translate the contract summary. STATUS: Steps completed so far this turn: 4 succeeded, 0 failed.\n"
-        "  Good: <narration>The translation is still in progress, not quite finished yet.</narration>\n"
-        "  TASK: book a table for two. STATUS: Steps completed so far this turn: 2 succeeded, 0 failed. "
-        "Task finished: yes.\n"
-        "  Good: <narration>Your table for two is booked.</narration>\n"
-        "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
-        "  Good: <narration></narration>\n"
-        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n"
-        "  TASK: find Anna's email about the invoice. STATUS: Работает уровень 1. Вызов инструмента mail_search "
-        "(аргументы: {\"from\": \"Anna\"}); результат: 2 messages: 'Invoice March', 'Re: invoice'\n"
-        f"  Good: <narration>{_NARRATION_WORKLOG_GOOD}</narration>\n"
-        f"  Bad (names the machinery): <narration>{_NARRATION_WORKLOG_BAD}</narration>\n"
-        "  TASK: find train times to Lviv for Friday. STATUS: Вызов инструмента web_search (аргументы: "
-        "{\"question\": \"Lviv trains Friday\"}); результат: I don't have access to live timetables. Вызов "
-        "инструмента request_info (аргументы: {\"query\": \"Lviv trains\"}); результат: Memory holds nothing relevant.\n"
-        f"  Good: <narration>{_NARRATION_DEADEND_GOOD}</narration>\n\n"
-        f"TASK (the user's request):\n---\n{task}\n---\n\n"
-        f"STATUS (what is happening):\n---\n{activity}\n---\n\n"
-        f"{_already_said_block(already_said)}"
-        "Reply now, wrapped in the tag."
-    )
+    prompt = _progress_comment_prompt(task, activity, already_said, draft_language=None)
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
     if session:
         body["session"] = session
@@ -918,6 +934,46 @@ async def generate_progress_comment(
         return ""
     log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=final_text)
     return final_text
+
+
+async def generate_progress_comment_direct(
+    task: str, activity: str, already_said: list[str], language: str,
+    resolve: Callable[[str], Awaitable[str]],
+) -> str | None:
+    """One-call narration (2026-10-10): drafted straight in `language` by the model
+    behind `resolve` (prompt -> raw reply), checked exactly like
+    generate_progress_comment's output. Same return contract: the remark, "" for
+    nothing new to say (including a repeat of `already_said`), None on failure --
+    callers fall back to generate_progress_comment.
+
+    Measured on a narrator golden set before switching (see the commit): the
+    two-call SMALL + translate route vs this one."""
+    if not activity or not task:
+        return None
+    prompt = _progress_comment_prompt(task, activity, already_said, draft_language=language)
+    try:
+        raw = (await resolve(prompt)) or ""
+    except Exception as exc:  # noqa: BLE001
+        log_event("plugin:voice", "generate_progress_comment_direct_failed", error=str(exc)[:300])
+        return None
+    if raw.startswith("Agent error"):
+        log_event("plugin:voice", "generate_progress_comment_direct_failed", error=raw[:300])
+        return None
+    if re.fullmatch(r"\s*<narration>\s*</narration>\s*", raw):
+        log_event("plugin:voice", "generate_progress_comment_nothing_new", direct=True)
+        return ""
+    text = _extract_tagged_text(raw, "narration")
+    if not text:
+        log_event("plugin:voice", "generate_progress_comment_unextractable", raw=raw[:300], direct=True)
+        return None
+    if _looks_like_narration_garbage(text, language) or _is_echo_of_prompt_example(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300], direct=True)
+        return None
+    if already_said and any(_is_repeat(text, prev) for prev in already_said):
+        log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300], direct=True)
+        return ""
+    log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True)
+    return text
 
 
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
