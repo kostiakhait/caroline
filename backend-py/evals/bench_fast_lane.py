@@ -17,7 +17,6 @@ e.log_event = lambda comp, ev, **kw: events.append((ev, kw))
 
 MODELS = [
     ("anthropic/claude-haiku-4.5", None),
-    ("anthropic/claude-sonnet-5", None),
 ]
 QUESTIONS = [
     ("answer", "Расскажи, что ты умеешь."),
@@ -28,6 +27,9 @@ QUESTIONS = [
     ("decline", "Что я тебе вчера говорил про проект?"),
     ("decline", "Отправь Ивану письмо, что я опоздаю."),
     ("decline", "Какие новости сегодня?"),
+    ("answer", "Объясни подробно, как растения делают фотосинтез."),
+    ("answer", "Расскажи подробно, почему небо голубое."),
+    ("decline", "Найди подробно всё, что я писал Ивану на прошлой неделе."),
 ]
 
 

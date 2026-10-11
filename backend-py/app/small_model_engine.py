@@ -1299,8 +1299,8 @@ _FAST_LANE_DIALOGUE_LINES = 12
 def _fast_lane_instructions(language: str, is_voice: bool) -> str:
     style = (
         "This is a spoken conversation: your reply will be read aloud. Plain sentences only -- no markdown, no "
-        "lists, no emoji. Keep it short and natural, like a person answering out loud (2-5 sentences), unless "
-        "the user asked for detail."
+        "lists, no emoji. Keep it short and natural, like a person answering out loud (2-5 sentences); if the "
+        "user asked for detail, explain fully -- still in plain spoken sentences."
         if is_voice
         else "Keep it concise and to the point."
     )
@@ -1311,7 +1311,10 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         "news, prices, dates, schedules), the user's own data (mail, notes, files, contacts, calendar, anything "
         "remembered about them beyond this conversation), looking something up, or doing anything (sending, "
         "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else. "
-        "When unsure, decline. Never claim to have done, checked or saved anything, and never promise to."
+        "When unsure, decline. Length or depth is never a reason to decline: a detailed explanation from general "
+        "knowledge is still yours to give (seen live: \"Объясни подробно, как растения делают фотосинтез\" was "
+        "declined, the same question without \"подробно\" answered). Never claim to have done, checked or saved "
+        "anything, and never promise to."
     )
 
 
