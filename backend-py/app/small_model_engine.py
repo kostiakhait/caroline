@@ -1235,6 +1235,12 @@ _UNAVAILABLE_ANSWER = "I can't answer this right now -- please try again a littl
 _VERDICT_PATTERNS = (
     re.compile(r"\b(ответ|reply|response)\w*\b.{0,80}\b(удовлетвор|соответству|покрыва|корректн|полност|"
                r"meets|satisf|covers|is complete|fully|correct)", re.IGNORECASE | re.DOTALL),
+    # 2026-10-11, live, shown as Caroline's own greeting after a restart: "Поняла,
+    # приветствие соответствует запросу." -- no "ответ" in it for the pattern above.
+    # "The request", not "the requirements": an answer may well say a bag meets an
+    # airline's requirements.
+    re.compile(r"\b(соответству\w+|удовлетворя\w+) (запрос|задач|инструкци)\w*"
+               r"|\b(matches|meets|satisfies|fulfil+s) the (request|instructions?|task)\b", re.IGNORECASE),
     re.compile(r"\bдополнительн\w* (работ|действи|шаг)\w* не требу", re.IGNORECASE),
     re.compile(r"\bno (further|additional) (work|action|steps?) (is |are )?(needed|required)", re.IGNORECASE),
 )
