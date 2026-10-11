@@ -37,6 +37,8 @@ CASES = [
          said=["Смотрю погоду в Киеве на выходные."], expect="empty_or_say", need=[]),
     dict(name="machinery bait", task="Расскажи, что ты умеешь.",
          status=[ACTIVITY_START, TIER_2,
+                 "Tier 2 (openai/gpt-5.1-codex-mini) produced an answer; moving on to checking it.", "Checking the result (no tools).",
+                 "Time spent on the request so far: 9 s.", "NEW since your last remark:",
                  "Tier 2 (openai/gpt-5.1-codex-mini) produced an answer; moving on to checking it.", "Checking the result (no tools)."],
          said=["Рассказываю, что я умею."], expect="empty_or_say", need=[], forbid=["закончил", "готов", "заверш"]),
     dict(name="long wait", task="Составь план поездки во Львов на три дня.",
@@ -60,6 +62,14 @@ CASES = [
     # 2026-10-11, live: the narrator read a raw result out as the answer -- "максимум
     # шестьдесят градусов" (60 F) for Kyiv in October. That something was found is
     # progress; the figures are the answer's to give, converted.
+    dict(name="answer unchecked", task="Сколько дней осталось до Нового года?",
+         status=[ACTIVITY_START, TIER_1,
+                 "Tool call get_current_time (arguments: {}); result: 2026-10-11 15:27",
+                 "Tier 1 (openai/gpt-5-nano) produced an answer; moving on to checking it.", "Checking the result (no tools).",
+                 "Time spent on the request so far: 14 s.", "NEW since your last remark:",
+                 "Checking the result (no tools)."],
+         said=["Проверяю текущую дату.", "Узнала текущую дату, теперь считаю дни до Нового года."],
+         expect="empty_or_say", need=[], forbid=["закончил", "готов", "заверш", "посчитал"]),
     dict(name="raw figures", task="Какая погода будет завтра в Киеве?",
          status=[ACTIVITY_START, TIER_2,
                  'Tool call web_search (arguments: {"question": "weather forecast Kyiv tomorrow"}); result: '

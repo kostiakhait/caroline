@@ -709,6 +709,18 @@ def _draft_language_line(draft_language: str | None) -> str:
             "exactly as they would be spoken.")
 
 
+# "Finished" is the answer's to say. Live (2026-10-11): "Закончила считать дни до Нового
+# года." was drafted from "Checking the result", two seconds before the checked answer
+# -- and would have been false had the check sent the work back. The prompt's own rule
+# (finished only if STATUS says so) held on the golden set and not there, so a remark
+# that claims it is dropped unless STATUS does say so.
+_FINISH_CLAIM = re.compile(
+    r"\b(закончил[аи]?|завершил[аи]?|готов[оаы]?|всё сделал[аи]?|все сделал[аи]?|сделано|finished|completed|done|all set)\b",
+    re.IGNORECASE,
+)
+_STATUS_SAYS_FINISHED = "Task finished: yes"
+
+
 # The engine's fact line for a finished tool call: "Tool call NAME (arguments: ...); result: ...".
 _TOOL_RESULT_IN_STATUS = re.compile(r"(\); result: )(.*)")
 
@@ -1031,6 +1043,9 @@ async def generate_progress_comment_direct(
         return None
     if already_said and any(_is_repeat(text, prev) for prev in already_said):
         log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300], direct=True)
+        return ""
+    if _FINISH_CLAIM.search(text) and _STATUS_SAYS_FINISHED not in activity:
+        log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300], direct=True)
         return ""
     log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True)
     return text
