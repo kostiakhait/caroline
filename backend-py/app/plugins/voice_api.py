@@ -692,8 +692,11 @@ def _draft_language_line(draft_language: str | None) -> str:
     # Direct drafting (2026-10-10): a strong model writes the tab's language itself --
     # the English-draft-then-translate route left names untranslated ("встреча с
     # Oleg") and cost a second round trip.
+    # Numbers as words (2026-10-10): the remark is read aloud, and a digit in it makes
+    # clean_text_for_speech spend a whole model call spelling it out first.
     return (f"Write in {draft_language}, the language of the conversation. Keep people's names in the form "
-            f"{draft_language} speakers would use.")
+            f"{draft_language} speakers would use. Write numbers, dates and temperatures out in words, "
+            "exactly as they would be spoken.")
 
 
 def _progress_comment_prompt(

@@ -23,7 +23,7 @@ CASES = [
          status=[ACTIVITY_START,
                  'Вызов инструмента mail_search (аргументы: {"from": "Anna", "unread": true}); результат: '
                  "3 messages: 'Счёт за март', 'Re: счёт', 'Встреча в пятницу'"],
-         said=["Проверяю почту от Анны."], expect="say", need=["три", "3", "письм"]),
+         said=["Проверяю почту от Анны."], expect="say", need=["три", "письм"]),
     dict(name="note saved", task="Сохрани заметку: встреча с Олегом в пятницу в десять.",
          status=[ACTIVITY_START,
                  'Вызов инструмента notes_create (аргументы: {"title": "Встреча с Олегом"}); результат: created note "Встреча с Олегом" in folder Caroline:Notes'],
@@ -44,6 +44,7 @@ FORBIDDEN = [
     ("machinery", re.compile(r"web_search|request_info|notes_|mail_search|инструмент|уровень|уровн[яе]|\btier\b|gpt|codex|nano|модел|верификац", re.I)),
     ("promise", re.compile(r"\b(я )?(сделаю|проверю|найду|отправлю|сообщу|напишу|вернусь)\b|\bскоро\b|\bсейчас (сделаю|проверю|найду)", re.I)),
     ("question", re.compile(r"\?")),
+    ("digits", re.compile(r"\d")),  # read aloud: numbers belong in words
     ("third person", re.compile(r"каролайн|caroline|пользовател", re.I)),
     # The persona is female: no masculine first-person past forms ("я искал", "Нашёл ...").
     ("wrong gender", re.compile(r"\bя (\w+ )?(искал|нашёл|нашел|сделал|проверил|понял|начал|сохранил|создал|посмотрел|получил|смог)\b"
