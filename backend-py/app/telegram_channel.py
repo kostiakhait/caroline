@@ -1,16 +1,37 @@
-"""app/telegram_channel.py -- Telegram personal-account connection (Telethon,
-MTProto Client API -- NOT a bot), per docs/MESSENGER_INTEGRATIONS_PLAN.md.
-Acts as the user, sees their own DMs and groups.
+"""app/telegram_channel.py -- Telegram connections (Telethon, MTProto Client
+API -- NOT a bot), per docs/MESSENGER_INTEGRATIONS_PLAN.md.
+
+TWO separate accounts, not one (decision 2026-10-11, after the single-
+account design above shipped but before any real login ever worked):
+"self" is Caroline's OWN Telegram account (her own number, her own DMs and
+groups -- she may read and reply there as herself, no extra permission
+needed); "owner" is the human owner's personal Telegram account, linked so
+Caroline can read it and keep them posted, but may send AS the owner only
+when they have explicitly asked her to, for that specific message (see
+telegram_send_message's own description -- this is a permission rule, not
+a technical gate, same shape as policies.py's
+no_unauthorized_secret_changes_instruction: nothing here can enforce it
+mechanically, the model has to actually follow it). Both accounts use the
+SAME Caroline application (api_id/api_hash identify the app, not the
+account -- Telegram allows many accounts under one app) and otherwise work
+identically: their own session file, their own live client, their own
+login flow, their own incoming-message notifications.
 
 Login is a conversational flow driven by the model, not a native form:
 phone number -> the code Telegram sends -> the 2FA password if the account
 has one. The resulting Telethon StringSession is encrypted at rest via
 app/secret_store.py (DPAPI), never stored plaintext.
 
-TELEGRAM_API_ID / TELEGRAM_API_HASH identify the Caroline APPLICATION (not
-the user). They come from one app registration at my.telegram.org -- same
-deferred one-time step as the Slack App ("Пока не регистрируем, реализуем"),
-so they stay empty until then, and login fails clearly until they're set.
+TELEGRAM_API_ID / TELEGRAM_API_HASH identify the Caroline APPLICATION
+itself (not any one account). They come from one app registration at
+my.telegram.org -- a one-time step done by a human with a Telegram account
+and phone (Caroline cannot do this herself), same deferred step as the
+Slack App ("Пока не регистрируем, реализуем"). Embedded directly in this
+file once registered (decision 2026-10-11: same as how official Telegram
+clients ship their own api_id/api_hash built in -- Telegram's own rule is
+only that api_hash not be published source-available/to end users at
+large, not that an app can't carry its own); until then they stay empty
+and every login attempt fails with a clear, non-misleading message.
 """
 
 from __future__ import annotations
@@ -31,22 +52,36 @@ from app.task_supervisor import supervise
 TELEGRAM_API_ID = 0
 TELEGRAM_API_HASH = ""
 
+ACCOUNTS = ("self", "owner")
+DEFAULT_ACCOUNT = "self"
+
 
 class TelegramLoginError(Exception):
     """Surfaced to the model/user as a plain is_error reply, never a crash."""
 
 
-def _session_path(workspace_dir: str):
-    return messenger_secrets_dir(workspace_dir, "telegram") / "session.bin"
+def is_valid_account(account: str) -> bool:
+    return account in ACCOUNTS
 
 
-def has_telegram_session(workspace_dir: str) -> bool:
-    return decrypt_text_from_file(_session_path(workspace_dir)) is not None
+def _check_account(account: str) -> str:
+    if account not in ACCOUNTS:
+        raise TelegramLoginError(f'"account" must be one of {", ".join(ACCOUNTS)}, not {account!r}.')
+    return account
+
+
+def _session_path(workspace_dir: str, account: str):
+    return messenger_secrets_dir(workspace_dir, "telegram") / f"session_{account}.bin"
+
+
+def has_telegram_session(workspace_dir: str, account: str) -> bool:
+    return decrypt_text_from_file(_session_path(workspace_dir, account)) is not None
 
 
 def app_configured() -> bool:
     """Whether this build carries the Caroline Telegram application's
-    api_id/api_hash; without them no login can work at all."""
+    api_id/api_hash; without them no login can work at all, for either
+    account."""
     return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
 
 
@@ -62,41 +97,44 @@ def _new_client(session: str = "") -> TelegramClient:
     return TelegramClient(StringSession(session), TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 
-# One in-flight login at a time: phone_code_hash + the connected client, held
-# between the "send me the code" and "here's the code" turns.
-_pending: dict[str, Any] | None = None
+# One in-flight login per account: phone_code_hash + the connected client,
+# held between the "send me the code" and "here's the code" turns. A login
+# of one account never disturbs an in-progress login of the other.
+_pending: dict[str, dict[str, Any]] = {}
 
 
-async def login_start(workspace_dir: str, phone: str) -> str:
-    global _pending
+async def login_start(workspace_dir: str, phone: str, account: str) -> str:
+    _check_account(account)
     _require_app_credentials()
-    if _pending is not None:
-        await _pending["client"].disconnect()
+    old = _pending.get(account)
+    if old is not None:
+        await old["client"].disconnect()
     client = _new_client()
     await client.connect()
     sent = await client.send_code_request(phone)
-    _pending = {"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash}
-    log_event("plugin:telegram", "login_code_sent")
+    _pending[account] = {"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash}
+    log_event("plugin:telegram", "login_code_sent", account=account)
     return "Telegram sent a login code to that number (in the Telegram app or by SMS). Give it to me to finish."
 
 
-async def login_finish(workspace_dir: str, code: str, password: str | None = None) -> str:
-    global _pending
-    if _pending is None:
-        raise TelegramLoginError("No Telegram login in progress -- start with the phone number first.")
-    client = _pending["client"]
+async def login_finish(workspace_dir: str, code: str, account: str, password: str | None = None) -> str:
+    _check_account(account)
+    pending = _pending.get(account)
+    if pending is None:
+        raise TelegramLoginError(f'No Telegram login in progress for the "{account}" account -- start with the phone number first.')
+    client = pending["client"]
     try:
-        await client.sign_in(phone=_pending["phone"], code=code.strip(), phone_code_hash=_pending["phone_code_hash"])
+        await client.sign_in(phone=pending["phone"], code=code.strip(), phone_code_hash=pending["phone_code_hash"])
     except SessionPasswordNeededError:
         if not password:
             return "This account has two-step verification. Tell me its password to finish."
         await client.sign_in(password=password)
     except Exception as exc:
         raise TelegramLoginError(f"Telegram rejected the code: {exc}") from exc
-    encrypt_text_to_file(_session_path(workspace_dir), client.session.save(), "Telegram session (Telethon StringSession)")
+    encrypt_text_to_file(_session_path(workspace_dir, account), client.session.save(), f"Telegram session ({account}, Telethon StringSession)")
     await client.disconnect()
-    _pending = None
-    log_event("plugin:telegram", "login_succeeded")
+    del _pending[account]
+    log_event("plugin:telegram", "login_succeeded", account=account)
     # The startup loop (start_telegram_channel) notices the new session within
     # its 30s recheck and starts the live client itself -- starting one here
     # too would run two clients on the same account.
@@ -105,6 +143,7 @@ async def login_finish(workspace_dir: str, code: str, password: str | None = Non
 
 @dataclass
 class TelegramChannelStatus:
+    account: str = ""
     linked: bool = False
     connected: bool = False
     own_user_id: int | None = None
@@ -112,37 +151,41 @@ class TelegramChannelStatus:
     last_error: str | None = None
 
 
-_status = TelegramChannelStatus()
-_live_client: TelegramClient | None = None
+_status: dict[str, TelegramChannelStatus] = {account: TelegramChannelStatus(account=account) for account in ACCOUNTS}
+_live_clients: dict[str, TelegramClient] = {}
 
 
 def get_telegram_channel_status() -> dict[str, Any]:
-    return asdict(_status)
+    return {account: asdict(status) for account, status in _status.items()}
 
 
-def get_live_client() -> TelegramClient | None:
-    return _live_client
+def get_live_client(account: str) -> TelegramClient | None:
+    return _live_clients.get(account)
 
 
-async def _start_background(workspace_dir: str, inject_proactive: Callable[[str], None] | None) -> None:
-    """Runs forever once a session exists. Telethon reconnects internally;
-    this only returns on an unrecoverable failure (supervise() restarts it)."""
-    global _live_client
-    session = decrypt_text_from_file(_session_path(workspace_dir))
+_ACCOUNT_LABEL = {"self": "your own", "owner": "the owner's"}
+
+
+async def _start_background(workspace_dir: str, account: str, inject_proactive: Callable[[str], None] | None) -> None:
+    """Runs forever once a session exists for this account. Telethon
+    reconnects internally; this only returns on an unrecoverable failure
+    (supervise() restarts it)."""
+    session = decrypt_text_from_file(_session_path(workspace_dir, account))
     if not session:
         return
     _require_app_credentials()
     client = _new_client(session)
     await client.connect()
+    status = _status[account]
     if not await client.is_user_authorized():
-        _status.linked = False
-        log_event("plugin:telegram", "session_not_authorized")
+        status.linked = False
+        log_event("plugin:telegram", "session_not_authorized", account=account)
         return
     me = await client.get_me()
-    _status.linked = True
-    _status.connected = True
-    _status.own_user_id = me.id
-    _live_client = client
+    status.linked = True
+    status.connected = True
+    status.own_user_id = me.id
+    _live_clients[account] = client
 
     @client.on(events.NewMessage(incoming=True))
     async def _on_new(event: events.NewMessage.Event) -> None:
@@ -156,36 +199,50 @@ async def _start_background(workspace_dir: str, inject_proactive: Callable[[str]
         sender = await event.get_sender()
         name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or str(event.sender_id)
         kind = "DM" if event.is_private else "group mention"
-        _status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        log_event("plugin:telegram", "message_received", kind=kind, chat_id=event.chat_id)
-        if inject_proactive is not None:
-            inject_proactive(
-                f'[New Telegram {kind} from "{name}" (chat_id={event.chat_id}) -- reply with '
-                f"telegram_send_message(chat=\"{event.chat_id}\", text=...) if it needs a response:\n{text}]"
+        status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        log_event("plugin:telegram", "message_received", account=account, kind=kind, chat_id=event.chat_id)
+        if inject_proactive is None:
+            return
+        note = (
+            f'[New Telegram {kind} in {_ACCOUNT_LABEL[account]} Telegram account, from "{name}" '
+            f'(chat_id={event.chat_id}, account="{account}"):\n{text}'
+        )
+        if account == "self":
+            note += f'\nReply with telegram_send_message(chat="{event.chat_id}", text=..., account="self") if it needs a response.]'
+        else:
+            note += (
+                "\nThis is the OWNER'S OWN correspondence, not yours -- read it and tell the owner about it if it "
+                "matters, but do not reply as them unless they have explicitly asked you to send this specific "
+                f'reply (telegram_send_message(chat="{event.chat_id}", text=..., account="owner")).]'
             )
+        inject_proactive(note)
 
     try:
         await client.run_until_disconnected()
     finally:
-        _status.connected = False
-        _live_client = None
+        status.connected = False
+        _live_clients.pop(account, None)
 
 
-def start_telegram_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:
-    """Startup loop: if a session already exists, connect; otherwise re-check
-    every 30s (cheap file read) until login_finish has stored one."""
-    async def _loop() -> None:
-        while True:
-            if not has_telegram_session(workspace_dir):
-                await asyncio.sleep(30)
-                continue
-            _status.linked = True
-            try:
-                await _start_background(workspace_dir, inject_proactive)
-            except Exception as exc:
-                _status.connected = False
-                _status.last_error = str(exc)
-                log_event("plugin:telegram", "connection_failed", error=str(exc))
-            await asyncio.sleep(5.0)
+def start_telegram_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> list[asyncio.Task[None]]:
+    """Startup loop, one per account: if a session already exists, connect;
+    otherwise re-check every 30s (cheap file read) until login_finish has
+    stored one. The two accounts are fully independent -- one can be linked
+    and running while the other has never logged in."""
+    def _make_loop(account: str) -> Callable[[], Any]:
+        async def _loop() -> None:
+            while True:
+                if not has_telegram_session(workspace_dir, account):
+                    await asyncio.sleep(30)
+                    continue
+                _status[account].linked = True
+                try:
+                    await _start_background(workspace_dir, account, inject_proactive)
+                except Exception as exc:
+                    _status[account].connected = False
+                    _status[account].last_error = str(exc)
+                    log_event("plugin:telegram", "connection_failed", account=account, error=str(exc))
+                await asyncio.sleep(5.0)
+        return _loop
 
-    return supervise("telegram_channel", _loop)
+    return [supervise(f"telegram_channel_{account}", _make_loop(account)) for account in ACCOUNTS]

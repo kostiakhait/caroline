@@ -1,5 +1,11 @@
 # Caroline: мессенджер-интеграции (Slack, Telegram, Discord, WhatsApp, Signal)
 
+## Статус (2026-10-11)
+
+Telegram переделан на ДВА отдельных аккаунта (решения 2026-10-10/11, после живого инцидента: модель спросила у владельца номер телефона и код для несуществующего подключения, хотя ключи приложения вообще не были прописаны). `telegram_channel.py` / `telegram_plugin.py`: `account` = `"self"` (свой аккаунт Кэролайн, читает и отвечает сама) или `"owner"` (личный аккаунт владельца — читает и уведомляет, но пишет от его имени только по прямому разовому указанию, это правило только в инструкции модели, механической проверки нет). У каждого аккаунта свой файл сессии (`session_self.bin` / `session_owner.bin`), свой живой клиент, свой вход, свои уведомления о новых сообщениях — размечены, чей это аккаунт. `api_id`/`api_hash` по-прежнему не вписаны: это один раз делает человек на my.telegram.org (Кэролайн не может сама), значения живут прямо в коде (как у штатных клиентов Telegram), один раз на все установки — ждут от пользователя.
+
+Все инструменты сначала проверяют `app_configured()` и говорят прямо «в этой сборке Telegram недоступен, не спрашивай номер/код», а не «не подключено — войди» — это и был живой баг.
+
 ## Статус (2026-10-07)
 
 Все пять реализованы в коде: `secret_store.py`, `sidecar_process.py`, `slack_channel.py`+`slack_plugin.py`, `telegram_channel.py`+`telegram_plugin.py`, `discord_channel.py`+`discord_plugin.py`, `whatsapp_channel.py`+`whatsapp_plugin.py`+`companion-apps/whatsapp-sidecar/`, `signal_channel.py`+`signal_plugin.py`. Инсталлятор дополнен: `pywin32`/`slack_sdk`/`setuptools`/`telethon`/`discord.py`/`qrcode`/`Pillow` в `PythonInstaller.cs`, реактивирован `NodeInstaller.cs`, добавлены `WhatsappSidecarInstaller.cs`, `JavaRuntimeInstaller.cs` (реальный хеш Temurin 17 JRE, проверен загрузкой), `SignalCliInstaller.cs` (реальный хеш signal-cli 0.14.9, проверен загрузкой).
