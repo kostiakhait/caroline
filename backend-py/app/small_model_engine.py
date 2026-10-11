@@ -1306,6 +1306,19 @@ FAST_LANE_DECLINE = "[[NEEDS_TOOLS]]"
 # Declining, the fast lane also does _start_tier_index's job (2026-10-10): the same
 # SIMPLE/COMPLEX call cost ~1.7s more on every tool turn, by a weaker model.
 FAST_LANE_DECLINE_COMPLEX = "[[NEEDS_TOOLS:COMPLEX]]"
+# A deterministic check after the model (2026-10-10), in the multi-stage sanitizing
+# sense of the microagents paper: told plainly to decline questions about the user's
+# own past or identity, the fast model still answered "Как меня зовут?" with "Мы ещё
+# не встречались" and "Что я тебе вчера говорил?" with "Мы ещё не общались" -- false
+# whenever memory or notes hold the answer. Such a reply is treated as a decline, so
+# the cascade, which can look, answers instead.
+_FAST_LANE_NO_HISTORY = re.compile(
+    r"не (встречал|общал|знаком|разговаривал)|"
+    r"(не знаю|не помню) (вашего|твоего|вашe|твоё|твое)? ?(имени|имя)|"
+    r"(ничего|ещё|еще) (мне )?не (говорил|рассказывал|писал)|"
+    r"haven'?t (met|talked|spoken)|don'?t know your name|you (haven'?t|didn'?t) (tell|told|mention)",
+    re.IGNORECASE,
+)
 _FAST_LANE_DIALOGUE_LINES = 12
 
 
@@ -1327,6 +1340,11 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else, or "
         "with exactly " + FAST_LANE_DECLINE_COMPLEX + " if it needs several dependent tool steps (check, then act, "
         "then verify). "
+        "Writing, drafting, editing, checking or translating text is yours to do here -- only SENDING, saving "
+        "or otherwise acting on it needs tools (seen live: \"help me write a polite letter to my teacher\" was "
+        "declined). Anything about the user themselves that your instructions above don't state -- their name, "
+        "history, preferences -- may be in their notes or memory: decline; never answer that you don't know them "
+        "or haven't met (seen live: \"Как меня зовут?\" -> \"Мы ещё не встречались\"). "
         "When unsure, decline. Length or depth is never a reason to decline: a detailed explanation from general "
         "knowledge is still yours to give (seen live: \"Объясни подробно, как растения делают фотосинтез\" was "
         "declined, the same question without \"подробно\" answered). Never claim to have done, checked or saved "
@@ -1398,6 +1416,9 @@ async def try_fast_answer(
         start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
         log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier)
         return None, start_tier
+    if _FAST_LANE_NO_HISTORY.search(text):
+        log_event("engine", "fast_lane_declined", ms=ms, start_tier=0, reason="claims_no_history", text=text[:200])
+        return None, 0
     log_event("engine", "fast_lane_answered", ms=ms, model=model, text_len=len(text), text=text)
     return text, None
 
