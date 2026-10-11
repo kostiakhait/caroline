@@ -32,6 +32,7 @@ doc comment.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -44,6 +45,7 @@ from app.logging_setup import log_event
 from app.plugins.files_plugin import open_file_with_default_app
 from app.secret_store import messenger_secrets_dir
 from app.task_supervisor import supervise
+from app.workspace_dir import WORKSPACE_DIR
 
 JAVA_HOME = os.environ.get("CAROLINE_JAVA_HOME", "")
 SIGNAL_CLI_BAT = os.environ.get("CAROLINE_SIGNAL_CLI_BAT", "")
@@ -208,13 +210,140 @@ async def _rpc_call(method: str, params: dict[str, Any]) -> Any:
     return result
 
 
+def _is_group_id(target: str) -> bool:
+    """signal-cli recipients are always E.164 phone numbers (a leading
+    '+'); group ids are opaque base64 strings with no such prefix -- the
+    same shape-based distinction telegram_channel.py and whatsapp_channel.
+    py each already use for their own id-vs-phone split, so every
+    to/target param here can take either without a separate flag."""
+    return not target.startswith("+")
+
+
 async def send_message(recipient: str, text: str) -> None:
-    await _rpc_call("send", {"recipient": [recipient], "message": text})
+    key = "groupId" if _is_group_id(recipient) else "recipient"
+    await _rpc_call("send", {key: [recipient], "message": text})
 
 
 async def list_contacts() -> list[dict[str, Any]]:
     result = await _rpc_call("listContacts", {})
     return result if isinstance(result, list) else []
+
+
+# Attachments (2026-10-11). signal-cli's own send/getAttachment commands
+# (confirmed against the real v0.14.9 source: SendCommand.java,
+# GetAttachmentCommand.java, JsonAttachment.java) move a local file as a
+# plain path on the way out, and base64 inside the JSON-RPC response on
+# the way back in -- there is no local disk path this process can just
+# read directly for a received attachment (getAttachment is the only
+# supported way to retrieve one), unlike Telegram/WhatsApp.
+SIGNAL_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "signal_downloads"
+
+
+async def send_file(to: str, path: str, caption: str | None = None) -> None:
+    if not Path(path).is_file():
+        raise SignalError(f"No such local file: {path}")
+    key = "groupId" if _is_group_id(to) else "recipient"
+    params: dict[str, Any] = {key: [to], "attachment": [path]}
+    if caption:
+        params["message"] = caption
+    await _rpc_call("send", params)
+
+
+async def download_attachment(ref: str, save_path: str | None = None) -> str:
+    """`ref` is "<attachment id>|<source>" (the source recipient number or
+    group id the attachment arrived from -- getAttachment requires one,
+    mutually exclusive with the other, to look it up), as handed out in
+    the proactive notification built by _dispatch_rpc_line below."""
+    try:
+        attachment_id, source = ref.split("|", 1)
+    except ValueError:
+        raise SignalError(f'Malformed attachment ref {ref!r} -- expected "<id>|<source>" from a proactive notification.')
+    key = "groupId" if _is_group_id(source) else "recipient"
+    result = await _rpc_call("getAttachment", {"id": attachment_id, key: source})
+    data = (result or {}).get("data") if isinstance(result, dict) else None
+    if not data:
+        raise SignalError(f"signal-cli returned no data for attachment {attachment_id}.")
+    if not save_path:
+        SIGNAL_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        save_path = str(SIGNAL_DOWNLOADS_DIR / attachment_id)
+    Path(save_path).write_bytes(base64.b64decode(data))
+    return save_path
+
+
+# Contacts (2026-10-11). Like WhatsApp, Signal has no "add contact" call
+# distinct from messaging someone -- any phone number can be messaged
+# directly. updateContact sets a local display name on a recipient
+# (creating a local contact entry for them if one didn't exist yet, the
+# closest Signal equivalent to Telegram's telegram_add_contact); block/
+# unblock work on both individual recipients and groups.
+async def update_contact_name(recipient: str, name: str | None = None, given_name: str | None = None, family_name: str | None = None) -> None:
+    params: dict[str, Any] = {"recipient": recipient}
+    if name:
+        params["name"] = name
+    if given_name:
+        params["givenName"] = given_name
+    if family_name:
+        params["familyName"] = family_name
+    await _rpc_call("updateContact", params)
+
+
+async def set_block(target: str, block: bool) -> None:
+    key = "groupId" if _is_group_id(target) else "recipient"
+    await _rpc_call("block" if block else "unblock", {key: [target]})
+
+
+# Groups (2026-10-11). Signal groups are fully decentralized -- every
+# member keeps their own independent copy, so there is no server call that
+# deletes a group "for everyone", not even for its creator (unlike
+# Telegram, and unlike even WhatsApp's own best-effort). delete_group
+# below approximates the same way whatsapp_channel.py's own delete_group
+# does: remove every other member this account can, then quit for good.
+async def create_group(name: str, members: list[str]) -> str:
+    result = await _rpc_call("updateGroup", {"name": name, "member": members})
+    group_id = (result or {}).get("groupId")
+    if not group_id:
+        raise SignalError("signal-cli didn't return a groupId for the new group.")
+    return group_id
+
+
+async def update_group_members(
+    group_id: str, *, add: list[str] | None = None, remove: list[str] | None = None,
+    promote: list[str] | None = None, demote: list[str] | None = None,
+) -> None:
+    params: dict[str, Any] = {"groupId": group_id}
+    if add:
+        params["member"] = add
+    if remove:
+        params["removeMember"] = remove
+    if promote:
+        params["admin"] = promote
+    if demote:
+        params["removeAdmin"] = demote
+    await _rpc_call("updateGroup", params)
+
+
+async def list_groups() -> list[dict[str, Any]]:
+    result = await _rpc_call("listGroups", {"detailed": True})
+    return result if isinstance(result, list) else []
+
+
+async def quit_group(group_id: str, *, delete: bool = False, new_admins: list[str] | None = None) -> None:
+    params: dict[str, Any] = {"groupId": group_id, "delete": delete}
+    if new_admins:
+        params["admin"] = new_admins
+    await _rpc_call("quitGroup", params)
+
+
+async def delete_group(group_id: str) -> None:
+    groups = await list_groups()
+    members: list[str] = []
+    for g in groups:
+        if g.get("id") == group_id:
+            members = [m.get("number") for m in (g.get("members") or []) if isinstance(m, dict) and m.get("number")]
+            break
+    if members:
+        await update_group_members(group_id, remove=members)
+    await quit_group(group_id, delete=True)
 
 
 async def _spawn_daemon(workspace_dir: str) -> subprocess.Popen[bytes]:
@@ -293,16 +422,43 @@ def _dispatch_rpc_line(msg: dict[str, Any], inject_proactive: Callable[[str], No
         envelope = (msg.get("params") or {}).get("envelope") or {}
         data_message = envelope.get("dataMessage") or {}
         text = (data_message.get("message") or "").strip()
-        if not text:
+        attachments = data_message.get("attachments") or []
+        # 2026-10-11: a media-only message (no text body) used to be
+        # dropped here entirely -- notified now the same way Telegram's
+        # and WhatsApp's own channels were changed to, so a bare photo/
+        # file is never silently invisible on any messenger.
+        if not text and not attachments:
             return
+        group_info = data_message.get("groupInfo")
         source = envelope.get("sourceNumber") or envelope.get("source") or "unknown"
         name = envelope.get("sourceName") or source
+        target = (group_info or {}).get("groupId") or source
+        kind = f'group "{group_info.get("groupName") or target}"' if group_info else "DM"
         _status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        log_event("plugin:signal", "message_received", source=source)
-        inject_proactive(
-            f'[New Signal message from "{name}" ({source}) -- reply with '
-            f"signal_send_message(to=\"{source}\", text=...) if it needs a response:\n{text}]"
-        )
+        log_event("plugin:signal", "message_received", source=source, kind=kind, has_media=bool(attachments))
+        note = f'[New Signal {kind} message from "{name}" ({source}):\n{text or "(no text)"}'
+        for att in attachments:
+            att_id = att.get("id")
+            if not att_id:
+                continue
+            ref = f"{att_id}|{target}"
+            note += f'\nAttached: {_describe_attachment(att)}. Use signal_download_attachment(ref="{ref}") to save it locally first.'
+        note += f'\nReply with signal_send_message(to="{target}", text=...) if it needs a response.]'
+        inject_proactive(note)
+
+
+def _describe_attachment(att: dict[str, Any]) -> str:
+    if att.get("isVoiceNote"):
+        return "voice message"
+    content_type = (att.get("contentType") or "").lower()
+    if content_type.startswith("image/"):
+        return "photo"
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("audio/"):
+        return "audio"
+    name = att.get("filename")
+    return f'file "{name}"' if name else "file"
 
 
 def start_signal_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:
