@@ -1112,9 +1112,13 @@
   // prefetchSpeech). Visual Mode too (2026-10-10): measured live, a short piece
   // renders in 0.5-0.8s, while synthesizing a whole reply first left 18s of silence.
   // Each piece opens its own talking-head window (VisualModeManager), so after the
-  // first sentence its pieces are larger -- fewer windows opening and closing.
+  // first piece its pieces are a bit larger -- fewer windows opening and closing.
   const SPEECH_PIECE_MAX_CHARS = 240;
-  const VISUAL_SPEECH_PIECE_MAX_CHARS = 500;
+  const VISUAL_SPEECH_PIECE_MAX_CHARS = 300;
+  // The first piece must last long enough for the second to be synthesized behind it:
+  // live, a 7-char first piece ("Конечно.") played in under a second and left a 13s
+  // gap before a 401-char second one. Sentences are joined until it reaches this.
+  const SPEECH_FIRST_PIECE_MIN_CHARS = 60;
   function splitForSpeech(text, maxChars = SPEECH_PIECE_MAX_CHARS) {
     const sentences = text
       .split(/\n+/)
@@ -1127,7 +1131,8 @@
     const pieces = [];
     for (const sentence of sentences) {
       const last = pieces[pieces.length - 1];
-      if (pieces.length > 1 && last.length + 1 + sentence.length <= maxChars) {
+      const firstTooShort = pieces.length === 1 && last.length < SPEECH_FIRST_PIECE_MIN_CHARS;
+      if ((pieces.length > 1 || firstTooShort) && last.length + 1 + sentence.length <= maxChars) {
         pieces[pieces.length - 1] = `${last} ${sentence}`;
       } else {
         pieces.push(sentence);

@@ -1040,7 +1040,13 @@ async def handle_control_request(
             sw_session = await _sw_session_or_none()
             cleaned_text = await clean_text_for_speech(text, sw_session)
             gender = get_persona_gender(WORKSPACE_DIR)
-            audio_b64 = await synthesize_speech(cleaned_text, voice_for_gender(gender), sw_session)
+            # The tab's language is already known (2026-10-10): without it every request
+            # first asks ai:detectLanguage -- live, even a 7-char piece took 4.5s end to
+            # end. Only the two languages edge-tts has voices for here; else detect as before.
+            iso = None
+            if session is not None:
+                iso = {"Russian": "ru", "English": "en"}.get(current_language_name(session.tab_id))
+            audio_b64 = await synthesize_speech(cleaned_text, voice_for_gender(gender), sw_session, language=iso)
         except Exception as exc:
             log_event("engine", "tts_failed", request_id=request_id, error=str(exc))
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
