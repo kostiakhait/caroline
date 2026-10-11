@@ -1109,10 +1109,13 @@
   // synthesis time -- 9s for 121 chars live, plus a separate model call whenever the
   // text has digits -- as silence before its first word. The first piece is a single
   // sentence so it starts fast; the rest are synthesized while earlier ones play (see
-  // prefetchSpeech). Visual Mode keeps whole replies: each piece would restart the
-  // talking-head render, and that path hasn't been tried with pieces yet.
+  // prefetchSpeech). Visual Mode too (2026-10-10): measured live, a short piece
+  // renders in 0.5-0.8s, while synthesizing a whole reply first left 18s of silence.
+  // Each piece opens its own talking-head window (VisualModeManager), so after the
+  // first sentence its pieces are larger -- fewer windows opening and closing.
   const SPEECH_PIECE_MAX_CHARS = 240;
-  function splitForSpeech(text) {
+  const VISUAL_SPEECH_PIECE_MAX_CHARS = 500;
+  function splitForSpeech(text, maxChars = SPEECH_PIECE_MAX_CHARS) {
     const sentences = text
       .split(/\n+/)
       // List markers would be read out: the backend only strips markdown from a piece
@@ -1124,7 +1127,7 @@
     const pieces = [];
     for (const sentence of sentences) {
       const last = pieces[pieces.length - 1];
-      if (pieces.length > 1 && last.length + 1 + sentence.length <= SPEECH_PIECE_MAX_CHARS) {
+      if (pieces.length > 1 && last.length + 1 + sentence.length <= maxChars) {
         pieces[pieces.length - 1] = `${last} ${sentence}`;
       } else {
         pieces.push(sentence);
@@ -1136,8 +1139,8 @@
   function speak(text, btn, opts) {
     const narration = !!opts?.narration;
     if (!narration && !btn) dropQueuedNarration();
-    if (!btn && !narration && !opts?.audioBase64 && !shouldUseVisualMode(btn) && text.length > SPEECH_PIECE_MAX_CHARS) {
-      const pieces = splitForSpeech(text);
+    if (!btn && !narration && !opts?.audioBase64 && text.length > SPEECH_PIECE_MAX_CHARS) {
+      const pieces = splitForSpeech(text, shouldUseVisualMode(btn) ? VISUAL_SPEECH_PIECE_MAX_CHARS : SPEECH_PIECE_MAX_CHARS);
       clog(`speaking reply in ${pieces.length} piece(s), ${text.length} chars`);
       for (const piece of pieces) speechQueue.push({ text: piece, btn: null, narration: false });
       if (speechQueueRunning) prefetchSpeech(speechQueue[0]);
