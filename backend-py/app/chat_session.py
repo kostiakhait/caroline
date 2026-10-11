@@ -3305,7 +3305,18 @@ class ChatSession:
             return "\n".join(self.small_model_activity[-8:]) or None
         # Counts only, never tool names: the narrator reports task status to the
         # user in plain words and must not surface internal machinery.
-        running = len(self._pending_tool_calls)
+        #
+        # Bug fix (2026-10-11), confirmed live: every plugin tool call goes
+        # through dispatch() (app/operations.py), which answers the SDK
+        # almost immediately with {operation_id, status} while the real
+        # work keeps running in the background -- _pending_tool_calls (raw
+        # SDK ToolUseBlock tracking) empties out again within that same
+        # instant, so a tool that was genuinely still running (a browser-
+        # automation call, confirmed live at 148s+) looked like "nothing
+        # running" to the narrator for its entire actual duration. REGISTRY
+        # is the same per-tab ground truth ChatSession.stop()'s own
+        # cancel_for_tab already relies on for "what's really running".
+        running = len(self._pending_tool_calls) + len(REGISTRY.running_for_tab(self.tab_id))
         finished = list(self.turn_tool_outcomes.values())
         if not running and not finished:
             return None

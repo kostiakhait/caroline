@@ -114,6 +114,17 @@ class OperationRegistry:
     def forget(self, operation_id: str) -> None:
         self._ops.pop(operation_id, None)
 
+    def running_for_tab(self, tab_id: str) -> list[Operation]:
+        """Operations genuinely still running for this tab right now --
+        the same ground truth cancel_for_tab (below) already uses, and
+        (2026-10-11) what the progress narrator's own fact-gathering was
+        missing: _pending_tool_calls (raw SDK ToolUseBlock tracking) only
+        covers the brief window before dispatch() answers with
+        {operation_id, status} and the real work moves here, so a tool
+        that's genuinely still running looked like "nothing running" to
+        the narrator for the tool's entire actual duration."""
+        return [op for op in self._ops.values() if op.tab_id == tab_id and op.status == "running"]
+
     def cancel_for_tab(self, tab_id: str, keep_tools: frozenset[str] = frozenset()) -> int:
         """Cancels every still-running operation tagged with this tab_id --
         called from ChatSession.stop() alongside client.interrupt() so
