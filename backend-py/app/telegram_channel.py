@@ -44,8 +44,14 @@ def has_telegram_session(workspace_dir: str) -> bool:
     return decrypt_text_from_file(_session_path(workspace_dir)) is not None
 
 
+def app_configured() -> bool:
+    """Whether this build carries the Caroline Telegram application's
+    api_id/api_hash; without them no login can work at all."""
+    return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
+
+
 def _require_app_credentials() -> None:
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+    if not app_configured():
         raise TelegramLoginError(
             "Telegram isn't set up in this build yet -- the Caroline Telegram application (api_id/api_hash from "
             "my.telegram.org) hasn't been registered/configured. Nothing to do here until that happens."

@@ -17,6 +17,7 @@ from typing import Any
 
 from app.telegram_channel import (
     TelegramLoginError,
+    app_configured,
     get_live_client,
     login_finish,
     login_start,
@@ -25,7 +26,30 @@ from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
 
 
+# Bug fix (2026-10-11), seen live: with the application not registered,
+# telegram_list_chats said only "isn't connected yet -- log in first", so
+# Caroline asked the owner for a phone number and a code that could never
+# work. Every tool now says first that Telegram is not available in this build.
+NOT_AVAILABLE = (
+    "Telegram can't be used in this build of Caroline: the Caroline Telegram application isn't registered yet "
+    "(it needs an api_id/api_hash from my.telegram.org, built into Caroline). Logging in cannot work until a "
+    "build with it ships -- do NOT ask the user for a phone number or a login code. Tell them Telegram isn't "
+    "available yet."
+)
+NOT_CONNECTED = "Telegram isn't connected yet -- use telegram_login_start/telegram_login_finish first."
+
+
+def _not_ready() -> dict[str, Any] | None:
+    if not app_configured():
+        return {"text": NOT_AVAILABLE, "is_error": True}
+    if get_live_client() is None:
+        return {"text": NOT_CONNECTED, "is_error": True}
+    return None
+
+
 async def telegram_login_start(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if not app_configured():
+        return {"text": NOT_AVAILABLE, "is_error": True}
     phone = str(args["phone"]).strip()
     try:
         message = await login_start(WORKSPACE_DIR, phone)
@@ -35,6 +59,8 @@ async def telegram_login_start(args: dict[str, Any], _rp: Any) -> dict[str, Any]
 
 
 async def telegram_login_finish(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if not app_configured():
+        return {"text": NOT_AVAILABLE, "is_error": True}
     code = str(args["code"]).strip()
     password = args.get("password")
     try:
@@ -45,9 +71,10 @@ async def telegram_login_finish(args: dict[str, Any], _rp: Any) -> dict[str, Any
 
 
 async def telegram_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    not_ready = _not_ready()
+    if not_ready:
+        return not_ready
     client = get_live_client()
-    if client is None:
-        return {"text": "Telegram isn't connected yet -- use telegram_login_start/telegram_login_finish first.", "is_error": True}
     limit = int(args.get("limit") or 50)
     dialogs = await client.get_dialogs(limit=limit)
     rows = [
@@ -58,9 +85,10 @@ async def telegram_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 async def telegram_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    not_ready = _not_ready()
+    if not_ready:
+        return not_ready
     client = get_live_client()
-    if client is None:
-        return {"text": "Telegram isn't connected yet -- use telegram_login_start/telegram_login_finish first.", "is_error": True}
     try:
         chat_id = int(args["chat"])
     except (TypeError, ValueError):
@@ -71,9 +99,10 @@ async def telegram_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any
 
 
 async def telegram_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    not_ready = _not_ready()
+    if not_ready:
+        return not_ready
     client = get_live_client()
-    if client is None:
-        return {"text": "Telegram isn't connected yet -- use telegram_login_start/telegram_login_finish first.", "is_error": True}
     try:
         chat_id = int(args["chat"])
     except (TypeError, ValueError):
