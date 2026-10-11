@@ -1302,8 +1302,23 @@ _VERDICT_PATTERNS = (
 )
 
 
+# A review can also be long, and say none of the above (2026-10-11, live, 573 chars
+# read out as the answer to "what will the weather be, and who wrote War and Peace"):
+# "В ответе другая помощница написала, что в Киеве ... Проверка источников показывает,
+# что ...". Whoever speaks of "the other assistant" or of what "the reply says" is
+# talking ABOUT the answer, at any length -- the user is never the one being told that.
+_REVIEW_MARKERS = re.compile(
+    r"друг(ая|ой|ого|ую) (помощни|ассистент|модел)|предыдущ\w+ (помощни|ассистент)|"
+    r"\bв ответе (выше )?(другая |другой )?(помощни\w+ |ассистент\w* )?(сказано|написано|написал|указано|указал|говорится|утверждается)|"
+    r"\bпроверка (источников|фактов|вызовов|результат\w*) (показ|подтвержда)|"
+    r"\b(the other|another|the previous|the first) (assistant|model)\b|\bthe (reply|response|answer) (above )?(says|states|claims|said)\b|"
+    r"\b(checking|a check of) the (sources|tool calls) (shows|confirms)",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_verdict(text: str) -> bool:
-    return len(text) < 400 and any(p.search(text) for p in _VERDICT_PATTERNS)
+    return bool(_REVIEW_MARKERS.search(text)) or (len(text) < 400 and any(p.search(text) for p in _VERDICT_PATTERNS))
 
 
 # The verifier also writes the final text, and sometimes opens it with its opinion of the
