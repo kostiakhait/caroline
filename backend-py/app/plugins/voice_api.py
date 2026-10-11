@@ -472,6 +472,21 @@ def _normalized_overlap(text: str, other: str) -> bool:
     return norm_text in norm_other or norm_other in norm_text
 
 
+# The news can be a single word (2026-10-11): "Нашла курс доллара к гривне." after "Ищу
+# курс доллара к гривне." shares every other word with it and was dropped as a repeat
+# three times out of three. A remark that reports an outcome -- found, saved, nothing,
+# not -- where the earlier one reported none (or another) is new, whatever else they share.
+_OUTCOME_WORDS = re.compile(
+    r"\b(?:(нашл|найден|получил|узнал|выяснил|сохранил|отправил|создал|записал|found|got|saved|sent|created)\w*"
+    r"|(ничего|нет|не|nothing|none|not|no))\b",
+    re.IGNORECASE,
+)
+
+
+def _outcomes(text: str) -> set[str]:
+    return {(m.group(1) or m.group(2)).lower() for m in _OUTCOME_WORDS.finditer(text.lower().replace("ё", "е"))}
+
+
 def _is_repeat(text: str, previous: str) -> bool:
     """Same remark in other words (2026-10-09). _normalized_overlap only catches
     near-verbatim containment; "я всё ещё проверяю прогноз..." vs "я все еще ищу
@@ -481,6 +496,8 @@ def _is_repeat(text: str, previous: str) -> bool:
     Words of one or two letters don't count (2026-10-11): "Нашла прогноз на завтра в
     Киеве." after "Ищу прогноз погоды на завтра в Киеве." is the news itself -- the
     search is over -- and was dropped as a repeat on the strength of "на" and "в"."""
+    if _outcomes(text) != _outcomes(previous):
+        return False  # before the containment check: "Не нашла ..." contains "Нашла ..."
     if _normalized_overlap(text, previous):
         return True
     def words(s: str) -> set[str]:
@@ -726,14 +743,16 @@ _TOOL_RESULT_IN_STATUS = re.compile(r"(\); result: )(.*)")
 
 
 def _without_result_figures(activity: str) -> str:
-    """STATUS as the narrator gets it: numbers inside tool results replaced by "N".
+    """STATUS as the narrator gets it: numbers inside tool results replaced by "<number>"
+    (a bare "N" read as a hole in the data: live, "Latest quote: N (-N%)" was narrated
+    as "данные не загрузились полностью"; the prompt now says what the placeholder is).
     A result is raw. Live (2026-10-11) a forecast that came back in Fahrenheit was
     narrated as "максимум шестьдесят градусов" for Kyiv in October, half a minute
     before the answer converted it; a prompt rule against reading figures out did not
     hold on the golden set (0 of 3). So the narrator sees that there is a number, not
     which one -- what was found it can still say, the figures are the answer's."""
     return "\n".join(
-        _TOOL_RESULT_IN_STATUS.sub(lambda m: m.group(1) + re.sub(r"\d+(?:[.,:]\d+)*", "N", m.group(2)), line)
+        _TOOL_RESULT_IN_STATUS.sub(lambda m: m.group(1) + re.sub(r"\d+(?:[.,:]\d+)*", "<number>", m.group(2)), line)
         for line in activity.splitlines()
     )
 
@@ -762,7 +781,9 @@ def _progress_comment_prompt(
         "When what was found IS the answer the user is waiting for -- a forecast, a price, a time, a "
         "definition -- say only that it has been found. Its content and figures are the final reply's to give: "
         "a result in STATUS is raw, and the reply may still convert or correct it (seen live: a forecast found "
-        "in Fahrenheit was read out as \"sixty degrees\" for an autumn day, half a minute before the answer).\n"
+        "in Fahrenheit was read out as \"sixty degrees\" for an autumn day, half a minute before the answer). "
+        "Numbers inside a result are shown to you as <number> on purpose: the result has them, they are only "
+        "kept from you -- never take that for missing, partial or unloaded data.\n"
         "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
         "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\". "
         "Each different place that gave nothing is its own new fact: the web, the notes or memory, the mail -- "

@@ -79,6 +79,19 @@ CASES = [
                  "Tomorrow in Kyiv: cloudy with rain in the morning, high 60 F, low 52 F, wind 9 mph."],
          said=["Ищу прогноз погоды на завтра в Киеве.", "Ищу прогноз в интернете."], expect="say",
          need=["наш", "прогноз", "есть"], forbid=["шестьдесят", "пятьдесят", "градус", "девят"]),
+    # 2026-10-11, live: with the figures masked, "Latest quote: N (-N%)" was narrated as
+    # "Нашла результаты поиска по курсу, но данные не загрузились полностью."
+    dict(name="masked figures", task="Какой сегодня курс доллара к гривне?",
+         status=[ACTIVITY_START, TIER_1,
+                 'Tool call web_search (arguments: {"question": "current USD to UAH exchange rate today"}); result: Web search '
+                 "results for: current USD to UAH exchange rate today 1. USDUAH | Latest quote: 44.852664 (-0.11%) | As of "
+                 "2026-10-11T20:25:10Z -- https://exa.ai/library/markets/forex/USDUAH # USDUAH The latest quote",
+                 "Time spent on the request so far: 9 s.", "NEW since your last remark:",
+                 'Tool call web_search (arguments: {"question": "current USD to UAH exchange rate today"}); result: Web search '
+                 "results for: current USD to UAH exchange rate today 1. USDUAH | Latest quote: 44.852664 (-0.11%) | As of "
+                 "2026-10-11T20:25:10Z -- https://exa.ai/library/markets/forex/USDUAH # USDUAH The latest quote"],
+         said=["Ищу курс доллара к гривне."], expect="say", need=["наш", "курс", "есть"],
+         forbid=["не загруз", "неполн", "не полност", "частичн", "ошибк", "сорок", "не удалось"]),
 ]
 
 FORBIDDEN = [
@@ -97,7 +110,16 @@ def norm(s):
     return re.findall(r"\w+", s.lower().replace("ё", "е"))
 
 
+_OUTCOME = re.compile(r"\b(?:(нашл|найден|получил|узнал|выяснил|сохранил|отправил|создал|записал)\w*|(ничего|нет|не))\b")
+
+
+def _outcomes(s):
+    return {m.group(1) or m.group(2) for m in _OUTCOME.finditer(s.lower().replace("ё", "е"))}
+
+
 def is_repeat(a, b):
+    if _outcomes(a) != _outcomes(b):  # as voice_api._is_repeat: a different outcome word is news by itself
+        return False
     wa, wb = set(norm(a)), set(norm(b))
     wa, wb = {w for w in wa if len(w) > 2}, {w for w in wb if len(w) > 2}  # as voice_api._is_repeat
     return len(wa) >= 3 and len(wb) >= 3 and len(wa & wb) / len(wa | wb) >= 0.6
