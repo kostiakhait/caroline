@@ -45,6 +45,17 @@ NODE_EXE = os.environ.get("CAROLINE_NODE_PATH", "")
 SIDECAR_DIR = os.environ.get("CAROLINE_WHATSAPP_SIDECAR_DIR", "")
 SEND_TIMEOUT_S = 30.0
 
+# Opt-in heartbeat watchdog (task_supervisor.py's supervise(), 2026-10-11,
+# after a real Telegram incident of the same shape -- see telegram_
+# channel.py's own docstring). Deliberately more generous than Telegram's
+# own 60s: linking here involves a human scanning a QR code at their own
+# pace, which can legitimately run several minutes with little sidecar
+# traffic in between -- Telegram's heartbeat-covered path never has an
+# analogous human-paced wait (its own first-link flow is a separate code
+# path from the one this watches).
+CHANNEL_HEARTBEAT_TIMEOUT_S = 300.0
+HEARTBEAT_PUMP_INTERVAL_S = 10.0
+
 
 class WhatsAppError(Exception):
     pass
@@ -221,7 +232,11 @@ async def start_login(workspace_dir: str) -> str:
     )
 
 
-async def _run_sidecar(workspace_dir: str, inject_proactive: Callable[[str], None]) -> None:
+async def _run_sidecar(workspace_dir: str, inject_proactive: Callable[[str], None], touch: Callable[[], None] = lambda: None) -> None:
+    """`touch()` is supervise()'s heartbeat callback (2026-10-11, after a
+    real Telegram incident of the same shape -- see telegram_channel.py's
+    own docstring for the full story). Called on "ready" and pumped
+    periodically for as long as the sidecar is connected."""
     global _sidecar
     if not NODE_EXE or not Path(NODE_EXE).exists():
         raise WhatsAppError("Node.js runtime not found -- reinstall Caroline to provision it.")
@@ -231,6 +246,13 @@ async def _run_sidecar(workspace_dir: str, inject_proactive: Callable[[str], Non
     closed_event = asyncio.Event()
 
     def on_line(msg: dict[str, Any]) -> None:
+        # Any line at all -- including routine traffic -- proves the
+        # sidecar's own event loop is alive, which is the actual thing the
+        # heartbeat watchdog needs to know; QR-scan waits are human-paced
+        # and can legitimately run long with little traffic, so this (not
+        # only "ready") is what keeps that wait from false-positiving as
+        # a stall. See CHANNEL_HEARTBEAT_TIMEOUT_S's own comment.
+        touch()
         msg_type = msg.get("type")
         if msg_type == "qr":
             _handle_qr(workspace_dir, str(msg.get("data") or ""))
@@ -279,9 +301,22 @@ async def _run_sidecar(workspace_dir: str, inject_proactive: Callable[[str], Non
     )
     sidecar.start()
     _sidecar = sidecar
+
+    async def _pump_heartbeat() -> None:
+        # Only touches once "ready" has actually fired (_status.connected)
+        # -- a sidecar that hangs before ever reaching "ready" must still
+        # be caught as stalled, the same failure shape the real Telegram
+        # incident had, not masked by a pump that started too early.
+        while True:
+            if _status.connected:
+                touch()
+            await asyncio.sleep(HEARTBEAT_PUMP_INTERVAL_S)
+
+    heartbeat_pump = asyncio.ensure_future(_pump_heartbeat())
     try:
         await closed_event.wait()
     finally:
+        heartbeat_pump.cancel()
         _sidecar = None
         _status.connected = False
         for fut in _pending.values():
@@ -311,21 +346,26 @@ def _handle_qr(workspace_dir: str, data: str) -> None:
 
 
 def start_whatsapp_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:
-    async def _loop() -> None:
+    async def _loop(touch: Callable[[], None]) -> None:
         while True:
             if not (_login_requested or _has_prior_session(workspace_dir)):
+                # Idly waiting for whatsapp_login to ever be called is
+                # normal, indefinite, healthy -- not a stall.
+                touch()
                 await asyncio.sleep(30.0)
                 continue
             try:
-                await _run_sidecar(workspace_dir, inject_proactive)
+                await _run_sidecar(workspace_dir, inject_proactive, touch)
             except WhatsAppError as exc:
                 _status.last_error = str(exc)
                 log_event("plugin:whatsapp", "sidecar_unavailable", error=str(exc))
+                touch()  # a deliberate backoff wait, not a stall
                 await asyncio.sleep(60.0)
                 continue
             except Exception as exc:
                 _status.last_error = str(exc)
                 log_event("plugin:whatsapp", "sidecar_failed", error=str(exc))
+            touch()
             await asyncio.sleep(5.0)
 
-    return supervise("whatsapp_channel", _loop)
+    return supervise("whatsapp_channel", _loop, heartbeat_timeout_s=CHANNEL_HEARTBEAT_TIMEOUT_S)

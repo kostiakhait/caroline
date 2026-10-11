@@ -54,6 +54,16 @@ DAEMON_READY_TIMEOUT_S = 20.0
 RPC_TIMEOUT_S = 30.0
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# Opt-in heartbeat watchdog (task_supervisor.py's supervise(), 2026-10-11,
+# after a real Telegram incident of the same shape -- see telegram_
+# channel.py's own docstring). Linking (signal-cli link, the human-paced
+# QR scan) is a one-shot subprocess started by start_login(), entirely
+# separate from this loop -- the daemon loop this watches only ever runs
+# once a number is already linked, same "no legitimate long human wait"
+# shape as Telegram's own reconnect path, hence the same tight timeout.
+CHANNEL_HEARTBEAT_TIMEOUT_S = 60.0
+HEARTBEAT_PUMP_INTERVAL_S = 10.0
+
 
 class SignalError(Exception):
     pass
@@ -356,7 +366,11 @@ async def _spawn_daemon(workspace_dir: str) -> subprocess.Popen[bytes]:
     )
 
 
-async def _run_daemon_connection(workspace_dir: str, inject_proactive: Callable[[str], None]) -> None:
+async def _run_daemon_connection(workspace_dir: str, inject_proactive: Callable[[str], None], touch: Callable[[], None] = lambda: None) -> None:
+    """`touch()` is supervise()'s heartbeat callback (2026-10-11, after a
+    real Telegram incident of the same shape -- see telegram_channel.py's
+    own docstring for the full story). Called once the daemon connection
+    is up, then on every received line for as long as it stays up."""
     global _writer
     _require_tooling()
     number = _linked_number(workspace_dir)
@@ -384,19 +398,34 @@ async def _run_daemon_connection(workspace_dir: str, inject_proactive: Callable[
         _status.linked = True
         _status.own_number = number
         log_event("plugin:signal", "daemon_connected", number=number)
+        touch()
 
-        while True:
-            raw = await reader.readline()
-            if not raw:
-                break
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except Exception:
-                continue
-            _dispatch_rpc_line(msg, inject_proactive)
+        async def _pump_heartbeat() -> None:
+            # readline() touches on every actual line, but a quiet Signal
+            # account can legitimately go long stretches with nothing
+            # arriving at all -- this pump is what keeps THAT healthy,
+            # idle wait from false-positiving as a stall.
+            while True:
+                touch()
+                await asyncio.sleep(HEARTBEAT_PUMP_INTERVAL_S)
+
+        heartbeat_pump = asyncio.ensure_future(_pump_heartbeat())
+        try:
+            while True:
+                raw = await reader.readline()
+                touch()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                _dispatch_rpc_line(msg, inject_proactive)
+        finally:
+            heartbeat_pump.cancel()
     finally:
         _writer = None
         _status.connected = False
@@ -462,21 +491,26 @@ def _describe_attachment(att: dict[str, Any]) -> str:
 
 
 def start_signal_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:
-    async def _loop() -> None:
+    async def _loop(touch: Callable[[], None]) -> None:
         while True:
             if not _linked_number(workspace_dir):
+                # Idly waiting for this account to ever be linked is
+                # normal, indefinite, healthy -- not a stall.
+                touch()
                 await asyncio.sleep(30.0)
                 continue
             try:
-                await _run_daemon_connection(workspace_dir, inject_proactive)
+                await _run_daemon_connection(workspace_dir, inject_proactive, touch)
             except SignalError as exc:
                 _status.last_error = str(exc)
                 log_event("plugin:signal", "daemon_unavailable", error=str(exc))
+                touch()  # a deliberate backoff wait, not a stall
                 await asyncio.sleep(60.0)
                 continue
             except Exception as exc:
                 _status.last_error = str(exc)
                 log_event("plugin:signal", "daemon_failed", error=str(exc))
+            touch()
             await asyncio.sleep(5.0)
 
-    return supervise("signal_channel", _loop)
+    return supervise("signal_channel", _loop, heartbeat_timeout_s=CHANNEL_HEARTBEAT_TIMEOUT_S)

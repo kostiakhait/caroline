@@ -333,10 +333,21 @@ def get_live_client(account: str) -> TelegramClient | None:
 _ACCOUNT_LABEL = {"self": "your own", "owner": "the owner's"}
 
 
-async def _start_background(workspace_dir: str, account: str, inject_proactive: Callable[[str], None] | None) -> None:
+async def _start_background(
+    workspace_dir: str, account: str, inject_proactive: Callable[[str], None] | None, touch: Callable[[], None] = lambda: None,
+) -> None:
     """Runs forever once a session exists for this account. Telethon
     reconnects internally; this only returns on an unrecoverable failure
-    (supervise() restarts it)."""
+    (supervise() restarts it).
+
+    `touch()` is supervise()'s heartbeat callback (2026-10-11, after a real
+    incident: client.connect() hung forever here once, silently, with no
+    exception and no return -- the outer try/except in start_telegram_
+    channel's own loop never got a chance to fire, so nothing ever noticed
+    or recovered for 55+ minutes). Called once right after a successful
+    connect+auth, then pumped periodically for as long as this account
+    stays connected -- see the loop started just before
+    run_until_disconnected() below."""
     session = decrypt_text_from_file(_session_path(workspace_dir, account))
     if not session:
         return
@@ -353,6 +364,7 @@ async def _start_background(workspace_dir: str, account: str, inject_proactive: 
     status.connected = True
     status.own_user_id = me.id
     _live_clients[account] = client
+    touch()
 
     @client.on(events.NewMessage(incoming=True))
     async def _on_new(event: events.NewMessage.Event) -> None:
@@ -393,11 +405,32 @@ async def _start_background(workspace_dir: str, account: str, inject_proactive: 
             )
         inject_proactive(note)
 
+    async def _pump_heartbeat() -> None:
+        # Nothing here can directly observe Telethon's own internal health
+        # once connected -- this pump just proves the surrounding coroutine
+        # is still scheduled and running at all, which is what the stuck-
+        # forever incident actually needed (the hang was in connect(),
+        # never reaching this point in the first place).
+        while True:
+            touch()
+            await asyncio.sleep(HEARTBEAT_PUMP_INTERVAL_S)
+
+    heartbeat_pump = asyncio.ensure_future(_pump_heartbeat())
     try:
         await client.run_until_disconnected()
     finally:
+        heartbeat_pump.cancel()
         status.connected = False
         _live_clients.pop(account, None)
+
+
+# Opt-in heartbeat watchdog (task_supervisor.py's supervise(), 2026-10-11):
+# generous enough that a slow-but-healthy connect (mobile network, a cold
+# Telegram DC) never false-positives, short enough that a genuinely stuck
+# connect() -- the real incident this fixes -- is caught and retried well
+# within a human noticing by accident.
+CHANNEL_HEARTBEAT_TIMEOUT_S = 60.0
+HEARTBEAT_PUMP_INTERVAL_S = 10.0
 
 
 def start_telegram_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> list[asyncio.Task[None]]:
@@ -405,20 +438,27 @@ def start_telegram_channel(workspace_dir: str, inject_proactive: Callable[[str],
     otherwise re-check every 30s (cheap file read) until login_finish has
     stored one. The two accounts are fully independent -- one can be linked
     and running while the other has never logged in."""
-    def _make_loop(account: str) -> Callable[[], Any]:
-        async def _loop() -> None:
+    def _make_loop(account: str) -> Callable[[Callable[[], None]], Any]:
+        async def _loop(touch: Callable[[], None]) -> None:
             while True:
                 if not has_telegram_session(workspace_dir, account):
+                    # Idly waiting for this account to ever be linked is
+                    # normal, indefinite, healthy -- not a stall.
+                    touch()
                     await asyncio.sleep(30)
                     continue
                 _status[account].linked = True
                 try:
-                    await _start_background(workspace_dir, account, inject_proactive)
+                    await _start_background(workspace_dir, account, inject_proactive, touch)
                 except Exception as exc:
                     _status[account].connected = False
                     _status[account].last_error = str(exc)
                     log_event("plugin:telegram", "connection_failed", account=account, error=str(exc))
+                touch()
                 await asyncio.sleep(5.0)
         return _loop
 
-    return [supervise(f"telegram_channel_{account}", _make_loop(account)) for account in ACCOUNTS]
+    return [
+        supervise(f"telegram_channel_{account}", _make_loop(account), heartbeat_timeout_s=CHANNEL_HEARTBEAT_TIMEOUT_S)
+        for account in ACCOUNTS
+    ]
