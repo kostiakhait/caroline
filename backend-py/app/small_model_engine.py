@@ -1370,6 +1370,19 @@ COMPLEXITY_TIMEOUT_S = 12.0
 # 195-char weather answer with "13-14 °C". Part of the system message, so the
 # verifier (which writes the final text) follows it too. The trade-off: the chat
 # bubble shows the numbers in words as well.
+# Messages sent one after another within USER_MESSAGE_MERGE_WINDOW_S reach the model
+# as one, joined by blank lines (chat_session._flush_held_user_messages) -- and they
+# need not be about the same thing. Per explicit instruction (2026-10-11): the answer
+# must not run them together. Tried on five joined pairs first: the topics were kept
+# apart, each in its own paragraph, but nothing said which paragraph answered what.
+_SEVERAL_REQUESTS_INSTRUCTION = (
+    "The user's message may be several messages sent one after another, joined by blank lines. When they ask "
+    "about different things, answer every one of them, in the order asked, and open each part by naming what it "
+    "is about (\"Что касается погоды, ...\", \"As for the translation, ...\") so that the parts cannot be mixed "
+    "up. When a later message corrects, narrows or withdraws an earlier one, answer what the user ended up "
+    "asking, not both."
+)
+
 _VOICE_ANSWER_INSTRUCTION = (
     "This conversation is spoken: your final reply will be read aloud. Write numbers, dates, temperatures, "
     "units and formulas out in words, as they would be said, and use no markdown."
@@ -1481,7 +1494,9 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         else ""
     )
     return (
-        f"Reply in {language}.\n{style}\n\n"
+        f"Reply in {language}.\n{style}\n{_SEVERAL_REQUESTS_INSTRUCTION} If even one of several requests needs "
+        "anything beyond this conversation and general knowledge, decline the whole message as described below -- "
+        "do not answer the rest of it here.\n\n"
         "Answer the user's last message directly ONLY if you can do it fully and correctly from this conversation "
         "and general knowledge alone. If answering needs ANYTHING else -- current or live information (weather, "
         "news, prices, dates, schedules), the user's own data (mail, notes, files, contacts, calendar, anything "
@@ -1686,7 +1701,7 @@ async def run_small_model_turn(
         memory_topics_system_prompt_clause(workspace_dir),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
-    ] + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else []))
+    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else []))
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for line in recent_dialogue_lines:
         is_caroline = line.startswith("Caroline:")
