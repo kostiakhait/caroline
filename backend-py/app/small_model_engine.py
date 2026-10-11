@@ -1293,6 +1293,9 @@ FAST_LANE_TIMEOUT_S = 15.0
 # gpt-5-nano) -- left at its default such a model thinks for seconds first.
 FAST_LANE_REASONING: dict[str, str] | None = None
 FAST_LANE_DECLINE = "[[NEEDS_TOOLS]]"
+# Declining, the fast lane also does _start_tier_index's job (2026-10-10): the same
+# SIMPLE/COMPLEX call cost ~1.7s more on every tool turn, by a weaker model.
+FAST_LANE_DECLINE_COMPLEX = "[[NEEDS_TOOLS:COMPLEX]]"
 _FAST_LANE_DIALOGUE_LINES = 12
 
 
@@ -1311,7 +1314,9 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
         "and general knowledge alone. If answering needs ANYTHING else -- current or live information (weather, "
         "news, prices, dates, schedules), the user's own data (mail, notes, files, contacts, calendar, anything "
         "remembered about them beyond this conversation), looking something up, or doing anything (sending, "
-        "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else. "
+        "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else, or "
+        "with exactly " + FAST_LANE_DECLINE_COMPLEX + " if it needs several dependent tool steps (check, then act, "
+        "then verify). "
         "When unsure, decline. Length or depth is never a reason to decline: a detailed explanation from general "
         "knowledge is still yours to give (seen live: \"Объясни подробно, как растения делают фотосинтез\" was "
         "declined, the same question without \"подробно\" answered). Never claim to have done, checked or saved "
@@ -1319,8 +1324,15 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
     )
 
 
-def fast_answer_is_in_language(text: str, language: str) -> bool:
-    """Whether the forced translation pass can be skipped for a fast-lane answer:
+# Experiment (2026-10-10): the same check for the cascade's own final answer. The
+# forced translation pass took 5-20s live on answers already in the tab's language;
+# an answer that fails the check (code, paths, English terms, another language) is
+# still translated exactly as before. False restores unconditional translation.
+CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE = True
+
+
+def answer_is_in_language(text: str, language: str) -> bool:
+    """Whether the forced translation pass can be skipped for an answer:
     only for the two languages it can be told apart cheaply and safely. Russian
     must not contain Ukrainian-only letters (a Russian/Ukrainian mix-up is exactly
     what the translation pass exists to catch)."""
@@ -1337,15 +1349,17 @@ def fast_answer_is_in_language(text: str, language: str) -> bool:
 
 async def try_fast_answer(
     workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
-) -> str | None:
-    """The fast-lane answer, or None to run the full cascade. Never raises."""
+) -> tuple[str | None, int | None]:
+    """(answer, None) when the fast lane answered; (None, start tier) when it declined
+    -- 1 for a COMPLEX request, else 0, for run_small_model_turn's start_tier; (None,
+    None) when it couldn't run, and the cascade picks its tier itself. Never raises."""
     if not FAST_LANE_ENABLED or camerlengo_ai is None:
-        return None
+        return None, None
     started = time.monotonic()
     try:
         api_key = await get_model_provider_key()
         if not api_key:
-            return None
+            return None, None
         ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
         model = FAST_LANE_MODEL
         system = "\n\n".join([
@@ -1364,17 +1378,18 @@ async def try_fast_answer(
     except Exception as exc:  # noqa: BLE001 -- the cascade is always there to fall back on
         log_event("engine", "fast_lane_failed", error=str(exc)[:300], error_type=type(exc).__name__,
                   ms=int((time.monotonic() - started) * 1000))
-        return None
+        return None, None
     text = str(raw or "").strip()
     ms = int((time.monotonic() - started) * 1000)
     if not text or text.startswith("Agent error"):
         log_event("engine", "fast_lane_failed", error=text[:300], error_type="agent_error", ms=ms)
-        return None
-    if FAST_LANE_DECLINE in text:
-        log_event("engine", "fast_lane_declined", ms=ms)
-        return None
+        return None, None
+    if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
+        start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
+        log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier)
+        return None, start_tier
     log_event("engine", "fast_lane_answered", ms=ms, model=model, text_len=len(text), text=text)
-    return text
+    return text, None
 
 
 # Same model as the fast lane, for the same reason: on a narrator golden set it beat
@@ -1434,6 +1449,7 @@ async def run_small_model_turn(
     on_live_dialogue_update: Callable[[list[str]], None] | None = None,
     get_new_user_comments: Callable[[], list[str]] | None = None,
     on_activity: Callable[[str], None] | None = None,
+    start_tier: int | None = None,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -1632,7 +1648,11 @@ async def run_small_model_turn(
     # a model call (~10s live), and until a tier starts the narrator had nothing to
     # draft from -- the first spoken remark of a voice turn came ~30s after the question.
     emit("Запрос получен, работа над ним началась.")
-    start_index = await _start_tier_index(ai, cfg, user_text)
+    if start_tier is not None:
+        start_index = start_tier  # already decided by the fast lane's decline
+        log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
+    else:
+        start_index = await _start_tier_index(ai, cfg, user_text)
     final_text = ""
     for index, model in enumerate(tiers):
         if index < start_index:

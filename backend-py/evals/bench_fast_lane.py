@@ -44,7 +44,7 @@ async def main():
         e.FAST_LANE_REASONING = reasoning
         for expect, q in QUESTIONS:
             events.clear()
-            text = await e.try_fast_answer(WORKSPACE_DIR, persona, q, [], "Russian", True)
+            text, start_tier = await e.try_fast_answer(WORKSPACE_DIR, persona, q, [], "Russian", True)
             ev, kw = events[-1] if events else ("none", {})
             got = "answer" if text else ("decline" if ev == "fast_lane_declined" else "FAIL")
             ok = got == expect

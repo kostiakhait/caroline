@@ -116,7 +116,10 @@ from app.failure_classification import (
 from app.logging_setup import log_event
 from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
-from app.small_model_engine import fast_answer_is_in_language, resolve_narration_prompt, run_small_model_turn, try_fast_answer
+from app.small_model_engine import (
+    CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE, answer_is_in_language, resolve_narration_prompt, run_small_model_turn,
+    try_fast_answer,
+)
 from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
@@ -2484,20 +2487,24 @@ class ChatSession:
         translate_answer = True
         try:
             fast = None
+            start_tier = None
             # Fast lane (2026-10-10 prototype, see small_model_engine.try_fast_answer):
             # real user questions only, and not with attachments (those need tools).
             if is_real_user and "[The user attached these files" not in text:
-                fast = await try_fast_answer(self.workspace_dir, persona, text, recent_dialogue_lines, language, is_voice)
+                fast, start_tier = await try_fast_answer(self.workspace_dir, persona, text, recent_dialogue_lines, language, is_voice)
             if fast is not None:
                 result = {"status": "answered", "text": fast}
-                translate_answer = not fast_answer_is_in_language(fast, language)
+                translate_answer = not answer_is_in_language(fast, language)
             else:
                 result = await run_small_model_turn(
                     tab_id=self.tab_id, workspace_dir=self.workspace_dir, persona=persona, user_text=text,
                     recent_dialogue_lines=recent_dialogue_lines, language=language,
                     send=self.send, on_live_dialogue_update=on_live_dialogue_update,
                     get_new_user_comments=get_new_user_comments, on_activity=on_activity,
+                    start_tier=start_tier,
                 )
+                if CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE:
+                    translate_answer = not answer_is_in_language(result["text"], language)
         except asyncio.CancelledError:
             # Stop button -- see stop()'s own small_model_active branch. Never starts a
             # queued real turn -- an explicit Stop means stop, not run the next thing.
@@ -2539,8 +2546,8 @@ class ChatSession:
         # Same rule as the SDK path (_strip_no_update_from_wire): a silent
         # [[NO_UPDATE]] reply never reaches the visible dialog.
         silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
-        # translate=False: a fast-lane answer already checked to be in the tab's language
-        # (fast_answer_is_in_language) -- the pass took 4-20s live and changed nothing.
+        # translate=False: an answer already checked to be in the tab's language
+        # (answer_is_in_language) -- the pass took 4-20s live and changed nothing.
         translated = None
         try:
             if translate:
