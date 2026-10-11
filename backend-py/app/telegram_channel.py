@@ -350,20 +350,29 @@ async def _start_background(
     run_until_disconnected() below."""
     session = decrypt_text_from_file(_session_path(workspace_dir, account))
     if not session:
+        log_event("plugin:telegram", "no_session_on_disk", account=account)
         return
     _require_app_credentials()
     client = _new_client(session)
-    await client.connect()
+    log_event("plugin:telegram", "connect_attempt_started", account=account)
+    # Belt-and-suspenders alongside supervise()'s own heartbeat watchdog
+    # (which catches a hang here too, eventually) -- this makes a stuck
+    # connect() raise directly, so it reaches start_telegram_channel's own
+    # except Exception/connection_failed log line immediately instead of
+    # waiting out a full heartbeat cycle.
+    await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT_S)
+    log_event("plugin:telegram", "connect_succeeded", account=account)
     status = _status[account]
-    if not await client.is_user_authorized():
+    if not await asyncio.wait_for(client.is_user_authorized(), timeout=CONNECT_TIMEOUT_S):
         status.linked = False
         log_event("plugin:telegram", "session_not_authorized", account=account)
         return
-    me = await client.get_me()
+    me = await asyncio.wait_for(client.get_me(), timeout=CONNECT_TIMEOUT_S)
     status.linked = True
     status.connected = True
     status.own_user_id = me.id
     _live_clients[account] = client
+    log_event("plugin:telegram", "connected", account=account, user_id=me.id)
     touch()
 
     @client.on(events.NewMessage(incoming=True))
@@ -431,6 +440,11 @@ async def _start_background(
 # within a human noticing by accident.
 CHANNEL_HEARTBEAT_TIMEOUT_S = 60.0
 HEARTBEAT_PUMP_INTERVAL_S = 10.0
+# Per-step timeout for connect/is_user_authorized/get_me -- well under
+# CHANNEL_HEARTBEAT_TIMEOUT_S, so a stuck step is caught and logged
+# immediately by _loop's own except Exception rather than only being
+# caught later by the heartbeat watchdog's coarser, silent cancellation.
+CONNECT_TIMEOUT_S = 30.0
 
 
 def start_telegram_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> list[asyncio.Task[None]]:
