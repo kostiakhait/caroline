@@ -99,37 +99,106 @@ def is_connected() -> bool:
     return _sidecar is not None and not _sidecar.closed and _status.connected
 
 
-async def send_message(to: str, text: str) -> None:
+async def _call(cmd: str, *, timeout: float = SEND_TIMEOUT_S, **fields: Any) -> dict[str, Any]:
+    """The request/response dance every sidecar command shares: send one
+    line with a fresh correlation id, wait for on_line (below) to resolve
+    the matching future from a "sendResult"/"chats" reply. Factored out
+    2026-10-11 once group/attachment/contact commands made send_message's
+    and list_chats' original copy of this dance a five-times-repeated
+    block."""
     if not is_connected():
         raise WhatsAppError("WhatsApp isn't connected yet -- use whatsapp_login first.")
     op_id = uuid.uuid4().hex
     fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
     _pending[op_id] = fut
     assert _sidecar is not None
-    _sidecar.send({"cmd": "sendMessage", "id": op_id, "to": to, "text": text})
+    _sidecar.send({"cmd": cmd, "id": op_id, **fields})
     try:
-        result = await asyncio.wait_for(fut, timeout=SEND_TIMEOUT_S)
+        return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
         _pending.pop(op_id, None)
-        raise WhatsAppError(f"No response from WhatsApp within {int(SEND_TIMEOUT_S)}s.")
+        raise WhatsAppError(f"No response from WhatsApp within {int(timeout)}s.")
+
+
+def _require_ok(result: dict[str, Any]) -> dict[str, Any]:
     if not result.get("ok"):
         raise WhatsAppError(result.get("error") or "unknown error")
+    return result
+
+
+async def send_message(to: str, text: str) -> None:
+    _require_ok(await _call("sendMessage", to=to, text=text))
 
 
 async def list_chats() -> list[dict[str, Any]]:
-    if not is_connected():
-        raise WhatsAppError("WhatsApp isn't connected yet -- use whatsapp_login first.")
-    op_id = uuid.uuid4().hex
-    fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-    _pending[op_id] = fut
-    assert _sidecar is not None
-    _sidecar.send({"cmd": "listChats", "id": op_id})
-    try:
-        result = await asyncio.wait_for(fut, timeout=SEND_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        _pending.pop(op_id, None)
-        raise WhatsAppError(f"No response from WhatsApp within {int(SEND_TIMEOUT_S)}s.")
+    result = await _call("listChats")
     return result.get("chats") or []
+
+
+async def check_number(phone: str) -> tuple[bool, str | None]:
+    """Whether a phone number is registered on WhatsApp at all -- unlike
+    Telegram, WhatsApp needs no "add contact first" step to message a
+    number cold (there is no server-side contact list to add to), so this
+    is purely an optional preflight, never required before send_message."""
+    result = _require_ok(await _call("checkNumber", phone=phone))
+    return bool(result.get("exists")), result.get("jid")
+
+
+async def set_block(jid: str, block: bool) -> None:
+    _require_ok(await _call("setBlock", jid=jid, block=block))
+
+
+# Attachments (2026-10-11). Unlike Telegram, WhatsApp/Baileys gives no way
+# to re-fetch an arbitrary past message by id -- the sidecar keeps a short-
+# lived cache of recent media messages' raw envelopes (see index.js's
+# pendingMedia) keyed by a "ref" string it hands back in the proactive
+# notification; download_media just asks the sidecar for that ref.
+WHATSAPP_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "whatsapp_downloads"
+DOWNLOAD_TIMEOUT_S = 60.0
+
+
+async def download_media(ref: str, save_path: str | None = None) -> str:
+    if not save_path:
+        WHATSAPP_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        # No file extension guessed here (unlike Telegram's default-path
+        # case) -- unlike Telethon's Message.file, nothing on the Python
+        # side knows this attachment's real type until the sidecar's own
+        # downloadMediaMessage call resolves it.
+        save_path = str(WHATSAPP_DOWNLOADS_DIR / ref.replace(":", "_").replace("@", "_"))
+    result = _require_ok(await _call("downloadMedia", timeout=DOWNLOAD_TIMEOUT_S, ref=ref, savePath=save_path))
+    return result.get("path") or save_path
+
+
+async def send_file(to: str, path: str, caption: str | None = None) -> None:
+    if not Path(path).is_file():
+        raise WhatsAppError(f"No such local file: {path}")
+    _require_ok(await _call("sendFile", timeout=DOWNLOAD_TIMEOUT_S, to=to, path=path, caption=caption))
+
+
+# Groups (2026-10-11). WhatsApp has only one kind of group entity (unlike
+# Telegram's basic-group/channel split), and no true "delete" operation --
+# delete_group is a deliberate approximation (remove every other
+# participant, then leave), documented as such rather than overclaiming.
+async def create_group(subject: str, participants: list[str]) -> str:
+    result = _require_ok(await _call("createGroup", subject=subject, participants=participants))
+    return result.get("jid") or ""
+
+
+async def update_group_participants(jid: str, participants: list[str], action: str) -> None:
+    _require_ok(await _call("groupParticipants", jid=jid, participants=participants, action=action))
+
+
+async def leave_group(jid: str) -> None:
+    _require_ok(await _call("leaveGroup", jid=jid))
+
+
+async def delete_group(jid: str) -> None:
+    """WhatsApp has no real "delete this group" call -- the sidecar's own
+    deleteGroup command removes every other participant it can, then
+    leaves, which empties the group and makes it inaccessible to everyone
+    including this account. Not a true delete; whatsapp_plugin.py's tool
+    description says so rather than letting the model overclaim it."""
+    _require_ok(await _call("deleteGroup", jid=jid))
 
 
 async def start_login(workspace_dir: str) -> str:

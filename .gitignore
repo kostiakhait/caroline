@@ -6,6 +6,7 @@ backend/vault-client/dist/
 backend/vault-client/node_modules/
 backend/mcp-servers-src/*/node_modules/
 backend/mcp-servers-src/*/dist/
+companion-apps/*/node_modules/
 dist/
 dist_installer/
 
