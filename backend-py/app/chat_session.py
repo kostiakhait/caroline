@@ -2501,7 +2501,7 @@ class ChatSession:
                     recent_dialogue_lines=recent_dialogue_lines, language=language,
                     send=self.send, on_live_dialogue_update=on_live_dialogue_update,
                     get_new_user_comments=get_new_user_comments, on_activity=on_activity,
-                    start_tier=start_tier,
+                    start_tier=start_tier, is_voice=is_voice,
                 )
                 if CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE:
                     translate_answer = not answer_is_in_language(result["text"], language)

@@ -1259,6 +1259,16 @@ def _continuation_note(tier_trace: list[str]) -> str:
 
 COMPLEXITY_TIMEOUT_S = 12.0
 
+# Voice turns (2026-10-10): the answer is read aloud, and any digit in it makes
+# clean_text_for_speech spend a model call per spoken piece first -- live, 6s for a
+# 195-char weather answer with "13-14 °C". Part of the system message, so the
+# verifier (which writes the final text) follows it too. The trade-off: the chat
+# bubble shows the numbers in words as well.
+_VOICE_ANSWER_INSTRUCTION = (
+    "This conversation is spoken: your final reply will be read aloud. Write numbers, dates, temperatures, "
+    "units and formulas out in words, as they would be said, and use no markdown."
+)
+
 _COMPLEXITY_PROMPT = (
     "Classify a request for an assistant that has tools (shell commands, files, apps, windows, email, notes). "
     "Reply with exactly one word: COMPLEX if it needs several dependent tool steps (check, then act, then verify), "
@@ -1450,6 +1460,7 @@ async def run_small_model_turn(
     get_new_user_comments: Callable[[], list[str]] | None = None,
     on_activity: Callable[[str], None] | None = None,
     start_tier: int | None = None,
+    is_voice: bool = False,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -1500,7 +1511,7 @@ async def run_small_model_turn(
         memory_topics_system_prompt_clause(workspace_dir),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
-    ])
+    ] + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else []))
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for line in recent_dialogue_lines:
         is_caroline = line.startswith("Caroline:")
