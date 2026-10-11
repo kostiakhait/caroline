@@ -3934,7 +3934,10 @@ class ChatSession:
                 # set 14/16 at 2.5s vs 11/16 at 7.3s for the SMALL-draft-plus-translation
                 # route, with names kept right ("от Анны", not "от Anna") and no leaked
                 # machinery. That route stays the fallback when this one can't run at all.
-                comment = await generate_progress_comment_direct(task, facts, already_said, language, resolve_narration_prompt)
+                comment = await generate_progress_comment_direct(
+                    task, facts, already_said, language, resolve_narration_prompt,
+                    gender=get_persona_gender(self.workspace_dir), addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                )
                 if comment is None:
                     comment = await generate_progress_comment(
                         "", language, timeout=NARRATION_NETWORK_TIMEOUT_S,

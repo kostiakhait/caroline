@@ -33,7 +33,8 @@ async def main():
             try:
                 if MODE == "direct":
                     text = await v.generate_progress_comment_direct(
-                        case["task"], activity, list(case["said"]), "Russian", eng.resolve_narration_prompt)
+                        case["task"], activity, list(case["said"]), "Russian", eng.resolve_narration_prompt,
+                        gender="female", addressee_gender=None)
                 else:
                     text = await v.generate_progress_comment(
                         "", "Russian", timeout=30.0, gender="female", activity=activity, task=case["task"],

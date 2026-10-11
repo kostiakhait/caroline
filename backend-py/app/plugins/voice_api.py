@@ -696,7 +696,9 @@ def _draft_language_line(draft_language: str | None) -> str:
             f"{draft_language} speakers would use.")
 
 
-def _progress_comment_prompt(task: str, activity: str, already_said: list[str] | None, draft_language: str | None) -> str:
+def _progress_comment_prompt(
+    task: str, activity: str, already_said: list[str] | None, draft_language: str | None, gender_clause: str = "",
+) -> str:
     """The narrator's prompt (2026-10-06 actions-only version), shared by the
     English-draft path below and generate_progress_comment_direct."""
     return (
@@ -720,7 +722,7 @@ def _progress_comment_prompt(task: str, activity: str, already_said: list[str] |
         "while, you may say once, plainly, that this one is taking a while -- never guess how long is left.\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n\n"
-        f"{_draft_language_line(draft_language)}\n\n"
+        f"{_draft_language_line(draft_language)}{(' ' + gender_clause) if gender_clause else ''}\n\n"
         "Examples of the right kind of reply (copy the style, never the words -- these are unrelated to the "
         "real task below):\n"
         "  TASK: plan a three-day trip to the coast. STATUS: Steps in progress right now: 2.\n"
@@ -938,7 +940,7 @@ async def generate_progress_comment(
 
 async def generate_progress_comment_direct(
     task: str, activity: str, already_said: list[str], language: str,
-    resolve: Callable[[str], Awaitable[str]],
+    resolve: Callable[[str], Awaitable[str]], gender: str | None = None, addressee_gender: str | None = None,
 ) -> str | None:
     """One-call narration (2026-10-10): drafted straight in `language` by the model
     behind `resolve` (prompt -> raw reply), checked exactly like
@@ -950,7 +952,13 @@ async def generate_progress_comment_direct(
     two-call SMALL + translate route vs this one."""
     if not activity or not task:
         return None
-    prompt = _progress_comment_prompt(task, activity, already_said, draft_language=language)
+    # The English-draft route gets grammatical gender from translate_text(gender=...);
+    # drafting directly, the clause has to be in the prompt itself -- seen live without
+    # it: "Я искал контекст..." from Caroline.
+    prompt = _progress_comment_prompt(
+        task, activity, already_said, draft_language=language,
+        gender_clause=_gender_agreement_clause(gender, addressee_gender),
+    )
     try:
         raw = (await resolve(prompt)) or ""
     except Exception as exc:  # noqa: BLE001
