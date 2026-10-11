@@ -482,6 +482,71 @@ def _is_echo_of_dialogue(text: str, recent_dialogue: str) -> bool:
     return any(_normalized_overlap(text, line.split(":", 1)[-1]) for line in recent_dialogue.splitlines())
 
 
+# Ported from a teammate's branch (2026-10-09/-11): the news can be a single
+# word -- "Нашла курс доллара к гривне." after "Ищу курс доллара к гривне."
+# shares every other word with it and was dropped as a repeat three times
+# out of three on their golden set. A remark that reports an outcome --
+# found, saved, nothing, not -- where the earlier one reported none (or a
+# different one) is new, whatever else the two share.
+_OUTCOME_WORDS = re.compile(
+    r"\b(?:(нашл|найден|получил|узнал|выяснил|сохранил|отправил|создал|записал|found|got|saved|sent|created)\w*"
+    r"|(ничего|нет|не|nothing|none|not|no))\b",
+    re.IGNORECASE,
+)
+
+
+def _outcomes(text: str) -> set[str]:
+    return {(m.group(1) or m.group(2)).lower() for m in _OUTCOME_WORDS.finditer(text.lower().replace("ё", "е"))}
+
+
+def _is_repeat(text: str, previous: str) -> bool:
+    """Same remark in other words. _normalized_overlap only catches near-
+    verbatim containment; "я всё ещё проверяю прогноз..." vs "я все еще ищу
+    прогноз..." differ in one verb and a letter. Word-set overlap catches
+    those while a remark with genuinely new content shares few words with
+    the old one. Words of one or two letters don't count: "Нашла прогноз на
+    завтра в Киеве." after "Ищу прогноз погоды на завтра в Киеве." is the
+    news itself -- the search is over -- and would otherwise be dropped as
+    a repeat on the strength of "на" and "в"."""
+    if _outcomes(text) != _outcomes(previous):
+        return False  # before the containment check: "Не нашла ..." contains "Нашла ..."
+    if _normalized_overlap(text, previous):
+        return True
+
+    def words(s: str) -> set[str]:
+        s = s.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
+        return {w for w in re.findall(r"\w+", s) if len(w) > 2}
+
+    a, b = words(text), words(previous)
+    if len(a) < 3 or len(b) < 3:
+        return False
+    return len(a & b) / len(a | b) >= 0.6
+
+
+def _already_said_block(already_said: list[str] | None) -> str:
+    """Ported from a teammate's branch (2026-10-09/-10): without its own
+    earlier remarks in view, the model restates the same status each time
+    -- the "talking to herself" stream consecutive_narration_count already
+    tracks. None (the default) means the caller never passes this at all,
+    same as before this was added -- no change in behavior. An empty list
+    means a real episode with nothing said yet: that the work has started
+    is itself a fact worth saying once, not silence."""
+    if already_said is None:
+        return ""
+    if not already_said:
+        return (
+            "Nothing has been said to the user about this request yet. If STATUS shows the work has started, "
+            "say so in one short present-tense sentence in the user's own terms (what you're looking into) -- "
+            "that is a fact, not a promise.\n\n"
+        )
+    lines = "\n".join(f"- {remark}" for remark in already_said[-6:])
+    return (
+        "ALREADY SAID to the user during this request (they heard these; never repeat or rephrase them -- say "
+        "only what STATUS adds beyond them, or reply with exactly <narration></narration> if it adds nothing):\n"
+        f"---\n{lines}\n---\n\n"
+    )
+
+
 # The prompt's own bad/good/tag-format example sentences (built into the
 # prompt string below via these same constants) -- kept as named constants
 # specifically so this check can never drift out of sync with what the
@@ -536,6 +601,21 @@ _NARRATION_EXAMPLE_THIRDPERSON_GOOD = "Regenerated it and reopened it for you to
 # longer in the prompt text itself.
 _NARRATION_COMBINED_BAD = "The user asks Caroline to check the invoice, and Caroline says she'll email accounting once she confirms the numbers."
 _NARRATION_COMBINED_GOOD = "Invoice math like this always takes longer than it looks like it should."
+
+# Ported from a teammate's branch (commit 69b8d20), confirmed live there:
+# "Закончила считать дни до Нового года." was drafted from "Checking the
+# result", two seconds before the real checked answer streamed -- and
+# would have been false had the check sent the work back. The prompt's
+# own rule (finished only if STATUS says so) isn't airtight on its own;
+# this is the deterministic backstop. Narration only ever runs while the
+# turn is still genuinely pending (see chat_session.py's
+# _check_progress_narration), so a real "finished" claim is never
+# legitimate here -- unconditional, no STATUS marker to check against.
+_FINISH_CLAIM = re.compile(
+    r"\b(закончил[аи]?|завершил[аи]?|готов[оаы]?|всё\s+сделал[аи]?|все\s+сделал[аи]?|сделано|"
+    r"finished|completed|done|all set)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_echo_of_prompt_example(text: str) -> bool:
@@ -643,6 +723,7 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
     activity: str | None = None, addressee_gender: str | None = None, task: str | None = None,
+    already_said: list[str] | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
@@ -769,8 +850,26 @@ async def generate_progress_comment(
         "machinery -- describe the progress of the task itself, in the terms the user used.\n"
         "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
         "guess the user's intent or mood; never promise or plan next steps.\n"
+        # Ported from a teammate's branch (commits 96de9fd/44a6036), confirmed
+        # against their golden set (16/16): a step that found nothing is
+        # still worth saying once, and each different place checked is its
+        # own new fact -- "nothing on the web" already said doesn't cover
+        # "nothing in the notes either".
+        "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user "
+        "once, in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to "
+        "say\". Each different place that gave nothing is its own new fact: the web, the notes or memory, the "
+        "mail -- \"nothing on the web\" being already said does not cover \"nothing in the notes either\".\n"
         "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
         "progress -- describe it that way.\n"
+        # Per explicit instruction (2026-10-11): a figure STATUS does show
+        # you is real, not invented -- say it. But everything in STATUS is
+        # from work still in progress, never yet the finished, confirmed
+        # answer: a number from a tool result can still change before the
+        # real reply. State it as a preliminary finding you're still
+        # confirming, not as the settled answer.
+        "If STATUS mentions a specific number or finding from a tool result, that's real data you may mention "
+        "-- but it is preliminary, from work still in progress, not yet the final confirmed answer. Say you "
+        "found it and are still confirming it, rather than stating it as settled.\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n\n"
         "Write in English. A separate step translates it afterward.\n\n"
@@ -783,11 +882,16 @@ async def generate_progress_comment(
         "  TASK: book a table for two. STATUS: Steps completed so far this turn: 2 succeeded, 0 failed. "
         "Task finished: yes.\n"
         "  Good: <narration>Your table for two is booked.</narration>\n"
+        "  TASK: check today's EURUSD rate. STATUS: Tool call web_search (arguments: EURUSD rate); result: "
+        "quote 1.0847.\n"
+        "  Good: <narration>I found a rate around 1.0847, confirming it now.</narration>\n"
+        "  Bad (states it as settled): <narration>The rate is 1.0847.</narration>\n"
         "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
         "  Good: <narration></narration>\n"
         "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n\n"
+        f"{_already_said_block(already_said)}"
         f"TASK (the user's request):\n---\n{task}\n---\n\n"
-        f"STATUS (what is happening, counts only):\n---\n{activity}\n---\n\n"
+        f"STATUS (what is happening right now):\n---\n{activity}\n---\n\n"
         "Reply now, wrapped in the tag."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
@@ -825,6 +929,12 @@ async def generate_progress_comment(
         return None
     if _is_echo_of_prompt_example(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_example_echo", text=text[:300])
+        return None
+    if _FINISH_CLAIM.search(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300])
+        return None
+    if already_said and any(_is_repeat(text, prev) for prev in already_said):
+        log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300])
         return None
     # Per explicit instruction (2026-09-13): force the final text through
     # Camerlengo's own dedicated ai:translate command, targeting `language`

@@ -1008,6 +1008,7 @@ def _make_executor_fn(
     registry: ToolRegistry, tab_id: str | None, send: session_context.SendFn | None,
     main_loop: asyncio.AbstractEventLoop, tracker: _TurnTracker, ai: Any, cfg: Any,
     stage_runner: Callable[[int], Awaitable[str]] | None = None,
+    on_tool_start: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> Callable[[str, dict[str, Any]], str]:
     """Bridges resolve_agentic()'s synchronous, worker-thread-side
     executor_fn(name, args) -> str callback into Caroline's own async
@@ -1040,6 +1041,15 @@ def _make_executor_fn(
         seen_calls[call_key] = seen_calls.get(call_key, 0) + 1
         count = seen_calls[call_key]
         log_event("engine", "small_model_tool_call", tab_id=tab_id, tool=name, args=args, repeat_count=count)
+        # Ported from a teammate's branch (afb8e0f): the narrator used to
+        # learn about a tool call only once it RETURNED -- live, the model's
+        # own thinking plus a web search left it nothing to say for ~16s.
+        # A failure here must never cost the actual call.
+        if on_tool_start is not None:
+            try:
+                on_tool_start(name, args)
+            except Exception:  # noqa: BLE001
+                pass
         if count > REPEATED_CALL_LIMIT:
             log_event("engine", "small_model_repeated_call_detected", tab_id=tab_id, tool=name, args=args, count=count)
             raise NeedsEscalation(f"tool '{name}' called with identical arguments {count} times in a row -- likely a stuck loop")
@@ -1331,8 +1341,6 @@ async def run_small_model_turn(
             user_text=user_text, model=current_model["name"],
         )
 
-    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage)
-
     live_dialogue = [f"User: {user_text}"]
     if on_live_dialogue_update:
         on_live_dialogue_update(list(live_dialogue))
@@ -1349,6 +1357,16 @@ async def run_small_model_turn(
                 on_activity(line)
             except Exception:  # noqa: BLE001
                 pass
+
+    # Ported from a teammate's branch (afb8e0f): a fact when a tool call
+    # STARTS, not only once it returns -- live, the model's own thinking
+    # plus a web search left the narrator nothing to say for ~16s.
+    def on_tool_start(name: str, args: dict[str, Any]) -> None:
+        emit(f"Started tool call {name} (arguments: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
+
+    executor_fn = _make_executor_fn(
+        registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage, on_tool_start=on_tool_start,
+    )
 
     def on_progress(evt: dict[str, Any]) -> None:
         tracker.touch_progress()

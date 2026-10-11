@@ -1656,6 +1656,13 @@ class ChatSession:
         # identically -- see ToolOutcome's own docstring.
         self._pending_tool_calls: dict[str, str] = {}
         self.turn_tool_outcomes: dict[str, ToolOutcome] = {}
+        # Every narration remark actually SENT this real-user episode (2026-10-11,
+        # ported from a teammate's branch) -- lets the drafting prompt see its own
+        # earlier remarks so it doesn't restate the same status, and lets the very
+        # first remark of an episode say plainly that work has started instead of
+        # finding "nothing concrete" to say. Reset alongside _pending_tool_calls/
+        # turn_tool_outcomes at the start of a new real-user episode (same scope).
+        self.turn_narration_remarks: list[str] = []
 
         # periodic mid-turn progress narration (see PROGRESS_NARRATION_INTERVAL_MS)
         # -- when a real user's own question was last actually shown something
@@ -2212,6 +2219,7 @@ class ChatSession:
             # too rather than left to dangle in _pending_tool_calls forever.
             self._pending_tool_calls = {}
             self.turn_tool_outcomes = {}
+            self.turn_narration_remarks = []
             self.last_visible_output_at = time.monotonic()
             # Bug fix (2026-09-14): a genuine new real message is the one
             # thing that should give this a clean slate -- see its own
@@ -2379,7 +2387,10 @@ class ChatSession:
             return comments
 
         def on_activity(line: str) -> None:
-            self.small_model_activity.append(line[:300])
+            # Ported from a teammate's branch (23665f1): a multi-line tool
+            # result (e.g. web_search) could otherwise smuggle a fact past
+            # line-based processing elsewhere -- one fact is one line.
+            self.small_model_activity.append(" ".join(line.split())[:300])
             del self.small_model_activity[:-20]
             # Bug fix (2026-10-03), explicit instruction: status is push-on-CHANGE
             # (turn_pending flips true once, _publish_status fires once, then nothing
@@ -3606,6 +3617,14 @@ class ChatSession:
         if activity is None:
             log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
             return
+        # Ported from a teammate's branch (807b3ea): how long this request has
+        # been running is a real fact too ("this one is taking a while"), but
+        # kept OUT of `activity` itself (which staleness/other checks compare
+        # against) -- a separate string just for the model, built fresh each
+        # attempt below isn't needed since elapsed time isn't part of any
+        # equality check here.
+        elapsed_s = int(time.monotonic() - self.turn_pending_since) if self.turn_pending_since is not None else None
+        activity_for_model = activity if elapsed_s is None else f"{activity}\nTime spent on this request so far: {elapsed_s}s."
         # Bug fix (2026-10-09), confirmed live: everything above is checked
         # BEFORE the remark is generated, and generating it (a network call,
         # retried) takes up to a minute. In that time the turn can finish and
@@ -3635,8 +3654,9 @@ class ChatSession:
             try:
                 comment = await generate_progress_comment(
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
-                    gender=get_persona_gender(self.workspace_dir), activity=activity, task=task,
+                    gender=get_persona_gender(self.workspace_dir), activity=activity_for_model, task=task,
                     addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                    already_said=list(self.turn_narration_remarks),
                 )
             except Exception as exc:
                 log_event("engine", "progress_narration_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))
@@ -3654,6 +3674,12 @@ class ChatSession:
         self.last_narration_failed_at = None
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count += 1
+        # Ported from a teammate's branch (2026-10-09/807b3ea): kept so the
+        # NEXT draft in this same episode sees its own earlier remarks (no
+        # restating the same status) and so the episode no longer looks
+        # "nothing said yet" after this one.
+        self.turn_narration_remarks.append(comment)
+        del self.turn_narration_remarks[:-20]
         log_event("engine", "progress_narration_sent", tab_id=self.tab_id, comment=comment, consecutive_count=self.consecutive_narration_count)
         # What the user just saw must be something Caroline knows she said. Kept
         # until the next submitted message, where it's handed to the model as a
