@@ -41,9 +41,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
+from telethon.tl.functions.contacts import BlockRequest, DeleteContactsRequest, ImportContactsRequest, UnblockRequest
+from telethon.tl.types import InputPhoneContact
 
 from app.logging_setup import log_event
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
@@ -139,6 +141,51 @@ async def login_finish(workspace_dir: str, code: str, account: str, password: st
     # its 30s recheck and starts the live client itself -- starting one here
     # too would run two clients on the same account.
     return "Telegram is connected -- it'll start receiving messages within about 30 seconds."
+
+
+async def resolve_or_add_contact(client: TelegramClient, phone: str, name: str | None = None) -> tuple[int | None, str | None]:
+    """Resolves a bare phone number to a Telegram user id, adding them to
+    this account's Telegram contacts if needed (telethon.contacts.
+    ImportContactsRequest) -- Telegram's own rule for starting a chat cold:
+    an account may only message someone who is already "known" to it (a
+    contact, or an existing dialog); a bare phone number alone is refused.
+    This is exactly what the ordinary Telegram app does the moment you add
+    a number to your contacts. Returns (user_id, display_name) on success,
+    or (None, reason) when Telegram has no match for that number -- either
+    it is not registered on Telegram, or its owner's privacy settings hide
+    them from being found this way (both look identical from here; there
+    is no way to tell them apart)."""
+    phone = phone.strip()
+    first_name = (name or "").strip() or "Contact"
+    parts = first_name.split(None, 1)
+    first_name, last_name = parts[0], (parts[1] if len(parts) > 1 else "")
+    result = await client(ImportContactsRequest(contacts=[InputPhoneContact(client_id=0, phone=phone, first_name=first_name, last_name=last_name)]))
+    if not result.users:
+        return None, (
+            f"Telegram has no account reachable at {phone} -- either that number isn't registered on Telegram, "
+            "or its owner's privacy settings hide them from being found by phone number (these look identical "
+            "from here). Ask the owner to confirm the number, or have that person message first instead."
+        )
+    user = result.users[0]
+    display = " ".join(filter(None, [getattr(user, "first_name", None), getattr(user, "last_name", None)])) or phone
+    return user.id, display
+
+
+async def delete_contact(client: TelegramClient, chat_id: int) -> None:
+    """Removes someone from this account's Telegram contacts (does not
+    block them, does not delete the chat history)."""
+    entity = await client.get_input_entity(chat_id)
+    await client(DeleteContactsRequest(id=[utils.get_input_user(entity)]))
+
+
+async def block_user(client: TelegramClient, chat_id: int) -> None:
+    entity = await client.get_input_entity(chat_id)
+    await client(BlockRequest(id=entity))
+
+
+async def unblock_user(client: TelegramClient, chat_id: int) -> None:
+    entity = await client.get_input_entity(chat_id)
+    await client(UnblockRequest(id=entity))
 
 
 @dataclass
