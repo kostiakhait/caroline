@@ -70,6 +70,48 @@ async def synthesize_to_bytes(text: str, options: EdgeTtsOptions | None = None) 
     return b"".join(parts)
 
 
+# One request takes about as long as its text is: measured 2026-10-11 on text the service
+# had not seen before (a repeated text comes back from its cache in 0.5s and says
+# nothing), 89 chars took 1.2s, 162 chars 2.2s, 285 chars 4.3s -- and live, a 218-char
+# reply waited 7.4s for its audio. The four sentences of a 285-char piece sent at once
+# were all back in 1.3-1.7s, the joined audio within 2% of the whole text's length, so
+# no pauses are added between them.
+PARALLEL_PART_MIN_CHARS = 40
+# Across every text being synthesized at the moment: empty audio is Microsoft's soft
+# rate limit (see _NoAudioError), and each hit costs a retry delay.
+_PARALLEL_REQUESTS = asyncio.Semaphore(6)
+
+
+def _parallel_parts(text: str) -> list[str]:
+    """Whole sentences; a short one stays with its neighbour -- a request of its own
+    for "Да." buys nothing."""
+    parts: list[str] = []
+    for sentence in (p.strip() for p in _SENT_SPLIT_RE.split(text)):
+        if not sentence:
+            continue
+        if parts and (len(parts[-1]) < PARALLEL_PART_MIN_CHARS or len(sentence) < PARALLEL_PART_MIN_CHARS):
+            parts[-1] = f"{parts[-1]} {sentence}"
+        else:
+            parts.append(sentence)
+    return parts
+
+
+async def synthesize_sentences_in_parallel(text: str, options: EdgeTtsOptions | None = None) -> bytes:
+    """synthesize_to_bytes for speech someone is waiting to hear: the text's sentences
+    are synthesized side by side and joined in order. Any part failing fails the whole
+    call, like synthesize_to_bytes itself."""
+    opts = options or EdgeTtsOptions()
+    parts = _parallel_parts(_sanitize_text(text))
+    if len(parts) < 2:
+        return await synthesize_to_bytes(text, opts)
+
+    async def one(part: str) -> bytes:
+        async with _PARALLEL_REQUESTS:
+            return await synthesize_to_bytes(part, opts)
+
+    return b"".join(await asyncio.gather(*(one(part) for part in parts)))
+
+
 async def _synth_chunk(text: str, opts: EdgeTtsOptions) -> bytes:
     if not text or len(text.strip()) < 2:
         return b""

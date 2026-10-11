@@ -1001,9 +1001,9 @@ async def _synthesize_speech_locally(text: str, voice: str) -> str:
     # worker thread forever (confirmed live: 0 of 14 real requests succeeded in one
     # session once that happened, every one paying Camerlengo's slow ai:tts fallback
     # instead, 20-97s even for a few words).
-    from app.local_edge_tts import EdgeTtsOptions, synthesize_to_bytes
+    from app.local_edge_tts import EdgeTtsOptions, synthesize_sentences_in_parallel
 
-    audio = await synthesize_to_bytes(text, EdgeTtsOptions(voice=voice))
+    audio = await synthesize_sentences_in_parallel(text, EdgeTtsOptions(voice=voice))
     if not audio:
         raise VoiceApiError("local edge-tts returned no audio")
     return base64.b64encode(audio).decode("ascii")
@@ -1021,7 +1021,10 @@ async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str 
     return data["result"]  # base64 MP3
 
 
-async def synthesize_speech(text: str, voice: str = "Nova", session: str | None = None, language: str | None = None) -> str:
+async def synthesize_speech(
+    text: str, voice: str = "Nova", session: str | None = None, language: str | None = None,
+    session_provider: Callable[[], Awaitable[str | None]] | None = None,
+) -> str:
     """Prefers the local edge-tts server over Camerlengo's ai:tts -- purely
     a latency optimization (no Camerlengo round trip), tried FIRST
     regardless of session, falling back to Camerlengo whenever the local
@@ -1038,6 +1041,10 @@ async def synthesize_speech(text: str, voice: str = "Nova", session: str | None 
         return audio
     except Exception as exc:
         log_event("plugin:voice", "tts_local_failed_falling_back", edge_voice=edge_voice, error=str(exc))
+        # `session_provider` (2026-10-11): the session only matters here, on the fallback,
+        # so a caller can hand over how to get one instead of minting it for every request.
+        if session is None and session_provider is not None:
+            session = await session_provider()
         return await _synthesize_speech_via_camerlengo(text, voice, session)
 
 
@@ -1046,11 +1053,16 @@ async def synthesize_speech(text: str, voice: str = "Nova", session: str | None 
 _NEEDS_TTS_CLEANUP = re.compile(r"[*_`#|~]|<[a-z][^>]*>|\d", re.IGNORECASE)
 
 
+def speech_needs_cleanup(text: str) -> bool:
+    """Whether clean_text_for_speech will spend a model call on this text."""
+    return bool(_NEEDS_TTS_CLEANUP.search(text))
+
+
 async def clean_text_for_speech(text: str, session: str | None = None) -> str:
     """Strips markdown/HTML formatting and rewrites digits/numerals into
     their spoken, correctly-inflected form before text reaches TTS/Visual
     Mode."""
-    if not _NEEDS_TTS_CLEANUP.search(text):
+    if not speech_needs_cleanup(text):
         return text
     prompt = (
         "Rewrite the following text so it is ready to be read aloud by a text-to-speech engine. "

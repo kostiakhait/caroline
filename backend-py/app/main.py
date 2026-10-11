@@ -63,7 +63,7 @@ from app.plugins.companion_sms_store import (
 from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
-from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
+from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
@@ -1037,7 +1037,11 @@ async def handle_control_request(
             return {"type": "control_response", "op": op, "ok": False, "stderr": "tts requires text", "requestId": request_id}
         log_event("engine", "tts_requested", request_id=request_id, text_len=len(text))
         try:
-            sw_session = await _sw_session_or_none()
+            # The session bills the model call that cleans the text, and the Camerlengo
+            # fallback. Minting it is a login round trip (0.5-0.8s, measured 2026-10-11) that
+            # came before every request; most have nothing to clean (voice replies spell
+            # their numbers out), so it is minted only when one of the two needs it.
+            sw_session = await _sw_session_or_none() if speech_needs_cleanup(text) else None
             cleaned_text = await clean_text_for_speech(text, sw_session)
             gender = get_persona_gender(WORKSPACE_DIR)
             # The tab's language is already known (2026-10-10): without it every request
@@ -1046,7 +1050,9 @@ async def handle_control_request(
             iso = None
             if session is not None:
                 iso = {"Russian": "ru", "English": "en"}.get(current_language_name(session.tab_id))
-            audio_b64 = await synthesize_speech(cleaned_text, voice_for_gender(gender), sw_session, language=iso)
+            audio_b64 = await synthesize_speech(
+                cleaned_text, voice_for_gender(gender), sw_session, language=iso, session_provider=_sw_session_or_none,
+            )
         except Exception as exc:
             log_event("engine", "tts_failed", request_id=request_id, error=str(exc))
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
