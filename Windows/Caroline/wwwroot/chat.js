@@ -1326,7 +1326,7 @@
     carolineStatusReason = "";
     stopHeartbeat();
     refreshConnectionUi();
-    addBanner("Не дождались ответа от Кэролайн вовремя — поле ввода разблокировано. Начатое действие могло не завершиться.");
+    addBanner("Caroline didn't answer in time -- the input box is unlocked again. The action she started may not have finished.");
   }
 
   function updateHeartbeatText() {

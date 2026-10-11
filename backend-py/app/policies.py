@@ -576,24 +576,21 @@ def vault_security_instruction() -> str:
 
 
 def thematic_memory_convention_instruction() -> str:
-    """Per the three-tier-memory design (2026-09-24): the mechanics behind
-    recall_memory_check_first_instruction's short always-on trigger (just
-    below in ALWAYS_ON_INSTRUCTIONS) -- fetched on demand via
-    get_tool_instructions, shared by notes_plugin.py (saving side) and
-    memory_search_plugin.py (recall_memory's own usage_instructions,
-    retrieval side), since it genuinely spans both."""
+    """Fetched on demand via get_tool_instructions as part of notes_plugin.py's
+    usage_instructions. Since the microagent memory (save_info /
+    request_info, see memory_check_first_instruction) the "Caroline:Topics"
+    and "Caroline:Memory" folders are the OLDER memory: still readable, not
+    where new things go. This text says so to a model that is about to use
+    a notes tool for remembering."""
     return (
-        'The "Caroline:Topics" Notes folder is for durable facts worth recalling later by topic/keyword -- '
-        'distinct from "Caroline:Profile" (standing facts about your owner specifically), "Caroline:Memory" (a '
-        'log of past completed tasks), and "Caroline:Vault" (secrets). Save a new fact with notes_create in a '
-        "fitting subfolder under it (create one if none fits yet -- e.g. \"Caroline:Topics/Grants/NLnet\" for a "
-        'grant-specific detail); group related topics under a shared subfolder as they accumulate rather than '
-        "leaving everything flat. To find something later, prefer the recall_memory tool over browsing this (or "
-        "any other Notes folder) yourself -- it searches in its own separate call, so it never costs your own "
-        "context/turns the way reading through folders and notes one by one would. recall_memory searches your "
-        "entire Notes account, not just this folder, so it's also the right first move for anything that might "
-        'be in "Caroline:Vault"/"Caroline:Profile"/"Caroline:Memory" instead -- your other notes_* tools remain '
-        "fully available too, for direct/addressed lookups where you already know exactly where something is."
+        'The "Caroline:Topics" and "Caroline:Memory" Notes folders are your OLDER memory: what is in them '
+        "stays readable (request_info looks there too), but do not put new things there. To remember a fact, "
+        "where a topic stands, a credential or a preference of your owner, call save_info -- it files each "
+        'thing where it belongs, including "Caroline:Vault" for secrets and "Caroline:Profile" for standing '
+        "facts about your owner. To find something, call request_info first rather than browsing folders "
+        "yourself -- it searches in its own separate calls, so it never costs your own context/turns the way "
+        "reading through notes one by one would. Your notes_* tools remain fully available for direct/addressed "
+        "work on notes the user names, and for looking yourself when request_info found nothing."
     )
 
 
@@ -614,55 +611,12 @@ def credentials_check_notes_first_instruction() -> str:
     get_tool_instructions once a notes tool call is actually in play, so
     this doesn't re-duplicate content already covered there."""
     return (
-        "Whenever a task needs a login, password, API key, or other credential and Notes is available, check "
-        'there FIRST -- the "Caroline:Vault" folder, or notes_search if you\'re not sure where -- before asking '
-        "the user for it or saying you don't have it (call get_tool_instructions on a notes tool for the exact "
-        "mechanics if you need them). When you obtain or generate a NEW credential worth keeping, save it there "
-        "yourself the same way -- don't just use it once and let it evaporate."
-    )
-
-
-def recall_memory_check_first_instruction() -> str:
-    """Per explicit instruction (2026-09-24), the three-tier-memory design:
-    the actual bottleneck isn't that Caroline doesn't know Notes exists --
-    it's that browsing/searching it inline, in her own turn, spends context
-    and attention she doesn't reliably have to spare. recall_memory (see
-    memory_search_plugin.py) factors that search out into its own separate
-    call so it never costs the main conversation anything but the answer.
-    Same shape as credentials_check_notes_first_instruction just above:
-    a short trigger only, always-on so it's never forgotten; the actual
-    mechanics (the "Caroline:Topics" folder convention, when to save vs.
-    search) stay on-demand via get_tool_instructions, fetched once a notes
-    tool is actually in play (notes_plugin.py's own usage_instructions)."""
-    return (
-        "When a topic/keyword comes up that you might already know something about, call recall_memory first "
-        "instead of re-deriving, re-asking, or trying to recall it from your own context -- it searches all of "
-        "your Notes (not just the current conversation) in its own separate call, so it costs nothing but the "
-        "answer. When you learn something durable worth recalling by topic later, save it yourself as a note in "
-        'the "Caroline:Topics" folder (create a fitting subfolder if none exists yet) -- this is in addition to, '
-        "not instead of, your other notes_* tools and folders (Caroline:Vault/Profile/Memory), which you still "
-        "use directly as before."
-    )
-
-
-def working_memory_check_first_instruction() -> str:
-    """Per explicit instruction (2026-10-04): frequently-needed facts (a
-    credential, a contact, a command that worked, a reference, an event)
-    don't only come from Notes, and Notes may not exist at all for a given
-    install (no SW account) -- working_memory.py's own small, source-agnostic
-    cache exists for exactly this, independent of Notes. Same shape as
-    recall_memory_check_first_instruction just above: a short trigger only,
-    always-on so it's never forgotten; the full mechanics (categories,
-    touch_fact vs. remember_fact, eviction) stay on-demand via
-    get_tool_instructions, fetched once a working_memory_* tool is actually
-    in play (working_memory_plugin.py's own usage_instructions)."""
-    return (
-        "Before re-deriving, re-fetching, or re-asking for a credential, contact, command, or reference you've "
-        "needed before this session, call working_memory_list (or just check the \"Things you've chosen to keep "
-        "handy\" block already in this system prompt, if present) first. When you find yourself using something "
-        "a second time, or you expect to need it again soon, save it yourself with working_memory_remember -- "
-        "this is separate from Notes (works even without a SquirrelWisdom account) and from recall_memory "
-        "(that's durable, topic-searched long-term memory; this is a small, auto-evicting short-term cache)."
+        "Whenever a task needs a login, password, API key, or other credential, call request_info for it "
+        'FIRST; if that finds nothing and Notes is available, look there yourself -- the "Caroline:Vault" '
+        "folder, or notes_search if you're not sure where -- before asking the user for it or saying you don't "
+        "have it (call get_tool_instructions on a notes tool for the exact mechanics if you need them). When "
+        "you obtain or generate a NEW credential worth keeping, save it with save_info yourself -- don't just "
+        "use it once and let it evaporate."
     )
 
 
@@ -675,8 +629,8 @@ def event_memory_check_first_instruction() -> str:
     never actually instructed for this use. event_memory.py's own records
     are written automatically by schedule_reminder, so the gap is purely
     that Caroline doesn't reliably think to check there first. Same shape as
-    recall_memory_check_first_instruction/working_memory_check_first_instruction
-    just above: a short trigger only, always-on so it's never forgotten; the
+    memory_check_first_instruction just below: a short trigger only, always-on
+    so it's never forgotten; the
     full mechanics stay on-demand via get_tool_instructions, fetched once an
     event_memory_* tool is actually in play (event_memory_plugin.py's own
     usage_instructions)."""
@@ -686,6 +640,55 @@ def event_memory_check_first_instruction() -> str:
         "reconstruct it from old conversation. Unlike list_reminders, it still shows things whose reminder has "
         "already fired. You don't need to log anything there yourself for reminders -- schedule_reminder already "
         "does that automatically every time."
+    )
+
+
+def memory_check_first_instruction() -> str:
+    """The always-on trigger for the microagent memory (save_info /
+    request_info, plugins/memory_plugin.py; see docs/MICROAGENTS_PLAN.md).
+    Replaces the two triggers that stood here for recall_memory and for
+    working_memory: those stores are deprecated and read-only for the model
+    now (see app/deprecated_memory.py). event_memory_check_first_instruction
+    is unrelated and stays as it was: event memory is the scheduler's record
+    of what was arranged, not part of this memory. Same shape as the old triggers: a short trigger only,
+    so it is never forgotten; the mechanics (what "materials" are, how to
+    read one in full, what the reply's sources mean) stay on-demand via
+    get_tool_instructions.
+
+    Strengthened 2026-10-09, per explicit instruction, after the first evening
+    on the live build: with the tools available and the earlier, milder
+    wording, Caroline called save_info once and request_info not at all in
+    six user messages and 115 service turns -- and wrote eight notes with
+    notes_create instead. The wording now makes both calls a duty of every
+    turn and names notes_create as not being memory."""
+    return (
+        "MEMORY IS NOT OPTIONAL. Your memory is two tools, save_info and request_info, and using them is part "
+        "of every turn, not something for special occasions. Nothing you learn survives this conversation "
+        "unless you save it, and nothing you saved comes back unless you ask for it.\n"
+        "SAVE: every time you learn a new fact, call save_info right then, before you go on -- from the user's "
+        "message, from a letter, a message, a document, a web page, the result of a tool, or your own work. A "
+        "fact is anything that may matter later: who someone is and how to reach them, a name, a number, a "
+        "date, an address, an account, a price, what was agreed or decided, what the user wants or prefers, "
+        "what you did and what came of it, what is now waiting on someone. Do not weigh whether it is "
+        "important enough: if it is new and specific, save it. Do not put it off to the end of the turn or "
+        "batch it for later -- a turn can be cut short. Save in your own words, complete enough to make sense "
+        "alone (full names, real dates). When a topic you are working on moves -- progress, a decision, a "
+        "blocker -- that is a new fact too: save it.\n"
+        "ASK: before you answer, act, or look anything up elsewhere, call request_info for what the turn is "
+        "about -- the people, organizations, things and topics the user's message names. Do it at the start "
+        "of every turn that concerns anything specific, and again whenever something new comes up mid-turn "
+        "that you might already know. Only after request_info found nothing do you search Notes, mail or old "
+        "conversation, or ask the user -- never before. Never tell the user you do not know or do not "
+        "remember something without having called request_info for it in this turn.\n"
+        "Writing a note with notes_create is NOT saving to memory: use notes_* only when the user asks for a "
+        "note, or for a document they will read themselves. What you want to remember goes to save_info. "
+        "A whole document FILE worth coming back to -- a contract, a resume, a report, a scan -- goes to "
+        "save_document(path): do not retell it in save_info, the file is kept, read and indexed for you, and "
+        "request_info finds it and its parts. "
+        "Anything about your OWNER themselves goes to owner_profile_remember and is found with "
+        "owner_profile_recall instead. The older memory tools (recall_memory, working_memory_*, "
+        "topic_upsert/topics_list/topic_close) are deprecated and read-only. Call get_tool_instructions on "
+        "save_info once for the details."
     )
 
 
@@ -911,8 +914,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     system_temp_dir_instruction,
     prefer_command_line_and_scripting_instruction,
     credentials_check_notes_first_instruction,
-    recall_memory_check_first_instruction,
-    working_memory_check_first_instruction,
+    memory_check_first_instruction,
     event_memory_check_first_instruction,
 )
 

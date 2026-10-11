@@ -351,7 +351,15 @@ class Supervisor:
             if now < self._tab_grace_until[tab_id]:
                 continue
             turn_pending = bool(tab.get("turnPending"))
-            last_activity_ms = tab.get("lastActivityMs") or 0
+            # Bug fix (2026-10-10), confirmed live: judged by the last SDK
+            # message alone, a turn whose model was writing one long reply
+            # (5+ minutes, no intermediate messages, the process busy all
+            # along) was taken for stuck and its CLI killed. The process's
+            # own activity decides when the backend can read it -- the same
+            # signal the engine's own hang check uses; the SDK-message clock
+            # is only the fallback.
+            idle_ms = tab.get("processIdleMs")
+            last_activity_ms = idle_ms if idle_ms is not None else (tab.get("lastActivityMs") or 0)
             if not (turn_pending and last_activity_ms > STUCK_TURN_MS):
                 continue
             pid = tab.get("cliProcessPid")

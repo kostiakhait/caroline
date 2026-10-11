@@ -1,9 +1,10 @@
-"""memory-search -- recall_memory: a fast, dedicated retrieval tool over the
+"""DEPRECATED since the microagent memory (save_info / request_info) -- see
+app/deprecated_memory.py. Still works; request_info is what to use.
+
+memory-search -- recall_memory: a fast, dedicated retrieval tool over the
 whole Notes account, so finding something never costs the MAIN conversation's
-own context/turns. See policies.py's thematic_memory_convention_instruction
-(the "Caroline:Topics" saving convention, on-demand) and
-recall_memory_check_first_instruction (the always-on trigger) for the "why"
--- this file is purely the retrieval side.
+own context/turns. It was the retrieval side of the "Caroline:Topics" saving
+convention; both are superseded by save_info / request_info.
 
 Root motivation (2026-09-24, the user's own words): the main model already
 knows, in principle, where things are in Notes -- it just doesn't reliably
@@ -50,6 +51,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.deprecated_memory import READ_PREFIX
 from app.durability import load_chat_mode
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager
@@ -149,7 +151,7 @@ PLUGIN = Plugin(
     tools=[
         PluginTool(
             "recall_memory",
-            "Searches your ENTIRE Notes account (not just one folder) for whatever might be relevant to a topic "
+            READ_PREFIX + "Searches your ENTIRE Notes account (not just one folder) for whatever might be relevant to a topic "
             "or keyword, using a separate fast model call to pick likely notes by title -- so it costs your own "
             "context/turns nothing but the answer, unlike browsing folders yourself. Prefer this over "
             "notes_search/notes_list for anything you're not sure exists or don't know the exact folder for; "

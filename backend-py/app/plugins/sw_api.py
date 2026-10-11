@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from app.http_tls import ssl_context
 
 API_URL = "https://www.squirrelwisdom.com/"
 V2_LOGIN_SERVICE_KEY = "fytZDwOTaBo8I173IS2DaY_qgzm0IFvqvnxJGvC5QrE"
@@ -105,7 +106,7 @@ async def _post_json(body: dict[str, Any], timeout: float = 30.0) -> Any:
     value -- per explicit instruction (2026-09-22), narration is cosmetic
     filler under a 60s promise, not worth the same patience a real
     user-facing call deserves."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout) as client:
         last_err: Exception | None = None
         for attempt in range(3):
             try:

@@ -88,6 +88,7 @@ from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
+from app.memory_topics import memory_topics_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
@@ -95,17 +96,16 @@ from app.policies import (
     credentials_check_notes_first_instruction,
     event_memory_check_first_instruction,
     learn_from_mistakes_instruction,
+    memory_check_first_instruction,
     no_internal_mechanics_to_user_instruction,
     no_unauthorized_secret_changes_instruction,
     no_unbounded_filesystem_scans_instruction,
     prefer_own_backend_tools_instruction,
     proactive_context_recovery_instruction,
-    recall_memory_check_first_instruction,
     recent_dialogue_history_instruction,
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     timestamp_awareness_instruction,
-    working_memory_check_first_instruction,
 )
 
 # Per explicit instruction (2026-09-13), after a real capability audit
@@ -129,8 +129,7 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     self_sufficiency_instruction,
     system_temp_dir_instruction,
     credentials_check_notes_first_instruction,
-    recall_memory_check_first_instruction,
-    working_memory_check_first_instruction,
+    memory_check_first_instruction,
     event_memory_check_first_instruction,
 )
 
@@ -263,7 +262,7 @@ async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], ta
             return result
         mark_funds_exhausted(reason)
         log_event("engine", "small_model_funds_exhausted", tab_id=tab_id, reason=reason, waited_s=round(waited_s))
-        emit(f"Не хватает баланса OpenRouter ({reason}) -- жду пополнения.")
+        emit(f"OpenRouter balance is insufficient ({reason}) -- waiting for a top-up.")
         if waited_s >= _FUNDS_EXHAUSTED_MAX_WAIT_S:
             raise _FundsExhaustedGivingUp(reason)
         await asyncio.sleep(_FUNDS_EXHAUSTED_RETRY_INTERVAL_S)
@@ -272,8 +271,8 @@ async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], ta
 
 def _funds_exhausted_final_answer(reason: str) -> str:
     return (
-        f"Не могу сейчас ответить -- на балансе OpenRouter закончились деньги ({reason}). "
-        "Нужно пополнить баланс, после этого всё заработает как раньше."
+        f"I can't answer right now -- the OpenRouter balance has run out ({reason}). "
+        "Once it is topped up, everything will work as before."
     )
 
 
@@ -851,10 +850,10 @@ async def _run_parallel_stage(
                 branch_messages = [
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": (
-                        f"Общая задача пользователя (для контекста): {user_text}\n\n"
-                        f"Ты выполняешь ОДИН шаг из общего плана, параллельно с другими шагами. Шаг: {step}\n\n"
-                        "Выполни только его: вызови нужные инструменты, дождись реальных результатов и ответь одним "
-                        "коротким фактическим итогом. Чужие шаги не делай."
+                        f"The user's overall task (for context): {user_text}\n\n"
+                        f"You are carrying out ONE step of the overall plan, in parallel with other steps. Step: {step}\n\n"
+                        "Do only this step: call the tools it needs, wait for their real results, and reply with one "
+                        "short factual summary. Do not do the other steps."
                     )},
                 ]
                 try:
@@ -870,18 +869,18 @@ async def _run_parallel_stage(
                     if _usable(text):
                         log_event("engine", "small_model_branch_finished", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt, ok=True)
                         tracker.branch_trace.append(
-                            f"Ветка шага {step_index} («{step}»), попытка {attempt}:\n" + ("\n".join(calls) or "  (инструменты не вызывались)")
+                            f"Branch of step {step_index} (\"{step}\"), attempt {attempt}:\n" + ("\n".join(calls) or "  (no tools were called)")
                         )
                         return True, text.strip()
-                    last_error = "пустой ответ"
+                    last_error = "empty reply"
                 except _FundsExhaustedGivingUp:
                     raise
                 except Exception as exc:  # noqa: BLE001 -- a failed branch is a result, not a turn-ending error
                     last_error = f"{type(exc).__name__}: {exc}"
                 log_event("engine", "small_model_branch_finished", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt, ok=False, error=last_error)
                 tracker.branch_trace.append(
-                    f"Ветка шага {step_index} («{step}»), попытка {attempt}, не выполнена ({last_error}):\n"
-                    + ("\n".join(calls) or "  (инструменты не вызывались)")
+                    f"Branch of step {step_index} (\"{step}\"), attempt {attempt}, not done ({last_error}):\n"
+                    + ("\n".join(calls) or "  (no tools were called)")
                 )
         return False, last_error
 
@@ -890,7 +889,7 @@ async def _run_parallel_stage(
         if isinstance(outcome, _FundsExhaustedGivingUp):
             raise outcome
 
-    lines = [f"Стадия {stage_index} (параллельно) завершена."]
+    lines = [f"Stage {stage_index} (parallel) finished."]
     for step_index, outcome in zip(indices, outcomes):
         if isinstance(outcome, BaseException):
             ok, info = False, f"{type(outcome).__name__}: {outcome}"
@@ -898,9 +897,9 @@ async def _run_parallel_stage(
             ok, info = outcome
         if ok:
             tracker.plan_done[step_index] = info[:500]
-            lines.append(f"OK, шаг {step_index}: {info[:300]}")
+            lines.append(f"OK, step {step_index}: {info[:300]}")
         else:
-            lines.append(f"НЕ ВЫПОЛНЕН, шаг {step_index}: {info}")
+            lines.append(f"NOT DONE, step {step_index}: {info}")
     return "\n".join(lines)
 
 
@@ -969,6 +968,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
             return "Unknown or already-completed operation_id."
         body = _operation_to_dict(op)
         if op.status in ("done", "error", "cancelled"):
+            op.collected = True  # no completion notice repeating it (operations._notify_unless_collected)
             OPERATIONS_REGISTRY.forget(op.id)
             tracker.pending_operation_ids.discard(op.id)
         return str(body)
@@ -1078,12 +1078,18 @@ def _make_executor_fn(
             session_context.set_tab_id(tab_id)
             if send is not None:
                 session_context.set_send(send)
-            return await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args)
+            # Waits for the real outcome (see dispatch()'s wait_to_end): this
+            # thread blocks on the result anyway, and a "running" answer only
+            # handed the model an internal operation to narrate to the user.
+            return await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args, wait_to_end=True)
 
         envelope = asyncio.run_coroutine_threadsafe(_run(), main_loop).result()
         log_event("engine", "small_model_tool_result", tab_id=tab_id, tool=name, status=envelope.get("status"))
+        note = f"\n{envelope['memory_note']}" if envelope.get("memory_note") else ""
         if envelope.get("status") == "error":
-            return f"ERROR: {envelope.get('error')}"
+            return f"ERROR: {envelope.get('error')}{note}"
+        if envelope.get("status") == "cancelled":
+            return f"ERROR: this tool call was cancelled before it finished.{note}"
         if envelope.get("status") == "running":
             # Genuinely normal (a slow tool call, e.g. a network-bound
             # plugin) -- NOT a signal of anything wrong. resolve_agentic()
@@ -1100,7 +1106,7 @@ def _make_executor_fn(
                 tracker.pending_operation_ids.add(op_id)
             return f"Operation {op_id} is still running."
         result = envelope.get("result")
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        return (result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)) + note
 
     return executor_fn
 
@@ -1190,7 +1196,9 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
     return "\n\n".join(parts)
 
 
-_UNAVAILABLE_ANSWER = "Сейчас не получается ответить на это — попробуй ещё раз чуть позже."
+# English like every text in the code; the answer is translated into the
+# conversation's language on its way out (_finish_small_model_turn_answered).
+_UNAVAILABLE_ANSWER = "I can't answer this right now -- please try again a little later."
 
 
 def _usable(text: str) -> bool:
@@ -1295,6 +1303,7 @@ async def run_small_model_turn(
         _persona_system_message(persona),
         owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
         working_memory_system_prompt_clause(load_working_memory(workspace_dir)),
+        memory_topics_system_prompt_clause(workspace_dir),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
     ])
@@ -1350,7 +1359,7 @@ async def run_small_model_turn(
         if evt.get("type") == "tool_call":
             log_event("engine", "small_model_tool_output", tab_id=tab_id, tool=evt.get("name"), args=evt.get("args"), result=str(evt.get("result", "")))
             args = json.dumps(evt.get("args") or {}, ensure_ascii=False, default=str)[:300]
-            emit(f"Вызов инструмента {evt.get('name')} (аргументы: {args[:120]}); результат: {str(evt.get('result', ''))[:160]}")
+            emit(f"Tool call {evt.get('name')} (arguments: {args[:120]}); result: {str(evt.get('result', ''))[:160]}")
             tier_trace.append(f"- {evt.get('name')}({args}) -> {str(evt.get('result', ''))[:300]}")
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
@@ -1409,7 +1418,7 @@ async def run_small_model_turn(
         _FundsExhaustedGivingUp is NOT a technical failure -- let it propagate to
         the caller, which turns it into the same honest final answer regardless of
         whether funds ran out on a tier call or here."""
-        emit("Проверка результата (без инструментов).")
+        emit("Checking the result (no tools).")
         verified = ""
         for attempt in (1, 2):
             log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate)
@@ -1437,7 +1446,7 @@ async def run_small_model_turn(
         if index < start_index:
             continue
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
-        emit(f"Работает уровень {index + 1} ({model}).")
+        emit(f"Tier {index + 1} ({model}) is working.")
         current_model["name"] = model
         candidate = ""
         try:
@@ -1467,7 +1476,7 @@ async def run_small_model_turn(
 
         if _usable(candidate):
             log_event("engine", "small_model_tier_answered", tab_id=tab_id, tier=index, model=model, text_len=len(candidate), text=candidate)
-            emit(f"Уровень {index + 1} ({model}) дал ответ, переходим к проверке.")
+            emit(f"Tier {index + 1} ({model}) produced an answer; moving on to checking it.")
             can_escalate = index < len(tiers) - 1
             try:
                 verified_text, needs_escalation = await verify_candidate(candidate, can_escalate, tier_trace)
@@ -1477,14 +1486,14 @@ async def run_small_model_turn(
             if not needs_escalation:
                 final_text = verified_text
                 break
-            emit(f"Проверка не подтвердила выполнение, эскалируем на уровень {index + 2}.")
+            emit(f"The check did not confirm the task was done; escalating to tier {index + 2}.")
             if tier_trace:
                 messages.append({"role": "user", "content": _continuation_note(tier_trace)})
                 tier_trace.clear()
             messages.append({"role": "user", "content": f"[Verifier checked the previous attempt and found it not actually finished: {verified_text.replace(ESCALATION_SENTINEL, '').strip()}]"})
             continue
 
-        emit(f"Уровень {index + 1} ({model}) не справился, переходим к следующему уровню.")
+        emit(f"Tier {index + 1} ({model}) did not manage; moving on to the next tier.")
         log_event("engine", "small_model_tier_escalating", tab_id=tab_id, tier=index, model=model, trace_calls=len(tier_trace))
         if tier_trace:
             messages.append({"role": "user", "content": _continuation_note(tier_trace)})

@@ -25,6 +25,8 @@ _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("c
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
 _current_inject_proactive: contextvars.ContextVar[InjectProactiveFn | None] = contextvars.ContextVar("current_inject_proactive", default=None)
 _current_cli_pid_sink: contextvars.ContextVar[CliPidSinkFn | None] = contextvars.ContextVar("current_cli_pid_sink", default=None)
+# Every live ChatSession's inject_proactive by tab id (see register_inject_proactive).
+_inject_proactive_by_tab: dict[str, InjectProactiveFn] = {}
 
 
 def get_send() -> SendFn:
@@ -67,8 +69,23 @@ def get_inject_proactive() -> InjectProactiveFn | None:
     happens to poll it. Same non-fatal shape as get_tab_id() -- None
     outside a live ChatSession turn, callers just skip notifying rather
     than raising (an Operation dispatched by a throwaway test script has
-    no session to notify anyway)."""
-    return _current_inject_proactive.get()
+    no session to notify anyway).
+
+    When the context var is not set but the tab is known, the tab's own
+    session is used (register_inject_proactive): the small-model engine
+    runs tool handlers on the main loop from worker threads, re-setting
+    only the tab id and send() in their context -- this is how they reach
+    their session too."""
+    fn = _current_inject_proactive.get()
+    if fn is None:
+        tab_id = _current_tab_id.get()
+        fn = _inject_proactive_by_tab.get(tab_id) if tab_id else None
+    return fn
+
+
+def register_inject_proactive(tab_id: str, fn: InjectProactiveFn) -> None:
+    """Called by a ChatSession for its tab; a later session of the same tab replaces it."""
+    _inject_proactive_by_tab[tab_id] = fn
 
 
 def set_inject_proactive(fn: InjectProactiveFn | None) -> contextvars.Token[InjectProactiveFn | None]:

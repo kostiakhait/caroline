@@ -121,6 +121,7 @@ from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
+from app.memory_topics import memory_topics_system_prompt_clause
 from app import agent_registry
 from app.agent_definitions import caroline_agents
 from app.policies import (
@@ -130,8 +131,11 @@ from app.policies import (
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
-from app.session_context import set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
-from app.plugins.sw_api import get_funds_exhausted_reason
+from app import memory_nudge
+from app.session_context import register_inject_proactive, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
+from app import memory_turns
+from app.process_kill import kill_process_tree
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
@@ -201,6 +205,21 @@ MAX_RESTARTS_PER_WINDOW = 5
 RESTART_WINDOW_MS = 10 * 60_000
 RESTART_BACKOFF_MS = 60_000
 API_RETRY_INTERVAL_MS = 90_000
+# Connection states that exist only because a retry loop is waiting on them;
+# an explicit Stop cancels that loop, so it clears these states too.
+STOP_RESETS_CONN_STATES = ("limited", "billing_blocked")
+# Stop tears down the main model and everything it launched through tools --
+# except a write into memory already under way, which is left to finish.
+STOP_KEEPS_TOOLS = frozenset({"save_info", "save_document", "owner_profile_remember"})
+# Shown to the model with the user's first message after a Stop, as its own block.
+STOP_NOTE_TEXT = (
+    "[Note: the user pressed Stop during your previous turn, and everything it was running was killed. "
+    "Pressing Stop usually means the user did not like what you were doing or how you were doing it: they "
+    "may well expect you to change your behavior, not to carry on. Whatever action was in progress may be "
+    "incomplete or partially applied -- do not assume it finished, and do not resume it or repeat it unless "
+    "the user asks you to. Read their message below with that in mind, and if it is not clear what they want "
+    "done differently, ask.]"
+)
 # Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
 # API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
 # is "keep retrying forever because the operation never even started" (a
@@ -369,6 +388,20 @@ _RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
 # connect()+generator wiring, content-as-block-list included, not just the
 # SDK's query(str) convenience path).
 FORCED_COMPACTION_HOURLY_MS = 3_600_000
+# Per explicit instruction (2026-10-10): messages the user sends one after
+# another are one message for the model. A user message waits this long;
+# every further one within the window joins it and restarts the wait. The
+# chat window still shows each bubble as it was typed.
+USER_MESSAGE_MERGE_WINDOW_S = 5.0
+# Per explicit instruction (2026-10-10): a compaction loses whatever the
+# model learned and never saved, so an hourly/growth compaction is preceded
+# by a service turn asking it to save first (see _check_forced_compaction).
+MEMORY_FLUSH_BEFORE_COMPACTION_TEXT = (
+    "[Your context is about to be compacted: much of the detail of what you have done and learned since your "
+    "last save_info will be gone afterwards. Save to memory now, with save_info, everything new and specific "
+    "from that work that may matter later -- people, contacts, links, numbers, file locations, what was decided "
+    "or done and its result, what is still open. Then reply with exactly [[NO_UPDATE]].]"
+)
 # Bug fix (2026-09-15): replaced the old byte-based growth threshold (see
 # tokens_at_last_forced_compaction's own __init__ comment for why bytes was
 # the wrong signal) -- this is real context tokens, checked against
@@ -1353,6 +1386,18 @@ class ChatSession:
         self.tab_id = tab_id
         self.workspace_dir = workspace_dir
         self.send = send
+        # See _on_memory_upstream_no_funds: the turn to start again once the
+        # memory service's provider has money, and the flat timer checking for that.
+        self._memory_replay: dict[str, Any] | None = None
+        # Set by stop() when it kills an engine that was idle between turns; read by the run loop.
+        self._stop_killed_idle_engine = False
+        # Set by stop(); the user's next real message carries a note (its own block) that the previous turn was killed.
+        self._stop_note_pending = False
+        # Set while a forced compaction waits for the save-to-memory turn it asked for.
+        self._memory_flushed_for_compaction = False
+        self._stop_note_in_next_push = False
+        self._memory_replay_timer: asyncio.TimerHandle | None = None
+        memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
 
         self.client: AgentEngine | None = None
         # Which engine the current/next query() runs on: "openai" only while the
@@ -1365,6 +1410,9 @@ class ChatSession:
         # queue / turn plumbing
         self.queue: list[dict[str, Any]] = []
         self._queue_event = asyncio.Event()
+        # User messages waiting out USER_MESSAGE_MERGE_WINDOW_S (see submit_or_try_small_model).
+        self._held_user_messages: list[tuple[str, list[Any], bool]] = []
+        self._held_user_flush: asyncio.TimerHandle | None = None
         self.turn_is_voice = False
         self.classifier_refusal_retry_count = 0
         # Backing field for the turn_pending property (defined below,
@@ -2052,6 +2100,17 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        if is_real_user and self._stop_note_pending:
+            # Delivered by _push_message as its own, machine-marked block --
+            # not glued into the user's words, so language detection and the
+            # history readers keep seeing exactly what the user wrote.
+            self._stop_note_pending = False
+            self._stop_note_in_next_push = True
+        if is_real_user:
+            # A real message begins a turn for the memory service's money rules
+            # (memory_turns.py) and supersedes a turn still waiting to be replayed.
+            self._cancel_memory_replay()
+            memory_turns.start_turn(self.tab_id, text, attachments, is_voice)
         if self.pending_interim_notes:
             notes = "\n".join(f"- {note}" for note in self.pending_interim_notes)
             self.pending_interim_notes = []
@@ -2200,9 +2259,38 @@ class ChatSession:
         self._push_message(wire_text, attachments, is_voice)
 
     def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, is_real_user: bool = True) -> None:
-        """Compatibility entry point for existing callers. In "sw" mode submit()
-        itself routes every turn to the small-model path, so this just delegates."""
-        self.submit(text, attachments, is_real_user, is_voice)
+        """The entry point for what the USER sends (the chat window, the
+        REST /api/message, the phone). In "sw" mode submit() itself routes
+        every turn to the small-model path.
+
+        Per explicit instruction (2026-10-10): consecutive user messages go
+        to the model as ONE. Seen live: four short messages typed one after
+        another reached the Claude CLI as four separate user messages, each
+        cutting into the work the previous one had started. A user message
+        is held for USER_MESSAGE_MERGE_WINDOW_S; each further one within
+        that time joins it and restarts the wait; then they are submitted
+        together. Internal turns and replays call submit() directly and are
+        never held."""
+        if not is_real_user:
+            self.submit(text, attachments, is_real_user, is_voice)
+            return
+        self._held_user_messages.append((text, list(attachments or []), is_voice))
+        if self._held_user_flush is not None:
+            self._held_user_flush.cancel()
+        self._held_user_flush = asyncio.get_running_loop().call_later(USER_MESSAGE_MERGE_WINDOW_S, self._flush_held_user_messages)
+        log_event("engine", "user_message_held", tab_id=self.tab_id, held=len(self._held_user_messages), text_len=len(text))
+
+    def _flush_held_user_messages(self) -> None:
+        held, self._held_user_messages = self._held_user_messages, []
+        self._held_user_flush = None
+        if not held or self.ended:
+            return
+        text = "\n\n".join(item_text for item_text, _attachments, _voice in held if item_text)
+        attachments = [attachment for _text, item_attachments, _voice in held for attachment in item_attachments]
+        is_voice = any(voice for _text, _attachments, voice in held)
+        if len(held) > 1:
+            log_event("engine", "user_messages_merged", tab_id=self.tab_id, count=len(held), text_len=len(text))
+        self.submit(text, attachments, True, is_voice)
 
     def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
         """Every turn in "sw" mode goes here, never to the Claude SDK (2026-10-03):
@@ -2322,7 +2410,7 @@ class ChatSession:
             raise
         except Exception as exc:  # noqa: BLE001 -- this path must never wedge the session
             log_event("engine", "small_model_turn_unexpected_error", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
-            result = {"status": "answered", "text": "Сейчас не получается ответить на это — попробуй ещё раз чуть позже."}
+            result = {"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         await self._finish_small_model_turn_answered(question_text, result["text"], is_voice)
@@ -2431,7 +2519,67 @@ class ChatSession:
         self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration)
         return True
 
+    def _cancel_memory_replay(self) -> None:
+        self._memory_replay = None
+        if self._memory_replay_timer:
+            self._memory_replay_timer.cancel()
+            self._memory_replay_timer = None
+
+    def _on_memory_upstream_no_funds(self, reason: str) -> None:
+        """The memory service could not run because ITS provider (OpenRouter,
+        our own cost) is out of money -- nothing the user's wallet can fix.
+        Per the agreed rule (docs/MICROAGENTS_PLAN.md, section 4): the turn is
+        reset to its start. It is stopped exactly as the Stop button stops
+        it, the status bar says why, and once the provider answers again the
+        user's message that began the turn is submitted anew. What the turn
+        already did (a letter sent) is not undone.
+
+        Called from inside a tool call of the very turn being stopped, so the
+        stop itself is deferred to the loop."""
+        turn = memory_turns.current_turn(self.tab_id)
+        log_event("engine", "memory_upstream_no_funds", tab_id=self.tab_id, reason=reason, replayable=bool(turn and turn.get("text")))
+        mark_funds_exhausted(reason)
+        replay = dict(turn) if turn and turn.get("text") else None
+
+        def _stop_and_wait() -> None:
+            if self.ended:
+                return
+            self.stop()                      # also clears any earlier replay
+            self._memory_replay = replay
+            if replay:
+                self._arm_memory_replay_timer()
+            asyncio.create_task(self._publish_status())
+
+        asyncio.get_event_loop().call_soon(_stop_and_wait)
+
+    def _arm_memory_replay_timer(self) -> None:
+        """Flat interval, forever, like every other retry here."""
+        def _fire() -> None:
+            self._memory_replay_timer = None
+            if not self.ended and self._memory_replay:
+                asyncio.create_task(self._check_memory_replay())
+
+        self._memory_replay_timer = asyncio.get_event_loop().call_later(API_RETRY_INTERVAL_MS / 1000, _fire)
+
+    async def _check_memory_replay(self) -> None:
+        """One cheap call that goes through the same provider: sw_api clears
+        its funds-exhausted mark on any call that succeeds and sets it again
+        on a 402, so the mark itself is the answer."""
+        from app.plugins.voice_api import detect_language
+        await detect_language("ping")
+        replay = self._memory_replay
+        if not replay or self.ended:
+            return
+        if get_funds_exhausted_reason():
+            self._arm_memory_replay_timer()
+            return
+        log_event("engine", "memory_replay_resubmitting", tab_id=self.tab_id, turn_id=replay["id"])
+        self._memory_replay = None
+        self.submit(replay["text"], replay["attachments"], is_real_user=True, is_voice=replay["is_voice"])
+
     def stop(self) -> None:
+        # An explicit Stop also drops a turn waiting to be replayed.
+        self._cancel_memory_replay()
         # Latched before the turn_pending check below: between turns nothing is
         # pending, yet the post-turn check is what re-arms the loop, so Stop must
         # still halt it. Cleared only by the next real user message.
@@ -2439,14 +2587,70 @@ class ChatSession:
         # A request queued behind a proactive turn (see small_model_queued_real_turns)
         # must not run right after an explicit Stop -- that's the opposite of what Stop means.
         self.small_model_queued_real_turns = []
-        if not self.turn_pending:
-            log_event("engine", "user_stop_between_turns", tab_id=self.tab_id)
-            return
-        log_event("engine", "user_stop", tab_id=self.tab_id)
-        self.user_stop_requested = True
+        # Bug fix (2026-10-09), confirmed live ("дважды жал стоп -- нихуя не
+        # остановилось"): input already queued for the engine but not yet
+        # taken by it (a nudge, a reminder, a follow-up, an earlier message)
+        # survived Stop and was fed to the fresh engine the moment it came
+        # back up. Everything queued before the click goes; what the user
+        # sends AFTER it is a new instruction and is kept.
+        dropped_inputs = len(self.queue)
+        self.queue.clear()
+        self.compaction_queued_turns = []
+        # The model learns about the Stop with the user's next message (see
+        # submit()), never through a turn of its own.
+        self._stop_note_pending = True
         # An explicit Stop must also cancel any pending "resumed question needs a visible answer" re-ask,
         # or the abandoned turn would start again on its own.
         self.resumed_unanswered_question = None
+        # Bug fix (2026-10-09), confirmed live: these two timers used to be
+        # cleared only at the very end of this method, AFTER the "nothing is
+        # pending" early return just below. A tab stuck on a usage cap spends
+        # almost all of its time BETWEEN turns -- each retry turn is rejected
+        # within seconds, then 90s of waiting for the next one -- so Stop
+        # nearly always landed between turns, returned early, and the retry
+        # loop kept re-submitting every 90s as if the user had never stepped
+        # in ("я жал стоп, но состояние не сбросилось"). Stop is the absolute
+        # switch for this tab whether or not a turn happens to be in flight at
+        # the instant of the click: every background recovery attempt is
+        # silenced first, unconditionally.
+        had_retry = bool(self.api_retry_timer or self.one_shot_followup_timer)
+        self._clear_api_retry_timer()
+        self._clear_one_shot_followup_timer()
+        # ...and the state those retries were holding goes with them: with
+        # nothing left to retry, "limited"/"billing_blocked" would otherwise
+        # sit on the status bar forever. The next message the user sends
+        # simply tries again and reports whatever is true then.
+        if self.conn_state.get("kind") in STOP_RESETS_CONN_STATES:
+            self._set_conn_state("connected")
+        if not self.turn_pending:
+            # Bug fix (2026-10-09), per explicit instruction: "основная модель
+            # и все, что ей запущено из инструментов должно полностью
+            # прерываться" -- also when the click lands between two turns.
+            # No turn is in flight then, but what earlier turns launched may
+            # well be: a tool call running as a background operation, a
+            # subagent or a background shell inside the engine's own process.
+            # Each of those wakes the model up again when it finishes, which
+            # from the user's side is "I pressed Stop and she kept going".
+            cancelled = REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
+            # Stop is the absolute kill switch: the engine's whole process
+            # tree goes, unconditionally -- no asking a registry whether an
+            # agent is "supposed" to be running. Whatever earlier turns left
+            # behind inside the engine (subagents, background shells, anything
+            # they launched) dies with it. The run loop starts a fresh, idle
+            # engine afterwards; _stop_killed_idle_engine tells it that this
+            # was the user's doing and that no turn is to be started over it.
+            killed = 0
+            if self.client and not self.small_model_active:
+                self._stop_killed_idle_engine = True
+                killed = self._kill_engine_process_tree("Stop between turns")
+                asyncio.create_task(self._force_stop_client())
+            log_event(
+                "engine", "user_stop_between_turns", tab_id=self.tab_id, cancelled_retry=had_retry,
+                cancelled_operations=cancelled, killed_processes=killed,
+            )
+            return
+        log_event("engine", "user_stop", tab_id=self.tab_id, cancelled_retry=had_retry)
+        self.user_stop_requested = True
         if self.small_model_active:
             # No SDK client/query() is involved in this path at all -- the
             # only thing to stop is the background task running
@@ -2471,7 +2675,15 @@ class ChatSession:
             # direct OS-process kill if disconnect() itself throws -- see
             # its own docstring for the SDK bug that makes that fallback
             # necessary).
+            # The whole process tree, right now and synchronously -- before
+            # anything asynchronous below even gets scheduled.
+            self._kill_engine_process_tree("Stop during a turn")
             asyncio.create_task(self._force_stop_client())
+        # Idle at once: the run loop only notices the dead engine when its
+        # stream breaks, which was seen to take 20-55 s; the status bar and
+        # the next message must not wait for that.
+        self.turn_pending = False
+        log_event("engine", "user_stop_dropped_queued_input", tab_id=self.tab_id, count=dropped_inputs)
         # Bug fix (2026-09-10): confirmed live -- client.interrupt() alone
         # only stops the model's own generation stream. A tool call that
         # already crossed dispatch()'s fast-path window (app/operations.py)
@@ -2480,21 +2692,39 @@ class ChatSession:
         # reached it, so it kept running to completion regardless. This
         # cancels exactly THIS tab's own still-running background
         # operations alongside the interrupt.
-        cancelled = REGISTRY.cancel_for_tab(self.tab_id)
+        cancelled = REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
         if cancelled:
             log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
-        # Bug fix (2026-09-14), per explicit instruction ("не понимает, что
-        # её прерывали и ход тем самым завершён"): confirmed live -- Stop
-        # never touched api_retry_timer/one_shot_followup_timer, so a
-        # pending auto-recovery nudge (scheduled while THIS turn was still
-        # struggling -- a rate-limit retry, a usage-cap follow-up) fired
-        # anyway, later, as if the user had never stepped in at all. From
-        # the user's side that reads as "I stopped her and she just kept
-        # going" -- an explicit Stop should silence every background
-        # recovery attempt tied to this now-abandoned turn, not just the
-        # turn itself.
-        self._clear_api_retry_timer()
-        self._clear_one_shot_followup_timer()
+        # (api_retry_timer/one_shot_followup_timer are cleared at the top of
+        # this method -- see the 2026-10-09 note there; the 2026-09-14 fix
+        # that first added the clearing had put it here, after the early
+        # return, where a Stop between turns never reached it.)
+
+    def _reset_after_stop(self) -> None:
+        """The run loop's side of a Stop, once the killed engine's stream has
+        broken. A message the user sent AFTER the click is already queued
+        and is a new instruction: it keeps its turn and runs on the fresh
+        engine. Otherwise the tab is simply idle."""
+        if self.queue:
+            log_event("engine", "after_stop_keeping_new_user_input", tab_id=self.tab_id, count=len(self.queue))
+            return
+        self.turn_pending = False
+        self.pending_user_text = None
+        self.pending_attachments = []
+
+    def _kill_engine_process_tree(self, why: str) -> int:
+        """Kills the engine process (claude.exe / codex) and every process
+        under it, immediately. Returns how many processes were in the tree."""
+        pid = self._cli_process_pid
+        if not pid:
+            try:
+                pid = self.client.process_pid() if self.client else None
+            except Exception:  # noqa: BLE001
+                pid = None
+        if not pid:
+            log_event("engine", "user_stop_no_engine_pid", tab_id=self.tab_id, why=why)
+            return 0
+        return kill_process_tree(pid, why=f"{why} (tab {self.tab_id})")
 
     async def _force_stop_client(self) -> None:
         """Per explicit instruction (2026-09-15): "Кнопка стоп это
@@ -2611,6 +2841,9 @@ class ChatSession:
             sent_line += ", via voice input -- may contain transcription errors"
         sent_line += "]"
         content: list[dict[str, Any]] = [{"type": "text", "text": sent_line}]
+        if self._stop_note_in_next_push:
+            self._stop_note_in_next_push = False
+            content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + STOP_NOTE_TEXT})
         for attachment in attachments:
             content.extend(_attachment_to_blocks(attachment))
         if text:
@@ -2693,7 +2926,20 @@ class ChatSession:
             self.api_retry_timer.cancel()
             self.api_retry_timer = None
 
+    def _stopped_by_user(self, what: str, reason: str) -> bool:
+        """True after an explicit Stop, until the user's next real message
+        (the same latch that halts post-turn checks). A retry turn that was
+        already in flight at the moment of the click can still deliver its
+        "limit" reply a moment later; without this, that late reply re-armed
+        the very retry loop Stop had just cancelled."""
+        if self._post_turn_checks_halted:
+            log_event("engine", f"{what}_not_scheduled_after_stop", tab_id=self.tab_id, reason=reason)
+            return True
+        return False
+
     def _schedule_api_retry(self, reason: str, is_voice: bool) -> None:
+        if self._stopped_by_user("api_retry", reason):
+            return
         if self.api_retry_timer:
             log_event("engine", "api_retry_already_pending", tab_id=self.tab_id, reason=reason)
             return
@@ -2752,6 +2998,8 @@ class ChatSession:
         this method again -- and now simply re-arms, exactly like every
         other flat retry in this codebase, until a real answer (anything
         other than another cap report) comes through."""
+        if self._stopped_by_user("one_shot_followup", reason):
+            return
         if self.one_shot_followup_timer:
             log_event("engine", "one_shot_followup_already_pending", tab_id=self.tab_id, reason=reason)
             return
@@ -3218,6 +3466,11 @@ class ChatSession:
                 block["text"] = translated
         return wire
 
+    def _narration_turn_marker(self) -> Any:
+        """Identifies the turn a narration remark is being written for: the
+        text that started it. A new turn always sets a new pending text."""
+        return id(self.pending_user_text), self.pending_user_text
+
     async def _check_progress_narration(self) -> None:
         """Per explicit instruction (2026-09-10): the user must see SOME
         comment from Caroline at least once a minute while a real turn of
@@ -3342,8 +3595,32 @@ class ChatSession:
         if activity is None:
             log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
             return
+        # Bug fix (2026-10-09), confirmed live: everything above is checked
+        # BEFORE the remark is generated, and generating it (a network call,
+        # retried) takes up to a minute. In that time the turn can finish and
+        # the model's own final report go out -- and the stale remark was then
+        # sent after it ("нарратор вылезает за пределы финального доклада":
+        # 4 of 13 remarks in one evening landed 30-66 s after their turn had
+        # ended). The remark is a stand-in for silence DURING a turn, so it is
+        # only sent if, once it is ready, this is still the same silent turn.
+        silence_marker = self.last_visible_output_at
+        turn_marker = self._narration_turn_marker()
+
+        def _stale() -> str | None:
+            if self.ended or not self.turn_pending:
+                return "turn_ended"
+            if self._narration_turn_marker() != turn_marker:
+                return "another_turn"
+            if self.last_visible_output_at != silence_marker:
+                return "model_spoke"
+            if self.current_turn_suppress_narration:
+                return "narration_suppressed"
+            return None
+
         comment: str | None = None
         for attempt in range(1, NARRATION_GENERATION_RETRY_ATTEMPTS + 1):
+            if _stale():
+                break
             try:
                 comment = await generate_progress_comment(
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
@@ -3356,6 +3633,10 @@ class ChatSession:
             if comment:
                 break
             log_event("engine", "progress_narration_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
+        stale = _stale()
+        if stale:
+            log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, had_comment=bool(comment))
+            return
         if not comment:
             self.last_narration_failed_at = time.monotonic()
             return
@@ -3679,6 +3960,18 @@ class ChatSession:
                 self.needs_startup_compaction = False
                 self.last_forced_compaction_at = now
                 return
+
+        # Save first (per explicit instruction, 2026-10-10): one service turn
+        # asking the model to save what it learned; the compaction itself
+        # runs on a later tick, once that turn is over (turn_pending gates
+        # this whole method). Not for "startup" (nothing was learned in this
+        # process yet) nor "post_limit" (the turn would hit the cap again).
+        if reason in ("hourly", "growth") and memory_nudge.has_unsaved_work(self.tab_id) and not self._memory_flushed_for_compaction:
+            self._memory_flushed_for_compaction = True
+            log_event("engine", "memory_flush_before_compaction", tab_id=self.tab_id, reason=reason)
+            self.inject_proactive(MEMORY_FLUSH_BEFORE_COMPACTION_TEXT, suppress_narration=True)
+            return
+        self._memory_flushed_for_compaction = False
 
         self.needs_startup_compaction = False
         self.last_forced_compaction_at = now
@@ -4140,7 +4433,20 @@ class ChatSession:
             # had been stuck. self._cli_process_pid is captured at spawn time
             # (win_subprocess_patch.py's pid sink) -- just never surfaced.
             "cliProcessPid": self._cli_process_pid,
+            # How long the CLI process itself has shown no sign of work
+            # (CPU/RSS/IO, see process_activity.py) -- the same signal
+            # _check_hang judges hangs by; None when it cannot be read.
+            # lastActivityMs above only counts SDK messages, and a model
+            # writing one long reply sends none for minutes (bug fix
+            # 2026-10-10: the supervisor killed exactly such a turn).
+            "processIdleMs": self._process_idle_ms(),
         }
+
+    def _process_idle_ms(self) -> int | None:
+        monitor = self._process_activity_monitor
+        if monitor is None or not monitor.available:
+            return None
+        return round(monitor.seconds_since_last_activity() * 1000)
 
     # ------------------------------------------------------------- run loop --
 
@@ -4148,6 +4454,7 @@ class ChatSession:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)
         set_inject_proactive(lambda text: self.inject_proactive(text))
+        register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:
@@ -4283,6 +4590,7 @@ class ChatSession:
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
                     working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
+                    memory_topics_system_prompt_clause(self.workspace_dir),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
@@ -4424,12 +4732,14 @@ class ChatSession:
                                 )
                                 continue
                             log_event("engine", "classifier_refusal_recurred", tab_id=self.tab_id, category=category)
+                            # English like every text in the code: this becomes an
+                            # assistant message, which _translate_wire_visible_text
+                            # puts into the conversation's language before sending.
                             explanation = (
-                                "Не смогла ответить на предыдущее сообщение: сработал внутренний фильтр безопасности "
-                                "Anthropic" + (f" (категория «{category}»)" if category else "") +
-                                ", похоже на ложное срабатывание — с содержанием разговора это не связано. Повторная "
-                                "попытка тоже не прошла. Попробуйте переформулировать сообщение или повторить чуть "
-                                "позже."
+                                "I couldn't answer the previous message: Anthropic's internal safety filter was "
+                                "triggered" + (f" (category \"{category}\")" if category else "") +
+                                ", most likely a false positive unrelated to what we were discussing. The retry "
+                                "failed too. Please rephrase the message or try again a little later."
                             )
                             for block in message.content:
                                 if isinstance(block, TextBlock):
@@ -5054,24 +5364,27 @@ class ChatSession:
                 if self.ended:
                     return
 
+                if self._stop_killed_idle_engine:
+                    # Stop pressed between turns killed an idle engine (see
+                    # stop()). Nothing was in flight, so there is nothing to
+                    # tell the model and no turn to start: just come back up
+                    # with a fresh engine and wait for the user.
+                    self._stop_killed_idle_engine = False
+                    self.user_stop_requested = False
+                    log_event("engine", "restarting_engine_after_stop_between_turns", tab_id=self.tab_id)
+                    self._reset_after_stop()
+                    continue
+
                 if self.user_stop_requested:
                     self.user_stop_requested = False
-                    # Bug fix (2026-09-11): no more explicit "stopped"
-                    # wire message -- setting turn_pending below (via the
-                    # property setter) already auto-publishes the correct
-                    # status (READY, since nothing else is pending yet at
-                    # this exact instant), and the imminent resubmit()
-                    # right after auto-publishes WORKING again. Two states
-                    # correctly represented, no special-cased message type.
-                    self.turn_pending = False
-                    self.pending_user_text = None
-                    self.pending_attachments = []
-                    self.submit(
-                        "[The user just stopped what you were doing. Whatever action was in progress may be "
-                        "incomplete or partially applied -- don't assume it finished. Wait for their next "
-                        "instruction.]",
-                        [], False,
-                    )
+                    # Bug fix (2026-10-09), confirmed live: this used to
+                    # submit a "[The user just stopped what you were doing...]"
+                    # note as a turn of its own -- so every Stop started a new
+                    # turn 20-55 s later, the moment the engine came back up,
+                    # and the model went on working. Now nothing is started:
+                    # the note rides on the user's next real message instead
+                    # (see _stop_note_pending in submit()).
+                    self._reset_after_stop()
                     continue
 
                 if self.restart_pending:

@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 
+from app.http_tls import ssl_context
 from app.plugins.sw_api import API_URL
 
 # Same shared v2 key portal/chat.js itself sends on every command. NOT a
@@ -77,7 +78,7 @@ async def _ratatosk_command(body: dict[str, Any]) -> dict[str, Any]:
     a password) -- left for a future structured-logging pass to mirror the
     original's console.error call; not logged at all for now rather than
     logging the session by mistake."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=30.0) as client:
         last_err: Exception | None = None
         for attempt in range(3):
             try:

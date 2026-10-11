@@ -34,6 +34,7 @@ import httpx
 # auth status" call. getattr(..., 0) keeps this a no-op on non-Windows.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+from app.http_tls import ssl_context
 from app.account_state import CachedAsyncValue
 from app.logging_setup import log_event
 from app.plugins.notes_api import load_credentials, verify_password
@@ -259,7 +260,7 @@ async def _fetch_sw_status() -> SwStatus:
         return SwStatus(False, None, None, None)
     email = creds["email"]
     session = await mint_v2_session(creds["email"], creds["password"])
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=30.0) as client:
         res = await client.post(API_URL, json={"command": "wallet:getBalance", "key": SW_SERVICE_KEY, "session": session})
         data = res.json()
     if data.get(".status") != "ok":
@@ -336,7 +337,7 @@ async def create_topup_checkout_url() -> str:
         raise RuntimeError("Not logged in to SquirrelWisdom.")
     session = await verify_password(creds["email"], creds["password"])
     url = f"{SQUIRRELWISDOM_ORIGIN}/revolut/topups?session={urllib.parse.quote(session)}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=30.0) as client:
         res = await client.post(url, json={"currency": DEFAULT_TOPUP_CURRENCY, "amount_minor": DEFAULT_TOPUP_AMOUNT_MINOR, "purpose": "wallet_topup"})
         data = res.json()
     checkout_url = data.get("checkout_url")

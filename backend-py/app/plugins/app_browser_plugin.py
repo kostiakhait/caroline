@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 
+from app.http_tls import ssl_context
 from app.logging_setup import log_event
 from app.plugins import app_browser_cdp as cdp
 from app.plugins.loader import Plugin, PluginTool
@@ -92,7 +93,7 @@ def _resolve_nativehost_exe() -> str | None:
 
 async def _nativehost_is_up(timeout_s: float = 2.0) -> bool:
     try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout_s) as client:
             res = await client.get(f"{APP_BROWSER_HOST}/list")
             return res.status_code == 200
     except Exception:
@@ -131,7 +132,7 @@ async def _ensure_nativehost_running() -> None:
 async def _call(path: str, body: dict[str, Any] | None, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
     try:
         await _ensure_nativehost_running()
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout_s) as client:
             res = await client.post(f"{APP_BROWSER_HOST}{path}", json=body or {})
             try:
                 return res.json()
@@ -144,7 +145,7 @@ async def _call(path: str, body: dict[str, Any] | None, timeout_s: float = DEFAU
 async def _get(path: str, timeout_s: float = 10.0) -> Any:
     try:
         await _ensure_nativehost_running()
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout_s) as client:
             res = await client.get(f"{APP_BROWSER_HOST}{path}")
             try:
                 return res.json()

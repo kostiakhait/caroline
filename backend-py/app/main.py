@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from app import memory_turns
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
@@ -285,6 +286,9 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
             "commentary) -- when you're actually done, tell the user the outcome/result directly, in one clear "
             "message."
         )
+    # Nobody's message is behind this turn: for the memory service's money
+    # rules it is a turn of its own (memory_turns.py).
+    memory_turns.start_service_turn(primary.tab_id)
     delivered = primary.inject_proactive(
         f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n{instruction}",
         suppress_narration=True,
@@ -430,6 +434,12 @@ async def _start_ratatosk_background_loops() -> None:
     # scratch) and every tab's session start reads it instead of spawning
     # its own. See app/account_state.py.
     asyncio.create_task(run_account_state_refresher())
+    # Logs the stack of whatever blocks this loop for more than 2 s (see app/loop_watchdog.py).
+    from app import loop_watchdog
+    loop_watchdog.start(asyncio.get_running_loop())
+    # The one TLS context every httpx client shares, built off the loop (see app/http_tls.py).
+    from app import http_tls
+    asyncio.create_task(http_tls.warm_up())
     asyncio.create_task(_prune_redundant_archives_in_background())
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
@@ -804,9 +814,18 @@ async def _notify_owner_ratatosk_turn_had_no_reply(missing_group_ids: list[str])
             return
         session = await get_own_v2_session(WORKSPACE_DIR)
         notice = (
-            "⚠️ Не смогла нормально ответить на предыдущее сообщение (сбой или лимит) -- напишите ещё раз, если "
-            "это всё ещё актуально."
+            "⚠️ I couldn't properly answer the previous message (a failure or a usage limit) -- please write "
+            "again if it still matters."
         )
+        # English like every text in the code, translated into the owner's language for sending.
+        try:
+            from app.plugins.voice_api import translate_text
+            primary = primary_session()
+            language = current_language_name(primary.tab_id) if primary else None
+            if language:
+                notice = await translate_text(notice, language) or notice
+        except Exception as exc:  # noqa: BLE001 -- an untranslated notice is still better than none
+            log_event("engine", "ratatosk_failure_notice_translate_failed", error=str(exc))
         targets = missing_group_ids or [await find_or_create_dm(session, caroline_email, owner_email)]
         for group_id in targets:
             await send_message(session, group_id, caroline_email, notice)

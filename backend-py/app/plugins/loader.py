@@ -124,7 +124,10 @@ def wrap_tool(plugin_name: str, plugin_tool: PluginTool) -> SdkMcpTool[Any]:
     @sdk_tool(plugin_tool.name, plugin_tool.description, plugin_tool.input_schema)
     async def dispatching_handler(args: dict[str, Any]) -> dict[str, Any]:
         envelope = await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args)
-        return _envelope_to_mcp_response(envelope)
+        response = _envelope_to_mcp_response(envelope)
+        if envelope.get("memory_note"):
+            response["content"] = list(response["content"]) + [{"type": "text", "text": envelope["memory_note"]}]
+        return response
 
     return dispatching_handler
 

@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from app.process_kill import kill_process_tree
 from app.plugins.loader import Plugin, PluginTool
 
 # See screenshot_plugin.py's identical constant/comment -- this backend runs
@@ -48,9 +49,17 @@ async def _run(proc_coro: Any, timeout_s: float) -> str:
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        proc.kill()
+        # The whole tree, not proc.kill(): for run_command `proc` is only the
+        # shell, and killing the shell alone leaves the command it launched running.
+        kill_process_tree(proc.pid, why="command timed out")
         await proc.communicate()
         raise TimeoutError(f"Command timed out after {timeout_s}s and was killed.") from None
+    except asyncio.CancelledError:
+        # Bug fix (2026-10-09): Stop cancels this tool call's task, and that
+        # used to be ALL it did -- the command itself kept running to the end,
+        # which is exactly what Stop exists to prevent.
+        kill_process_tree(proc.pid, why="tool call cancelled (Stop)")
+        raise
     return _format_output(stdout, stderr, proc.returncode)
 
 

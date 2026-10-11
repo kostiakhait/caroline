@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server, tool as sdk_tool
 
+from app import memory_nudge
 from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
 from app.session_context import get_inject_proactive, get_tab_id
@@ -47,6 +48,11 @@ from app.workspace_dir import WORKSPACE_DIR
 # of Phase 2's ported plugins) landing on the fast path consistently rather
 # than flapping between "done" and "running" run to run.
 FAST_PATH_TIMEOUT_S = 0.5
+# A completion notice for an operation the caller walked away from waits
+# this long first; if the model has meanwhile collected the result itself
+# with check_operation_status, the notice is not sent (see
+# _notify_unless_collected).
+NOTIFY_GRACE_S = 10.0
 
 ReportProgress = Callable[[Any], None]
 ToolHandler = Callable[[dict[str, Any], ReportProgress], Awaitable[dict[str, Any]]]
@@ -82,6 +88,11 @@ class Operation:
     # to fire a proactive nudge automatically; a fast-path operation never
     # needs one, since its result already reached the caller synchronously.
     notify_on_completion: bool = False
+    # Set when check_operation_status handed out the final result: the
+    # completion notice would only repeat it (bug fix 2026-10-10, confirmed
+    # live: 199 polls in one session, and most results then came a second
+    # time, whole, in an "[Internal: a background operation ...]" turn).
+    collected: bool = False
 
 
 class OperationRegistry:
@@ -103,15 +114,21 @@ class OperationRegistry:
     def forget(self, operation_id: str) -> None:
         self._ops.pop(operation_id, None)
 
-    def cancel_for_tab(self, tab_id: str) -> int:
+    def cancel_for_tab(self, tab_id: str, keep_tools: frozenset[str] = frozenset()) -> int:
         """Cancels every still-running operation tagged with this tab_id --
         called from ChatSession.stop() alongside client.interrupt() so
         Stop actually reaches a tool call that already crossed dispatch()'s
         fast-path window and became a detached background task (interrupt()
         alone only stops the model's own generation stream, not that
-        task). Returns how many were actually cancelled, for logging."""
+        task). Returns how many were actually cancelled, for logging.
+
+        `keep_tools`: tool names whose operations are left to finish. A
+        write into memory is one: half of it may already be on the server,
+        so it is allowed to complete whatever else Stop tears down."""
         cancelled = 0
         for op in self._ops.values():
+            if op.tool_name in keep_tools:
+                continue
             if op.tab_id == tab_id and op.status == "running" and op.task is not None and not op.task.done():
                 op.task.cancel()
                 cancelled += 1
@@ -119,6 +136,13 @@ class OperationRegistry:
 
 
 REGISTRY = OperationRegistry()
+
+
+def _notify_unless_collected(plugin_name: str, op: Operation) -> None:
+    if op.collected:
+        log_event(f"plugin:{plugin_name}", "operation_completion_notice_skipped", tool=op.tool_name, operation_id=op.id)
+        return
+    _notify_operation_completed(plugin_name, op)
 
 
 def _notify_operation_completed(plugin_name: str, op: Operation) -> None:
@@ -151,12 +175,25 @@ def _notify_operation_completed(plugin_name: str, op: Operation) -> None:
     log_event(f"plugin:{plugin_name}", "operation_completion_notified", tool=op.tool_name, operation_id=op.id, status=op.status, error=op.error)
 
 
-async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args: dict[str, Any]) -> dict[str, Any]:
+async def dispatch(
+    plugin_name: str, tool_name: str, handler: ToolHandler, args: dict[str, Any], wait_to_end: bool = False,
+) -> dict[str, Any]:
     """Runs one tool call through the uniform start/status/stop contract.
     Always logs call/result/error/duration at the engine level (see
     plugins/loader.py's wrap_tool, which calls this) -- individual plugins
-    never implement their own polling/cancellation plumbing."""
+    never implement their own polling/cancellation plumbing.
+
+    `wait_to_end`: the caller waits for the call's real outcome instead of
+    getting "running" after FAST_PATH_TIMEOUT_S. For the small-model
+    engine, whose tool loop runs in a worker thread and has no polling of
+    its own: a "running" answer there only gave the model an internal
+    operation id to talk about -- it told the user about "operation ...
+    still running" -- and a later "[Internal: a background operation ...]"
+    turn to narrate. The operation stays registered while it runs, so Stop
+    (REGISTRY.cancel_for_tab) still cancels it; the envelope's status is
+    then "cancelled"."""
     op = REGISTRY.create(tool_name, tab_id=get_tab_id())
+    memory_note = memory_nudge.note_tool_call(op.tab_id, tool_name)
 
     def report_progress(data: Any) -> None:
         op.partial = data
@@ -183,7 +220,10 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
             # "cancelled" -- whoever cancelled it (REGISTRY.cancel_for_tab,
             # stop_operation) already knows.
             if op.notify_on_completion and op.status != "cancelled":
-                _notify_operation_completed(plugin_name, op)
+                # After a grace period, and only if the model has not
+                # collected the result itself by then. call_later keeps this
+                # context, so the notice still reaches this tab's session.
+                asyncio.get_running_loop().call_later(NOTIFY_GRACE_S, _notify_unless_collected, plugin_name, op)
             # Same "only if it was ever persisted" gating -- see
             # save_pending_operation's own call site below. Clears
             # regardless of tab_id being set; clear_pending_operation is a
@@ -199,8 +239,10 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         duration_ms = round((time.monotonic() - op.started_at) * 1000, 1)
         log_event(f"plugin:{plugin_name}", "operation_done_fast", tool=tool_name, operation_id=op.id, duration_ms=duration_ms)
         REGISTRY.forget(op.id)
-        return {"operation_id": op.id, "status": "done", "result": result}
+        return _with_note({"operation_id": op.id, "status": "done", "result": result}, memory_note)
     except asyncio.TimeoutError:
+        if wait_to_end:
+            return _with_note(await _wait_to_end(plugin_name, tool_name, op), memory_note)
         op.notify_on_completion = True
         # Per explicit instruction (2026-09-15): see durability.py's own
         # "per-tab in-flight background operations" section for why this
@@ -211,12 +253,43 @@ async def dispatch(plugin_name: str, tool_name: str, handler: ToolHandler, args:
         if op.tab_id:
             save_pending_operation(WORKSPACE_DIR, op.tab_id, op.id, tool_name, args)
         log_event(f"plugin:{plugin_name}", "operation_running", tool=tool_name, operation_id=op.id)
-        return {"operation_id": op.id, "status": "running"}
+        return _with_note({"operation_id": op.id, "status": "running"}, memory_note)
     except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()
         duration_ms = round((time.monotonic() - op.started_at) * 1000, 1)
         log_event(f"plugin:{plugin_name}", "operation_error", tool=tool_name, operation_id=op.id, duration_ms=duration_ms, error=str(exc))
         REGISTRY.forget(op.id)
+        return _with_note({"operation_id": op.id, "status": "error", "error": str(exc)}, memory_note)
+
+
+def _with_note(envelope: dict[str, Any], memory_note: str | None) -> dict[str, Any]:
+    """The memory reminder (memory_nudge.py) rides on the envelope; each
+    engine appends it to the text the model reads."""
+    if memory_note:
+        envelope["memory_note"] = memory_note
+    return envelope
+
+
+async def _wait_to_end(plugin_name: str, tool_name: str, op: Operation) -> dict[str, Any]:
+    """dispatch()'s wait_to_end case, past the fast-path window."""
+    assert op.task is not None
+    log_event(f"plugin:{plugin_name}", "operation_awaited", tool=tool_name, operation_id=op.id)
+    try:
+        result = await asyncio.shield(op.task)
+    except asyncio.CancelledError:
+        if not op.task.cancelled():
+            raise  # the caller itself was cancelled, not the tool call
+        REGISTRY.forget(op.id)
+        log_event(f"plugin:{plugin_name}", "operation_cancelled_while_awaited", tool=tool_name, operation_id=op.id)
+        return {"operation_id": op.id, "status": "cancelled"}
+    except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()
+        REGISTRY.forget(op.id)
+        log_event(f"plugin:{plugin_name}", "operation_error", tool=tool_name, operation_id=op.id,
+                  duration_ms=round((time.monotonic() - op.started_at) * 1000, 1), error=str(exc))
         return {"operation_id": op.id, "status": "error", "error": str(exc)}
+    REGISTRY.forget(op.id)
+    log_event(f"plugin:{plugin_name}", "operation_done_awaited", tool=tool_name, operation_id=op.id,
+              duration_ms=round((time.monotonic() - op.started_at) * 1000, 1))
+    return {"operation_id": op.id, "status": "done", "result": result}
 
 
 def _operation_to_dict(op: Operation) -> dict[str, Any]:
@@ -246,6 +319,7 @@ async def check_operation_status(args: dict[str, Any]) -> dict[str, Any]:
     body = _operation_to_dict(op)
     if op.status in ("done", "error", "cancelled"):
         log_event("engine", "check_operation_status_final", operation_id=op.id, tool=op.tool_name, status=op.status, error=op.error)
+        op.collected = True
         REGISTRY.forget(op.id)
     return {"content": [{"type": "text", "text": str(body)}]}
 

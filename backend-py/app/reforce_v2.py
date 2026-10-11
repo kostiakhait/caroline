@@ -11,6 +11,7 @@ import asyncio
 from typing import Any
 
 import httpx
+from app.http_tls import ssl_context
 
 REFORCE_URL = "https://beautysqrl.com"
 REFORCE_KEY = "EaYW2x8-oi7qjz4cl9cZWj7Udg6U8RcotHLs0B9xZUM"
@@ -26,7 +27,7 @@ class ReforceSessionExpired(ReforceError):
 
 async def call(command: str, body: dict[str, Any] | None = None, *, timeout: float = 180.0) -> dict[str, Any]:
     payload: dict[str, Any] = {"command": command, "key": REFORCE_KEY, **(body or {})}
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout) as client:
         last_err: Exception | None = None
         for attempt in range(3):
             try:
