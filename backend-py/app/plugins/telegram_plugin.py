@@ -41,14 +41,20 @@ from app.telegram_channel import (
     TelegramLoginError,
     app_configured,
     block_user,
+    create_channel,
+    create_group,
+    delete_chat,
     delete_contact,
     download_attachment,
     get_live_client,
     is_valid_account,
+    leave_chat,
     login_finish,
     login_start,
+    remove_member,
     resolve_or_add_contact,
     send_file,
+    set_admin,
     unblock_user,
 )
 from app.workspace_dir import WORKSPACE_DIR
@@ -304,6 +310,124 @@ async def telegram_send_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f'Sent {path} to {chat_id} (account="{account}").'}
 
 
+async def telegram_create_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    title = str(args.get("title") or "").strip()
+    if not title:
+        return {"text": 'telegram_create_group needs "title".', "is_error": True}
+    members = [str(m) for m in (args.get("members") or [])]
+    if not members:
+        return {"text": 'telegram_create_group needs at least one "members" entry (a chat id or phone number) -- a basic group cannot be created with just yourself in it.', "is_error": True}
+    client = get_live_client(account)
+    user_ids = []
+    for raw in members:
+        user_id, error = await _resolve_chat(client, raw)
+        if error:
+            return error
+        user_ids.append(user_id)
+    chat_id = await create_group(client, title, user_ids)
+    return {"text": f'Created group "{title}" (chat id {chat_id}) on the "{account}" account.'}
+
+
+async def telegram_create_channel(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    title = str(args.get("title") or "").strip()
+    if not title:
+        return {"text": 'telegram_create_channel needs "title".', "is_error": True}
+    client = get_live_client(account)
+    is_megagroup = bool(args.get("isMegagroup"))
+    chat_id = await create_channel(client, title, str(args.get("about") or ""), is_megagroup)
+    kind = "supergroup" if is_megagroup else "broadcast channel"
+    return {"text": f'Created {kind} "{title}" (chat id {chat_id}) on the "{account}" account.'}
+
+
+async def telegram_set_admin(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    try:
+        chat_id = int(args["chat"])
+    except (TypeError, ValueError, KeyError):
+        return {"text": "chat must be the numeric chat id of the group/channel.", "is_error": True}
+    user_id, error = await _resolve_chat(client, str(args.get("user") or ""))
+    if error:
+        return error
+    is_admin = bool(args.get("isAdmin"))
+    try:
+        await set_admin(client, chat_id, user_id, is_admin, args.get("title"))
+    except TelegramLoginError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f'{"Promoted" if is_admin else "Demoted"} {user_id} in {chat_id} (account="{account}").'}
+
+
+async def telegram_remove_member(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    try:
+        chat_id = int(args["chat"])
+    except (TypeError, ValueError, KeyError):
+        return {"text": "chat must be the numeric chat id of the group/channel.", "is_error": True}
+    user_id, error = await _resolve_chat(client, str(args.get("user") or ""))
+    if error:
+        return error
+    await remove_member(client, chat_id, user_id)
+    return {"text": f'Removed {user_id} from {chat_id} (account="{account}").'}
+
+
+async def telegram_delete_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    try:
+        chat_id = int(args["chat"])
+    except (TypeError, ValueError, KeyError):
+        return {"text": "chat must be the numeric chat id of the group/channel.", "is_error": True}
+    try:
+        await delete_chat(client, chat_id)
+    except TelegramLoginError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f'Deletion of {chat_id} requested (account="{account}") -- Telegram only applies it fully if this account created the chat or has the right admin permission; otherwise this account was likely just removed from it instead.'}
+
+
+async def telegram_leave_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    try:
+        chat_id = int(args["chat"])
+    except (TypeError, ValueError, KeyError):
+        return {"text": "chat must be the numeric chat id of the group/channel.", "is_error": True}
+    await leave_chat(client, chat_id)
+    return {"text": f'Left {chat_id} (account="{account}").'}
+
+
 def _usage_instructions() -> str:
     return (
         "TWO separate Telegram accounts, chosen with \"account\" on every tool: \"self\" (the default -- your "
@@ -329,7 +453,16 @@ def _usage_instructions() -> str:
         "messageId, account) before using it; omit savePath to let it pick a default location and return the "
         "resulting path. telegram_send_file(chat, path, caption, account) sends a local file the same way "
         "telegram_send_message sends text, including the same phone-number auto-resolve and the same "
-        "owner-account permission rule."
+        "owner-account permission rule.\n"
+        "Groups and channels: telegram_create_group(title, members, account) makes a small basic group -- "
+        "`members` needs at least one other chat id/phone number, it cannot be created with just yourself in "
+        "it. telegram_create_channel(title, about, isMegagroup, account) makes a broadcast channel "
+        "(isMegagroup=false) or a supergroup (isMegagroup=true) instead -- no initial members needed. "
+        "telegram_set_admin(chat, user, isAdmin, account) promotes/demotes a member (`user` may be a phone "
+        "number too). telegram_remove_member(chat, user, account) kicks someone. telegram_delete_chat(chat, "
+        "account) asks Telegram to delete the whole group/channel, but it only actually does that for the "
+        "creator (or an admin with the right permission on a channel) -- otherwise this account is just "
+        "removed from it, same as telegram_leave_chat(chat, account), which always just leaves."
     )
 
 
@@ -423,6 +556,48 @@ PLUGIN = Plugin(
             "(default \"self\") picks which account sends it -- same owner-impersonation rule as "
             "telegram_send_message: only send as \"owner\" when explicitly asked, for this specific message.",
             {"chat": str, "path": str, "caption": str | None, "account": str | None}, telegram_send_file,
+        ),
+        PluginTool(
+            "telegram_create_group",
+            "Creates a basic Telegram group chat. `members` is a list of at least one chat id or phone number "
+            "to start it with -- a group cannot be created with just yourself. `account`: \"self\" (default) "
+            "or \"owner\".",
+            {"title": str, "members": list, "account": str | None}, telegram_create_group,
+        ),
+        PluginTool(
+            "telegram_create_channel",
+            "Creates a Telegram channel: a broadcast channel (isMegagroup=false, the default) or a supergroup "
+            "(isMegagroup=true). Optional `about`. No initial members, unlike telegram_create_group. `account`: "
+            "\"self\" (default) or \"owner\".",
+            {"title": str, "about": str | None, "isMegagroup": bool | None, "account": str | None}, telegram_create_channel,
+        ),
+        PluginTool(
+            "telegram_set_admin",
+            "Promotes (isAdmin=true) or demotes (isAdmin=false) someone in a group/channel. `chat` is the "
+            "group/channel's numeric id; `user` is their chat id or phone number. Optional `title` sets their "
+            "custom admin rank label. Only works if this account itself has the right to grant admin there. "
+            "`account`: \"self\" (default) or \"owner\".",
+            {"chat": str, "user": str, "isAdmin": bool, "title": str | None, "account": str | None}, telegram_set_admin,
+        ),
+        PluginTool(
+            "telegram_remove_member",
+            "Removes (kicks) someone from a group/channel. `chat` is the group/channel's numeric id; `user` is "
+            "their chat id or phone number. `account`: \"self\" (default) or \"owner\".",
+            {"chat": str, "user": str, "account": str | None}, telegram_remove_member,
+        ),
+        PluginTool(
+            "telegram_delete_chat",
+            "Asks Telegram to delete a group/channel outright. `chat` is its numeric id. Telegram only honors "
+            "this fully for the chat's creator (or an admin with the right permission on a channel) -- "
+            "otherwise this account is simply removed from it instead, the same as telegram_leave_chat. "
+            "`account`: \"self\" (default) or \"owner\".",
+            {"chat": str, "account": str | None}, telegram_delete_chat,
+        ),
+        PluginTool(
+            "telegram_leave_chat",
+            "Leaves a group or channel (does not delete it). `chat` is its numeric id. `account`: \"self\" "
+            "(default) or \"owner\".",
+            {"chat": str, "account": str | None}, telegram_leave_chat,
         ),
     ],
 )

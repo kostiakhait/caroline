@@ -45,8 +45,10 @@ from typing import Any, Callable
 from telethon import TelegramClient, events, utils
 from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import CreateChannelRequest, DeleteChannelRequest
 from telethon.tl.functions.contacts import BlockRequest, DeleteContactsRequest, ImportContactsRequest, UnblockRequest
-from telethon.tl.types import InputPhoneContact
+from telethon.tl.functions.messages import CreateChatRequest, DeleteChatRequest
+from telethon.tl.types import Channel, Chat, InputPhoneContact
 
 from app.logging_setup import log_event
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
@@ -188,6 +190,60 @@ async def block_user(client: TelegramClient, chat_id: int) -> None:
 async def unblock_user(client: TelegramClient, chat_id: int) -> None:
     entity = await client.get_input_entity(chat_id)
     await client(UnblockRequest(id=entity))
+
+
+# Groups and channels (2026-10-11). Telegram has two different underlying
+# entity types here -- a "basic group" (small, created with CreateChatRequest,
+# deleted with DeleteChatRequest) and a "channel", which covers both
+# broadcast channels and supergroups (created with CreateChannelRequest,
+# megagroup=True for a supergroup; deleted with DeleteChannelRequest).
+# create_group always makes a basic group (CreateChatRequest requires at
+# least one other member to begin with, unlike a channel); create_channel
+# always makes the channel-family entity, broadcast or supergroup. The
+# high-level client.edit_admin/kick_participant/delete_dialog methods paper
+# over that split for admin/kick/leave, so only delete_chat needs to look
+# at which type it got (get_entity) to pick the matching delete call.
+async def create_group(client: TelegramClient, title: str, user_ids: list[int]) -> int:
+    users = [await client.get_input_entity(uid) for uid in user_ids]
+    result = await client(CreateChatRequest(users=users, title=title))
+    return result.chats[0].id
+
+
+async def create_channel(client: TelegramClient, title: str, about: str = "", megagroup: bool = False) -> int:
+    result = await client(CreateChannelRequest(title=title, about=about, megagroup=megagroup))
+    return result.chats[0].id
+
+
+async def set_admin(client: TelegramClient, chat_id: int, user_id: int, is_admin: bool, title: str | None = None) -> None:
+    entity = await client.get_input_entity(chat_id)
+    user = await client.get_input_entity(user_id)
+    await client.edit_admin(entity, user, is_admin=is_admin, title=title)
+
+
+async def remove_member(client: TelegramClient, chat_id: int, user_id: int) -> None:
+    """Kicking yourself ('me') leaves the chat instead -- same as Telethon's
+    own kick_participant; leave_chat below is the direct way to do that."""
+    entity = await client.get_input_entity(chat_id)
+    user = await client.get_input_entity(user_id)
+    await client.kick_participant(entity, user)
+
+
+async def delete_chat(client: TelegramClient, chat_id: int) -> None:
+    """Attempts to delete the group/channel outright -- Telegram only
+    honors this for its creator (or an admin with the right permission on
+    a channel); otherwise it may just remove this account instead, same as
+    leave_chat. There is no separate "delete" concept for a private chat."""
+    entity = await client.get_entity(chat_id)
+    if isinstance(entity, Channel):
+        await client(DeleteChannelRequest(channel=entity))
+    elif isinstance(entity, Chat):
+        await client(DeleteChatRequest(chat_id=entity.id))
+    else:
+        raise TelegramLoginError(f"Chat {chat_id} is neither a group nor a channel -- nothing to delete.")
+
+
+async def leave_chat(client: TelegramClient, chat_id: int) -> None:
+    await client.delete_dialog(chat_id)
 
 
 # Attachments (2026-10-11, after the deliberate choice to notify on every
