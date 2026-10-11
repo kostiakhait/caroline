@@ -1083,7 +1083,7 @@
 
   voiceStopBtn?.addEventListener("click", () => {
     stopActiveSpeech();
-    speechQueue = [];
+    clearSpeechQueue();
   });
 
   // Click handling for a message's manual 🔊 button: clicking the button
@@ -1094,11 +1094,11 @@
   function toggleSpeak(text, btn) {
     if (activeSpeech && activeSpeech.btn === btn) {
       stopActiveSpeech();
-      speechQueue = [];
+      clearSpeechQueue();
       return;
     }
     stopActiveSpeech();
-    speechQueue = [];
+    clearSpeechQueue();
     speak(text, btn);
   }
 
@@ -1164,6 +1164,7 @@
   // so replies never overlap and never cut off mid-word.
   function dropQueuedNarration() {
     const before = speechQueue.length;
+    forgetPreparedVisual(speechQueue.filter((item) => item.narration));
     speechQueue = speechQueue.filter((item) => !item.narration);
     if (speechQueue.length !== before) clog(`dropped ${before - speechQueue.length} queued narration remark(s): a real reply arrived`);
   }
@@ -1185,7 +1186,8 @@
   // does, so a reply lost to a reconnect can't stall the queue forever.
   const TTS_PREFETCH_TIMEOUT_MS = 45_000;
   function prefetchSpeech(item) {
-    if (!item || item.prefetched || item.ttsPromise) return;
+    if (!item) return;
+    if (item.prefetched || item.ttsPromise) { prepareNextVisual(); return; }
     const requestId = `tts-${++ttsRequestSeq}`;
     item.ttsPromise = new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -1194,10 +1196,41 @@
       }, TTS_PREFETCH_TIMEOUT_MS);
       pendingTtsRequests.set(requestId, (ok, audioBase64, err) => {
         clearTimeout(timer);
+        if (ok && audioBase64) item.readyAudio = audioBase64;
         resolve({ ok, audioBase64, err });
+        prepareNextVisual();
       });
       sendControl("tts", { text: item.text, requestId });
     });
+  }
+
+  // Visual Mode: hands the NEXT item's audio to the native side while the current clip
+  // is still on screen (2026-10-11), so its talking-head video is already rendered when
+  // its turn comes (VisualModeManager.HandlePrepareAsync) -- live, rendering it only
+  // then left 4.0s of nothing between every two pieces of a reply. Not before the
+  // current clip's own audio has gone out: the native side renders one clip at a time,
+  // and the clip about to play must not wait behind this one. A shell that doesn't know
+  // the message ignores it and renders at play time, as before.
+  function prepareNextVisual() {
+    const item = speechQueue[0];
+    if (!item || item.visualRequestId || !activeSpeech?.visual || !activeSpeech.audioSent) return;
+    const useVisual = item.forceVisual ? !!window.chrome?.webview : shouldUseVisualMode(item.btn);
+    const audioBase64 = item.prefetched || item.readyAudio;
+    if (!useVisual || !audioBase64) return;
+    item.visualRequestId = `tts-${++ttsRequestSeq}`;
+    window.chrome.webview.postMessage({ type: "visual_speech_prepare", requestId: item.visualRequestId, audioBase64 });
+  }
+
+  // Items leaving the queue unplayed: a video rendered ahead for one is thrown away.
+  function forgetPreparedVisual(items) {
+    for (const item of items) {
+      if (item.visualRequestId) window.chrome?.webview?.postMessage({ type: "visual_speech_cancel", requestId: item.visualRequestId });
+    }
+  }
+
+  function clearSpeechQueue() {
+    forgetPreparedVisual(speechQueue);
+    speechQueue = [];
   }
 
   // Backend-synthesized audio pushed by the play_speech tool (see
@@ -1248,10 +1281,13 @@
     return visualModeState.enabled && visualModeState.available && !!window.chrome?.webview;
   }
 
-  function playOneSpeech({ text, btn, prefetched, forceVisual, ttsPromise }) {
+  function playOneSpeech({ text, btn, prefetched, forceVisual, ttsPromise, visualRequestId }) {
     return new Promise((resolve) => {
       const useVisual = forceVisual ? !!window.chrome?.webview : shouldUseVisualMode(btn);
-      const requestId = `tts-${++ttsRequestSeq}`;
+      // Rendered ahead (prepareNextVisual): played under the id the render was made for.
+      // Visual Mode switched off in between: that render is not needed after all.
+      if (visualRequestId && !useVisual) forgetPreparedVisual([{ visualRequestId }]);
+      const requestId = (useVisual && visualRequestId) || `tts-${++ttsRequestSeq}`;
       clog(`playOneSpeech requestId=${requestId} scheme=${useVisual ? "visual" : "plain-audio"}`, {
         visualModeEnabled: visualModeState.enabled,
         visualModeAvailable: visualModeState.available,
@@ -1301,6 +1337,8 @@
     if (entry.aborted) { onDone?.(); return; }
     pendingVisualDone.set(entry.requestId, { base64, entry, onDone });
     window.chrome.webview.postMessage({ type: "visual_speech_audio", requestId: entry.requestId, audioBase64: base64 });
+    entry.audioSent = true;
+    prepareNextVisual();
   }
 
   const STT_TIMEOUT_MS = 30_000;
@@ -2708,8 +2746,9 @@
         // notice layered on top.
         setStatusBarText(data.text);
       } else if (data && data.type === "visual_speech_done") {
-        // VisualModeWindow finished playing (or failed to render/play) and has
-        // already closed itself -- advance playOneSpeech's queue the same way
+        // VisualModeWindow finished playing (or failed to render/play); it stays up
+        // for its 1s post-roll, where the next clip can take it over -- advance
+        // playOneSpeech's queue the same way
         // playAudioBase64 does on the <audio> element's "ended" event.
         const pending = pendingVisualDone.get(data.requestId);
         if (pending) {
@@ -2726,6 +2765,10 @@
             // same requestId for "signaling fallback" / the exact cause.
             playAudioBase64(pending.base64, pending.entry, pending.onDone);
           } else {
+            // Stop pressed on the talking-head window itself: like the chat's own voice
+            // Stop, nothing still queued is read. A reply is read in pieces, one clip
+            // each, and the window only ended its clip -- the next piece just went on.
+            if (data.stopped) clearSpeechQueue();
             if (activeSpeech === pending.entry) activeSpeech = null;
             pending.entry.btn?.classList.remove("speaking");
             pending.onDone?.();

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
@@ -19,9 +20,25 @@ namespace Caroline;
 /// that's exactly what already happens for free by JS not calling
 /// HandleAudioAsync again until the previous call's Task completes. This
 /// class only ever has at most one active window/request at a time.
+///
+/// Two things do look past the clip playing now (2026-10-11), because chat.js
+/// reads a long reply in pieces and each piece is a request of its own. Measured
+/// live, every boundary between two pieces was 4.0s of nothing: the 1s post-roll,
+/// 2.8s to render the next piece, a new window. So the next piece can be rendered
+/// while the current one is still playing (HandlePrepareAsync), and a clip that is
+/// ready within the previous clip's post-roll takes that clip's window over
+/// (StartPostRoll) instead of one window vanishing and another appearing.
 /// </summary>
 public sealed class VisualModeManager
 {
+    /// <summary>"через 1 секунду после окончания анимации исчезать" -- how long the window
+    /// outlives its clip, and so also how long the next clip has to take it over.</summary>
+    private static readonly TimeSpan PostRoll = TimeSpan.FromSeconds(1);
+
+    /// <summary>chat.js prepares one item ahead; the second slot is slack for a prepare that
+    /// crosses a cancel on the wire. Anything beyond that is a request nobody will play.</summary>
+    private const int MaxRendersAhead = 2;
+
     private readonly string _tempDir;
     private XcfaRenderer.Renderer.PreparedModel? _prepared;
     private byte[]? _staticPng;
@@ -29,6 +46,16 @@ public sealed class VisualModeManager
 
     private VisualModeWindow? _activeWindow;
     private string? _activeRequestId;
+
+    /// <summary>One clip's render. Done is false when it failed (already logged); it never faults.</summary>
+    private sealed record RenderJob(string RequestId, byte[] Audio, string AudioPath, string OutputPath, Task<bool> Done);
+
+    private readonly List<RenderJob> _rendersAhead = new();
+    private Task _lastRender = Task.CompletedTask;
+
+    /// <summary>The window of a clip that has ended, during its post-roll -- see StartPostRoll.</summary>
+    private VisualModeWindow? _lingeringWindow;
+    private int _postRollGeneration;
 
     /// <summary>Best-effort delete of a per-request temp file (audio/rendered video) --
     /// failure just leaves one stray file behind in _tempDir, never fatal to the caller,
@@ -131,24 +158,112 @@ public sealed class VisualModeManager
     }
 
     /// <summary>
-    /// TTS audio is ready -- renders and plays it. Resolves once playback (and the 1s
-    /// post-roll) is fully done. Returns whether visual playback actually happened --
-    /// false means the caller (MainWindow) should tell the client to fall back to plain
+    /// Starts rendering one clip in the background. Renders run one at a time and in the
+    /// order they were asked for, so the clip about to play never waits behind the one
+    /// being prepared for after it.
+    /// </summary>
+    private RenderJob StartRender(string requestId, byte[] audioBytes, XcfaRenderer.Renderer.PreparedModel prepared, string caller)
+    {
+        var audioPath = Path.Combine(_tempDir, $"{requestId}.mp3");
+        var outputPath = Path.Combine(_tempDir, $"{requestId}.webm");
+        var previous = _lastRender;
+        var done = Task.Run(async () =>
+        {
+            await previous;
+            try
+            {
+                await File.WriteAllBytesAsync(audioPath, audioBytes);
+                Logger.Log($"VisualModeManager: {caller} requestId={requestId} render starting");
+                var renderSw = Stopwatch.StartNew();
+                prepared.Render(audioPath, outputPath,
+                    new XcfaRenderer.RenderOptions { RemoveBg = true, Height = 480, Ffmpeg = FfmpegPath });
+                Logger.Log($"VisualModeManager: {caller} requestId={requestId} render finished in {renderSw.Elapsed.TotalSeconds:F1}s");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"VisualModeManager: {caller} requestId={requestId} render failed: {ex}");
+                return false;
+            }
+        });
+        _lastRender = done;
+        return new RenderJob(requestId, audioBytes, audioPath, outputPath, done);
+    }
+
+    private RenderJob? TakeRenderAhead(string requestId)
+    {
+        var index = _rendersAhead.FindIndex(job => job.RequestId == requestId);
+        if (index < 0) return null;
+        var job = _rendersAhead[index];
+        _rendersAhead.RemoveAt(index);
+        return job;
+    }
+
+    /// <summary>Deletes the files of a render nobody will play, once it is done writing them.</summary>
+    private static async Task DiscardRenderAsync(RenderJob job)
+    {
+        await job.Done;
+        SafeDeleteTemp(job.AudioPath);
+        SafeDeleteTemp(job.OutputPath);
+    }
+
+    /// <summary>
+    /// The audio of the item chat.js will play NEXT, sent while the current one is still
+    /// playing (2026-10-11): rendering it now, not when its turn comes, takes the render
+    /// out of the pause between two clips. This only renders -- no window, and nothing
+    /// becomes "current"; HandleAudioAsync for the same requestId picks the result up.
+    /// </summary>
+    public Task HandlePrepareAsync(string requestId, byte[] audioBytes)
+    {
+        Logger.Log($"VisualModeManager: HandlePrepareAsync requestId={requestId} bytes={audioBytes.Length}");
+        XcfaRenderer.Renderer.PreparedModel? prepared;
+        lock (_prepGate) prepared = _prepared;
+        if (prepared == null)
+        {
+            Logger.Log("VisualModeManager: HandlePrepareAsync -- model not warmed (yet), nothing prepared.");
+            return Task.CompletedTask;
+        }
+        if (_rendersAhead.Exists(job => job.RequestId == requestId)) return Task.CompletedTask;
+        while (_rendersAhead.Count >= MaxRendersAhead)
+        {
+            var stale = _rendersAhead[0];
+            _rendersAhead.RemoveAt(0);
+            Logger.Log($"VisualModeManager: HandlePrepareAsync -- dropping the render prepared for {stale.RequestId}, it was never played");
+            _ = DiscardRenderAsync(stale);
+        }
+        _rendersAhead.Add(StartRender(requestId, audioBytes, prepared, "HandlePrepareAsync"));
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// TTS audio is ready -- renders and plays it. Resolves once playback is done (the 1s
+    /// post-roll no longer holds it up -- see StartPostRoll). Played=false means the
+    /// caller (MainWindow) should tell the client to fall back to plain
     /// audio instead, so a not-yet-warmed model or a render failure degrades to normal
     /// TTS playback instead of silence. Confirmed live (2026-09-03) as a real gap: right
     /// after a fresh restart, the model can still be mid-warm-up when the first voice
     /// reply comes in, and this used to just close the window with nothing audible at
     /// all -- worse than not having Visual Mode.
     /// </summary>
-    public async Task<bool> HandleAudioAsync(string requestId, byte[] audioBytes)
+    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes)
     {
         Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} bytes={audioBytes.Length}");
+        var ahead = TakeRenderAhead(requestId);
+        // Request ids are per chat tab ("tts-N"), and tabs share this one manager: a render
+        // prepared for another tab's request of the same name must not be played as this one.
+        if (ahead != null && !audioBytes.AsSpan().SequenceEqual(ahead.Audio))
+        {
+            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} -- the render prepared under this id is for other audio, rendering anew");
+            _ = DiscardRenderAsync(ahead);
+            ahead = null;
+        }
         if (_activeRequestId != requestId)
         {
             // Already stopped/cancelled for this request -- not a failure, and definitely
             // not something a plain-audio fallback should un-silence after the fact.
             Logger.Log("VisualModeManager: HandleAudioAsync -- requestId no longer current, ignoring (no fallback).");
-            return true;
+            if (ahead != null) _ = DiscardRenderAsync(ahead);
+            return new VisualPlaybackResult(Played: true, StoppedByUser: false);
         }
 
         XcfaRenderer.Renderer.PreparedModel? prepared;
@@ -156,27 +271,21 @@ public sealed class VisualModeManager
         if (prepared == null)
         {
             Logger.Log("VisualModeManager: HandleAudioAsync -- model not warmed (yet), signaling fallback.");
-            return false;
+            if (ahead != null) _ = DiscardRenderAsync(ahead);
+            return new VisualPlaybackResult(Played: false, StoppedByUser: false);
         }
 
-        var audioPath = Path.Combine(_tempDir, $"{requestId}.mp3");
-        var outputPath = Path.Combine(_tempDir, $"{requestId}.webm");
-        await File.WriteAllBytesAsync(audioPath, audioBytes);
-
-        Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} render starting");
-        var renderSw = Stopwatch.StartNew();
-        try
+        if (ahead != null) Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} using the render prepared ahead ({(ahead.Done.IsCompleted ? "ready" : "still rendering")})");
+        var job = ahead ?? StartRender(requestId, audioBytes, prepared, "HandleAudioAsync");
+        var audioPath = job.AudioPath;
+        var outputPath = job.OutputPath;
+        if (!await job.Done)
         {
-            await Task.Run(() => prepared.Render(audioPath, outputPath,
-                new XcfaRenderer.RenderOptions { RemoveBg = true, Height = 480, Ffmpeg = FfmpegPath }));
-        }
-        catch (Exception ex)
-        {
-            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} render failed: {ex} -- signaling fallback.");
+            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} has no render -- signaling fallback.");
             SafeDeleteTemp(audioPath);
-            return false;
+            SafeDeleteTemp(outputPath);
+            return new VisualPlaybackResult(Played: false, StoppedByUser: false);
         }
-        Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} render finished in {renderSw.Elapsed.TotalSeconds:F1}s");
 
         if (_activeRequestId != requestId)
         {
@@ -185,41 +294,52 @@ public sealed class VisualModeManager
             Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} no longer current after render, skipping playback (no fallback)");
             SafeDeleteTemp(audioPath);
             SafeDeleteTemp(outputPath);
-            return true;
+            return new VisualPlaybackResult(Played: true, StoppedByUser: false);
         }
 
-        // The window is created HERE, right before actual playback -- per explicit
-        // instruction (2026-09-03, the SECOND correction on this point): even an
-        // invisible, pre-warmed window sitting around since TTS-generation-start was
-        // "too early." Show() still has to happen before InitializeAsync (see that
-        // method's own doc comment for why -- WebView2 needs a real HWND to attach
-        // to), so there's an unavoidable ~0.3-0.5s pause here while the window comes
-        // up, but that's the earliest point that's actually correct to show it at.
-        var window = new VisualModeWindow();
-        _activeWindow = window;
-        window.Show();
-        window.SetVisuallyHidden(true); // hidden for the brief Init/navigate window, revealed just below once actually playing
-        Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} window created and shown, calling InitializeAsync");
-        await window.InitializeAsync();
-
-        if (_activeRequestId != requestId)
+        var window = _lingeringWindow;
+        if (window != null)
         {
-            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} no longer current after InitializeAsync, closing without playing (no fallback)");
-            await CloseActiveWindowAsync();
-            SafeDeleteTemp(audioPath);
-            SafeDeleteTemp(outputPath);
-            return true;
+            // The previous clip ended less than PostRoll ago: its window is still up and
+            // already initialized, so this clip simply continues in it.
+            _lingeringWindow = null;
+            _activeWindow = window;
+            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} taking over the previous clip's window");
         }
-        if (!window.IsReady)
+        else
         {
-            Logger.Log("VisualModeManager: HandleAudioAsync -- window failed to become ready (InitializeAsync timed out), closing, signaling fallback.");
-            await CloseActiveWindowAsync();
-            SafeDeleteTemp(audioPath);
-            SafeDeleteTemp(outputPath);
-            return false;
+            // The window is created HERE, right before actual playback -- per explicit
+            // instruction (2026-09-03, the SECOND correction on this point): even an
+            // invisible, pre-warmed window sitting around since TTS-generation-start was
+            // "too early." Show() still has to happen before InitializeAsync (see that
+            // method's own doc comment for why -- WebView2 needs a real HWND to attach
+            // to), so there's an unavoidable ~0.3-0.5s pause here while the window comes
+            // up, but that's the earliest point that's actually correct to show it at.
+            window = new VisualModeWindow();
+            _activeWindow = window;
+            window.Show();
+            window.SetVisuallyHidden(true); // hidden for the brief Init/navigate window, revealed just below once actually playing
+            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} window created and shown, calling InitializeAsync");
+            await window.InitializeAsync();
+
+            if (_activeRequestId != requestId)
+            {
+                Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} no longer current after InitializeAsync, closing without playing (no fallback)");
+                CloseWindow(window);
+                SafeDeleteTemp(audioPath);
+                SafeDeleteTemp(outputPath);
+                return new VisualPlaybackResult(Played: true, StoppedByUser: false);
+            }
+            if (!window.IsReady)
+            {
+                Logger.Log("VisualModeManager: HandleAudioAsync -- window failed to become ready (InitializeAsync timed out), closing, signaling fallback.");
+                CloseWindow(window);
+                SafeDeleteTemp(audioPath);
+                SafeDeleteTemp(outputPath);
+                return new VisualPlaybackResult(Played: false, StoppedByUser: false);
+            }
         }
 
-        var stoppedEarly = false;
         var played = false;
         var playbackEnded = new TaskCompletionSource();
         void OnEnded() => playbackEnded.TrySetResult();
@@ -231,9 +351,9 @@ public sealed class VisualModeManager
             window.SetVisuallyHidden(false);
             await window.PlayVideoAsync(outputPath);
             await playbackEnded.Task;
-            stoppedEarly = _activeWindow != window;
             played = true;
-            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} playback ended ({(stoppedEarly ? "via stop" : "naturally")})");
+            var how = _activeRequestId != requestId ? "via stop" : window.StoppedByUser ? "via the window's own stop button" : "naturally";
+            Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} playback ended ({how})");
         }
         catch (Exception ex)
         {
@@ -246,51 +366,93 @@ public sealed class VisualModeManager
             SafeDeleteTemp(outputPath);
         }
 
-        // "через 1 секунду после окончания анимации исчезать" -- 1s after playback ends,
-        // THEN close, whether it ended naturally or via the Stop button.
-        await Task.Delay(1000);
-        if (_activeWindow == window) await CloseActiveWindowAsync();
-        return played;
-    }
-
-    /// <summary>TTS synthesis itself failed -- suppress whatever HandleAudioAsync would otherwise
-    /// have done for this request (no window exists yet at this point -- see HandleStartAsync).</summary>
-    public async Task HandleCancelAsync(string requestId)
-    {
-        Logger.Log($"VisualModeManager: HandleCancelAsync requestId={requestId} matchesActive={_activeRequestId == requestId}");
-        if (_activeRequestId == requestId) await CloseActiveWindowAsync();
+        // Not the active window any more: HandleStopAsync closed it, nothing left to do here.
+        if (_activeWindow == window)
+        {
+            // A window that failed to play is not handed on to the next clip.
+            if (played) StartPostRoll(window);
+            else CloseWindow(window);
+        }
+        return new VisualPlaybackResult(played, played && window.StoppedByUser);
     }
 
     /// <summary>
-    /// User-requested stop (this window's own button, or the main chat window's
-    /// Stop / queue-clear) -- closes immediately, unlike the natural end-of-
-    /// playback path's 1s post-roll. TriggerStop() first so a concurrently
-    /// in-flight HandleAudioAsync (awaiting playbackEnded) unblocks and runs its
-    /// own cleanup instead of hanging forever; the immediate CloseActiveWindowAsync
-    /// right after is what actually makes the window disappear right away --
-    /// HandleAudioAsync's own tail-end close is then a no-op (_activeWindow is
-    /// already null by the time it gets there).
+    /// "через 1 секунду после окончания анимации исчезать" -- the window closes PostRoll
+    /// after its clip ended, whether that was naturally or via the window's own Stop
+    /// button. HandleAudioAsync no longer waits that second out (2026-10-11): chat.js
+    /// learns right away that the clip is over, and if its next item is ready before the
+    /// post-roll runs out (it is when it was rendered ahead -- see HandlePrepareAsync),
+    /// that clip takes this window over. Live before this, the pieces of one reply each
+    /// closed the window and opened a new one, 4.0s apart.
     /// </summary>
-    public async Task HandleStopAsync(string requestId)
+    private void StartPostRoll(VisualModeWindow window)
     {
-        Logger.Log($"VisualModeManager: HandleStopAsync requestId={requestId} matchesActive={_activeRequestId == requestId}");
-        if (_activeRequestId != requestId) return;
-        _activeWindow?.TriggerStop();
-        await CloseActiveWindowAsync();
+        _activeWindow = null;
+        _lingeringWindow = window;
+        _ = CloseAfterPostRollAsync(window, ++_postRollGeneration);
     }
 
-    private Task CloseActiveWindowAsync()
+    private async Task CloseAfterPostRollAsync(VisualModeWindow window, int generation)
     {
-        var window = _activeWindow;
-        _activeWindow = null;
+        await Task.Delay(PostRoll);
+        // Taken over by the next clip (and possibly lingering again, for THAT clip's
+        // post-roll -- hence the generation), or closed by a stop in the meantime.
+        if (_lingeringWindow != window || _postRollGeneration != generation) return;
+        Logger.Log("VisualModeManager: post-roll over, no clip took the window over.");
+        CloseWindow(window);
+    }
+
+    /// <summary>The request is not going to be played: TTS synthesis itself failed (no window
+    /// exists yet at this point -- see HandleStartAsync), or chat.js dropped a queued item
+    /// whose render was already prepared ahead.</summary>
+    public Task HandleCancelAsync(string requestId)
+    {
+        Logger.Log($"VisualModeManager: HandleCancelAsync requestId={requestId} matchesActive={_activeRequestId == requestId}");
+        var ahead = TakeRenderAhead(requestId);
+        if (ahead != null) _ = DiscardRenderAsync(ahead);
+        if (_activeRequestId != requestId) return Task.CompletedTask;
         _activeRequestId = null;
-        if (window == null)
-        {
-            Logger.Log("VisualModeManager: CloseActiveWindowAsync -- no active window, nothing to do.");
-            return Task.CompletedTask;
-        }
-        Logger.Log("VisualModeManager: CloseActiveWindowAsync -- closing active window.");
-        try { window.Close(); } catch (Exception ex) { Logger.Log($"VisualModeManager: window.Close() threw: {ex}"); }
+        CloseWindow(_activeWindow);
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// User-requested stop (the main chat window's Stop / queue-clear) -- closes
+    /// immediately, unlike the natural end-of-playback path's 1s post-roll.
+    /// TriggerStop() first so a concurrently in-flight HandleAudioAsync (awaiting
+    /// playbackEnded) unblocks and runs its own cleanup instead of hanging forever.
+    /// That continuation can run right inside TriggerStop() and hand the window to
+    /// the post-roll, so the window is closed by reference, wherever it is by then --
+    /// which is what actually makes it disappear right away. A request stopped before
+    /// its own playback began has no window yet; the previous clip's window, if it is
+    /// still in its post-roll, goes instead.
+    /// </summary>
+    public Task HandleStopAsync(string requestId)
+    {
+        Logger.Log($"VisualModeManager: HandleStopAsync requestId={requestId} matchesActive={_activeRequestId == requestId}");
+        if (_activeRequestId != requestId) return Task.CompletedTask;
+        _activeRequestId = null;
+        var window = _activeWindow;
+        window?.TriggerStop();
+        CloseWindow(window ?? _lingeringWindow);
+        return Task.CompletedTask;
+    }
+
+    private void CloseWindow(VisualModeWindow? window)
+    {
+        if (window == null)
+        {
+            Logger.Log("VisualModeManager: CloseWindow -- no window, nothing to do.");
+            return;
+        }
+        if (_activeWindow == window) _activeWindow = null;
+        if (_lingeringWindow == window) _lingeringWindow = null;
+        Logger.Log("VisualModeManager: CloseWindow -- closing the window.");
+        try { window.Close(); } catch (Exception ex) { Logger.Log($"VisualModeManager: window.Close() threw: {ex}"); }
+    }
 }
+
+/// <summary>How VisualModeManager.HandleAudioAsync ended. Played=false: nothing was shown
+/// or heard, the client should fall back to plain audio. StoppedByUser: cut short by the
+/// talking-head window's own Stop button, which the chat side cannot see otherwise.</summary>
+public readonly record struct VisualPlaybackResult(bool Played, bool StoppedByUser);

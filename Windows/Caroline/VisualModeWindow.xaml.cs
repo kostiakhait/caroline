@@ -30,6 +30,12 @@ public partial class VisualModeWindow : Window
     /// <summary>Fired when the video finishes playing on its own (not via Stop).</summary>
     public event Action? PlaybackEnded;
 
+    /// <summary>True when the clip playing now was cut short by this window's own Stop
+    /// button. The chat side reads replies in pieces, one clip each: without this it only
+    /// saw "the clip is over" and went on to the next piece of a reply the user had just
+    /// stopped (VisualModeManager passes it on in visual_speech_done).</summary>
+    public bool StoppedByUser { get; private set; }
+
     public VisualModeWindow()
     {
         InitializeComponent();
@@ -185,6 +191,7 @@ public partial class VisualModeWindow : Window
             Logger.Log("VisualModeWindow: PlayVideoAsync -- not ready, skipping");
             return;
         }
+        StoppedByUser = false; // a window can play several clips in a row, see VisualModeManager.StartPostRoll
         var fileUri = new Uri(webmPath).AbsoluteUri;
         var result = await _webView.CoreWebView2.ExecuteScriptAsync($"window.playVideo({JsonSerializer.Serialize(fileUri)})");
         Logger.Log($"VisualModeWindow: PlayVideoAsync ExecuteScriptAsync result={result}, IsVisible={IsVisible}");
@@ -217,6 +224,7 @@ public partial class VisualModeWindow : Window
         // keeps decoding/outputting audio in the background at all.
         _webView?.CoreWebView2?.ExecuteScriptAsync(
             "(function(){var v=document.getElementById('vid'); v.pause(); v.removeAttribute('src'); v.load();})()");
+        StoppedByUser = true;
         TriggerStop();
     }
 

@@ -1041,17 +1041,29 @@ public partial class MainWindow : Window
                 var audioBytes = Convert.FromBase64String(root.GetProperty("audioBase64").GetString()!);
                 _ = RunVisualModeAsync(async () =>
                 {
-                    var played = await _visualMode.HandleAudioAsync(visReqId, audioBytes);
+                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes);
                     // playOneSpeech (chat.js) awaits this to advance the speech queue.
                     // played=false tells it to fall back to plain audio playback instead
                     // of silently moving on with nothing having been heard (see
                     // HandleAudioAsync's own doc comment for why this can happen -- most
                     // commonly the model still warming up right after a fresh restart).
+                    // stopped=true: the user pressed Stop on the talking-head window itself,
+                    // so chat.js drops what it still had queued instead of reading on.
                     // Key is "requestId" here too -- see visual_speech_start's comment.
-                    Logger.Log($"MainWindow: posting visual_speech_done requestId={visReqId} played={played}");
-                    var payload = JsonSerializer.Serialize(new { type = "visual_speech_done", requestId = visReqId, played });
+                    Logger.Log($"MainWindow: posting visual_speech_done requestId={visReqId} played={result.Played} stopped={result.StoppedByUser}");
+                    var payload = JsonSerializer.Serialize(new { type = "visual_speech_done", requestId = visReqId, played = result.Played, stopped = result.StoppedByUser });
                     webView.CoreWebView2.PostWebMessageAsJson(payload);
                 }, $"visual_speech_audio({visReqId})");
+                return;
+            }
+
+            if (type == "visual_speech_prepare")
+            {
+                // The NEXT queued item's audio, sent while the current one is still
+                // playing -- see VisualModeManager.HandlePrepareAsync.
+                var visReqId = root.GetProperty("requestId").GetString()!;
+                var audioBytes = Convert.FromBase64String(root.GetProperty("audioBase64").GetString()!);
+                _ = RunVisualModeAsync(() => _visualMode.HandlePrepareAsync(visReqId, audioBytes), $"visual_speech_prepare({visReqId})");
                 return;
             }
 
