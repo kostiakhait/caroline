@@ -714,24 +714,83 @@ _WEB_SEARCH_TOOL_DEFS: list[dict[str, Any]] = [
 _WEB_SEARCH_TOOL_NAMES = {t["function"]["name"] for t in _WEB_SEARCH_TOOL_DEFS}
 
 
+# web_search really searches, or says it could not (2026-10-11, per explicit instruction:
+# the main model must have real access to the web through OpenRouter's own mechanism).
+# It did go through ":online" before -- via AI.resolveOnline, which on ANY exception
+# silently asks the same model again WITHOUT the web. That model then answers "I can't
+# access live weather data", and this came back as the search result: live, the same
+# question about tomorrow's weather took 41-180s, once ended in "нет доступа к живым
+# данным", and once sent the tier to the browser and the command line. Probed with
+# Caroline's own key the same day, the search itself works: the web plugin with the Exa
+# engine returns in 3.2-3.8s for $0.007, with the pages it read.
+#
+# So the call is made here, where its outcome can be seen: Exa, because it returns its
+# sources (url, title, excerpt) and a reply without a single source is then known not to
+# be grounded; the sources themselves go to the main model, not only another model's
+# retelling of them; and a failure is reported as a failure.
+WEB_SEARCH_ENGINE = "exa"
+WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_TIMEOUT_S = 40.0
+WEB_SEARCH_EXCERPT_CHARS = 700
+WEB_SEARCH_REASONING = {"effort": "minimal"}
+_WEB_SEARCH_SYSTEM = (
+    "Today is {today}. Answer ONLY from the web search results you are given: state figures exactly as the "
+    "sources do, with their units, and say which date each one is for. If the results do not contain the "
+    "answer, say so plainly -- never fill in from general knowledge or typical values."
+)
+
+
+def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[str, Any]]]:
+    """(the search model's answer, the pages it was given). Raises on any API failure."""
+    response = ai.adapter.client.with_options(timeout=WEB_SEARCH_TIMEOUT_S, max_retries=0).chat.completions.create(
+        model=cfg.AI_MODEL_SMALL,
+        messages=[
+            {"role": "system", "content": _WEB_SEARCH_SYSTEM.format(today=time.strftime("%A, %Y-%m-%d"))},
+            {"role": "user", "content": question},
+        ],
+        max_tokens=1200,
+        extra_body={
+            "plugins": [{"id": "web", "engine": WEB_SEARCH_ENGINE, "max_results": WEB_SEARCH_MAX_RESULTS}],
+            "reasoning": WEB_SEARCH_REASONING,
+        },
+    )
+    message = response.model_dump()["choices"][0]["message"]
+    sources = [a.get("url_citation") or {} for a in (message.get("annotations") or []) if a.get("type") == "url_citation"]
+    return str(message.get("content") or "").strip(), [s for s in sources if s.get("url")]
+
+
 def _run_web_search_tool(name: str, args: dict[str, Any], ai: Any, cfg: Any) -> str:
     question = str(args.get("question") or "").strip()
     if not question:
         return "ERROR: 'question' is required."
-    # One retry (2026-10-03, confirmed live): the FIRST resolveOnline call sometimes
-    # comes back empty while an identical immediate retry succeeds -- same ordinary
-    # intermittent-empty-result shape already retried everywhere else in this file
-    # (key fetch, verification, narration), not a sign anything is actually broken.
-    last_error: Exception | None = None
+    # One retry, as before (2026-10-03: the first online call sometimes comes back empty
+    # while an identical immediate retry succeeds).
+    reason = "no result"
     for attempt in (1, 2):
+        started = time.monotonic()
         try:
-            result = ai.resolveOnline(question, model=cfg.AI_MODEL_SMALL)
+            answer, sources = _web_search_once(question, ai, cfg)
         except Exception as exc:  # noqa: BLE001 -- a failed search is a tool result, not a turn-ending error
-            last_error = exc
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+            log_event("engine", "small_model_web_search_failed", attempt=attempt, error=reason,
+                      ms=int((time.monotonic() - started) * 1000))
             continue
-        if result:
-            return str(result)
-    return f"ERROR: web_search failed: {last_error}" if last_error else "ERROR: web_search returned no answer (tried twice)."
+        log_event("engine", "small_model_web_search", attempt=attempt, sources=len(sources), answer_len=len(answer),
+                  ms=int((time.monotonic() - started) * 1000), question=question[:200])
+        if not sources:
+            reason = "the search returned no pages"
+            continue
+        lines = [f"Web search results for: {question}"]
+        for index, source in enumerate(sources, 1):
+            excerpt = " ".join(str(source.get("content") or "").split())[:WEB_SEARCH_EXCERPT_CHARS]
+            lines.append(f"{index}. {source.get('title') or '(untitled)'} -- {source['url']}" + (f"\n   {excerpt}" if excerpt else ""))
+        if answer:
+            lines.append("Summary by the search model (it read the same pages; where it differs from them, trust the pages):\n" + answer)
+        return "\n".join(lines)
+    return (
+        f"ERROR: the web search did not work ({reason}); nothing was found out. Do not answer from memory as if it "
+        "were current -- say that the search failed, or get the information another way."
+    )
 
 
 @dataclass
@@ -915,9 +974,6 @@ async def _run_parallel_stage(
         else:
             lines.append(f"NOT DONE, step {step_index}: {info}")
     return "\n".join(lines)
-
-
-_WEB_SEARCH_TOOL_NAMES = frozenset(t["function"]["name"] for t in _WEB_SEARCH_TOOL_DEFS)
 
 
 @dataclass
