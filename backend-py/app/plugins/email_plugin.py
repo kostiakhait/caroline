@@ -112,6 +112,8 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             extra["query"] = args["query"]
         if args.get("sinceIso"):
             extra["sinceDate"] = args["sinceIso"]
+        if args.get("untilIso"):
+            extra["untilDate"] = args["untilIso"]
         result = await call_v2("email:listMessages", **extra)
         return result.get("messages") or []
 
@@ -321,17 +323,18 @@ PLUGIN = Plugin(
             "email_list_messages",
             "Lists lightweight message metadata (uid, from, subject, date, flags) for a folder, newest "
             "first. Use `query` for a simple subject/from/body substring search, `unseenOnly` to "
-            "restrict to unread mail, or `sinceIso` (an ISO date, e.g. \"2026-10-01\") to restrict to "
-            "messages received on or after that date (day granularity only -- IMAP has no finer filter). "
-            "Checking more than one mailbox or folder at once? Use email_list_messages_batch instead -- "
-            "it does this concurrently in one call." + _ACCOUNT_PARAM_NOTE,
-            {**_CREDENTIAL_PARAMS, "folder": str | None, "limit": int | None, "unseenOnly": bool | None, "query": str | None, "sinceIso": str | None},
+            "restrict to unread mail, or `sinceIso`/`untilIso` (ISO dates, e.g. \"2026-10-01\") for a "
+            "[since, until) date interval (day granularity only -- IMAP has no finer filter). Need the "
+            "actual content (to/from/cc/body/attachments), not just this metadata, for every message in "
+            "a folder/date range? Use email_read_range instead of listing then fetching each uid one by "
+            "one. Checking more than one mailbox or folder at once? Use email_list_messages_batch." + _ACCOUNT_PARAM_NOTE,
+            {**_CREDENTIAL_PARAMS, "folder": str | None, "limit": int | None, "unseenOnly": bool | None, "query": str | None, "sinceIso": str | None, "untilIso": str | None},
             email_list_messages,
         ),
         PluginTool(
             "email_get_message",
-            "Fetches a single message's full content (subject, from, to, date, text/html body, attachment "
-            "list) by folder + uid." + _ACCOUNT_PARAM_NOTE,
+            "Fetches a single message's full content (subject, from, to, cc, date, text/html body, "
+            "attachment list) by folder + uid." + _ACCOUNT_PARAM_NOTE,
             {**_CREDENTIAL_PARAMS, "folder": str, "uid": int}, email_get_message,
         ),
         PluginTool(
