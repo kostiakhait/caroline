@@ -298,6 +298,75 @@ async def translate_text(
     return translated
 
 
+async def review_reply(text: str, task: str, session: str | None = None, timeout: float = 15.0) -> str | None:
+    """Per explicit instruction (2026-10-11): every piece of outbound text
+    (a progress-narration remark or a real final reply) must be checked for
+    task relevance, absence of internal-mechanics leaks, and sounding like a
+    person rather than an AI -- backed by a real microagent (server-side
+    reply.review, same escalation ladder as FactMemory/AddressBook/etc.),
+    not just the system-prompt-only policies.py instruction that was the
+    only check before this. Runs AFTER translate_text, on the final,
+    already-translated text.
+
+    Fail-open, same philosophy as translate_text: any error, timeout, or
+    malformed/empty response returns None, and the caller is expected to
+    fall back to the text it already had rather than block or drop a reply
+    over this."""
+    body: dict[str, Any] = {"command": "reply:review", "key": CAROLINE_SW_KEY, "text": text, "task": task}
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "review_reply_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "review_reply_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("text"), str) or not output["text"].strip():
+        log_event("plugin:voice", "review_reply_failed", reason="empty")
+        return None
+    return output["text"]
+
+
+async def check_permission_guard(task: str, recent_dialogue: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-11): Caroline often asks a yes/no
+    permission question and then, a turn or two later, does the thing
+    anyway even though the user never answered -- silence must be treated
+    as a refusal. The same applies, even without a question, to any
+    communication sent on the user's behalf or anything affecting their
+    finances: those always need a clear, specific prior approval. Backed by
+    a real microagent (server-side turn.permission.guard, same escalation
+    ladder as reply.review/FactMemory/etc.), not a system-prompt-only
+    instruction -- deciding whether approval was actually given needs real
+    judgment over the dialogue, not a keyword check.
+
+    Returns {"needs_approval": bool, "reason": str} on a clean result, or
+    None on any error/timeout/malformed response (fail-open, same
+    philosophy as translate_text/review_reply: an infrastructure hiccup
+    must not paralyze Caroline -- this is defense-in-depth on top of the
+    system prompt, not the only line of defense). The caller
+    (chat_session.py) decides what to do with None -- typically, leave
+    whatever gate state it already had untouched."""
+    body: dict[str, Any] = {"command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue}
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "check_permission_guard_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "check_permission_guard_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("needs_approval"), bool):
+        log_event("plugin:voice", "check_permission_guard_failed", reason="malformed")
+        return None
+    return {"needs_approval": output["needs_approval"], "reason": str(output.get("reason") or "")}
+
+
 # Guards against the failure modes seen live rather than trusting any
 # non-empty .result blindly (screenshots, tab 2):
 #  - the SMALL model REFUSING the task ("I'm sorry, I can't help with

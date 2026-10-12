@@ -132,7 +132,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import register_inject_proactive, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import register_inject_proactive, register_permission_blocker, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -219,6 +219,15 @@ STOP_NOTE_TEXT = (
     "incomplete or partially applied -- do not assume it finished, and do not resume it or repeat it unless "
     "the user asks you to. Read their message below with that in mind, and if it is not clear what they want "
     "done differently, ask.]"
+)
+# Shown to the model with the user's first message after the permission guard stopped a
+# turn (2026-10-11) -- same {reason}-interpolated-note shape as STOP_NOTE_TEXT above, but
+# with its own, more specific explanation (a plain Stop note would not tell the model WHY).
+PERMISSION_NOTE_TEXT_TEMPLATE = (
+    "[Note: your previous turn was stopped because {reason} needs the user's explicit permission, which you "
+    "did not have yet. Asking a yes/no question and getting no clear answer is NOT permission -- silence "
+    "means no. Ask the user directly and plainly, and wait for their actual answer before attempting this or "
+    "an equivalent action again.]"
 )
 # Per explicit instruction (2026-09-11): deliberately the SAME 90s number as
 # API_RETRY_INTERVAL_MS, but a conceptually different constant -- that one
@@ -1681,6 +1690,22 @@ class ChatSession:
         # see the result handler and RESUMED_ANSWER_MAX_NUDGES.
         self.resumed_unanswered_question: str | None = None
         self.resumed_answer_nudges: int = 0
+        # Per explicit instruction (2026-10-11): set by _check_permission_guard() whenever
+        # turn.permission.guard (reforce-microagents) finds an unanswered yes/no permission
+        # question, or a communication/financial action lacking a specific prior approval,
+        # outstanding in the recent dialogue. None means nothing is currently blocking.
+        # Consumed by _on_permission_block_checked (registered with session_context's
+        # register_permission_blocker), which stops the whole turn the next time ANY tool
+        # call is attempted while this is set -- see app/operations.py's dispatch().
+        self.pending_unapproved_action: str | None = None
+        self._permission_note_pending: bool = False
+        self._permission_note_in_next_push: bool = False
+        # The fully-formatted note text (PERMISSION_NOTE_TEXT_TEMPLATE with
+        # the specific reason already filled in), captured at the moment
+        # _on_permission_block_checked fires -- by the time it is actually
+        # delivered (the user's next real message), pending_unapproved_action
+        # itself has already been cleared, so the text has to be saved here.
+        self._pending_permission_note_text: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -2113,6 +2138,11 @@ class ChatSession:
             # history readers keep seeing exactly what the user wrote.
             self._stop_note_pending = False
             self._stop_note_in_next_push = True
+        if is_real_user and self._permission_note_pending:
+            # Same delivery mechanism as the Stop note above, just its own
+            # flag/text -- a plain Stop note would not explain WHY.
+            self._permission_note_pending = False
+            self._permission_note_in_next_push = True
         if is_real_user:
             # A real message begins a turn for the memory service's money rules
             # (memory_turns.py) and supersedes a turn still waiting to be replayed.
@@ -2226,6 +2256,11 @@ class ChatSession:
             # __init__ comment for the incident this fixes.
             self.consecutive_narration_count = 0
             self.last_real_user_question = text
+            # Per explicit instruction (2026-10-11): a just-given "yes" must clear
+            # pending_unapproved_action before the model's NEXT turn starts, not
+            # only the next time an outbound message triggers a re-check -- fire-
+            # and-forget, same mechanism as refresh_language_in_background below.
+            asyncio.ensure_future(self._check_permission_guard())
             # Bug fix (2026-09-11), per explicit instruction: language must
             # be tracked CONTINUOUSLY, not resolved once and left alone --
             # confirmed live a tab can legitimately switch languages
@@ -2351,6 +2386,9 @@ class ChatSession:
             self.real_user_turn_answered = False
             self.silence_nudge_sent_for_turn = False
             self.last_real_user_question = text
+            # Per explicit instruction (2026-10-11): same re-check as the SDK
+            # path's own submit() -- see that call site's comment for why.
+            asyncio.ensure_future(self._check_permission_guard())
             refresh_language_in_background(self.last_saved_session_id, self.tab_id)
             save_pending_turn(self.workspace_dir, self.tab_id, text, [])
 
@@ -2447,7 +2485,7 @@ class ChatSession:
         Caroline said to the user, and every later reader of that history
         (recent-dialogue narration input, the 24h-dialogue file, a resumed
         SDK session) should see the same thing the user actually saw."""
-        from app.plugins.voice_api import translate_text
+        from app.plugins.voice_api import review_reply, translate_text
 
         # Same rule as the SDK path (_strip_no_update_from_wire): a silent
         # [[NO_UPDATE]] reply never reaches the visible dialog.
@@ -2463,6 +2501,21 @@ class ChatSession:
         if translated and translated != text:
             log_event("engine", "small_model_translate_applied", tab_id=self.tab_id, original_len=len(text), translated_len=len(translated))
             text = translated
+        # Per explicit instruction (2026-10-11): reply.review checks the
+        # final (translated-or-original) text for task relevance, internal-
+        # mechanics leaks, and human-sounding tone -- fail-open to `text`
+        # as is on any failure, same philosophy as translate_text above.
+        try:
+            reviewed = await review_reply(text, task=question_text)
+        except Exception as exc:
+            log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
+            reviewed = None
+        if reviewed and reviewed != text:
+            text = reviewed
+        # Per explicit instruction (2026-10-11): re-evaluate the permission
+        # guard on every outbound message -- see _check_permission_guard's
+        # own docstring for why this runs here too, not just in submit().
+        await self._check_permission_guard()
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
         _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
         assistant_wire = {
@@ -2613,6 +2666,12 @@ class ChatSession:
         # An explicit Stop must also cancel any pending "resumed question needs a visible answer" re-ask,
         # or the abandoned turn would start again on its own.
         self.resumed_unanswered_question = None
+        # An explicit user Stop (this method) is a separate event from a permission-guard
+        # stop (_on_permission_block_checked, which calls this SAME method) -- clear
+        # whatever the guard was holding too, so stale state from before the click can't
+        # wrongly block the user's own next message. The next real message re-evaluates
+        # this from scratch (see _check_permission_guard's own submit()-time call site).
+        self.pending_unapproved_action = None
         # Bug fix (2026-10-09), confirmed live: these two timers used to be
         # cleared only at the very end of this method, AFTER the "nothing is
         # pending" early return just below. A tab stuck on a usage cap spends
@@ -2710,6 +2769,45 @@ class ChatSession:
         # this method -- see the 2026-10-09 note there; the 2026-09-14 fix
         # that first added the clearing had put it here, after the early
         # return, where a Stop between turns never reached it.)
+
+    def _on_permission_block_checked(self) -> str | None:
+        """Per explicit instruction (2026-10-11): registered with
+        session_context's register_permission_blocker, called by
+        app/operations.py's dispatch() right before EVERY tool call in
+        either engine, for this tab. A truthy pending_unapproved_action
+        means a tool call was just attempted while an unanswered yes/no
+        permission question, or an un-approved communication/financial
+        action, is outstanding (see _check_permission_guard) -- stop the
+        WHOLE turn, not just this one call, per explicit instruction ("Ход
+        останавливаться").
+
+        Reuses stop() completely unchanged: it already fully supports
+        being called mid-turn, mid-tool-call (that is its own main branch,
+        `elif self.client:`, not an edge case) -- it only mutates state and
+        schedules background cleanup tasks, never awaits or recurses back
+        into dispatch(), so calling it synchronously from inside a tool
+        dispatch is safe by the same reasoning that already makes it safe
+        to call from an external Stop click mid-tool-call. Confirmed by
+        reading stop()'s own code, not yet exercised live from this exact
+        call path -- verify live before shipping.
+
+        One stop per violation: the flag is consumed (cleared) here, not
+        left set to re-trigger stop() again on every subsequent call --
+        the very next outbound message or real user message re-evaluates
+        pending_unapproved_action from scratch."""
+        reason = self.pending_unapproved_action
+        if reason:
+            self.pending_unapproved_action = None
+            self._permission_note_pending = True
+            self._pending_permission_note_text = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
+            log_event("engine", "permission_guard_stopped_turn", tab_id=self.tab_id, reason=reason)
+            self.stop()
+            # stop() unconditionally also queues the generic "the user pressed Stop"
+            # note (self._stop_note_pending) -- wrong here (the user didn't click
+            # anything) and would otherwise show up ALONGSIDE the permission note
+            # below. The permission note already says everything that matters.
+            self._stop_note_pending = False
+        return reason
 
     def _reset_after_stop(self) -> None:
         """The run loop's side of a Stop, once the killed engine's stream has
@@ -2855,6 +2953,11 @@ class ChatSession:
         if self._stop_note_in_next_push:
             self._stop_note_in_next_push = False
             content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + STOP_NOTE_TEXT})
+        if self._permission_note_in_next_push:
+            self._permission_note_in_next_push = False
+            note_text = self._pending_permission_note_text or PERMISSION_NOTE_TEXT_TEMPLATE.format(reason="a previous action")
+            self._pending_permission_note_text = None
+            content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + note_text})
         for attachment in attachments:
             content.extend(_attachment_to_blocks(attachment))
         if text:
@@ -3445,6 +3548,39 @@ class ChatSession:
 
         return "\n".join(lines[-limit:])
 
+    async def _check_permission_guard(self) -> None:
+        """Per explicit instruction (2026-10-11): re-evaluates
+        self.pending_unapproved_action from the recent dialogue, via the
+        server-side turn.permission.guard microagent (reforce-microagents,
+        same escalation ladder as reply.review -- deciding whether approval
+        was actually given needs real judgment, not a keyword check).
+        Called after every outbound assistant message (same 3 send sites
+        reply.review already uses, same cadence -- no extra network cost
+        beyond what that already pays) AND from submit() on every real user
+        message, so a just-given "yes" clears the flag before the model's
+        NEXT turn even starts, rather than wrongly blocking its first tool
+        call on stale state.
+
+        Sets the reason string when something needs approval and does not
+        have it yet; clears it (None) otherwise. Does NOT itself stop
+        anything -- enforcement happens once, lazily, the next time a tool
+        call is actually attempted (see _on_permission_block_checked,
+        app/operations.py's dispatch()). Fail-open on any error/timeout:
+        leaves pending_unapproved_action exactly as it was, same philosophy
+        as translate_text/review_reply -- an infrastructure hiccup must not
+        silently clear a real pending block, nor manufacture one that was
+        never there."""
+        from app.plugins.voice_api import check_permission_guard
+
+        try:
+            result = await check_permission_guard(self._narration_task(), self._gather_recent_dialogue_for_narration())
+        except Exception as exc:
+            log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        if result is None:
+            return
+        self.pending_unapproved_action = result["reason"] if result["needs_approval"] else None
+
     async def _translate_wire_visible_text(self, wire: dict[str, Any]) -> dict[str, Any]:
         """Per explicit instruction (2026-09-15): forced translation used
         to be narration-only (generate_progress_comment) -- confirmed live
@@ -3466,7 +3602,7 @@ class ChatSession:
         content_blocks = wire.get("message", {}).get("content") or []
         if not any(isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip() for b in content_blocks):
             return wire
-        from app.plugins.voice_api import translate_text
+        from app.plugins.voice_api import review_reply, translate_text
 
         language = current_language_name(self.tab_id)
         for block in content_blocks:
@@ -3482,10 +3618,26 @@ class ChatSession:
                 )
             except Exception as exc:
                 log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
-                continue
+                translated = None
             if translated and translated != text:
                 log_event("engine", "wire_translate_applied", tab_id=self.tab_id, language=language, original_len=len(text), translated_len=len(translated))
                 block["text"] = translated
+            # Per explicit instruction (2026-10-11): reply.review checks the
+            # final text above (translated, or the original if translation
+            # failed) for task relevance, internal-mechanics leaks, and
+            # human-sounding tone -- fail-open to that text as is on any
+            # failure, same philosophy as translate_text just above.
+            try:
+                reviewed = await review_reply(block["text"], task=self.pending_user_text or "")
+            except Exception as exc:
+                log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
+                reviewed = None
+            if reviewed and reviewed != block["text"]:
+                block["text"] = reviewed
+            # Per explicit instruction (2026-10-11): re-evaluate the permission
+            # guard on every outbound message -- see _check_permission_guard's
+            # own docstring for why this runs here too, not just in submit().
+            await self._check_permission_guard()
         return wire
 
     def _narration_turn_marker(self) -> Any:
@@ -3595,7 +3747,7 @@ class ChatSession:
         # possible here: _watchdog_loop awaits this whole coroutine
         # sequentially, one tick at a time -- no other tick can start
         # until this one returns, slow or not.
-        from app.plugins.voice_api import generate_progress_comment
+        from app.plugins.voice_api import generate_progress_comment, review_reply
 
         task = self._narration_task()
         dialogue = ""
@@ -3674,6 +3826,21 @@ class ChatSession:
         self.last_narration_failed_at = None
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count += 1
+        # Per explicit instruction (2026-10-11): reply.review checks this
+        # already-translated remark for task relevance, internal-mechanics
+        # leaks, and human-sounding tone -- fail-open to `comment` as is on
+        # any failure, same philosophy as translate_text above.
+        try:
+            reviewed = await review_reply(comment, task=task)
+        except Exception as exc:
+            log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
+            reviewed = None
+        if reviewed:
+            comment = reviewed
+        # Per explicit instruction (2026-10-11): re-evaluate the permission
+        # guard on every outbound message -- see _check_permission_guard's
+        # own docstring for why this runs here too, not just in submit().
+        await self._check_permission_guard()
         # Ported from a teammate's branch (2026-10-09/807b3ea): kept so the
         # NEXT draft in this same episode sees its own earlier remarks (no
         # restating the same status) and so the episode no longer looks
@@ -4492,6 +4659,7 @@ class ChatSession:
         set_tab_id(self.tab_id)
         set_inject_proactive(lambda text: self.inject_proactive(text))
         register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
+        register_permission_blocker(self.tab_id, self._on_permission_block_checked)
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:

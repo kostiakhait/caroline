@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 InjectProactiveFn = Callable[[str], bool]
 CliPidSinkFn = Callable[[int], None]
+PermissionBlockerFn = Callable[[], "str | None"]
 
 _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("current_send", default=None)
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
@@ -27,6 +28,8 @@ _current_inject_proactive: contextvars.ContextVar[InjectProactiveFn | None] = co
 _current_cli_pid_sink: contextvars.ContextVar[CliPidSinkFn | None] = contextvars.ContextVar("current_cli_pid_sink", default=None)
 # Every live ChatSession's inject_proactive by tab id (see register_inject_proactive).
 _inject_proactive_by_tab: dict[str, InjectProactiveFn] = {}
+# Every live ChatSession's permission blocker by tab id (see register_permission_blocker).
+_permission_blocker_by_tab: dict[str, PermissionBlockerFn] = {}
 
 
 def get_send() -> SendFn:
@@ -90,6 +93,30 @@ def register_inject_proactive(tab_id: str, fn: InjectProactiveFn) -> None:
 
 def set_inject_proactive(fn: InjectProactiveFn | None) -> contextvars.Token[InjectProactiveFn | None]:
     return _current_inject_proactive.set(fn)
+
+
+def register_permission_blocker(tab_id: str, fn: PermissionBlockerFn) -> None:
+    """Per explicit instruction (2026-10-11): lets app/operations.py's
+    dispatch() ask the calling ChatSession, before running ANY tool's real
+    handler, whether this tab currently has an un-approved action
+    outstanding (an unanswered yes/no permission question, or a
+    communication/financial action without a specific prior approval --
+    see apps/microagents/PermissionGuard.py in reforce-microagents for the
+    actual judgment). Mirrors register_inject_proactive exactly -- same
+    per-tab dict, same non-fatal shape (a missing tab just means no
+    blocker, never an error). A later session of the same tab replaces
+    it."""
+    _permission_blocker_by_tab[tab_id] = fn
+
+
+def get_permission_block(tab_id: str | None) -> str | None:
+    """The reason a tool call must not run right now, or None when nothing
+    is blocking this tab. Calling this is also how the blocker gets
+    consumed/cleared on the ChatSession side (see its own
+    _on_permission_block_checked) -- this function itself never caches or
+    mutates anything, it just forwards to whatever the tab registered."""
+    fn = _permission_blocker_by_tab.get(tab_id) if tab_id else None
+    return fn() if fn else None
 
 
 def get_cli_pid_sink() -> CliPidSinkFn | None:
