@@ -1042,7 +1042,7 @@ public partial class MainWindow : Window
                 // "more": chat.js has further speech queued behind this clip (absent from an older chat.js).
                 var moreToCome = root.TryGetProperty("more", out var moreProp) && moreProp.ValueKind == JsonValueKind.True;
                 // "dialogue": spoken on its own as part of a voice conversation, not by a click
-                // on a message's speaker button -- the window then stays (VisualModeManager.DialogueIdle).
+                // on a message's speaker button -- the window then stays (VisualModeManager.StayForNextClip).
                 var dialogue = root.TryGetProperty("dialogue", out var dialogueProp) && dialogueProp.ValueKind == JsonValueKind.True;
                 _ = RunVisualModeAsync(async () =>
                 {
@@ -1076,6 +1076,14 @@ public partial class MainWindow : Window
             {
                 var visReqId = root.GetProperty("requestId").GetString()!;
                 _ = RunVisualModeAsync(() => _visualMode.HandleStopAsync(visReqId), $"visual_speech_stop({visReqId})");
+                return;
+            }
+
+            if (type == "visual_speech_dismiss")
+            {
+                // The chat's Stop, or Visual Mode switched off, while the talking-head
+                // window is up -- see VisualModeManager.HandleDismissAsync.
+                _ = RunVisualModeAsync(() => _visualMode.HandleDismissAsync(), "visual_speech_dismiss");
                 return;
             }
 

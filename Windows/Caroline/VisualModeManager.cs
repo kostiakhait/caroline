@@ -32,17 +32,11 @@ namespace Caroline;
 public sealed class VisualModeManager
 {
     /// <summary>"через 1 секунду после окончания анимации исчезать" -- how long the window
-    /// outlives its clip, and so also how long the next clip has to take it over.</summary>
+    /// outlives its clip, and so also how long the next clip has to take it over. This is
+    /// for a clip played by a click on a message's speaker button, and for a window the
+    /// user has just pressed Stop on. A dialogue's window is on no timer at all -- see
+    /// StayForNextClip.</summary>
     private static readonly TimeSpan PostRoll = TimeSpan.FromSeconds(1);
-
-    /// <summary>Per explicit instruction (2026-10-11): in a continuous spoken dialogue the
-    /// animation window is not closed at all -- not "kept while the queue is not empty",
-    /// kept. A clip that is part of the dialogue (chat.js says so: a reply or a remark
-    /// spoken on its own, not a click on a message's speaker button) leaves the window
-    /// standing, the model on its last frame, for the next thing said. What ends a
-    /// dialogue was left open; until that is decided it is this much silence, or Stop
-    /// on the window, or the chat's own Stop.</summary>
-    private static readonly TimeSpan DialogueIdle = TimeSpan.FromSeconds(180);
 
     /// <summary>chat.js prepares one item ahead; the second slot is slack for a prepare that
     /// crosses a cancel on the wire. Anything beyond that is a request nobody will play.</summary>
@@ -62,7 +56,8 @@ public sealed class VisualModeManager
     private readonly List<RenderJob> _rendersAhead = new();
     private Task _lastRender = Task.CompletedTask;
 
-    /// <summary>The window of a clip that has ended, during its post-roll -- see StartPostRoll.</summary>
+    /// <summary>The window of a clip that has ended: in its post-roll (StartPostRoll), or
+    /// standing between two remarks of a dialogue (StayForNextClip).</summary>
     private VisualModeWindow? _lingeringWindow;
     private int _postRollGeneration;
 
@@ -309,8 +304,8 @@ public sealed class VisualModeManager
         var window = _lingeringWindow;
         if (window != null)
         {
-            // The previous clip ended less than PostRoll ago: its window is still up and
-            // already initialized, so this clip simply continues in it.
+            // The previous clip's window is still up (in its post-roll, or standing in a
+            // dialogue) and already initialized, so this clip simply continues in it.
             _lingeringWindow = null;
             _activeWindow = window;
             Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} taking over the previous clip's window");
@@ -370,6 +365,9 @@ public sealed class VisualModeManager
             // The controls bar from the first piece on (see VisualModeWindow.MoreToCome) --
             // and for every clip of a dialogue: a window that stays needs its Stop.
             window.MoreToCome = moreToCome || dialogue;
+            // Once a dialogue's window, it stays one: a speaker button clicked in between
+            // must not put it back on the one-second timer.
+            if (dialogue) window.StaysUp = true;
             await window.PlayVideoAsync(outputPath);
             await playbackEnded.Task;
             played = true;
@@ -391,10 +389,11 @@ public sealed class VisualModeManager
         if (_activeWindow == window)
         {
             // A window that failed to play is not handed on to the next clip.
+            if (!played) CloseWindow(window);
             // Stopped by its own button, the window goes after the usual second even in a
-            // dialogue: the user has just said they do not want to hear more.
-            if (played) StartPostRoll(window, dialogue && !window.StoppedByUser ? DialogueIdle : PostRoll);
-            else CloseWindow(window);
+            // dialogue: that is the user closing it.
+            else if (window.StaysUp && !window.StoppedByUser) StayForNextClip(window);
+            else StartPostRoll(window);
         }
         return new VisualPlaybackResult(played, played && window.StoppedByUser);
     }
@@ -408,21 +407,36 @@ public sealed class VisualModeManager
     /// that clip takes this window over. Live before this, the pieces of one reply each
     /// closed the window and opened a new one, 4.0s apart.
     /// </summary>
-    private void StartPostRoll(VisualModeWindow window, TimeSpan linger)
+    private void StartPostRoll(VisualModeWindow window)
+    {
+        _activeWindow = null;
+        _lingeringWindow = window;
+        _ = CloseAfterPostRollAsync(window, ++_postRollGeneration);
+    }
+
+    /// <summary>
+    /// Per explicit instruction (2026-10-11, and again the same day when a 180s silence
+    /// limit was tried here): in a continuous spoken dialogue the animation window is
+    /// closed by the user and by nothing else -- "закрывается ТОЛЬКО принудительно
+    /// пользователем (Стоп на окне или в чате) и никак иначе ... автозакрытия по таймеру
+    /// быть не должно". A clip that is part of the dialogue (chat.js says so: a reply or
+    /// a remark spoken on its own, not a click on a message's speaker button) leaves the
+    /// window standing for the next thing said, however long that takes. It goes by its
+    /// own Stop (VisualModeWindow.DismissRequested), by the chat's Stop
+    /// (HandleDismissAsync), or with the app.
+    /// </summary>
+    private void StayForNextClip(VisualModeWindow window)
     {
         _activeWindow = null;
         _lingeringWindow = window;
         var generation = ++_postRollGeneration;
-        if (linger > PostRoll)
-        {
-            Logger.Log($"VisualModeManager: dialogue -- the window stays for the next clip, up to {linger.TotalSeconds:F0}s of silence.");
-            // Between two remarks the model stands in its rest pose, not frozen on the
-            // last frame of the last word (seen live: mouth open, for as long as the pause).
-            byte[]? rest;
-            lock (_prepGate) rest = _staticPng;
-            if (rest != null) _ = ShowRestPoseAsync(window, rest, generation);
-        }
-        _ = CloseAfterPostRollAsync(window, generation, linger);
+        Logger.Log("VisualModeManager: dialogue -- the window stays for the next clip, until the user closes it.");
+        window.Idle = true;
+        // Between two remarks the model stands in its rest pose, not frozen on the
+        // last frame of the last word (seen live: mouth open, for as long as the pause).
+        byte[]? rest;
+        lock (_prepGate) rest = _staticPng;
+        if (rest != null) _ = ShowRestPoseAsync(window, rest, generation);
     }
 
     private async Task ShowRestPoseAsync(VisualModeWindow window, byte[] png, int generation)
@@ -439,9 +453,9 @@ public sealed class VisualModeManager
         }
     }
 
-    private async Task CloseAfterPostRollAsync(VisualModeWindow window, int generation, TimeSpan linger)
+    private async Task CloseAfterPostRollAsync(VisualModeWindow window, int generation)
     {
-        await Task.Delay(linger);
+        await Task.Delay(PostRoll);
         // Taken over by the next clip (and possibly lingering again, for THAT clip's
         // post-roll -- hence the generation), or closed by a stop in the meantime.
         if (_lingeringWindow != window || _postRollGeneration != generation) return;
@@ -480,6 +494,22 @@ public sealed class VisualModeManager
         if (_activeRequestId != requestId) return Task.CompletedTask;
         _activeRequestId = null;
         var window = _activeWindow;
+        window?.TriggerStop();
+        CloseWindow(window ?? _lingeringWindow);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The chat's own Stop, or Visual Mode switched off: whatever window is up goes, a
+    /// clip playing in it or not. chat.js stops the clip it is playing by its request id
+    /// (HandleStopAsync); this is for the window no request owns any more -- the one
+    /// standing between two remarks of a dialogue, which nothing else would close.
+    /// </summary>
+    public Task HandleDismissAsync()
+    {
+        var window = _activeWindow;
+        Logger.Log($"VisualModeManager: HandleDismissAsync -- {(window != null ? "a clip is playing" : _lingeringWindow != null ? "the window is standing idle" : "no window")}");
+        _activeRequestId = null;
         window?.TriggerStop();
         CloseWindow(window ?? _lingeringWindow);
         return Task.CompletedTask;

@@ -49,9 +49,25 @@ public partial class VisualModeWindow : Window
     private bool _controlsShown;
 
     /// <summary>Stop was pressed while no clip was playing -- the window is standing
-    /// between two remarks of a dialogue (see VisualModeManager.DialogueIdle).</summary>
+    /// between two remarks of a dialogue (see VisualModeManager.StayForNextClip).</summary>
     public event Action? DismissRequested;
     private bool _playing;
+
+    /// <summary>This window has played a clip of a spoken dialogue, so it is the user who
+    /// closes it, not a timer -- see VisualModeManager.StayForNextClip.</summary>
+    public bool StaysUp { get; set; }
+
+    /// <summary>Standing between two remarks: there is nothing to pause or to restart
+    /// (Restart would play the last remark again, out of a file already deleted), only
+    /// Stop, which sends the window away.</summary>
+    public bool Idle
+    {
+        set
+        {
+            PauseBtn.Visibility = RestartBtn.Visibility = value ? Visibility.Collapsed : Visibility.Visible;
+            if (value) ControlsBar.Visibility = Visibility.Visible;
+        }
+    }
 
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
@@ -273,6 +289,7 @@ public partial class VisualModeWindow : Window
         }
         StoppedByUser = false; // a window can play several clips in a row, see VisualModeManager.StartPostRoll
         _playing = true;
+        Idle = false;
         PositionBottomRight(); // the chat window may have been moved since the last clip
         var fileUri = new Uri(webmPath).AbsoluteUri;
         var result = await _webView.CoreWebView2.ExecuteScriptAsync($"window.playVideo({JsonSerializer.Serialize(fileUri)})");

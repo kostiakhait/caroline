@@ -165,6 +165,7 @@
   visualModeEnabled.addEventListener("change", () => {
     visualModeState.enabled = visualModeEnabled.checked;
     sendControl("visual_mode_set", { enabled: visualModeEnabled.checked });
+    if (!visualModeEnabled.checked) dismissVisualWindow();
   });
 
   const localSttEnabled = document.getElementById("localSttEnabled");
@@ -1084,7 +1085,16 @@
   voiceStopBtn?.addEventListener("click", () => {
     stopActiveSpeech();
     clearSpeechQueue();
+    dismissVisualWindow();
   });
+
+  // In a spoken dialogue the talking-head window stays up between remarks and is closed
+  // by the user alone (VisualModeManager.StayForNextClip): by its own Stop, or by a Stop
+  // here. stopActiveSpeech() closes it only while a clip of ours is playing in it; this
+  // closes it standing idle as well.
+  function dismissVisualWindow() {
+    window.chrome?.webview?.postMessage({ type: "visual_speech_dismiss" });
+  }
 
   // Click handling for a message's manual 🔊 button: clicking the button
   // that's currently blinking (mid-synthesis or mid-playback) stops it
@@ -2800,6 +2810,11 @@
       stopVoiceSession(voiceSession, true);
       return;
     }
+    // Stop means the voice too (2026-10-11): what is being said and what is queued behind
+    // it belong to the turn being stopped, and the talking-head window goes with them.
+    stopActiveSpeech();
+    clearSpeechQueue();
+    dismissVisualWindow();
     stopCurrentTurn();
   });
   inputEl.addEventListener("input", autoGrow);
