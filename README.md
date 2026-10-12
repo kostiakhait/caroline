@@ -1,61 +1,64 @@
 # Caroline
 
 A standalone desktop AI secretary: email, notes, browser and Windows
-automation, driven by natural-language chat, without needing an IDE or a
-terminal open. Tray app, global hotkey, WPF shell around a local chat UI,
-backed by the Claude Agent SDK.
+automation, messaging, phone-companion SMS, driven by natural-language
+chat, without needing an IDE or a terminal open. Tray app, global hotkey,
+WPF shell around a local chat UI. A tab can answer through the user's own
+Claude account, the user's own ChatGPT/Codex account, or pay-as-you-go
+through a SquirrelWisdom wallet -- same assistant, switchable per tab.
+
+See `PROJECT.md` for the full, code-derived architecture writeup --
+including the server-side **microagent** layer (reply review, a permission
+guard that stops a turn until the user actually says yes, and the memory
+agents behind long-term notes) backing several of these features.
 
 Caroline is built to be **portable**: nothing at runtime references any
 repo outside this one. Everything it needs ships inside its own install
-directory or lives in a per-user workspace directory created on first run
-(`%LOCALAPPDATA%\Caroline\workspace\`). See
-`backend/scripts/bundle-mcp-servers.mjs` for the one place that *does* read
-from elsewhere in this repo (`backend/mcp-servers-src/*`) -- a dev-time
-packaging step, not part of the shipped app.
+directory, is provisioned by the installer into an isolated runtime
+directory (see below), or lives in a per-user workspace directory created
+on first run (`%LOCALAPPDATA%\Caroline\workspace\`).
 
 ## External requirements (target machine)
 
 These are not bundled and must already be present wherever Caroline is
-installed -- relevant for the installer:
+installed:
 
 - **Windows 10/11, x64.** The bundled automation helpers are win32-x64 only.
-- **Node.js** (v18+; developed against v22) -- runs the backend sidecar and
-  the MCP server wrappers it spawns. Not bundled; the installer needs to
-  either require it as a prerequisite or bundle a Node runtime.
 - **.NET 8 Desktop Runtime** -- required by the native Windows-automation
-  helper executables (`mouse.exe`, `keyboard.exe`, `screenshot.exe`, etc.,
-  bundled under `backend/mcp-servers/*/dist/`). These are framework-dependent
-  builds (`dotnet build`, not a self-contained publish), so the runtime must
-  be present separately. The WPF shell itself, by contrast, is published
-  self-contained (`dotnet publish --self-contained -p:PublishSingleFile=true`)
-  and needs nothing extra.
-- **WebView2 Runtime** -- hosts the chat UI inside the WPF shell. Usually
-  preinstalled on Windows 11; may need installing on Windows 10.
-- **A Claude subscription** (Pro/Max) or an Anthropic Console account. No API
-  key to configure -- log in from inside Caroline (tray menu -> "Log in to
-  Claude", runs the bundled CLI's own `claude auth login` OAuth flow). The
-  Node backend's Claude Agent SDK dependency (`@anthropic-ai/claude-agent-sdk`)
-  pulls in a fully self-contained, platform-specific `claude.exe`
-  (`node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe`, ~200MB)
-  via plain `npm install` -- no separate Claude Code install needed.
+  helper executables (`mouse.exe`, `keyboard.exe`, `screenshot.exe`, etc.).
+  These are framework-dependent builds (`dotnet build`, not a self-contained
+  publish), so the runtime must be present separately. The WPF shell itself,
+  by contrast, is published self-contained
+  (`dotnet publish --self-contained -p:PublishSingleFile=true`) and needs
+  nothing extra.
+- **An account to chat with**: a Claude subscription (Pro/Max) or Anthropic
+  Console account, a ChatGPT/Codex account, or a SquirrelWisdom wallet to
+  pay as you go -- any one is enough to start. Log in from inside Caroline
+  (Settings), never by typing a key into chat.
+
+Everything else the app needs on the native-automation/messaging side --
+Node.js, Python, a JRE (for Signal), WebView2, ffmpeg, git-bash, Playwright's
+Chromium, `codex-app-server`, the WhatsApp sidecar -- is provisioned by
+`CarolineInstaller.exe` itself into `%LocalAppData%\Caroline\runtime\`
+(`Windows/CarolineInstaller/Dependencies/*Installer.cs`, one pinned,
+sha256-verified installer per dependency), never from system PATH and never
+left for the target machine to already have.
 
 ## Architecture
 
 - `Windows/Caroline/` -- WPF shell (C#): tray icon, global hotkey, WebView2
-  hosting the chat UI, Settings screen. Spawns/kills the backend sidecar.
-- `backend/` -- Node/TypeScript sidecar. Exposes a loopback WebSocket
-  (`ws://127.0.0.1:48765` by default) that the chat UI talks to. Wraps the
-  Claude Agent SDK's streaming `query()`, with a watchdog that auto-restarts
-  a hung or crashed session (replaying the unanswered message) so the app
-  never needs a manual restart.
-- `backend/mcp-servers/` -- default MCP servers, produced by
-  `scripts/bundle-mcp-servers.mjs` from this repo's own
-  `backend/mcp-servers-src/*` sources (each esbuild-bundled into a single
-  `.mjs` file, native helpers copied alongside as-is -- see that script's
-  own header comment). Registered once, on first run, at **user scope**
-  (`claude mcp add --scope user`) under `caroline-`-prefixed names (e.g.
-  `caroline-time`, `caroline-windows-mouse`) so they can never collide with
-  or be shadowed by any other MCP server config already on the machine.
+  hosting the chat UI, Settings screen. Spawns/supervises the backend
+  sidecar process.
+- `backend-py/` -- the live Python backend (FastAPI). `app/chat_session.py`
+  is the per-tab core; `app/plugins/` is the tool roster, auto-wired to the
+  model as MCP servers; `app/*_channel.py` own the always-running messenger
+  connections. See `PROJECT.md`.
+- `backend/` -- the original Node/TypeScript sidecar. No longer the live
+  engine, but its `mcp-servers`/`mcp-servers-src` (the default MCP tool
+  binaries) and `skills-src` are still built and bundled into every install.
+  Registered once, on first run, at **user scope** (`claude mcp add
+  --scope user`) under `caroline-`-prefixed names so they can never collide
+  with any other MCP server config already on the machine.
 - Adding/removing MCP servers or skills after install is just the normal
   Claude Code mechanism (`claude mcp add/remove`, editing
   `%LOCALAPPDATA%\Caroline\workspace\Skills\`) -- exposed through Caroline's
@@ -65,5 +68,3 @@ installed -- relevant for the installer:
 
 - Only one default browser-automation profile is seeded (`caroline-browser`,
   port 9822).
-- Node.js itself is an external prerequisite, not bundled -- the installer
-  needs to either require it or ship a Node runtime.
