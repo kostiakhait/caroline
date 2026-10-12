@@ -1338,7 +1338,12 @@
     pendingVisualDone.set(entry.requestId, { base64, entry, onDone });
     // more: something is queued behind this clip -- the window then shows its Stop bar
     // even for a short clip (the first piece of a long reply always is one).
-    window.chrome.webview.postMessage({ type: "visual_speech_audio", requestId: entry.requestId, audioBase64: base64, more: speechQueue.length > 0 });
+    // dialogue: spoken on its own (a voice reply or a narration remark), not from a click
+    // on a message's speaker button -- the talking-head window then stays up for the next
+    // thing said instead of closing after every clip.
+    window.chrome.webview.postMessage({
+      type: "visual_speech_audio", requestId: entry.requestId, audioBase64: base64, more: speechQueue.length > 0, dialogue: !entry.btn,
+    });
     entry.audioSent = true;
     prepareNextVisual();
   }

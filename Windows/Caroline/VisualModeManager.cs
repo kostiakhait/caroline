@@ -35,6 +35,15 @@ public sealed class VisualModeManager
     /// outlives its clip, and so also how long the next clip has to take it over.</summary>
     private static readonly TimeSpan PostRoll = TimeSpan.FromSeconds(1);
 
+    /// <summary>Per explicit instruction (2026-10-11): in a continuous spoken dialogue the
+    /// animation window is not closed at all -- not "kept while the queue is not empty",
+    /// kept. A clip that is part of the dialogue (chat.js says so: a reply or a remark
+    /// spoken on its own, not a click on a message's speaker button) leaves the window
+    /// standing, the model on its last frame, for the next thing said. What ends a
+    /// dialogue was left open; until that is decided it is this much silence, or Stop
+    /// on the window, or the chat's own Stop.</summary>
+    private static readonly TimeSpan DialogueIdle = TimeSpan.FromSeconds(180);
+
     /// <summary>chat.js prepares one item ahead; the second slot is slack for a prepare that
     /// crosses a cancel on the wire. Anything beyond that is a request nobody will play.</summary>
     private const int MaxRendersAhead = 2;
@@ -245,7 +254,7 @@ public sealed class VisualModeManager
     /// reply comes in, and this used to just close the window with nothing audible at
     /// all -- worse than not having Visual Mode.
     /// </summary>
-    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes, bool moreToCome = false)
+    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes, bool moreToCome = false, bool dialogue = false)
     {
         Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} bytes={audioBytes.Length}");
         var ahead = TakeRenderAhead(requestId);
@@ -316,6 +325,15 @@ public sealed class VisualModeManager
             // to), so there's an unavoidable ~0.3-0.5s pause here while the window comes
             // up, but that's the earliest point that's actually correct to show it at.
             window = new VisualModeWindow();
+            // Stop pressed while nothing is playing: the model standing between two
+            // remarks is sent away.
+            var created = window;
+            created.DismissRequested += () =>
+            {
+                if (_lingeringWindow != created) return;
+                Logger.Log("VisualModeManager: the idle window was dismissed with its Stop button.");
+                CloseWindow(created);
+            };
             _activeWindow = window;
             window.Show();
             window.SetVisuallyHidden(true); // hidden for the brief Init/navigate window, revealed just below once actually playing
@@ -349,7 +367,9 @@ public sealed class VisualModeManager
         {
             Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} playback starting");
             window.SetVisuallyHidden(false);
-            window.MoreToCome = moreToCome; // see VisualModeWindow.MoreToCome: the controls bar from the first piece on
+            // The controls bar from the first piece on (see VisualModeWindow.MoreToCome) --
+            // and for every clip of a dialogue: a window that stays needs its Stop.
+            window.MoreToCome = moreToCome || dialogue;
             await window.PlayVideoAsync(outputPath);
             await playbackEnded.Task;
             played = true;
@@ -371,7 +391,9 @@ public sealed class VisualModeManager
         if (_activeWindow == window)
         {
             // A window that failed to play is not handed on to the next clip.
-            if (played) StartPostRoll(window);
+            // Stopped by its own button, the window goes after the usual second even in a
+            // dialogue: the user has just said they do not want to hear more.
+            if (played) StartPostRoll(window, dialogue && !window.StoppedByUser ? DialogueIdle : PostRoll);
             else CloseWindow(window);
         }
         return new VisualPlaybackResult(played, played && window.StoppedByUser);
@@ -386,16 +408,40 @@ public sealed class VisualModeManager
     /// that clip takes this window over. Live before this, the pieces of one reply each
     /// closed the window and opened a new one, 4.0s apart.
     /// </summary>
-    private void StartPostRoll(VisualModeWindow window)
+    private void StartPostRoll(VisualModeWindow window, TimeSpan linger)
     {
         _activeWindow = null;
         _lingeringWindow = window;
-        _ = CloseAfterPostRollAsync(window, ++_postRollGeneration);
+        var generation = ++_postRollGeneration;
+        if (linger > PostRoll)
+        {
+            Logger.Log($"VisualModeManager: dialogue -- the window stays for the next clip, up to {linger.TotalSeconds:F0}s of silence.");
+            // Between two remarks the model stands in its rest pose, not frozen on the
+            // last frame of the last word (seen live: mouth open, for as long as the pause).
+            byte[]? rest;
+            lock (_prepGate) rest = _staticPng;
+            if (rest != null) _ = ShowRestPoseAsync(window, rest, generation);
+        }
+        _ = CloseAfterPostRollAsync(window, generation, linger);
     }
 
-    private async Task CloseAfterPostRollAsync(VisualModeWindow window, int generation)
+    private async Task ShowRestPoseAsync(VisualModeWindow window, byte[] png, int generation)
     {
-        await Task.Delay(PostRoll);
+        try
+        {
+            // Not if the next clip has taken the window over by now.
+            if (_lingeringWindow != window || _postRollGeneration != generation) return;
+            await window.ShowStaticAsync("data:image/png;base64," + Convert.ToBase64String(png));
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"VisualModeManager: showing the rest pose failed: {ex.Message}");
+        }
+    }
+
+    private async Task CloseAfterPostRollAsync(VisualModeWindow window, int generation, TimeSpan linger)
+    {
+        await Task.Delay(linger);
         // Taken over by the next clip (and possibly lingering again, for THAT clip's
         // post-roll -- hence the generation), or closed by a stop in the meantime.
         if (_lingeringWindow != window || _postRollGeneration != generation) return;

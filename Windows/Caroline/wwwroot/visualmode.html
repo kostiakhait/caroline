@@ -6,6 +6,9 @@
   html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
   img, video { width: 100%; height: 100%; object-fit: contain; display: block; }
   #vid { display: none; position: relative; }
+  /* The rest pose shown between the remarks of a dialogue: under the video, so that it
+     stays in view until the next clip is really playing. */
+  #staticImg { position: absolute; left: 0; top: 0; display: none; }
   /* The previous clip's last frame, under the video -- see holdLastFrame. */
   #hold { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
 </style>
@@ -33,6 +36,12 @@
     function releaseHeldFrame() {
       hold.style.display = "none";
     }
+    // The new clip has a frame on screen: whatever stood in for it goes.
+    function onPlaying() {
+      vid.style.display = "block";
+      staticImg.style.display = "none";
+      releaseHeldFrame();
+    }
 
     // Called by VisualModeWindow.xaml.cs (ExecuteScriptAsync) to show the "silence" frame
     // the moment TTS generation starts, before any audio/render exists yet.
@@ -47,7 +56,6 @@
     // Called once the rendered .webm is ready -- fileUri is a file:/// path.
     window.playVideo = function (fileUri) {
       holdLastFrame();
-      staticImg.style.display = "none";
       vid.style.display = "block";
       vid.muted = false;
       vid.volume = 1.0;
@@ -65,7 +73,7 @@
       });
     };
 
-    vid.addEventListener("playing", releaseHeldFrame);
+    vid.addEventListener("playing", onPlaying);
 
     // Reports the real clip duration back to native the moment it's known, so
     // VisualModeWindow can hide the control bar entirely for very short clips

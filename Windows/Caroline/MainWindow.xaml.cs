@@ -1041,9 +1041,12 @@ public partial class MainWindow : Window
                 var audioBytes = Convert.FromBase64String(root.GetProperty("audioBase64").GetString()!);
                 // "more": chat.js has further speech queued behind this clip (absent from an older chat.js).
                 var moreToCome = root.TryGetProperty("more", out var moreProp) && moreProp.ValueKind == JsonValueKind.True;
+                // "dialogue": spoken on its own as part of a voice conversation, not by a click
+                // on a message's speaker button -- the window then stays (VisualModeManager.DialogueIdle).
+                var dialogue = root.TryGetProperty("dialogue", out var dialogueProp) && dialogueProp.ValueKind == JsonValueKind.True;
                 _ = RunVisualModeAsync(async () =>
                 {
-                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes, moreToCome);
+                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes, moreToCome, dialogue);
                     // playOneSpeech (chat.js) awaits this to advance the speech queue.
                     // played=false tells it to fall back to plain audio playback instead
                     // of silently moving on with nothing having been heard (see

@@ -48,6 +48,11 @@ public partial class VisualModeWindow : Window
     public bool MoreToCome { get; set; }
     private bool _controlsShown;
 
+    /// <summary>Stop was pressed while no clip was playing -- the window is standing
+    /// between two remarks of a dialogue (see VisualModeManager.DialogueIdle).</summary>
+    public event Action? DismissRequested;
+    private bool _playing;
+
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
     private static readonly IntPtr HwndTopmost = new(-1);
@@ -119,8 +124,24 @@ public partial class VisualModeWindow : Window
     private void PositionBottomRight()
     {
         var wa = SystemParameters.WorkArea; // excludes the taskbar -- "above the tray" for free
-        Left = wa.Right - Width - ScreenMargin;
-        Top = wa.Bottom - Height - ScreenMargin;
+        var left = wa.Right - Width - ScreenMargin;
+        var top = wa.Bottom - Height - ScreenMargin;
+        // A window that stays for a whole dialogue must not stand on the chat (2026-10-11):
+        // docked at the right edge, the chat window has its input box, microphone and send
+        // button exactly under this corner. Then the model stands just left of the chat
+        // window instead, when there is room for it.
+        foreach (Window other in System.Windows.Application.Current.Windows)
+        {
+            if (other is not MainWindow || !other.IsVisible || other.WindowState == WindowState.Minimized) continue;
+            var overlaps = left < other.Left + other.ActualWidth && left + Width > other.Left
+                           && top < other.Top + other.ActualHeight && top + Height > other.Top;
+            var beside = other.Left - Width - ScreenMargin;
+            if (overlaps && beside >= wa.Left) left = beside;
+            break;
+        }
+        if (Math.Abs(Left - left) < 0.5 && Math.Abs(Top - top) < 0.5) return;
+        Left = left;
+        Top = top;
         Logger.Log($"VisualModeWindow: PositionBottomRight -- WorkArea={wa} -> Left={Left} Top={Top}");
     }
 
@@ -205,6 +226,7 @@ public partial class VisualModeWindow : Window
                 var type = doc.RootElement.GetProperty("type").GetString();
                 if (type == "ended")
                 {
+                    _playing = false;
                     PlaybackEnded?.Invoke();
                 }
                 else if (type == "duration")
@@ -250,6 +272,8 @@ public partial class VisualModeWindow : Window
             return;
         }
         StoppedByUser = false; // a window can play several clips in a row, see VisualModeManager.StartPostRoll
+        _playing = true;
+        PositionBottomRight(); // the chat window may have been moved since the last clip
         var fileUri = new Uri(webmPath).AbsoluteUri;
         var result = await _webView.CoreWebView2.ExecuteScriptAsync($"window.playVideo({JsonSerializer.Serialize(fileUri)})");
         Logger.Log($"VisualModeWindow: PlayVideoAsync ExecuteScriptAsync result={result}, IsVisible={IsVisible}");
@@ -282,8 +306,11 @@ public partial class VisualModeWindow : Window
         // keeps decoding/outputting audio in the background at all.
         _webView?.CoreWebView2?.ExecuteScriptAsync(
             "(function(){var v=document.getElementById('vid'); v.pause(); v.removeAttribute('src'); v.load();})()");
+        var wasPlaying = _playing;
+        _playing = false;
         StoppedByUser = true;
         TriggerStop();
+        if (!wasPlaying) DismissRequested?.Invoke();
     }
 
     /// <summary>
