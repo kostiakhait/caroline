@@ -1458,6 +1458,11 @@ class ChatSession:
         self.pending_interim_notes: list[str] = []
         self.pending_is_real_user: bool = False
         self.pending_attachments: list[Any] = []
+        # The current turn's own last real visible assistant text -- see
+        # _check_refusal_and_maybe_retry's own docstring. Reset at each
+        # fresh real turn's start (submit()), updated as visible text
+        # actually reaches the wire, consumed (and cleared) once checked.
+        self._turn_last_visible_text: str | None = None
         # Per explicit instruction (2026-10-07): a reminder-driven turn
         # (service or user event, see scheduler_plugin.py's EVENT_TYPES)
         # never gets progress-narrator chatter -- see _check_progress_
@@ -2225,6 +2230,7 @@ class ChatSession:
         # user message still always wins immediately either way.
         if is_real_user or not self.turn_pending:
             self.pending_is_real_user = is_real_user
+            self._turn_last_visible_text = None
         # Same "only a genuinely new turn" guard as pending_is_real_user
         # just above -- see current_turn_suppress_narration's own __init__
         # comment for why this must never retroactively silence narration
@@ -2378,6 +2384,7 @@ class ChatSession:
         self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
         self.pending_is_real_user = is_real_user
+        self._turn_last_visible_text = None
         self.pending_attachments = []
         self.turn_pending = True
         self.last_activity = time.monotonic()
@@ -3712,6 +3719,46 @@ class ChatSession:
         if result is None:
             return
         self.pending_unapproved_action = result["reason"] if result["needs_approval"] else None
+
+    async def _check_refusal_and_maybe_retry(self) -> None:
+        """Per explicit instruction (2026-10-12): a separate concern from
+        _check_permission_guard (that one is about a missing user APPROVAL;
+        this one is about the assistant itself voluntarily declining the
+        user's actual task, on its own judgment -- a real incident the same
+        day: declining to modify/deploy its own permission-control code
+        unsupervised). Runs once, right after a real user turn finishes
+        with real visible text (see the ResultMessage call site and
+        _turn_last_visible_text's own docstring).
+
+        On a confirmed decline, automatically retries the SAME task once
+        through the SW-subscription small-model path (_start_small_model_
+        turn) -- a one-off hand-off for this task only, per explicit
+        instruction: no persisted chat_mode change, nothing reverted
+        afterward because nothing was changed. The declined Claude reply
+        the user already saw is left exactly as sent (not hidden) -- the
+        small-model's own answer simply follows it as a normal new turn.
+
+        Fail-open on any error/timeout/malformed response, same philosophy
+        as every other microagent check here: an infrastructure hiccup must
+        never be mistaken for a decline."""
+        text = self._turn_last_visible_text
+        self._turn_last_visible_text = None
+        if not text:
+            return
+        task = (self.last_real_user_question or "").strip()
+        if not task:
+            return
+        from app.plugins.voice_api import check_refusal_guard
+
+        try:
+            result = await check_refusal_guard(task, text)
+        except Exception as exc:
+            log_event("engine", "check_refusal_guard_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        if result is None or not result["declined"]:
+            return
+        log_event("engine", "refusal_guard_retrying_via_sw", tab_id=self.tab_id, reason=result["reason"])
+        self._start_small_model_turn(task, [], True, self.turn_is_voice)
 
     async def _translate_wire_visible_text(self, wire: dict[str, Any]) -> dict[str, Any]:
         """Per explicit instruction (2026-09-15): forced translation used
@@ -5509,6 +5556,8 @@ class ChatSession:
                                 # nudge here already uses.
                                 log_event("engine", "post_turn_completion_check_ground_truth_override", tab_id=self.tab_id)
                                 self._fire_post_turn_completion_check()
+                            if was_real_user_turn and not resumed_nudged:
+                                await self._check_refusal_and_maybe_retry()
                         self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
                         self.consecutive_auth_retry_failures = 0
@@ -5658,6 +5707,17 @@ class ChatSession:
                                         self.last_visible_output_at = time.monotonic()
                                         self.turn_saw_any_visible_text = True
                                         self.consecutive_narration_count = 0
+                                        # Refusal-guard's own input (see
+                                        # _check_refusal_and_maybe_retry) --
+                                        # only for a real user turn; a
+                                        # proactive/internal one declining
+                                        # something is a different, not-yet
+                                        # in-scope case.
+                                        if self.pending_is_real_user:
+                                            self._turn_last_visible_text = "\n".join(
+                                                b.get("text", "") for b in content_blocks
+                                                if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                                            )
 
                     if isinstance(message, ResultMessage):
                         if result_is_fake:

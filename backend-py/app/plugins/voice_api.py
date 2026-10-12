@@ -367,6 +367,38 @@ async def check_permission_guard(task: str, recent_dialogue: str, session: str |
     return {"needs_approval": output["needs_approval"], "reason": str(output.get("reason") or "")}
 
 
+async def check_refusal_guard(task: str, assistant_reply: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-12): a separate concern from
+    check_permission_guard -- that one is about a missing user APPROVAL;
+    this one is about the assistant itself voluntarily DECLINING a real
+    user task on its own judgment (a real incident the same day: declining
+    to modify/deploy its own permission-control code unsupervised). Backed
+    by a real microagent (server-side turn.refusal.guard).
+
+    Returns {"declined": bool, "reason": str} on a clean result, or None on
+    any error/timeout/malformed response (fail-open, same philosophy as
+    translate_text/check_permission_guard -- an infrastructure hiccup must
+    not be mistaken for a decline, nor paralyze Caroline). The caller
+    (chat_session.py) decides what to do with None -- typically, do nothing
+    further, same as if the reply were not a decline."""
+    body: dict[str, Any] = {"command": "reply:refusalGuard", "key": CAROLINE_SW_KEY, "task": task, "assistantReply": assistant_reply}
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("declined"), bool):
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="malformed")
+        return None
+    return {"declined": output["declined"], "reason": str(output.get("reason") or "")}
+
+
 # Guards against the failure modes seen live rather than trusting any
 # non-empty .result blindly (screenshots, tab 2):
 #  - the SMALL model REFUSING the task ("I'm sorry, I can't help with
