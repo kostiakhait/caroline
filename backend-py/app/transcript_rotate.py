@@ -59,6 +59,30 @@ def _journal_path(cold: Path) -> Path:
     return cold.with_name(cold.name + ".journal")
 
 
+def _scan_cache_path(cold: Path) -> Path:
+    return cold.with_name(cold.name + ".noboundary")
+
+
+def _load_no_boundary_before(cold: Path) -> int:
+    """Byte offset up to which a PREVIOUS call already confirmed there is no
+    compact_boundary line, or 0 if there's no cache (or it's stale/unreadable).
+    Safe to trust as long as the live file is append-only since that scan,
+    which it always is until a boundary IS found (see module docstring) --
+    _recover_interrupted/the cut<min_prefix_bytes short-circuit below never
+    touch bytes before this offset either."""
+    try:
+        return int(_scan_cache_path(cold).read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
+def _save_no_boundary_before(cold: Path, offset: int) -> None:
+    try:
+        _scan_cache_path(cold).write_text(str(offset), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _recover_interrupted(live: Path, cold: Path) -> None:
     journal = _journal_path(cold)
     if not journal.exists():
@@ -74,13 +98,21 @@ def _recover_interrupted(live: Path, cold: Path) -> None:
         journal.unlink(missing_ok=True)
 
 
-def _find_last_boundary_offset(path: Path, size: int) -> int | None:
+def _find_last_boundary_offset(path: Path, size: int, stop_at: int = 0) -> int | None:
     """Byte offset of the start of the newest compact_boundary line, found by
-    reading backwards; None if the file has none."""
+    reading backwards; None if there's none in [stop_at, size). stop_at lets a
+    caller that already proved [0, stop_at) has no boundary (a previous call,
+    see _load/_save_no_boundary_before) skip re-reading that already-settled
+    prefix -- on a huge transcript with no boundary at all, every restart used
+    to re-walk the ENTIRE file backwards from scratch and find nothing, every
+    single time (confirmed live: a real hang/restart loop, tab 3, repeating
+    every ~2 minutes with no progress -- see chat_session.py's call site)."""
     from app.history import iter_lines_reversed
 
     consumed = 0  # sum(len+1) over ALL pieces of a file == size + 1
     for raw in iter_lines_reversed(path, cold=False):
+        if size - consumed <= stop_at:
+            break
         consumed += len(raw) + 1
         if not _BOUNDARY_RE.search(raw):
             continue
@@ -108,8 +140,10 @@ def rotate_transcript(
         size = live.stat().st_size
         if size < min_file_bytes:
             return RotateReport(False, "small")
-        cut = _find_last_boundary_offset(live, size)
+        no_boundary_before = min(_load_no_boundary_before(cold), size)
+        cut = _find_last_boundary_offset(live, size, stop_at=no_boundary_before)
         if cut is None:
+            _save_no_boundary_before(cold, size)
             return RotateReport(False, "no_boundary")
         if cut < min_prefix_bytes:
             return RotateReport(False, "prefix_small")
@@ -157,6 +191,9 @@ def rotate_transcript(
             journal.unlink(missing_ok=True)
             raise
         journal.unlink(missing_ok=True)
+        # The live file was just replaced starting at the old boundary -- any
+        # "no boundary before X" cached for the OLD file no longer means anything.
+        _scan_cache_path(cold).unlink(missing_ok=True)
         log_event("engine", "transcript_rotated", path=str(live), moved_bytes=cut, kept_bytes=size - cut)
         return RotateReport(True, "ok", cut, size - cut)
     except Exception as exc:
