@@ -119,6 +119,29 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": json.dumps(messages, indent=2, ensure_ascii=False)}
 
 
+async def email_latest_uid(address: str, password: str, imap_host: str, folder: str = "INBOX") -> int | None:
+    """Per explicit instruction (2026-10-12): the reply-expected auto-
+    checker's own email probe (chat_session.py's _reply_watch_tick) needs
+    to know whether NEW mail has landed in a mailbox since a message was
+    sent, on a 5/15-minute cadence -- too fine-grained for IMAP's own
+    SINCE search (day granularity only, see Api2EmailCommands.py's
+    before_date/since_date). UIDs are monotonically increasing per folder
+    (RFC 3501), so "highest UID now > the UID captured right after
+    sending" is a simple, exact "something new arrived" check with no
+    date parsing at all. Internal helper, not a model-facing tool -- same
+    credentials shape as every other function here, called directly with
+    plain arguments rather than through the args-dict tool contract."""
+    async def do(session: str) -> Any:
+        result = await call_v2(
+            "email:listMessages", session=session, folder=folder, limit=1,
+            address=address, password=password, imapServer=imap_host,
+        )
+        messages = result.get("messages") or []
+        return int(messages[0]["uid"]) if messages else None
+
+    return await _sessions.with_session(do)
+
+
 async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         result = await call_v2("email:getMessage", session=session, folder=args["folder"], uid=args["uid"], **_creds_kwargs(args))

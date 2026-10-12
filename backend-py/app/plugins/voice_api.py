@@ -399,6 +399,40 @@ async def check_refusal_guard(task: str, assistant_reply: str, session: str | No
     return {"declined": output["declined"], "reason": str(output.get("reason") or "")}
 
 
+async def check_reply_expected(task: str, channel: str, sent_message: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-12): after Caroline sends ANY
+    message (email or messenger), decide whether a reply is actually
+    expected -- a question/request left open versus a pure FYI nobody need
+    answer -- so chat_session.py can arm its own tapering follow-up checks
+    (email only; every messenger channel already notifies on arrival via
+    its own push connection or, for Ratatosk, a tight global poll, so
+    there is nothing useful to schedule there -- see
+    _on_outbound_message_sent's own docstring). Backed by a real
+    microagent (server-side turn.reply.expected).
+
+    Returns {"needs_reply": bool, "reason": str} on a clean result, or None
+    on any error/timeout/malformed response (fail-open, same philosophy as
+    check_permission_guard/check_refusal_guard -- an infrastructure hiccup
+    must not be mistaken for "no reply needed", it just means the caller
+    skips watching this once)."""
+    body: dict[str, Any] = {"command": "reply:replyExpected", "key": CAROLINE_SW_KEY, "task": task, "channel": channel, "sentMessage": sent_message}
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "check_reply_expected_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "check_reply_expected_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("needs_reply"), bool):
+        log_event("plugin:voice", "check_reply_expected_failed", reason="malformed")
+        return None
+    return {"needs_reply": output["needs_reply"], "reason": str(output.get("reason") or "")}
+
+
 # Guards against the failure modes seen live rather than trusting any
 # non-empty .result blindly (screenshots, tab 2):
 #  - the SMALL model REFUSING the task ("I'm sorry, I can't help with
