@@ -1224,7 +1224,7 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
     if tier_trace:
         parts.append(
             "Real tool calls made while producing that reply, with their real results (this is ground truth -- "
-            "the reply above is a separate, later summary of this, not the source of it):\n" + "\n".join(tier_trace[-40:])
+            "the reply above is a separate, later summary of this, not the source of it):\n" + _trace_text(tier_trace, 40)
         )
     if tracker.branch_trace:
         parts.append(
@@ -1249,18 +1249,41 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
             "These tool operations were started but never confirmed as finished: "
             + ", ".join(sorted(tracker.pending_operation_ids))
         )
-    if can_escalate:
-        parts.append(
-            "If, based on the reply and the facts above, the task is genuinely NOT finished yet -- real work "
-            f'still needed, not just a wording issue -- reply with EXACTLY this and nothing else: "{ESCALATION_SENTINEL} '
-            '<one short sentence saying what is still missing or wrong>". A stronger model will pick it up from '
-            "exactly that point, with the full tool-call history so far. Only do this for genuinely unfinished "
-            "work -- if it's actually done, write the final reply instead, as described below."
+    # The verifier's reply is a verdict a program reads, in one of up to three forms
+    # (2026-10-11, agreed: "OK / эскалация / исправленный текст в теге"). Until then it
+    # was told to write the final message itself, "even if the earlier reply was already
+    # fine" -- and four times in two days what it wrote was its opinion OF the reply,
+    # shown or read out to the user as the answer (see _looks_like_verdict). A good
+    # reply now goes out as the tier wrote it; the verifier writes text only when the
+    # reply has to change, and then inside a tag, so a comment outside it is never the answer.
+    has_candidate = bool(final_text.strip())
+    forms = []
+    if has_candidate:
+        forms.append(
+            f'- "{VERIFIER_OK}" -- the reply above answers the request, claims nothing the facts above do not show, '
+            "and can go to the user exactly as it stands. It is then sent word for word. This is the normal outcome "
+            "for a good reply: never rewrite a reply that is already fine."
         )
-    parts.append(
-        "Your reply is the final message the user will read. Write it fresh, clearly and to the point, directly "
-        "answering their request, even if the earlier reply was already fine. Never describe the other assistant's "
-        "work as a report. Do not claim anything is done unless the reply and facts above show it."
+    if can_escalate:
+        forms.append(
+            f'- "{ESCALATION_SENTINEL} <one short sentence saying what is still missing or wrong>" -- the task is '
+            "genuinely NOT finished yet: real work is still needed, not just a wording issue. A stronger model will "
+            "pick it up from exactly that point, with the full tool-call history so far. Only for genuinely "
+            "unfinished work -- which includes a reply that only promises or announces an action (\"I'll send it "
+            "now\") where the facts above show no such action was taken."
+        )
+    forms.append(
+        f'- "<{VERIFIER_FINAL_TAG}>the reply</{VERIFIER_FINAL_TAG}>" -- '
+        + (
+            "the reply above has to change before the user reads it: it claims something the facts above do not "
+            "show, leaves out part of what was asked, or is not written to the user."
+            if has_candidate
+            else "there is no reply to send, so you write the message the user will read."
+        )
+        + " What is inside the tag is sent to the user as the whole reply. Write the reply itself there -- to the "
+        "user, in the language of their request, clearly and to the point, directly answering it. Never describe "
+        "the other assistant's work as a report, and never put a comment on the reply or on your own check inside "
+        "the tag. Do not claim anything is done unless the reply and facts above show it."
         + (
             ""
             if can_escalate
@@ -1276,6 +1299,11 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
         + " You have no tools and this is the only message you get to send -- never promise to check, follow up, "
         "or give it a minute: nothing will act on that promise after this reply, so it would just be a lie."
     )
+    parts.append(
+        "CRITICAL: a program reads your reply. Reply in exactly one of these forms and with nothing else -- no "
+        "explanation, no opinion of the reply:\n" + "\n".join(forms)
+    )
+    parts.append(f"A corrected reply written without the <{VERIFIER_FINAL_TAG}> tag cannot be used and is thrown away.")
     return "\n\n".join(parts)
 
 
@@ -1355,15 +1383,94 @@ def _usable(text: str) -> bool:
     return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
 
 
+VERIFIER_OK = "OK"
+VERIFIER_FINAL_TAG = "final"
+_VERIFIER_OK = re.compile(r"^\W*OK\W*$", re.IGNORECASE)
+# The closing tag may be missing (a reply cut short): everything after the opening one is the text.
+_VERIFIER_FINAL = re.compile(rf"<{VERIFIER_FINAL_TAG}>(.*?)(?:</{VERIFIER_FINAL_TAG}>|\Z)", re.IGNORECASE | re.DOTALL)
+_ANY_TAG = re.compile(r"</?[a-zA-Z][\w-]*>")
+
+
+def _verifier_form_reminder(can_escalate: bool, has_candidate: bool) -> str:
+    """Sent once when the verifier's reply was in none of the forms (verify_candidate).
+    On the golden set (evals/verifier_eval.py) the usual such reply was a correct
+    correction written without the tag -- 2 runs of 3 for a wrong figure -- and keeping
+    the candidate there sends the wrong figure out."""
+    forms = [f'"{VERIFIER_OK}"'] if has_candidate else []
+    if can_escalate:
+        forms.append(f'"{ESCALATION_SENTINEL} <what is still missing>"')
+    forms.append(f'"<{VERIFIER_FINAL_TAG}>the reply the user should read</{VERIFIER_FINAL_TAG}>"')
+    return ("That reply is in none of the forms, so the program cannot use it. Reply again with exactly one of these and "
+            "nothing else: " + ", or ".join(forms) + ".")
+
+
+def _read_verifier_reply(verified: str, candidate: str) -> tuple[str, str]:
+    """What goes to the user after a verifier reply that is not an escalation, and how it
+    was decided (for the log): see _build_verification_prompt for the forms.
+
+    The candidate is the answer unless the verifier corrected it inside the tag. A reply
+    in neither form is the verifier talking about the candidate instead of ruling on it
+    -- exactly what used to reach the user -- so the candidate goes out, not that text.
+    Only when there is no candidate at all (no tier produced one) is free text used: it
+    is then the one message there is."""
+    stripped = verified.strip()
+    has_candidate = _usable(candidate)
+    if _VERIFIER_OK.match(stripped):
+        return (candidate, "ok") if has_candidate else ("", "ok_without_candidate")
+    match = _VERIFIER_FINAL.search(stripped)
+    if match and match.group(1).strip():
+        text = match.group(1).strip()
+        # The tag is where the answer goes, and still a model wrote it: the old guards stay.
+        if has_candidate and _looks_like_verdict(text):
+            return candidate, "verdict_in_tag"
+        return _strip_verdict_preface(text, candidate), "corrected"
+    if has_candidate:
+        return candidate, "unparsed_candidate_kept"
+    return _strip_verdict_preface(_ANY_TAG.sub("", stripped).strip(), candidate), "unparsed_text_used"
+
+
 def _answer(text: str) -> dict[str, Any]:
     return {"status": "answered", "text": text}
+
+
+# How much of a tool result the trace keeps -- the trace is the verifier's "ground truth"
+# and what an escalated tier continues from. It was the first 300 characters. Live
+# (2026-10-11, twice in a row, the same question): a web_search result is five sources
+# with excerpts, ~4000 characters, and its first 300 are the heading and the start of the
+# first source -- "... Morning temperature of 10 °C, af". The tier answered from the whole
+# result (night, day, rain, wind); the verifier, shown only that stub, ruled "ответ
+# содержит только данные о температуре утра" and escalated a correct answer that was ready
+# at 10s, and the next tier, with the same stub to continue from, searched again and
+# browsed for three minutes (190s and 223s to the answer). A whole web_search result fits now.
+TRACE_RESULT_CHARS = 4500
+# All trace lines shown together stay within this; beyond it older results are cut back to
+# the old stub (a page snapshot from the app browser is as long as the limit above, and a
+# browsing tier makes dozens).
+TRACE_BUDGET_CHARS = 20000
+TRACE_OLD_LINE_CHARS = 650
+
+
+def _trace_line(name: Any, args_json: str, result: Any) -> str:
+    return f"- {name}({args_json}) -> {str(result)[:TRACE_RESULT_CHARS]}"
+
+
+def _trace_text(lines: list[str], limit: int) -> str:
+    """The last `limit` trace lines: the newest whole, older ones cut once the budget is spent."""
+    kept: list[str] = []
+    spent = 0
+    for line in reversed(lines[-limit:]):
+        if spent + len(line) > TRACE_BUDGET_CHARS and len(line) > TRACE_OLD_LINE_CHARS:
+            line = line[:TRACE_OLD_LINE_CHARS] + " ..."
+        spent += len(line)
+        kept.append(line)
+    return "\n".join(reversed(kept))
 
 
 def _continuation_note(tier_trace: list[str]) -> str:
     return (
         "[Internal: a previous attempt at this same request already ran these tool calls, with their real "
         "results. Continue from exactly where it stopped -- do not repeat these calls, do not restart from scratch.]\n"
-        + "\n".join(tier_trace[-25:])
+        + _trace_text(tier_trace, 25)
     )
 
 
@@ -1890,7 +1997,7 @@ async def run_small_model_turn(
             log_event("engine", "small_model_tool_output", tab_id=tab_id, tool=evt.get("name"), args=evt.get("args"), result=str(evt.get("result", "")))
             args = json.dumps(evt.get("args") or {}, ensure_ascii=False, default=str)[:300]
             emit(f"Tool call {evt.get('name')} (arguments: {args[:120]}); result: {str(evt.get('result', ''))[:160]}")
-            tier_trace.append(f"- {evt.get('name')}({args}) -> {str(evt.get('result', ''))[:300]}")
+            tier_trace.append(_trace_line(evt.get("name"), args, evt.get("result", "")))
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
             if ESCALATION_SENTINEL not in text:
@@ -1926,10 +2033,13 @@ async def run_small_model_turn(
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
     # is no longer only a final polish pass tacked on after the loop.
-    async def run_verifier(candidate_text: str, can_escalate: bool, trace: list[str]) -> str:
+    async def run_verifier(candidate_text: str, can_escalate: bool, trace: list[str], not_a_form: str | None = None) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace)})
+        if not_a_form is not None:
+            verification_messages.append({"role": "assistant", "content": not_a_form})
+            verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, _usable(candidate_text))})
         return await _call_with_funds_wait(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
@@ -1967,15 +2077,27 @@ async def run_small_model_turn(
         if can_escalate and ESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=verified.replace(ESCALATION_SENTINEL, "").strip()[:200])
             return verified, True
-        if _looks_like_verdict(verified) and _usable(candidate_text):
-            log_event("engine", "small_model_verification_verdict_replaced", tab_id=tab_id, verdict=verified, candidate_len=len(candidate_text))
-            return candidate_text, False
-        without_preface = _strip_verdict_preface(verified, candidate_text)
-        if without_preface != verified:
-            log_event("engine", "small_model_verification_preface_stripped", tab_id=tab_id, verified=verified[:200])
-            verified = without_preface
-        log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
-        return verified, False
+        final, how = _read_verifier_reply(verified, candidate_text)
+        if how.startswith("unparsed"):
+            # In none of the forms: asked once more, with its own reply in view.
+            log_event("engine", "small_model_verification_not_a_form", tab_id=tab_id, verifier_reply=verified[:300])
+            try:
+                again = await run_verifier(candidate_text, can_escalate, trace or [], not_a_form=verified)
+            except _FundsExhaustedGivingUp:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the first reading stands
+                log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt="second ask", error=str(exc), error_type=type(exc).__name__)
+                again = ""
+            if can_escalate and ESCALATION_SENTINEL in again:
+                log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=again.replace(ESCALATION_SENTINEL, "").strip()[:200])
+                return again, True
+            if again.strip():
+                final_again, how_again = _read_verifier_reply(again, candidate_text)
+                if not how_again.startswith("unparsed"):
+                    final, how, verified = final_again, how_again + "_on_second_ask", again
+        log_event("engine", "small_model_verification_done", tab_id=tab_id, how=how, text_len=len(final), text=final,
+                  verifier_reply=verified[:300] if how != "ok" else VERIFIER_OK)
+        return final, False
 
     # A real fact from the first second (2026-10-10): picking the starting tier is itself
     # a model call (~10s live), and until a tier starts the narrator had nothing to
