@@ -901,6 +901,11 @@ public partial class MainWindow : Window
     {
         try
         {
+            if (!WebViewOriginGuard.IsTrustedSource(args.Source))
+            {
+                Logger.Log($"MainWindow: OnWebMessageReceived rejected untrusted source={args.Source}");
+                return;
+            }
             var json = args.WebMessageAsJson;
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;

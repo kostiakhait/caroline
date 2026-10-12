@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -143,9 +144,24 @@ def _get_pipeline():
         return _pipeline
 
 
+# `fmt` comes straight from the caller's request body (main.py's "stt" op
+# control_request, "format" field) with no validation before this -- used
+# verbatim as NamedTemporaryFile's suffix, it was a path-traversal /
+# arbitrary-filename primitive (e.g. fmt="x/../../../../somewhere/evil").
+# Whitelist to a short alphanumeric extension; anything else falls back to
+# a safe default rather than erroring, matching this function's existing
+# "never a hard dependency" tolerance for odd input.
+_SAFE_FMT_RE = re.compile(r"^[A-Za-z0-9]{1,8}$")
+
+
+def _safe_suffix(fmt: str | None) -> str:
+    cleaned = (fmt or "").lstrip(".")
+    return f".{cleaned}" if _SAFE_FMT_RE.match(cleaned) else ".bin"
+
+
 def _transcribe_sync(audio_bytes: bytes, fmt: str) -> str:
     pipeline = _get_pipeline()
-    suffix = f".{fmt}" if fmt and not fmt.startswith(".") else (fmt or ".bin")
+    suffix = _safe_suffix(fmt)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
         f.write(audio_bytes)
         tmp_path = f.name

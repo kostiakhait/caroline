@@ -68,7 +68,7 @@ _sessions = SessionManager()
 # "caroline-email-provisioning" key (reforce's key_scopes table, id 20 --
 # previously scoped only to email:create) rather than mint a whole new
 # credential for the same feature area.
-EMAIL_SERVICE_KEY = "SVdTcM0PwAm1qmZD-ucFUqHpcEiClVGTuJXdHbOEajg"
+from app.sw_service_keys_local import EMAIL_SERVICE_KEY  # noqa: E402
 
 _ACCOUNT_PARAM_NOTE = (
     " Look up this mailbox's saved credentials first (see this plugin's own usage instructions) -- "

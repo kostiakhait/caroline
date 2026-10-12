@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from app.logging_setup import log_event
+from app.login_api import get_cached_v2_session
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json
 
 
@@ -21,6 +22,8 @@ class VoiceApiError(Exception):
 
 async def transcribe_audio(audio_base64: str, fmt: str, session: str | None = None) -> str:
     body: dict[str, Any] = {"command": "ai:stt", "key": CAROLINE_SW_KEY, "audio": audio_base64, "format": fmt}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     data = await _post_json(body)
@@ -65,7 +68,11 @@ async def detect_language(text: str) -> str | None:
     intentionally NOT this function -- see the dedicated
     resolve-based-language-detection redesign plan for that one."""
     try:
-        data = await _post_json({"command": "ai:detectLanguage", "key": CAROLINE_SW_KEY, "text": text})
+        body: dict[str, Any] = {"command": "ai:detectLanguage", "key": CAROLINE_SW_KEY, "text": text}
+        session = await get_cached_v2_session()
+        if session:
+            body["session"] = session
+        data = await _post_json(body)
     except Exception:
         return None
     if data.get(".status") != "ok" or not isinstance(data.get("language"), str):
@@ -122,6 +129,8 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
         f"{recent_text}"
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -273,6 +282,8 @@ async def translate_text(
         "command": "ai:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
         "instructions": _gender_agreement_clause(gender, addressee_gender) or None,
     }
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -313,6 +324,8 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     fall back to the text it already had rather than block or drop a reply
     over this."""
     body: dict[str, Any] = {"command": "reply:review", "key": CAROLINE_SW_KEY, "text": text, "task": task}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -350,6 +363,8 @@ async def check_permission_guard(task: str, recent_dialogue: str, session: str |
     (chat_session.py) decides what to do with None -- typically, leave
     whatever gate state it already had untouched."""
     body: dict[str, Any] = {"command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -382,6 +397,8 @@ async def check_refusal_guard(task: str, assistant_reply: str, session: str | No
     (chat_session.py) decides what to do with None -- typically, do nothing
     further, same as if the reply were not a decline."""
     body: dict[str, Any] = {"command": "reply:refusalGuard", "key": CAROLINE_SW_KEY, "task": task, "assistantReply": assistant_reply}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -416,6 +433,8 @@ async def check_reply_expected(task: str, channel: str, sent_message: str, sessi
     must not be mistaken for "no reply needed", it just means the caller
     skips watching this once)."""
     body: dict[str, Any] = {"command": "reply:replyExpected", "key": CAROLINE_SW_KEY, "task": task, "channel": channel, "sentMessage": sent_message}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -1030,6 +1049,8 @@ async def generate_progress_comment(
         "Reply now, wrapped in the tag."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -1111,6 +1132,8 @@ async def _synthesize_speech_locally(text: str, voice: str) -> str:
 
 async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str | None = None) -> str:
     body: dict[str, Any] = {"command": "ai:tts", "key": CAROLINE_SW_KEY, "text": text, "voice": voice}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     data = await _post_json(body)
@@ -1166,6 +1189,8 @@ async def clean_text_for_speech(text: str, session: str | None = None) -> str:
         f"Text:\n{text}"
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -1181,7 +1206,11 @@ async def describe_image_cheap(base64_png: str) -> dict[str, Any]:
     """Cheap image understanding (Camerlengo's ai:describeImage, a small
     model) as a deliberately CHEAPER alternative to putting raw image
     bytes into Claude's own context."""
-    data = await _post_json({"command": "ai:describeImage", "key": CAROLINE_SW_KEY, "content": base64_png, "type": "base64"})
+    body: dict[str, Any] = {"command": "ai:describeImage", "key": CAROLINE_SW_KEY, "content": base64_png, "type": "base64"}
+    session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    data = await _post_json(body)
     if data.get(".status") != "ok" or not isinstance(data.get("result"), dict):
         raise VoiceApiError(str(data.get(".reason") or "describeImage failed"))
     r = data["result"]

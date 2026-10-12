@@ -12,9 +12,9 @@ from typing import Any
 
 import httpx
 from app.http_tls import ssl_context
+from app.sw_service_keys_local import REFORCE_KEY
 
 REFORCE_URL = "https://beautysqrl.com"
-REFORCE_KEY = "EaYW2x8-oi7qjz4cl9cZWj7Udg6U8RcotHLs0B9xZUM"
 
 
 class ReforceError(Exception):
@@ -27,6 +27,15 @@ class ReforceSessionExpired(ReforceError):
 
 async def call(command: str, body: dict[str, Any] | None = None, *, timeout: float = 180.0) -> dict[str, Any]:
     payload: dict[str, Any] = {"command": command, "key": REFORCE_KEY, **(body or {})}
+    # Per explicit instruction (2026-10-12): this never threaded a session
+    # through at all, which Camerlengo was treating as a free, unmetered
+    # "internal" call for every ai:generateImage/wikipediaSearch/factExtract/
+    # etc. here -- see login_api.get_cached_v2_session's own doc comment.
+    if "session" not in payload:
+        from app.login_api import get_cached_v2_session  # local: login_api -> notes_api -> reforce_v2 is a real import cycle
+        session = await get_cached_v2_session()
+        if session:
+            payload["session"] = session
     async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout) as client:
         last_err: Exception | None = None
         for attempt in range(3):

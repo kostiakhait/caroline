@@ -19,19 +19,16 @@ import httpx
 from app.http_tls import ssl_context
 
 API_URL = "https://www.squirrelwisdom.com/"
-V2_LOGIN_SERVICE_KEY = "fytZDwOTaBo8I173IS2DaY_qgzm0IFvqvnxJGvC5QrE"
 
-# Caroline's own general-purpose SquirrelWisdom service key -- ai:resolve/
-# ai:tts/ai:stt/ai:describeImage/... (matches backend/src/voice.ts's own
-# hardcoded API_KEY). Shared here rather than duplicated per plugin.
-CAROLINE_SW_KEY = "QvR-sujLOgpKWZ-yhSOK5ZNgEe4sgF0EUU7GexQqr4M"
-
-# Issued 2026-10-05 (service_name "caroline-remote-session-check") scoped to
-# EXACTLY user:getSessionUser, nothing broader -- V2_LOGIN_SERVICE_KEY above
-# is only scoped for user:verify, confirmed live ("Key scope/resource ACL
-# does not permit this call" using it for getSessionUser). Used solely by
-# get_session_user below, main.py's remote-auth middleware's one dependency.
-V2_SESSION_LOOKUP_KEY = "rG2-bS_X_cLc0_hx1gvYnK5DSW8mio_oplzQeM3QxSo"
+# Real values come from sw_service_keys_local.py (gitignored, maintainer-only
+# -- see its template sw_service_keys_example.py). Previously hardcoded here
+# in plaintext; rotated after that leaked into this repo's public history
+# (2026-10). V2_LOGIN_SERVICE_KEY is scoped to exactly user:verify +
+# wallet:getBalance; CAROLINE_SW_KEY is Caroline's general-purpose service
+# key (ai:resolve/ai:tts/ai:stt/ai:describeImage/memory:*/contact:*/reply:*);
+# V2_SESSION_LOOKUP_KEY is scoped to exactly user:getSessionUser, used solely
+# by get_session_user below, main.py's remote-auth middleware's one dependency.
+from app.sw_service_keys_local import CAROLINE_SW_KEY, V2_LOGIN_SERVICE_KEY, V2_SESSION_LOOKUP_KEY  # noqa: E402
 
 CREDENTIALS_PATH = Path.home() / ".mcp-notes" / "credentials.json"
 

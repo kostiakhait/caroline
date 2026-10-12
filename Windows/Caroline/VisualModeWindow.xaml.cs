@@ -138,6 +138,7 @@ public partial class VisualModeWindow : Window
         webView.CoreWebView2.WebMessageReceived += (_, args) =>
         {
             Logger.Log($"VisualModeWindow: WebMessageReceived raw={args.WebMessageAsJson}");
+            if (!WebViewOriginGuard.IsTrustedSource(args.Source)) return;
             try
             {
                 using var doc = JsonDocument.Parse(args.WebMessageAsJson);
