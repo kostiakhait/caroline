@@ -1,0 +1,187 @@
+diff --git a/AI.py b/AI.py
+index 060a5ef..f6f1f5b 100644
+--- a/AI.py
++++ b/AI.py
+@@ -369,7 +369,8 @@ class OpenRouterAdapter(Adapter):
+     POOL_TIMEOUT_S = 10.0
+ 
+     def _resolve(self, model, messages, max_tokens=100000, temperature=0.5,
+-                transforms=None, stop=None, tools=None, reasoning=None, timeout=None):
++                transforms=None, stop=None, tools=None, reasoning=None, timeout=None,
++                plugins=None):
+         """
+         timeout: seconds for this one call; None (default) means
+         DEFAULT_TIMEOUT_S, unchanged for every existing caller.
+@@ -390,6 +391,12 @@ class OpenRouterAdapter(Adapter):
+         chat-completions call). None (default) means no change for every
+         existing caller.
+ 
++        plugins: optional list forwarded to OpenRouter as-is, e.g.
++        [{"id": "web", "engine": "exa", "max_results": 5}] for a web search
++        whose sources come back in the message's annotations (2026-10-12,
++        for ai:resolveAgenticStep -- see AI.resolve_agentic_step()). None
++        (default) means no change for every existing caller.
++
+         Requirement for proper timeout behavior:
+         - httpx must be imported at module level: import httpx
+         """
+@@ -416,6 +423,8 @@ class OpenRouterAdapter(Adapter):
+             extra_body = {"transforms": transforms}
+             if reasoning:
+                 extra_body["reasoning"] = reasoning
++            if plugins:
++                extra_body["plugins"] = plugins
+             # Per explicit instruction (2026-09-15): the agentic dialog engine
+             # bills by REAL OpenRouter cost, not an estimate from token counts
+             # and a hand-maintained price table -- {"include": True} makes
+@@ -3111,7 +3120,8 @@ class AI(AIBase):
+ 
+         return "Agent reached maximum iterations without completing."
+ 
+-    def resolve_agentic_step(self, messages, tool_defs, model=None):
++    def resolve_agentic_step(self, messages, tool_defs, model=None, transforms=None,
++                             reasoning=None, plugins=None, max_tokens=None, temperature=None):
+         """Single-iteration counterpart to resolve_agentic() above, for a
+         caller that can't hand this method a local executor_fn -- e.g. a v2
+         API command (Api2AICommands.cmdV2ResolveAgenticStep) serving a
+@@ -3135,14 +3145,36 @@ class AI(AIBase):
+         list -- exactly the shape resolve_agentic()'s own loop already
+         maintains internally, just crossing a network hop between rounds
+         instead of a Python for-loop iteration.
++
++        transforms / reasoning / plugins / max_tokens / temperature
++        (2026-10-12): the same per-call options resolve_agentic() already
++        passes to adapter._resolve() for an in-process caller, so a remote
++        client loses nothing by making its model calls here instead of
++        holding a provider key itself. Each is forwarded only when given;
++        with none of them this call is exactly what it was before.
++
++        Both shapes may also carry "usage" ({"prompt_tokens",
++        "completion_tokens", "cached_tokens", "cost"}), and a "final" one
++        "annotations" (the provider's own list, e.g. url_citation entries of
++        a web-search plugin) -- only when the provider returned them.
+         """
+         used_model = model or getattr(self, 'model', None) or Config.AI_MODEL_ALTERNATE
++        options = {}
++        if transforms is not None:
++            options["transforms"] = transforms
++        if reasoning:
++            options["reasoning"] = reasoning
++        if plugins:
++            options["plugins"] = plugins
++        if max_tokens:
++            options["max_tokens"] = max_tokens
+         try:
+             response = self.adapter._resolve(
+                 model=used_model,
+                 messages=messages,
+                 tools=tool_defs or None,
+-                temperature=0.2
++                temperature=0.2 if temperature is None else temperature,
++                **options
+             )
+         except Exception as e:
+             return {"type": "final", "text": f"Agent error: {e}"}
+@@ -3150,16 +3182,41 @@ class AI(AIBase):
+         if isinstance(response, str):
+             return {"type": "final", "text": response}
+ 
++        extra = {}
++        try:
++            usage = getattr(response, "usage", None)
++            if usage is not None:
++                details = getattr(usage, "prompt_tokens_details", None)
++                extra["usage"] = {
++                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
++                    "completion_tokens": getattr(usage, "completion_tokens", None),
++                    "cached_tokens": getattr(details, "cached_tokens", None) if details is not None else None,
++                    "cost": getattr(usage, "cost", None),
++                }
++        except Exception:
++            pass
++
+         try:
+             msg = response.choices[0].message
+         except Exception:
+-            return {"type": "final", "text": ""}
++            return dict({"type": "final", "text": ""}, **extra)
+ 
+         tool_calls = getattr(msg, 'tool_calls', None)
+         if not tool_calls:
+-            return {"type": "final", "text": (msg.content or "").strip()}
++            try:
++                annotations = []
++                for item in (getattr(msg, "annotations", None) or []):
++                    if hasattr(item, "model_dump"):
++                        item = item.model_dump()
++                    if isinstance(item, dict):
++                        annotations.append(item)
++                if annotations:
++                    extra["annotations"] = annotations
++            except Exception:
++                pass
++            return dict({"type": "final", "text": (msg.content or "").strip()}, **extra)
+ 
+-        return {
++        return dict(extra, **{
+             "type": "tool_calls",
+             "assistant_message": {
+                 "role": "assistant",
+@@ -3174,7 +3231,7 @@ class AI(AIBase):
+                 ],
+             },
+             "calls": [{"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments} for tc in tool_calls],
+-        }
++        })
+ 
+ 
+ class BookDescriptorAI(AI):
+diff --git a/API/Api2AICommands.py b/API/Api2AICommands.py
+index fb41521..d5c134c 100644
+--- a/API/Api2AICommands.py
++++ b/API/Api2AICommands.py
+@@ -281,10 +281,34 @@ class Api2AICommands:
+         model call per request and hands back either a final answer or the
+         tool_calls the client needs to run and report back, via
+         AI.resolve_agentic_step() (see its own docstring for the exact
+-        request/response shape, shared verbatim with the client)."""
++        request/response shape, shared verbatim with the client).
++
++        Optional per-call options (2026-10-12), each forwarded only when
++        present: "reasoning" (object), "transforms" (list), "plugins" (list),
++        "max_tokens" (integer), "temperature" (number). They are what the
++        client's own loop passed to the provider while it still held a key
++        (reasoning effort per tier, middle-out switched off for a long
++        tool-calling history, the web-search plugin) -- without them here
++        that loop could not move to this command without changing how it
++        behaves. The reply may carry "usage" and, for a final answer,
++        "annotations" (web-search sources)."""
+         messages = cmd.get("messages")
+         if not isinstance(messages, list) or not messages:
+             return self.error(self.ERROR_NO_MANDATORY_ARGUMENT, '"messages" must be a non-empty list', self._getId(cmd))
++        options = {}
++        for name, kinds, what in (
++            ("reasoning", (dict,), "an object"),
++            ("transforms", (list,), "a list"),
++            ("plugins", (list,), "a list"),
++            ("max_tokens", (int,), "an integer"),
++            ("temperature", (int, float), "a number"),
++        ):
++            value = cmd.get(name)
++            if value is None:
++                continue
++            if isinstance(value, bool) or not isinstance(value, kinds):
++                return self.error(self.ERROR_NO_MANDATORY_ARGUMENT, f'"{name}" must be {what}', self._getId(cmd))
++            options[name] = value
+         tools = cmd.get("tools")
+         model = AI.resolveModelCategory(cmd.get("model")) or Config.AI_MODEL_ALTERNATE
+         session = cmd.get("session")
+@@ -292,7 +316,7 @@ class Api2AICommands:
+         if err:
+             return err
+         try:
+-            result = self._ai_processor().resolve_agentic_step(messages, tools, model=model)
++            result = self._ai_processor().resolve_agentic_step(messages, tools, model=model, **options)
+         except Exception as e:
+             traceback.print_exc()
+             return self.error(self.ERROR_EXCEPTION, str(e), self._getId(cmd))

@@ -1931,8 +1931,8 @@ class ChatSession:
         live, the first fast-lane call after a start took 4.9s instead of ~1.8s, the
         difference being this fetch. Cached for the process; a failure here is harmless."""
         try:
-            from app.model_key_provisioning import get_model_provider_key
-            await get_model_provider_key()
+            from app.small_model_engine import prewarm_model_access
+            await prewarm_model_access()
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "model_key_prewarm_failed", tab_id=self.tab_id, error=str(exc))
 

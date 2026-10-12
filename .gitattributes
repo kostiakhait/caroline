@@ -1,0 +1,2 @@
+# A patch for another repository whose files have CRLF line endings: kept byte for byte.
+docs/reforce-resolveAgenticStep-options.patch -text

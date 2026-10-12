@@ -91,7 +91,7 @@ from app.owner_profile import get_owner_profile, owner_profile_system_prompt_cla
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
-from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
+from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
     continuity_pointer_instruction,
     credentials_check_notes_first_instruction,
@@ -740,8 +740,175 @@ _WEB_SEARCH_SYSTEM = (
 )
 
 
+# Where the model is called from.
+#
+# Per explicit instruction (2026-10-11): "Кэролайн не должна НИ В КАКОМ СЛУЧАЕ напрямую
+# обращаться к OpenRouter и тем более сама получать ключ -- вызов модели должен идти через
+# SquirrelWisdom", and (2026-10-12) through ai:resolveAgenticStep specifically -- the
+# server's own tool-calling step command -- which is to be extended where it lacks
+# something, rather than a second route built beside it.
+#
+# What exists since 2026-09-12 is the opposite: ai:getModelKey hands this process the
+# provider key, and Camerlengo's loop (AI.resolve_agentic) calls the provider with it.
+# This branch added more callers of the same kind (fast lane and its gate, the narrator's
+# ladder, the web-search plugin call, the speech-recognition check). All of them now get
+# their AI object from _model_ai(), so there is one switch for the lot.
+#
+# With the switch on, the loop stays Camerlengo's and the tools still run here, but the
+# adapter under the loop is _SquirrelWisdomStepAdapter: each model call is one
+# ai:resolveAgenticStep request made with the user's own session, and no provider key is
+# fetched or held by this process at all.
+#
+# The switch is OFF until the server side is in place; turned on today, nothing answers:
+#   1. Caroline's API key is refused the command -- errcode 997, "Key scope/resource ACL
+#      does not permit this call" (probed 2026-10-11 and again 2026-10-12);
+#   2. the command forwards neither reasoning, transforms, plugins, max_tokens nor
+#      temperature, and returns neither annotations (web-search sources) nor usage. The
+#      change for it was handed over as a patch against reforce's microagents branch
+#      (resolveAgenticStep-options.patch); this adapter already speaks that form, and a
+#      server without it simply ignores the extra fields.
+# With both done: set this to True, and ai:getModelKey has no caller left.
+MODEL_CALLS_VIA_SQUIRRELWISDOM = False
+SW_STEP_TIMEOUT_S = 300.0
+# login_api.get_v2_session() logs in afresh on every call (0.5-0.8s): one session serves
+# the calls of the next minute, and a call refused for its session gets a new one.
+SW_SESSION_REUSE_S = 60.0
+_sw_session: str | None = None
+_sw_session_at = 0.0
+_SW_ERRCODE_SESSION = "202"
+_SW_ERRCODE_FUNDS = "402"
+
+
+def _step_as_response(step: dict[str, Any]) -> Any:
+    """ai:resolveAgenticStep's reply in the shape AI.resolve_agentic reads off a provider
+    response: choices[0].message (.content, .tool_calls[].id / .function.name /
+    .function.arguments, .annotations) and .usage."""
+    from types import SimpleNamespace as NS
+
+    usage = step.get("usage")
+    usage_ns = None
+    if isinstance(usage, dict):
+        usage_ns = NS(
+            prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"), cost=usage.get("cost"),
+            prompt_tokens_details=NS(cached_tokens=usage.get("cached_tokens")),
+        )
+    if step.get("type") == "tool_calls":
+        calls = [
+            NS(id=call.get("id"), type="function", function=NS(name=call.get("name"), arguments=call.get("arguments") or "{}"))
+            for call in step.get("calls") or []
+        ]
+        message = NS(content=(step.get("assistant_message") or {}).get("content") or "", tool_calls=calls, annotations=None)
+    else:
+        message = NS(content=step.get("text") or "", tool_calls=None, annotations=step.get("annotations") or None)
+    return NS(choices=[NS(message=message)], usage=usage_ns)
+
+
+class _SquirrelWisdomStepAdapter:
+    """Stands where Camerlengo's OpenRouterAdapter stands under AI.resolve_agentic():
+    the same _resolve(), answered by the server's ai:resolveAgenticStep.
+
+    _resolve is called on the worker thread resolve_agentic runs in. The request itself
+    is made on the main loop (sw_api._post_json is a coroutine), which is free at that
+    moment: whoever started the loop is awaiting that very thread."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def _on_loop(self, coro: Any, timeout: float) -> Any:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            coro.close()
+            raise RuntimeError("a model call must not be made on the event loop itself")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    def _session(self, fresh: bool = False) -> str:
+        global _sw_session, _sw_session_at
+        if fresh or _sw_session is None or time.monotonic() - _sw_session_at > SW_SESSION_REUSE_S:
+            from app.login_api import get_v2_session
+
+            _sw_session = self._on_loop(get_v2_session(), 30.0)
+            _sw_session_at = time.monotonic()
+        return _sw_session
+
+    def _resolve(
+        self, model: str, messages: list[dict[str, Any]], max_tokens: int | None = None, temperature: float = 0.2,
+        transforms: list[str] | None = None, stop: Any = None, tools: list[dict[str, Any]] | None = None,
+        reasoning: dict[str, Any] | None = None, timeout: float | None = None, plugins: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        body: dict[str, Any] = {
+            "command": "ai:resolveAgenticStep", "key": CAROLINE_SW_KEY, "messages": messages, "model": model,
+            "temperature": temperature,
+        }
+        if tools:
+            body["tools"] = tools
+        if transforms is not None:
+            body["transforms"] = transforms
+        if reasoning:
+            body["reasoning"] = reasoning
+        if plugins:
+            body["plugins"] = plugins
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        wait = float(timeout or SW_STEP_TIMEOUT_S)
+        data: Any = None
+        for attempt in (1, 2):
+            body["session"] = self._session(fresh=attempt == 2)
+            data = self._on_loop(_post_json(body, timeout=wait), wait + 10.0)
+            expired = isinstance(data, dict) and data.get(".status") == "error" and str(data.get(".errcode")) == _SW_ERRCODE_SESSION
+            if not expired:
+                break
+        if not isinstance(data, dict) or data.get(".status") != "ok":
+            code = str(data.get(".errcode")) if isinstance(data, dict) else "?"
+            reason = data.get(".reason") if isinstance(data, dict) else "no reply"
+            if code == _SW_ERRCODE_FUNDS:
+                # The words the engine's own funds handling looks for (_call_with_funds_wait).
+                raise RuntimeError(f"SquirrelWisdom returned 402 Insufficient funds: {reason}")
+            raise RuntimeError(f"SquirrelWisdom ai:resolveAgenticStep failed (errcode {code}): {reason}")
+        return _step_as_response(data)
+
+
+async def _model_ai() -> Any | None:
+    """The AI object every model call in this file is made with -- see the note above
+    MODEL_CALLS_VIA_SQUIRRELWISDOM. None when there is no way to call a model right now
+    (Camerlengo missing; or, on the old route, not logged in / no key)."""
+    if camerlengo_ai is None:
+        return None
+    if MODEL_CALLS_VIA_SQUIRRELWISDOM:
+        return camerlengo_ai.AI(adapter=_SquirrelWisdomStepAdapter(asyncio.get_running_loop()))
+    api_key = await get_model_provider_key()
+    if not api_key:
+        return None
+    return camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
+
+
+async def prewarm_model_access() -> None:
+    """What the first model call would otherwise wait for, done ahead: the login, and on
+    the old route the key (2026-10-10: the first fast-lane call after a start took 4.9s
+    instead of ~1.8s for exactly that)."""
+    if MODEL_CALLS_VIA_SQUIRRELWISDOM:
+        adapter = _SquirrelWisdomStepAdapter(asyncio.get_running_loop())
+        await asyncio.to_thread(adapter._session)
+    else:
+        await get_model_provider_key()
+
+
 def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[str, Any]]]:
     """(the search model's answer, the pages it was given). Raises on any API failure."""
+    search_messages = [
+        {"role": "system", "content": _WEB_SEARCH_SYSTEM.format(today=time.strftime("%A, %Y-%m-%d"))},
+        {"role": "user", "content": question},
+    ]
+    search_plugins = [{"id": "web", "engine": WEB_SEARCH_ENGINE, "max_results": WEB_SEARCH_MAX_RESULTS}]
+    if isinstance(ai.adapter, _SquirrelWisdomStepAdapter):
+        via_server = ai.adapter._resolve(
+            model=cfg.AI_MODEL_SMALL, messages=search_messages, max_tokens=1200, reasoning=WEB_SEARCH_REASONING,
+            plugins=search_plugins, timeout=WEB_SEARCH_TIMEOUT_S,
+        ).choices[0].message
+        found = [a.get("url_citation") or {} for a in (via_server.annotations or []) if isinstance(a, dict) and a.get("type") == "url_citation"]
+        return str(via_server.content or "").strip(), [s for s in found if s.get("url")]
     response = ai.adapter.client.with_options(timeout=WEB_SEARCH_TIMEOUT_S, max_retries=0).chat.completions.create(
         model=cfg.AI_MODEL_SMALL,
         messages=[
@@ -1750,10 +1917,9 @@ async def try_fast_answer(
         return None, None, None
     started = time.monotonic()
     try:
-        api_key = await get_model_provider_key()
-        if not api_key:
+        ai = await _model_ai()
+        if ai is None:
             return None, None, None
-        ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
         if FAST_LANE_GATE_ENABLED:
             gate = await _fast_lane_gate(ai, workspace_dir, persona, user_text, recent_dialogue_lines, language, is_voice)
             if gate is not None and gate[0]:
@@ -1806,10 +1972,9 @@ async def resolve_narration_prompt(prompt: str, model: str | None = None, reason
     the provider key is unavailable (the caller then falls back)."""
     if camerlengo_ai is None:
         raise RuntimeError("camerlengo unavailable")
-    api_key = await get_model_provider_key()
-    if not api_key:
+    ai = await _model_ai()
+    if ai is None:
         raise RuntimeError("no provider key")
-    ai = camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
     return await asyncio.wait_for(
         asyncio.to_thread(ai.resolve_agentic, [{"role": "user", "content": prompt}], None, None,
                           model=model or NARRATOR_MODEL, max_iterations=1, reasoning=reasoning),
@@ -1903,20 +2068,17 @@ async def run_small_model_turn(
         log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
         return _answer(_UNAVAILABLE_ANSWER)
 
-    api_key = await get_model_provider_key()
-    if not api_key:
-        log_event("engine", "small_model_no_key_available", tab_id=tab_id)
-        return _answer(_UNAVAILABLE_ANSWER)
-
-    # Explicit adapter with the freshly-fetched key -- never rely on
-    # camerlengo_ai.AI()'s own default (Config.OPENROUTER_KEY, server-only)
-    # from this process; Caroline always passes its own, per-session key.
+    # Explicit adapter -- never rely on camerlengo_ai.AI()'s own default
+    # (Config.OPENROUTER_KEY, server-only) from this process. Which adapter, and
+    # whether a provider key is involved at all: see _model_ai().
     # Built here (moved up 2026-10-03) rather than right before the tier loop
     # so executor_fn (built below) can use `ai`/`cfg` directly for the
     # web_search tool, which is a plain blocking call, not a dispatch()'d
     # plugin operation.
-    adapter = camerlengo_ai.OpenRouterAdapter(api_key=api_key)
-    ai = camerlengo_ai.AI(adapter=adapter)
+    ai = await _model_ai()
+    if ai is None:
+        log_event("engine", "small_model_no_key_available", tab_id=tab_id)
+        return _answer(_UNAVAILABLE_ANSWER)
     cfg = camerlengo_ai.Config
 
     registry = build_tool_registry()
