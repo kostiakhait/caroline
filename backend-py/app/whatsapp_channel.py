@@ -8,8 +8,15 @@ planned messenger integrations (docs/MESSENGER_INTEGRATIONS_PLAN.md,
 app/sidecar_process.py for the stdio transport this rides on.
 
 Linking shows a QR code: rendered to a PNG under workspace_dir and opened
-with the OS default viewer (files_plugin.open_file_with_default_app) --
-no new native UI needed, reusing what already exists.
+in Caroline's own floating viewer window (the same "open_editor" WS
+message viewer_plugin.py's open_in_viewer sends, just pushed directly via
+session_context's register_send_for_tab/get_send_for_tab instead of
+get_send() -- this fires from the background sidecar loop, not from
+inside a turn). A refreshed QR (Baileys reissues one every 20-60s while
+unscanned) updates that SAME window instead of opening another one -- see
+MainWindow.xaml.cs's open_editor handler for the reuse-in-place fix this
+relies on (2026-10-11; a real incident, piling up one OS-viewer window per
+refresh before this).
 
 Baileys' own multi-file auth-state (created on first link) lives under
 workspace_dir/messengers/whatsapp/auth/ -- not individually DPAPI-
@@ -33,8 +40,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
-from app.plugins.files_plugin import open_file_with_default_app
 from app.secret_store import messenger_secrets_dir
+from app.session_context import get_send_for_tab, get_tab_id
 from app.sidecar_process import SidecarProcess
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
@@ -93,6 +100,12 @@ _pending: dict[str, asyncio.Future[Any]] = {}
 # one case; every later reconnect (including across a Caroline restart,
 # once linked once) goes through the normal auth-dir check.
 _login_requested = False
+# Which tab's whatsapp_login call set _login_requested -- the tab whose own
+# window should show the QR code (see register_send_for_tab/get_send_for_tab,
+# needed because _handle_qr fires from the background sidecar loop, not from
+# inside that tab's own turn). Sticky like _login_requested itself; a later
+# relink from a different tab simply replaces it.
+_login_requested_tab_id: str | None = None
 
 
 def _has_prior_session(workspace_dir: str) -> bool:
@@ -214,16 +227,22 @@ async def delete_group(jid: str) -> None:
 
 async def start_login(workspace_dir: str) -> str:
     """Sets the flag that lets start_whatsapp_channel's loop actually spawn
-    the sidecar -- the QR itself appears (as an opened image) once it
-    connects and emits one, not synchronously from this call. Doesn't wait
-    inside the tool call for something that can take a while and needs the
-    user to act in between (scan the code)."""
-    global _login_requested
+    the sidecar -- the QR itself appears (opened in Caroline's own viewer
+    window) once it connects and emits one, not synchronously from this
+    call. Doesn't wait inside the tool call for something that can take a
+    while and needs the user to act in between (scan the code).
+
+    Captures the calling tab's id (get_tab_id() is only valid here, inside
+    a real tool call -- not later, inside the background sidecar loop that
+    actually needs it) so the QR lands in the window of whichever tab
+    asked to connect, not an arbitrary one."""
+    global _login_requested, _login_requested_tab_id
     if not NODE_EXE or not Path(NODE_EXE).exists():
         raise WhatsAppError("WhatsApp isn't set up in this build yet -- Node.js wasn't provisioned.")
     if is_connected():
         return f"Already connected (as {_status.own_jid})."
     _login_requested = True
+    _login_requested_tab_id = get_tab_id()
     return (
         "Starting WhatsApp -- a QR code image will open automatically in a moment. Scan it with WhatsApp on "
         "your phone (Linked Devices > Link a Device). Real risk, stated plainly: WhatsApp has no official API "
@@ -261,6 +280,7 @@ async def _run_sidecar(workspace_dir: str, inject_proactive: Callable[[str], Non
             _status.linked = True
             _status.own_jid = msg.get("jid")
             log_event("plugin:whatsapp", "connected", jid=_status.own_jid)
+            _close_qr_viewer(workspace_dir)
         elif msg_type == "loggedOut":
             _status.connected = False
             _status.linked = False
@@ -340,9 +360,25 @@ def _handle_qr(workspace_dir: str, data: str) -> None:
         path = _qr_image_path(workspace_dir)
         img.save(path)
         log_event("plugin:whatsapp", "qr_ready", path=str(path))
-        open_file_with_default_app(str(path))
     except Exception as exc:
         log_event("plugin:whatsapp", "qr_render_failed", error=str(exc))
+        return
+    send = get_send_for_tab(_login_requested_tab_id)
+    if send is None:
+        log_event("plugin:whatsapp", "qr_no_tab_to_notify")
+        return
+    # Fixed path, same requestId reused isn't needed -- MainWindow.xaml.cs's
+    # open_editor handler keys its already-open-viewer check on PATH, not
+    # requestId, so a repeat send here (a refreshed, still-unscanned QR)
+    # updates the same window in place instead of opening another one.
+    asyncio.ensure_future(send({"type": "open_editor", "requestId": uuid.uuid4().hex, "path": str(path), "kind": "image"}))
+
+
+def _close_qr_viewer(workspace_dir: str) -> None:
+    send = get_send_for_tab(_login_requested_tab_id)
+    if send is None:
+        return
+    asyncio.ensure_future(send({"type": "close_editor", "path": str(_qr_image_path(workspace_dir))}))
 
 
 def start_whatsapp_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:

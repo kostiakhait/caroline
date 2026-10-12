@@ -36,7 +36,7 @@ public sealed record OfficeEditorConfig(
 /// </summary>
 public partial class DocumentViewerWindow : Window
 {
-    private readonly string _path = "";
+    private string _path = "";
     private readonly string _kind; // "image" | "video" | "office" | "login"
     private readonly Action<ViewerOutcome, string?, string?>? _onDone;
     private readonly Action<string?, string?, bool, bool, bool>? _onLoginDone;
@@ -212,10 +212,15 @@ public partial class DocumentViewerWindow : Window
         ViewButtons.Visibility = Visibility.Visible;
         try
         {
+            // Loaded from a byte buffer, not UriSource -- a path-keyed cache (WPF's
+            // or the OS image cache) could otherwise hand back stale bytes for a
+            // file that was just overwritten at the same path (see UpdateImage,
+            // used for a refreshing WhatsApp-link QR code at a fixed path).
+            var bytes = File.ReadAllBytes(_path);
             var bmp = new BitmapImage();
             bmp.BeginInit();
             bmp.CacheOption = BitmapCacheOption.OnLoad;
-            bmp.UriSource = new Uri(_path);
+            bmp.StreamSource = new MemoryStream(bytes);
             bmp.EndInit();
             ImageView.Source = bmp;
             ImageView.Visibility = Visibility.Visible;
@@ -224,6 +229,18 @@ public partial class DocumentViewerWindow : Window
         {
             ShowError($"Could not load image: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Re-renders this already-open image window for a new/changed file at
+    /// (usually) the same path -- see MainWindow.xaml.cs's open_editor handler,
+    /// which calls this instead of opening a second window when one is already
+    /// open for the same path and kind=="image".
+    /// </summary>
+    public void UpdateImage(string newPath)
+    {
+        _path = newPath;
+        ShowImage();
     }
 
     private void ShowVideo()

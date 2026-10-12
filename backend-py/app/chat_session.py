@@ -132,7 +132,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import register_inject_proactive, register_permission_blocker, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import register_inject_proactive, register_permission_blocker, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -2577,6 +2577,16 @@ class ChatSession:
         attachments = attachments or []
         log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
+        # Per explicit instruction (2026-10-11): a proactive note is often exactly
+        # the thing that says whose account/identity a reply would go out under
+        # (e.g. "your own Telegram account" vs "the owner's own correspondence,
+        # not yours") -- text the permission guard would otherwise never see, since
+        # _gather_recent_dialogue_for_narration drops synthetic notes on purpose
+        # (right for the narrator, wrong for this). Fired before submit() queues
+        # the note for the model to act on, so it has a head start on the model's
+        # own (typically slower) turn -- best-effort, same fail-open philosophy as
+        # every other call to this, not a hard guarantee of ordering.
+        asyncio.ensure_future(self._check_permission_guard(extra_context=text))
         # Internal turns follow the same chat-mode gate as real ones (2026-10-03):
         # in "sw" mode they run through the small-model cascade; everything else
         # (other modes, attachments, pending_text replays) keeps the SDK path.
@@ -3548,7 +3558,7 @@ class ChatSession:
 
         return "\n".join(lines[-limit:])
 
-    async def _check_permission_guard(self) -> None:
+    async def _check_permission_guard(self, extra_context: str | None = None) -> None:
         """Per explicit instruction (2026-10-11): re-evaluates
         self.pending_unapproved_action from the recent dialogue, via the
         server-side turn.permission.guard microagent (reforce-microagents,
@@ -3556,10 +3566,31 @@ class ChatSession:
         was actually given needs real judgment, not a keyword check).
         Called after every outbound assistant message (same 3 send sites
         reply.review already uses, same cadence -- no extra network cost
-        beyond what that already pays) AND from submit() on every real user
-        message, so a just-given "yes" clears the flag before the model's
+        beyond what that already pays), from submit() on every real user
+        message (so a just-given "yes" clears the flag before the model's
         NEXT turn even starts, rather than wrongly blocking its first tool
-        call on stale state.
+        call on stale state), and from inject_proactive (see extra_context
+        below).
+
+        `extra_context` (bug fix, 2026-10-11, confirmed live): a proactive
+        note (e.g. "[New Telegram message in the owner's account...]") is
+        marked with _SYNTHETIC_TURN_MARKER and _usable_dialogue_lines
+        -- what _gather_recent_dialogue_for_narration reads -- drops every
+        synthetic line on purpose (so the narrator never reacts to internal
+        bookkeeping). That is exactly right for the narrator, but it means
+        the ONE piece of text that says whose account/identity a reply
+        would go out under -- "your own account" vs "the owner's own
+        correspondence" -- was invisible to this check too, confirmed live
+        via a direct call against the real deployed agent: an owner-account
+        note with no reply drafted yet came back needs_approval=False
+        (nothing to flag YET, correctly, but also never re-checked once
+        the model actually tries to reply) while a self-account note came
+        back True (the model had nothing in the dialogue telling it this
+        was Caroline's own identity, since that exact sentence had been
+        stripped). inject_proactive passes the raw note text here so the
+        guard sees it however it reads today's actual notifications tell
+        the model whose account a reply would be under, same text the
+        model itself is about to act on.
 
         Sets the reason string when something needs approval and does not
         have it yet; clears it (None) otherwise. Does NOT itself stop
@@ -3572,8 +3603,12 @@ class ChatSession:
         never there."""
         from app.plugins.voice_api import check_permission_guard
 
+        dialogue = self._gather_recent_dialogue_for_narration()
+        if extra_context:
+            note = " ".join(extra_context.split())
+            dialogue = f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
         try:
-            result = await check_permission_guard(self._narration_task(), self._gather_recent_dialogue_for_narration())
+            result = await check_permission_guard(self._narration_task(), dialogue)
         except Exception as exc:
             log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
             return
@@ -4660,6 +4695,7 @@ class ChatSession:
         set_inject_proactive(lambda text: self.inject_proactive(text))
         register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
         register_permission_blocker(self.tab_id, self._on_permission_block_checked)
+        register_send_for_tab(self.tab_id, self.send)
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:

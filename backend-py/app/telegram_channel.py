@@ -405,7 +405,12 @@ async def _start_background(
                 f'messageId={event.id}, account="{account}") to save it locally first.'
             )
         if account == "self":
-            note += f'\nReply with telegram_send_message(chat="{event.chat_id}", text=..., account="self") if it needs a response.]'
+            note += (
+                "\nThis is Caroline's own separate Telegram account, not the user's -- replying here is "
+                "Caroline's own correspondence, not something done on the user's behalf, and needs no extra "
+                f'permission. Reply with telegram_send_message(chat="{event.chat_id}", text=..., account="self") '
+                "if it needs a response.]"
+            )
         else:
             note += (
                 "\nThis is the OWNER'S OWN correspondence, not yours -- read it and tell the owner about it if it "
