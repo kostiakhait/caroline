@@ -326,6 +326,23 @@ NARRATION_FAILURE_RETRY_S = 15.0
 # (both speakers) to have something to react to.
 RECENT_DIALOGUE_WINDOW = 12
 
+# Bug fix (2026-10-12), confirmed live (a real false-positive incident: the
+# user HAD explicitly approved a conference submission, in an earlier turn
+# of a long multi-step task -- build an app, research venues, draft a paper
+# -- but the permission guard still reported no approval present and the
+# turn was wrongly stopped). _check_permission_guard used to reuse
+# _gather_recent_dialogue_for_narration() wholesale, inheriting TWO limits
+# that make sense for narration but not for this: a short RECENT_DIALOGUE_
+# WINDOW=12 tuned for "does the narrator have enough to react to", and a
+# hard floor at the CURRENT real user turn's own start time (see that
+# function's own 2026-09-16 bug fix) that excludes every EARLIER turn
+# entirely -- exactly where a multi-step task's actual approval usually
+# lives, once several turns of real work have passed since it was given.
+# The guard needs to see further back than the narrator ever does: approval
+# given once for a multi-step task should stay visible for as long as that
+# task continues, not just within the turn it happened to be given in.
+PERMISSION_GUARD_DIALOGUE_WINDOW = 60
+
 # Hard break for the post-turn completion check (2026-10-03): it re-arms itself
 # after any reply with visible text, so a check whose own replies keep producing
 # text chained forever. At most this many checks in a row, counted from the last
@@ -1702,14 +1719,6 @@ class ChatSession:
         # register_permission_blocker), which stops the whole turn the next time ANY tool
         # call is attempted while this is set -- see app/operations.py's dispatch().
         self.pending_unapproved_action: str | None = None
-        self._permission_note_pending: bool = False
-        self._permission_note_in_next_push: bool = False
-        # The fully-formatted note text (PERMISSION_NOTE_TEXT_TEMPLATE with
-        # the specific reason already filled in), captured at the moment
-        # _on_permission_block_checked fires -- by the time it is actually
-        # delivered (the user's next real message), pending_unapproved_action
-        # itself has already been cleared, so the text has to be saved here.
-        self._pending_permission_note_text: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -2142,11 +2151,6 @@ class ChatSession:
             # history readers keep seeing exactly what the user wrote.
             self._stop_note_pending = False
             self._stop_note_in_next_push = True
-        if is_real_user and self._permission_note_pending:
-            # Same delivery mechanism as the Stop note above, just its own
-            # flag/text -- a plain Stop note would not explain WHY.
-            self._permission_note_pending = False
-            self._permission_note_in_next_push = True
         if is_real_user:
             # A real message begins a turn for the memory service's money rules
             # (memory_turns.py) and supersedes a turn still waiting to be replayed.
@@ -2795,32 +2799,41 @@ class ChatSession:
         WHOLE turn, not just this one call, per explicit instruction ("Ход
         останавливаться").
 
-        Reuses stop() completely unchanged: it already fully supports
-        being called mid-turn, mid-tool-call (that is its own main branch,
-        `elif self.client:`, not an edge case) -- it only mutates state and
-        schedules background cleanup tasks, never awaits or recurses back
-        into dispatch(), so calling it synchronously from inside a tool
-        dispatch is safe by the same reasoning that already makes it safe
-        to call from an external Stop click mid-tool-call. Confirmed by
-        reading stop()'s own code, not yet exercised live from this exact
-        call path -- verify live before shipping.
+        Bug fix (2026-10-12), confirmed live (a real incident: a draft
+        submission was correctly held up, but the user was never told why --
+        the explanation used to be queued to attach to the user's own NEXT
+        real message, see the old _permission_note_pending mechanism; if
+        they didn't happen to send one, it never reached them at all and
+        the turn just looked dead -- "отвалилась молча"). stop() and the
+        explanation are now both fired immediately, deferred one tick via
+        call_soon (same pattern as _on_memory_upstream_no_funds's own
+        _stop_and_wait): stop() must finish its own synchronous cleanup (in
+        particular self.queue.clear()) before inject_proactive() queues the
+        new note, or the note could be wiped out in the same tick it was
+        added. inject_proactive() starts a real new turn, so the model gets
+        a chance to actually tell the user why right away, not whenever
+        they next happen to speak.
 
         One stop per violation: the flag is consumed (cleared) here, not
-        left set to re-trigger stop() again on every subsequent call --
-        the very next outbound message or real user message re-evaluates
-        pending_unapproved_action from scratch."""
+        left set to re-trigger stop() again on every subsequent call."""
         reason = self.pending_unapproved_action
         if reason:
             self.pending_unapproved_action = None
-            self._permission_note_pending = True
-            self._pending_permission_note_text = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
             log_event("engine", "permission_guard_stopped_turn", tab_id=self.tab_id, reason=reason)
-            self.stop()
-            # stop() unconditionally also queues the generic "the user pressed Stop"
-            # note (self._stop_note_pending) -- wrong here (the user didn't click
-            # anything) and would otherwise show up ALONGSIDE the permission note
-            # below. The permission note already says everything that matters.
-            self._stop_note_pending = False
+            note_text = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
+
+            def _stop_and_explain() -> None:
+                if self.ended:
+                    return
+                self.stop()
+                # stop() unconditionally also queues the generic "the user pressed Stop"
+                # note (self._stop_note_pending) -- wrong here (the user didn't click
+                # anything) and would otherwise show up ALONGSIDE the permission note
+                # below. The permission note already says everything that matters.
+                self._stop_note_pending = False
+                self.inject_proactive(note_text)
+
+            asyncio.get_event_loop().call_soon(_stop_and_explain)
         return reason
 
     def _reset_after_stop(self) -> None:
@@ -2967,11 +2980,6 @@ class ChatSession:
         if self._stop_note_in_next_push:
             self._stop_note_in_next_push = False
             content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + STOP_NOTE_TEXT})
-        if self._permission_note_in_next_push:
-            self._permission_note_in_next_push = False
-            note_text = self._pending_permission_note_text or PERMISSION_NOTE_TEXT_TEMPLATE.format(reason="a previous action")
-            self._pending_permission_note_text = None
-            content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + note_text})
         for attachment in attachments:
             content.extend(_attachment_to_blocks(attachment))
         if text:
@@ -3626,6 +3634,27 @@ class ChatSession:
 
         return "\n".join(lines[-limit:])
 
+    def _gather_recent_dialogue_for_permission_guard(self) -> str:
+        """Bug fix (2026-10-12): _check_permission_guard used to reuse
+        _gather_recent_dialogue_for_narration() wholesale -- see
+        PERMISSION_GUARD_DIALOGUE_WINDOW's own comment for the false-
+        positive this caused. This is the same shape (dual-engine handling,
+        consecutive-repeat dedup) but with its own, much wider window and
+        deliberately NO min_ts_ms floor -- every other caller of
+        _read_recent_dialogue_lines already gets the unbounded default, and
+        the guard belongs with them, not with the narrator's own
+        current-turn-only restriction."""
+        if self.small_model_active and self.small_model_live_dialogue:
+            return "\n".join(self.small_model_live_dialogue[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+        lines = _read_recent_dialogue_lines(
+            self.last_saved_session_id, self.tab_id, self.workspace_dir, PERMISSION_GUARD_DIALOGUE_WINDOW,
+        )
+        deduped: list[str] = []
+        for line in lines:
+            if not deduped or deduped[-1] != line:
+                deduped.append(line)
+        return "\n".join(deduped[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+
     async def _check_permission_guard(self, extra_context: str | None = None) -> None:
         """Per explicit instruction (2026-10-11): re-evaluates
         self.pending_unapproved_action from the recent dialogue, via the
@@ -3671,7 +3700,7 @@ class ChatSession:
         never there."""
         from app.plugins.voice_api import check_permission_guard
 
-        dialogue = self._gather_recent_dialogue_for_narration()
+        dialogue = self._gather_recent_dialogue_for_permission_guard()
         if extra_context:
             note = " ".join(extra_context.split())
             dialogue = f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
