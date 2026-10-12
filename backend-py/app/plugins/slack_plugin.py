@@ -3,11 +3,15 @@ First of the planned messenger integrations (docs/MESSENGER_INTEGRATIONS_PLAN.md
 2026-10-06). Read and send from turn one, not read-only -- per explicit
 instruction.
 
-Acts AS the user (user token, xoxp-), not as a separate bot identity --
-sees the user's own DMs and every channel they're a member of, same as
-opening Slack themselves. See slack_channel.py's own doc comment for
-why Socket Mode needs a SEPARATE app-level token purely for the
-connection, distinct from this one.
+TWO accounts, same split as Telegram's (2026-10-11): `account="self"`
+(default) is Caroline's own separate Slack bot identity -- read/reply
+there freely, no extra permission needed, but it only sees channels/DMs
+the bot itself was invited to. `account="owner"` acts AS the human owner
+(their own DMs and every channel they're a member of, same as opening
+Slack themselves) -- read freely, but only send as them when they've
+explicitly asked for that specific message. See slack_channel.py's own
+doc comment for why both share one Socket Mode connection and why the
+bot-token half isn't confirmed working against a live install yet.
 """
 
 from __future__ import annotations
@@ -17,14 +21,29 @@ from typing import Any
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
-from app.slack_channel import SlackLoginError, get_user_token, run_oauth_login
+from app.slack_channel import (
+    ACCOUNTS,
+    DEFAULT_ACCOUNT,
+    SlackLoginError,
+    get_token_for_account,
+    run_oauth_login,
+)
 from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
 
 
-def _client() -> AsyncWebClient | None:
-    token = get_user_token(WORKSPACE_DIR)
-    return AsyncWebClient(token=token) if token else None
+def _account_or_error(args: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    account = str(args.get("account") or DEFAULT_ACCOUNT).strip()
+    if account not in ACCOUNTS:
+        return account, {"text": f'"account" must be one of {", ".join(ACCOUNTS)}, not {account!r}.', "is_error": True}
+    return account, None
+
+
+def _client_or_error(account: str) -> tuple[AsyncWebClient | None, dict[str, Any] | None]:
+    token = get_token_for_account(WORKSPACE_DIR, account)
+    if not token:
+        return None, {"text": f'Slack ("{account}") isn\'t linked yet -- use slack_login(account="{account}") first.', "is_error": True}
+    return AsyncWebClient(token=token), None
 
 
 async def slack_login(_args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -37,13 +56,17 @@ async def slack_login(_args: dict[str, Any], report_progress: Any) -> dict[str, 
     except SlackLoginError as exc:
         return {"text": str(exc), "is_error": True}
     team = result.get("team") or "your Slack workspace"
-    return {"text": f"Signed in to Slack ({team}). Try slack_list_channels to confirm."}
+    bot_note = " Caroline's own bot identity was also linked." if result.get("hasBotToken") else " (No separate bot identity came back -- only the owner's own account is usable for now.)"
+    return {"text": f"Signed in to Slack ({team}). Try slack_list_channels to confirm.{bot_note}"}
 
 
-async def slack_list_channels(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    client = _client()
-    if client is None:
-        return {"text": "Slack isn't linked yet -- use slack_login first.", "is_error": True}
+async def slack_list_channels(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
     try:
         result = await client.conversations_list(
             types="public_channel,private_channel,mpim,im", exclude_archived=True, limit=200,
@@ -58,9 +81,12 @@ async def slack_list_channels(_args: dict[str, Any], _rp: Any) -> dict[str, Any]
 
 
 async def slack_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    client = _client()
-    if client is None:
-        return {"text": "Slack isn't linked yet -- use slack_login first.", "is_error": True}
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
     channel = str(args["channel"]).strip()
     text = str(args["text"])
     try:
@@ -71,9 +97,12 @@ async def slack_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 async def slack_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    client = _client()
-    if client is None:
-        return {"text": "Slack isn't linked yet -- use slack_login first.", "is_error": True}
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
     query = str(args["query"]).strip()
     channel = args.get("channel")
     count = int(args.get("limit") or 20)
@@ -87,6 +116,10 @@ async def slack_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any
             msgs = [m for m in result.get("messages", []) if query.lower() in (m.get("text") or "").lower()][:count]
             rows = [{"ts": m.get("ts"), "user": m.get("user"), "text": m.get("text")} for m in msgs]
         else:
+            # search.messages is a user-token-only Slack API -- a bot
+            # token (account="self") has no equivalent at all.
+            if account == "self":
+                return {"text": 'Workspace-wide search needs account="owner" -- Slack has no bot-token search API.', "is_error": True}
             result = await client.search_messages(query=query, count=count)
             matches = (result.get("messages") or {}).get("matches", [])
             rows = [
@@ -100,14 +133,20 @@ async def slack_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any
 
 def _usage_instructions() -> str:
     return (
-        "Acts as the user's own Slack account (their real DMs and every channel they belong to), not a separate "
-        "bot. `channel` everywhere here is the raw Slack conversation ID (e.g. \"C0123ABCD\" for a channel, "
-        "\"D0123ABCD\" for a DM) -- always use the EXACT id from slack_list_channels or from a proactive "
-        "new-message notification, never a guessed #name or @user, same reasoning as every other messenger/"
-        "channel integration in this codebase: a bare name is ambiguous and a wrong guess sends to the wrong "
-        "place silently. slack_login opens the user's own browser to Slack's real login/consent screen (a "
-        "normal OAuth flow) -- call it only when the user has actually asked to connect Slack, never on your "
-        "own initiative, and tell them to watch for the browser window that opens."
+        "Two accounts, same split as Telegram's: `account=\"self\"` (default) is Caroline's own separate "
+        "Slack bot identity -- read/reply there freely, no extra permission needed, but it only sees "
+        "channels/DMs the bot itself was invited to. `account=\"owner\"` acts as the user's own Slack account "
+        "(their real DMs and every channel they belong to) -- read freely, but only send as them when they've "
+        "explicitly asked for that specific message. `channel` everywhere here is the raw Slack conversation "
+        "ID (e.g. \"C0123ABCD\" for a channel, \"D0123ABCD\" for a DM) -- always use the EXACT id from "
+        "slack_list_channels or from a proactive new-message notification, never a guessed #name or @user, "
+        "same reasoning as every other messenger/channel integration in this codebase: a bare name is "
+        "ambiguous and a wrong guess sends to the wrong place silently. slack_login opens the user's own "
+        "browser to Slack's real login/consent screen (a normal OAuth flow, requesting both identities at "
+        "once) -- call it only when the user has actually asked to connect Slack, never on your own "
+        "initiative, and tell them to watch for the browser window that opens. Workspace-wide search "
+        "(slack_search_messages without `channel`) only works with account=\"owner\" -- Slack has no "
+        "bot-token search API at all."
     )
 
 
@@ -117,29 +156,34 @@ PLUGIN = Plugin(
     tools=[
         PluginTool(
             "slack_login",
-            "Connects Caroline to the user's Slack account: opens their own browser to Slack's real login/"
-            "consent screen (normal OAuth, no tokens to copy/paste). Waits for them to approve, then saves "
-            "the result encrypted. Call this only when the user has explicitly asked to connect Slack.",
+            "Connects Caroline to Slack: opens the user's own browser to Slack's real login/consent screen "
+            "(normal OAuth, no tokens to copy/paste) -- requests both Caroline's own bot identity and the "
+            "owner's own account in one authorization. Waits for them to approve, then saves whichever "
+            "token(s) come back, encrypted. Call this only when the user has explicitly asked to connect Slack.",
             {}, slack_login,
         ),
         PluginTool(
             "slack_list_channels",
-            "Lists every channel, private channel, group DM and 1:1 DM the user's Slack account belongs to, "
-            "each with its raw conversation id -- the id to use for slack_send_message/slack_search_messages.",
-            {}, slack_list_channels,
+            "Lists every channel, private channel, group DM and 1:1 DM an account's Slack identity belongs "
+            "to (or, for \"self\", was invited to), each with its raw conversation id -- the id to use for "
+            "slack_send_message/slack_search_messages. `account`: \"self\" (default) or \"owner\".",
+            {"account": str | None}, slack_list_channels,
         ),
         PluginTool(
             "slack_send_message",
-            "Sends a message to a Slack channel or DM, as the user. `channel` must be the exact conversation "
-            "id (see this plugin's own usage_instructions).",
-            {"channel": str, "text": str}, slack_send_message,
+            "Sends a message to a Slack channel or DM. `channel` must be the exact conversation id (see this "
+            "plugin's own usage_instructions). `account`: \"self\" (default) or \"owner\" -- only send as "
+            "\"owner\" when the user has explicitly asked for this specific message.",
+            {"channel": str, "text": str, "account": str | None}, slack_send_message,
         ),
         PluginTool(
             "slack_search_messages",
             "Searches Slack messages matching `query`. Without `channel`, searches across the whole "
-            "workspace (Slack's own search.messages). With `channel` (a conversation id), searches that "
-            "conversation's own recent history instead. `limit` caps how many results come back (default 20).",
-            {"query": str, "channel": str | None, "limit": int | None}, slack_search_messages,
+            "workspace (Slack's own search.messages, account=\"owner\" only -- no bot-token equivalent "
+            "exists). With `channel` (a conversation id), searches that conversation's own recent history "
+            "instead (works for either account). `limit` caps how many results come back (default 20). "
+            "`account`: \"self\" (default) or \"owner\".",
+            {"query": str, "channel": str | None, "limit": int | None, "account": str | None}, slack_search_messages,
         ),
     ],
 )

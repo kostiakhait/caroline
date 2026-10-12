@@ -79,6 +79,8 @@ win_subprocess_patch.apply()
 from app.durability import (
     _sanitize_tab_id,
     claude_project_dir,
+    clear_pending_api_retry,
+    clear_pending_one_shot_followup,
     clear_pending_turn,
     clear_tab_continuity_archive,
     clear_tab_session_id,
@@ -90,6 +92,8 @@ from app.durability import (
     load_tab_continuity_archive,
     load_tab_session_id,
     save_discovered_foreign_tool_overlap,
+    save_pending_api_retry,
+    save_pending_one_shot_followup,
     save_pending_turn,
     save_tab_continuity_archive,
     save_tab_session_id,
@@ -135,7 +139,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import register_inject_proactive, register_permission_blocker, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import register_inject_proactive, register_permission_blocker, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -372,6 +376,23 @@ VOICE_NARRATION_CLIENT_SPEAKING_STALE_S = 120.0
 # feed progress narration, which genuinely needs real back-and-forth
 # (both speakers) to have something to react to.
 RECENT_DIALOGUE_WINDOW = 12
+
+# Bug fix (2026-10-12), confirmed live (a real false-positive incident: the
+# user HAD explicitly approved a conference submission, in an earlier turn
+# of a long multi-step task -- build an app, research venues, draft a paper
+# -- but the permission guard still reported no approval present and the
+# turn was wrongly stopped). _check_permission_guard used to reuse
+# _gather_recent_dialogue_for_narration() wholesale, inheriting TWO limits
+# that make sense for narration but not for this: a short RECENT_DIALOGUE_
+# WINDOW=12 tuned for "does the narrator have enough to react to", and a
+# hard floor at the CURRENT real user turn's own start time (see that
+# function's own 2026-09-16 bug fix) that excludes every EARLIER turn
+# entirely -- exactly where a multi-step task's actual approval usually
+# lives, once several turns of real work have passed since it was given.
+# The guard needs to see further back than the narrator ever does: approval
+# given once for a multi-step task should stay visible for as long as that
+# task continues, not just within the turn it happened to be given in.
+PERMISSION_GUARD_DIALOGUE_WINDOW = 60
 
 # Hard break for the post-turn completion check (2026-10-03): it re-arms itself
 # after any reply with visible text, so a check whose own replies keep producing
@@ -1761,14 +1782,6 @@ class ChatSession:
         # register_permission_blocker), which stops the whole turn the next time ANY tool
         # call is attempted while this is set -- see app/operations.py's dispatch().
         self.pending_unapproved_action: str | None = None
-        self._permission_note_pending: bool = False
-        self._permission_note_in_next_push: bool = False
-        # The fully-formatted note text (PERMISSION_NOTE_TEXT_TEMPLATE with
-        # the specific reason already filled in), captured at the moment
-        # _on_permission_block_checked fires -- by the time it is actually
-        # delivered (the user's next real message), pending_unapproved_action
-        # itself has already been cleared, so the text has to be saved here.
-        self._pending_permission_note_text: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -1954,8 +1967,8 @@ class ChatSession:
         if self._voice_narration_task:
             self._voice_narration_task.cancel()
         self._reset_voice_narration()
-        self._clear_api_retry_timer()
-        self._clear_one_shot_followup_timer()
+        self._clear_api_retry_timer(clear_persisted=False)
+        self._clear_one_shot_followup_timer(clear_persisted=False)
         self._clear_mcp_reconnect_timers()
         if self.client:
             asyncio.create_task(self._safe_interrupt())
@@ -2241,11 +2254,6 @@ class ChatSession:
             # history readers keep seeing exactly what the user wrote.
             self._stop_note_pending = False
             self._stop_note_in_next_push = True
-        if is_real_user and self._permission_note_pending:
-            # Same delivery mechanism as the Stop note above, just its own
-            # flag/text -- a plain Stop note would not explain WHY.
-            self._permission_note_pending = False
-            self._permission_note_in_next_push = True
         if is_real_user:
             # A real message begins a turn for the memory service's money rules
             # (memory_turns.py) and supersedes a turn still waiting to be replayed.
@@ -2790,6 +2798,16 @@ class ChatSession:
         attachments = attachments or []
         log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
+        # Per explicit instruction (2026-10-11): a proactive note is often exactly
+        # the thing that says whose account/identity a reply would go out under
+        # (e.g. "your own Telegram account" vs "the owner's own correspondence,
+        # not yours") -- text the permission guard would otherwise never see, since
+        # _gather_recent_dialogue_for_narration drops synthetic notes on purpose
+        # (right for the narrator, wrong for this). Fired before submit() queues
+        # the note for the model to act on, so it has a head start on the model's
+        # own (typically slower) turn -- best-effort, same fail-open philosophy as
+        # every other call to this, not a hard guarantee of ordering.
+        asyncio.ensure_future(self._check_permission_guard(extra_context=text))
         # Internal turns follow the same chat-mode gate as real ones (2026-10-03):
         # in "sw" mode they run through the small-model cascade; everything else
         # (other modes, attachments, pending_text replays) keeps the SDK path.
@@ -2994,32 +3012,41 @@ class ChatSession:
         WHOLE turn, not just this one call, per explicit instruction ("Ход
         останавливаться").
 
-        Reuses stop() completely unchanged: it already fully supports
-        being called mid-turn, mid-tool-call (that is its own main branch,
-        `elif self.client:`, not an edge case) -- it only mutates state and
-        schedules background cleanup tasks, never awaits or recurses back
-        into dispatch(), so calling it synchronously from inside a tool
-        dispatch is safe by the same reasoning that already makes it safe
-        to call from an external Stop click mid-tool-call. Confirmed by
-        reading stop()'s own code, not yet exercised live from this exact
-        call path -- verify live before shipping.
+        Bug fix (2026-10-12), confirmed live (a real incident: a draft
+        submission was correctly held up, but the user was never told why --
+        the explanation used to be queued to attach to the user's own NEXT
+        real message, see the old _permission_note_pending mechanism; if
+        they didn't happen to send one, it never reached them at all and
+        the turn just looked dead -- "отвалилась молча"). stop() and the
+        explanation are now both fired immediately, deferred one tick via
+        call_soon (same pattern as _on_memory_upstream_no_funds's own
+        _stop_and_wait): stop() must finish its own synchronous cleanup (in
+        particular self.queue.clear()) before inject_proactive() queues the
+        new note, or the note could be wiped out in the same tick it was
+        added. inject_proactive() starts a real new turn, so the model gets
+        a chance to actually tell the user why right away, not whenever
+        they next happen to speak.
 
         One stop per violation: the flag is consumed (cleared) here, not
-        left set to re-trigger stop() again on every subsequent call --
-        the very next outbound message or real user message re-evaluates
-        pending_unapproved_action from scratch."""
+        left set to re-trigger stop() again on every subsequent call."""
         reason = self.pending_unapproved_action
         if reason:
             self.pending_unapproved_action = None
-            self._permission_note_pending = True
-            self._pending_permission_note_text = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
             log_event("engine", "permission_guard_stopped_turn", tab_id=self.tab_id, reason=reason)
-            self.stop()
-            # stop() unconditionally also queues the generic "the user pressed Stop"
-            # note (self._stop_note_pending) -- wrong here (the user didn't click
-            # anything) and would otherwise show up ALONGSIDE the permission note
-            # below. The permission note already says everything that matters.
-            self._stop_note_pending = False
+            note_text = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
+
+            def _stop_and_explain() -> None:
+                if self.ended:
+                    return
+                self.stop()
+                # stop() unconditionally also queues the generic "the user pressed Stop"
+                # note (self._stop_note_pending) -- wrong here (the user didn't click
+                # anything) and would otherwise show up ALONGSIDE the permission note
+                # below. The permission note already says everything that matters.
+                self._stop_note_pending = False
+                self.inject_proactive(note_text)
+
+            asyncio.get_event_loop().call_soon(_stop_and_explain)
         return reason
 
     def _reset_after_stop(self) -> None:
@@ -3166,11 +3193,6 @@ class ChatSession:
         if self._stop_note_in_next_push:
             self._stop_note_in_next_push = False
             content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + STOP_NOTE_TEXT})
-        if self._permission_note_in_next_push:
-            self._permission_note_in_next_push = False
-            note_text = self._pending_permission_note_text or PERMISSION_NOTE_TEXT_TEMPLATE.format(reason="a previous action")
-            self._pending_permission_note_text = None
-            content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + note_text})
         for attachment in attachments:
             content.extend(_attachment_to_blocks(attachment))
         if text:
@@ -3248,10 +3270,21 @@ class ChatSession:
             return False
         return self.turn_pending or (time.monotonic() - self.last_user_activity) < idle_threshold_s
 
-    def _clear_api_retry_timer(self) -> None:
+    def _clear_api_retry_timer(self, clear_persisted: bool = True) -> None:
+        """`clear_persisted=False` only from dispose(): a retry timer
+        cancelled because the PROCESS is tearing down (app closing,
+        restarting) must stay recorded on disk -- see durability.py's own
+        "pending API retry" section for the 2026-10-12 incident this
+        covers. Every other caller (Stop, an engine switch, a genuine
+        recovery, or _fire() itself once it has actually injected the
+        nudge) means the retry is genuinely no longer owed, so the default
+        clears the durability file too -- callers never have to remember
+        to do it themselves."""
         if self.api_retry_timer:
             self.api_retry_timer.cancel()
             self.api_retry_timer = None
+        if clear_persisted:
+            clear_pending_api_retry(self.workspace_dir, self.tab_id)
 
     def _stopped_by_user(self, what: str, reason: str) -> bool:
         """True after an explicit Stop, until the user's next real message
@@ -3271,6 +3304,12 @@ class ChatSession:
             log_event("engine", "api_retry_already_pending", tab_id=self.tab_id, reason=reason)
             return
         log_event("engine", "api_retry_scheduled", tab_id=self.tab_id, reason=reason, delay_ms=API_RETRY_INTERVAL_MS)
+        # Per explicit instruction (2026-10-12): survives a full app restart --
+        # see durability.py's own "pending API retry" section for the real
+        # incident this closes. Cleared by _clear_api_retry_timer (every
+        # caller of that except dispose()) or right below once this _fire()
+        # has actually injected the nudge.
+        save_pending_api_retry(self.workspace_dir, self.tab_id, reason, is_voice)
 
         def _fire() -> None:
             self.api_retry_timer = None
@@ -3286,6 +3325,7 @@ class ChatSession:
             # was no "working" indication at all. Also reuses
             # CONTINUE_OR_SILENT_NUDGE_TEMPLATE now (language-aware,
             # [[NO_UPDATE]]-aware) instead of bespoke text with neither.
+            clear_pending_api_retry(self.workspace_dir, self.tab_id)
             self.inject_proactive(
                 "[Internal: automatic recheck after an API/subscription limit blocked a previous turn.] "
                 f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
@@ -3334,12 +3374,17 @@ class ChatSession:
             "engine", "one_shot_followup_scheduled", tab_id=self.tab_id, reason=reason,
             delay_ms=ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS,
         )
+        # Per explicit instruction (2026-10-12): same restart-survival fix as
+        # _schedule_api_retry's own save_pending_api_retry -- see
+        # durability.py's own "pending API retry" section.
+        save_pending_one_shot_followup(self.workspace_dir, self.tab_id, reason, is_voice)
 
         def _fire() -> None:
             self.one_shot_followup_timer = None
             if self.ended:
                 return
             log_event("engine", "one_shot_followup_firing", tab_id=self.tab_id, reason=reason)
+            clear_pending_one_shot_followup(self.workspace_dir, self.tab_id)
             self.inject_proactive(
                 f"[Internal: automatic follow-up check -- your previous turn concluded by reporting a usage cap, "
                 f"and this check fires again every 90s until a real reply gets through. The user has not said "
@@ -3357,10 +3402,14 @@ class ChatSession:
         loop = asyncio.get_event_loop()
         self.one_shot_followup_timer = loop.call_later(ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS / 1000, _fire)
 
-    def _clear_one_shot_followup_timer(self) -> None:
+    def _clear_one_shot_followup_timer(self, clear_persisted: bool = True) -> None:
+        """Same `clear_persisted=False`-only-from-dispose() reasoning as
+        _clear_api_retry_timer's own docstring."""
         if self.one_shot_followup_timer:
             self.one_shot_followup_timer.cancel()
             self.one_shot_followup_timer = None
+        if clear_persisted:
+            clear_pending_one_shot_followup(self.workspace_dir, self.tab_id)
 
     def _clear_mcp_reconnect_timers(self) -> None:
         for t in self.mcp_reconnect_timers.values():
@@ -3655,6 +3704,43 @@ class ChatSession:
             lines.append(f"Steps completed so far this turn: {len(finished) - failed} succeeded, {failed} failed")
         return "\n".join(lines)
 
+    async def _send_silence_fallback_notice(self) -> None:
+        """Hard ceiling on narrator silence (2026-10-12, explicit instruction:
+        "Нарратор не имеет право молчать дольше минуты") -- fires in place of a
+        real progress comment when _check_progress_narration has nothing concrete
+        to report (_narration_action_facts() is None) but is already at its own
+        60s-of-silence gate (PROGRESS_NARRATION_INTERVAL_MS). Deliberately bypasses
+        generate_progress_comment entirely: that pipeline needs real facts to work
+        from, and feeding it none is exactly the failure mode the 2026-10-03 "no
+        facts -> stay silent" fix was written to avoid (asked to comment on
+        nothing, it invents specifics that sound plausible but aren't true). A
+        fixed, honest, content-free line carries no such risk, so it also skips
+        review_reply -- nothing task-specific in it to leak or mistone."""
+        from app.plugins.voice_api import translate_text
+
+        text = "Still working on this -- nothing new to report yet."
+        try:
+            translated = await translate_text(
+                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                addressee_gender=get_owner_profile(self.workspace_dir).gender,
+            )
+        except Exception as exc:
+            log_event("engine", "progress_narration_fallback_translate_failed", tab_id=self.tab_id, error=str(exc))
+            translated = None
+        if translated:
+            text = translated
+        log_event("engine", "progress_narration_sent_fallback_no_facts", tab_id=self.tab_id)
+        self.last_visible_output_at = time.monotonic()
+        self.turn_narration_remarks.append(text)
+        del self.turn_narration_remarks[:-20]
+        self.pending_interim_notes.append(text)
+        wire = {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}], "model": None, "stop_reason": None},
+            "session_id": None, "parent_tool_use_id": None,
+        }
+        await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
+
     def _narration_task(self) -> str:
         """The user's request for the current task -- the one thing the narrator
         needs to say where the task stands. Only the current real user request,
@@ -3766,7 +3852,28 @@ class ChatSession:
 
         return "\n".join(lines[-limit:])
 
-    async def _check_permission_guard(self) -> None:
+    def _gather_recent_dialogue_for_permission_guard(self) -> str:
+        """Bug fix (2026-10-12): _check_permission_guard used to reuse
+        _gather_recent_dialogue_for_narration() wholesale -- see
+        PERMISSION_GUARD_DIALOGUE_WINDOW's own comment for the false-
+        positive this caused. This is the same shape (dual-engine handling,
+        consecutive-repeat dedup) but with its own, much wider window and
+        deliberately NO min_ts_ms floor -- every other caller of
+        _read_recent_dialogue_lines already gets the unbounded default, and
+        the guard belongs with them, not with the narrator's own
+        current-turn-only restriction."""
+        if self.small_model_active and self.small_model_live_dialogue:
+            return "\n".join(self.small_model_live_dialogue[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+        lines = _read_recent_dialogue_lines(
+            self.last_saved_session_id, self.tab_id, self.workspace_dir, PERMISSION_GUARD_DIALOGUE_WINDOW,
+        )
+        deduped: list[str] = []
+        for line in lines:
+            if not deduped or deduped[-1] != line:
+                deduped.append(line)
+        return "\n".join(deduped[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+
+    async def _check_permission_guard(self, extra_context: str | None = None) -> None:
         """Per explicit instruction (2026-10-11): re-evaluates
         self.pending_unapproved_action from the recent dialogue, via the
         server-side turn.permission.guard microagent (reforce-microagents,
@@ -3774,10 +3881,31 @@ class ChatSession:
         was actually given needs real judgment, not a keyword check).
         Called after every outbound assistant message (same 3 send sites
         reply.review already uses, same cadence -- no extra network cost
-        beyond what that already pays) AND from submit() on every real user
-        message, so a just-given "yes" clears the flag before the model's
+        beyond what that already pays), from submit() on every real user
+        message (so a just-given "yes" clears the flag before the model's
         NEXT turn even starts, rather than wrongly blocking its first tool
-        call on stale state.
+        call on stale state), and from inject_proactive (see extra_context
+        below).
+
+        `extra_context` (bug fix, 2026-10-11, confirmed live): a proactive
+        note (e.g. "[New Telegram message in the owner's account...]") is
+        marked with _SYNTHETIC_TURN_MARKER and _usable_dialogue_lines
+        -- what _gather_recent_dialogue_for_narration reads -- drops every
+        synthetic line on purpose (so the narrator never reacts to internal
+        bookkeeping). That is exactly right for the narrator, but it means
+        the ONE piece of text that says whose account/identity a reply
+        would go out under -- "your own account" vs "the owner's own
+        correspondence" -- was invisible to this check too, confirmed live
+        via a direct call against the real deployed agent: an owner-account
+        note with no reply drafted yet came back needs_approval=False
+        (nothing to flag YET, correctly, but also never re-checked once
+        the model actually tries to reply) while a self-account note came
+        back True (the model had nothing in the dialogue telling it this
+        was Caroline's own identity, since that exact sentence had been
+        stripped). inject_proactive passes the raw note text here so the
+        guard sees it however it reads today's actual notifications tell
+        the model whose account a reply would be under, same text the
+        model itself is about to act on.
 
         Sets the reason string when something needs approval and does not
         have it yet; clears it (None) otherwise. Does NOT itself stop
@@ -3790,8 +3918,12 @@ class ChatSession:
         never there."""
         from app.plugins.voice_api import check_permission_guard
 
+        dialogue = self._gather_recent_dialogue_for_permission_guard()
+        if extra_context:
+            note = " ".join(extra_context.split())
+            dialogue = f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
         try:
-            result = await check_permission_guard(self._narration_task(), self._gather_recent_dialogue_for_narration())
+            result = await check_permission_guard(self._narration_task(), dialogue)
         except Exception as exc:
             log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
             return
@@ -3984,11 +4116,23 @@ class ChatSession:
         # budget -- see that constant's own comment for the 71s real
         # incident this fixes) so a slow/hung attempt fails fast and this
         # loop gets a real chance to try again within the SAME tick.
-        # Narrator sees only real facts about a running small-model turn. No facts -> stay silent
-        # (2026-10-03): filler without facts misleads the user.
+        # Narrator sees only real facts about a running small-model turn. No facts
+        # -> used to stay silent indefinitely (2026-10-03: filler without facts
+        # misleads the user). Per explicit instruction (2026-10-12), "Нарратор не
+        # имеет право молчать дольше минуты": that left the user staring at total
+        # silence for as long as the turn had genuinely nothing to report (a real
+        # incident: tab 3's hang/restart loop produced zero tool-call facts for
+        # ~12 minutes straight, 7 cycles, narrator silent the whole time). This
+        # function only ever reaches this point once at least PROGRESS_NARRATION_
+        # INTERVAL_MS has already elapsed since the last visible output (the gate
+        # above) -- so "no facts" here means the user is exactly at that minute-
+        # of-silence boundary. Send one honest, generic, nothing-invented notice
+        # instead of returning silently; NOT a revival of the 2026-10-03 filler --
+        # that fix was about not fabricating SPECIFIC false claims from stale
+        # dialogue, which this fixed, content-free line cannot do.
         activity = self._narration_action_facts()
         if activity is None:
-            log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
+            await self._send_silence_fallback_notice()
             return
         # Ported from a teammate's branch (807b3ea): how long this request has
         # been running is a real fact too ("this one is taking a while"), but
@@ -5169,6 +5313,7 @@ class ChatSession:
         set_inject_proactive(lambda text: self.inject_proactive(text))
         register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
         register_permission_blocker(self.tab_id, self._on_permission_block_checked)
+        register_send_for_tab(self.tab_id, self.send)
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:
@@ -5256,6 +5401,27 @@ class ChatSession:
                         claude_project_dir(self.workspace_dir) / f"{resume_session_id}.jsonl",
                         self.workspace_dir,
                     )
+                    # Bug fix (2026-10-12), root-caused from a real incident (tab 3,
+                    # repeated hang_escalation_force_close every ~2 minutes, 7 cycles,
+                    # zero SDK messages, ProcessActivityMonitor never available any
+                    # cycle): last_activity was last set at the top of this while-loop
+                    # iteration (now self.last_activity above, well before this point),
+                    # and nothing refreshes it again until a real SDK message arrives
+                    # post-connect. rotate_transcript's own full-file backward scan on
+                    # an oversized (observed: tens of MB in this very workspace, see
+                    # transcript_rotate.py's docstring -- 147/368 MB precedent) transcript
+                    # with no compact_boundary yet can legitimately run for a couple of
+                    # minutes; with no subprocess spawned yet there is no
+                    # ProcessActivityMonitor to vouch for that time as real work, so
+                    # _check_hang's only signal is the stale last_activity timestamp --
+                    # exactly long enough to look hung on the fallback path, force-
+                    # closing a connection attempt that was never actually stuck, right
+                    # before it could reach connect() and start the real subprocess.
+                    # Claiming a fresh timestamp here (this phase's own, bounded, single-
+                    # threaded work just finished) is the same principle _check_hang
+                    # already applies to the CLI subprocess itself -- legitimate slow
+                    # work must not read as a hang.
+                    self.last_activity = time.monotonic()
                     # Bug fix (2026-09-18), confirmed live: _recent_24h_
                     # dialogue_file_path used to only ever get (re)written
                     # inside submit()'s real-user branch -- meaning the

@@ -1,261 +1,263 @@
 # Caroline — project overview
 
 A standalone Windows desktop AI secretary: email, notes, browser/Windows automation, messaging,
-SMS, scheduling — driven by natural-language chat, as a tray app with a global hotkey and a chat
-window, no terminal or IDE required. Built on the Claude Agent SDK, with a persistent identity
-(persona), voice, and its own SquirrelWisdom-backed feature set.
+phone-companion SMS, scheduling — driven by natural-language chat, as a tray app with a global
+hotkey and a chat window, no terminal or IDE required. A tab can answer through the user's own
+Claude account (Claude Agent SDK), the user's own ChatGPT/Codex account, or pay-as-you-go through
+a SquirrelWisdom wallet — same assistant, same tools, same chat window, switchable per tab. Built
+with a persistent identity (persona), voice, and a growing plugin + server-side microagent tool
+set.
 
 This file is the detailed, code-derived companion to `README.md` (portability/build basics). It
-describes what's actually implemented, not the roadmap.
+describes what's actually implemented, not the roadmap — rewritten 2026-10-11 to describe the
+current Python backend (`backend-py/`), which replaced the original Node/TypeScript backend
+(`backend/`) as the live engine; the Node tree survives only as a source of bundled MCP-server
+binaries and skills content copied into every build, not as a running process.
 
-## Three layers
+## Four layers
 
 - **`Windows/Caroline/`** — WPF shell (C#). Tray icon, global hotkey (default Ctrl+Alt+C), a
   WebView2-hosted chat UI (`wwwroot/chat.html`/`chat.js`), a Settings panel, and several
   secondary windows (`DocumentViewerWindow`, `AppBrowserWindow`, `VisualModeWindow`,
-  `SplashWindow`). Spawns and supervises the backend sidecar process (`BackendProcess.cs`).
-- **`backend/`** — Node/TypeScript sidecar. Hosts a loopback WebSocket (`ws://127.0.0.1:48765`)
-  the chat UI talks to, and wraps the Claude Agent SDK's streaming `query()` per chat tab.
-- **`backend/mcp-servers/`** — the default MCP tool roster, built from this repo's
-  `backend/mcp-servers-src/*` sources by `scripts/bundle-mcp-servers.mjs` (esbuild-bundled into
-  single `.mjs` files; `browser` is copied wholesale instead, see that script's own header comment
-  for why).
+  `SplashWindow`). Spawns and supervises the backend sidecar process (`Native/SupervisorClient.cs`
+  talks to `backend-py/supervisor.py`).
+- **`backend-py/`** — the live Python backend (FastAPI). `app/chat_session.py`'s `ChatSession` is
+  the per-tab core; `app/plugins/` is the tool roster; `app/*_channel.py` own the always-running
+  messenger connections. See "Chat session core" and "Plugins & tools" below.
+- **`backend/`** — the original Node/TypeScript sidecar, not run anymore as the live engine. Its
+  `mcp-servers`/`mcp-servers-src` (default MCP tool binaries) and `skills-src` are still built and
+  copied into every install by the root `Makefile`, which explicitly labels `backend-py` as "the
+  live backend" in its own build-step comments.
+- **The backing SquirrelWisdom/Camerlengo service** (a separate repository, `reforce`) — every
+  SW-gated feature (Notes/memory, email, consult, voice, pay-as-you-go chat billing) and the whole
+  server-side **microagent layer** (see "Memory and microagents" below) live here, not in
+  Caroline's own process. Caroline talks to it exclusively over its versioned HTTP API
+  (`app/plugins/sw_api.py`'s `call_v2`/`CAROLINE_SW_KEY`), never by importing its code.
 - **`Windows/CarolineInstaller/`** — a separate, no-admin-rights WPF bootstrapper that downloads
   `Caroline.zip` from `downloader.multi-portal.org`, installs isolated Node/Python runtimes under
   `%LocalAppData%\Caroline\runtime\` (never touches system PATH), and Chromium for Playwright.
 
-Caroline is **portable by design**: nothing at runtime references any repo outside this one.
-Everything ships inside the install directory or lives in the per-user workspace
-(`%LOCALAPPDATA%\Caroline\workspace\`).
+Caroline is **portable by design**: nothing at runtime references any repo outside this one
+(the backing SquirrelWisdom service is reached over HTTP, like any other cloud dependency, not
+checked out locally). Everything ships inside the install directory or lives in the per-user
+workspace (`%LOCALAPPDATA%\Caroline\workspace\`).
 
-## Chat session core (`server.ts` + friends)
+## Chat session core (`chat_session.py` + engines)
 
-Each browser tab in the WebView2 chat UI gets its own `ChatSession`, each running its own Claude
-Agent SDK `query()` against `systemPrompt: {type: "preset", preset: "claude_code", append: [...]}`
-— the `append` array is where `persona.ts`'s identity block and every instruction in
-`policies.ts` get concatenated in.
+`ChatSession` (`backend-py/app/chat_session.py`, one instance per open tab) is the Python port of
+the original Node backend's `runLoop` resilience layer — hang detection, a bounded restart
+budget, dehydration/compaction, a failure-classification gauntlet, a continuity-archive pointer,
+and durability across a full app restart, ported "near-verbatim" per its own module docstring,
+which calls it out as the riskiest single piece of that whole migration. `submit()` is the single
+choke point every turn goes through — a real user message, an internal/proactive nudge, or a
+replay after a restart all funnel through it, and it logs every call.
 
-Reliability engineering, all confirmed-live fixes for real incidents, not speculative hardening:
+A turn runs on one of two engines behind a shared `AgentEngine` interface
+(`app/engines/base.py`): `ClaudeEngine` wraps the vendored `claude_agent_sdk`'s `ClaudeSDKClient`;
+`CodexEngine` runs one `codex-app-server` process per tab (JSON-RPC over stdio) and adapts its
+events into the same message shape, so wire format, failure classification, status, and history
+are shared code regardless of which one answered. Caroline's own plugin tools are handed to Codex
+as `dynamicTools` over an in-process MCP bridge, so a tool behaves identically under either engine.
+A third, older path — `app/small_model_engine.py`'s `run_small_model_turn` — is ChatSession's own
+pay-as-you-go primary path: a cheap OpenRouter-backed model (billed through a SquirrelWisdom
+wallet, not through the AgentEngine abstraction) running its own tool-calling loop, used when a
+tab is on the SquirrelWisdom chat source rather than Claude or OpenAI.
 
-- **Watchdog + auto-restart**: a hung or crashed `query()` gets killed and restarted, replaying
-  the unanswered message, so the app never needs a manual restart.
-- **`durability.ts`**: survives a full app close/crash mid-turn (not just an in-process watchdog
-  restart) — pending-turn state and each tab's own resumed session id persist to disk.
-- **`compaction.ts`**: ages out old context from a tab's ever-growing resumed session without
-  ever touching the live/original transcript, so a long-running tab doesn't blow its context
-  window.
-- **`processReaper.ts`**: cleans up a real leak class — a `query()`'s underlying CLI process (and
-  its whole MCP-server child-process tree) that fails to exit when Caroline abandons it for a
-  fresh `query()`.
-- **`sharedMcpServers.ts`**: every bundled utility server (mouse/keyboard/notes/time/sms/voice/
-  screen-video/etc.) runs as ONE long-lived HTTP-mode instance per backend process, shared across
-  every tab, instead of each tab spawning its own stdio copy — fixes a confirmed 240+ `node.exe`
-  process swarm that accumulated over a day of restarts when stdio (strictly 1:1) was the default.
-  `caroline-browser` is the deliberate exception (still per-tab stdio): each tab genuinely needs
-  its own browser profile/CDP session.
-- **`history.ts`**: reads real conversation history straight from the Claude Code CLI's own
-  session transcript (`~/.claude/projects/.../*.jsonl`) — the authoritative record, independent
-  of what the chat UI happens to have rendered.
+Every long-running background loop a `ChatSession` owns (the watchdog, narration, dialogue
+refresh) runs through `app/task_supervisor.py`'s `supervise()`, added after a real incident where
+an uncaught exception silently killed a background loop with no log line: `supervise()` logs any
+non-cancellation exception in full and restarts the loop automatically. A 2026-10-11 addition adds
+an opt-in heartbeat (`heartbeat_timeout_s` + a `touch()` the loop body calls to prove liveness) for
+loops that legitimately run forever (a live messenger connection) where elapsed time alone can't
+tell "healthy" from "stuck."
 
-## Identity, voice, and presentation
+## Paying for chat: three sources, one assistant
 
-- **`persona.ts`**: `profileKey` is `"custom"` (freeform name/gender/age/bio) or a standard
-  profile (`"caroline"` / `"peter"`), each with its own fixed identity/biography/photo set that
-  Settings can override per-field. Default is an independent-minded, middle-aged personal
-  secretary persona — deliberately not a blank slate or a deferential assistant (an unset
-  gender/identity was observed to drift). Applied via the system-prompt `append`, takes effect on
-  the next session restart, not mid-session.
-- **`voice.ts`**: STT/TTS via Camerlengo v2 (`ai:tts`/`ai:stt`), with `localTtsServer.ts` as a
-  faster local-first path — spawns a local `edge-tts` HTTP server
-  (`python-scripts/local_tts_server.py`) once per backend process lifetime, purely to cut
-  per-call latency (no per-call Python interpreter startup); falls back to the Camerlengo path
-  whenever the local server is unavailable or errors. Chat UI has a mic button, auto-send toggle,
-  and a 🔊 replay button on any message.
-- **`visualMode.ts`** + `VisualModeWindow`: instead of just playing voice replies aloud, shows a
-  small animated talking-head window (Caroline/Peter profiles only).
-- **`backend/mcp-servers-src/voice`** (`text_to_speech`/`speech_to_text`) and
-  **`backend/mcp-servers-src/screen-video`**
-  (`start_screen_recording`/`stop_screen_recording`/`sample_video_frames`) are general-purpose
-  sibling MCP servers (same dual-use pattern as `backend/mcp-servers-src/sms` below) bundled in as
-  `caroline-voice`/`caroline-screen-video`, paired with the `analyzing-video` skill.
+`app/subscription_mode.py` resolves the Claude path: per explicit policy, Claude is reached
+**only** through the user's own account — their own `claude auth login` CLI session, or a pasted
+Anthropic API key (`subscription.json`) — never proxied through SquirrelWisdom. SquirrelWisdom is
+not a Claude backend; it's a client for Notes/email/Ratatosk/voice/consult, and separately bills
+the small-model path pay-as-you-go against a PIA wallet balance (`chat_mode_eligible()` requires
+both a real Claude subscription on the account *and* a SquirrelWisdom login with a positive
+balance — the small-model path is a fallback tier, not a replacement). `app/openai_mode.py` +
+`app/openai_account.py` resolve the third source the same way as Claude: the user's own
+ChatGPT/Codex sign-in, or a separately pasted `OPENAI_API_KEY`. A tab switches between all three
+with the `Claude / SW / OpenAI` header control; nothing migrates, each source keeps its own resume
+state (`tab-session-<tab>.json`).
 
-## Paying for chat: `subscriptionMode.ts`
+## Identity, voice, and persona
 
-Every session resolves ONE of four chat sources, in this priority order, and never silently
-switches someone already paying Anthropic directly onto a metered proxy just because they *also*
-happen to have an SW account:
+`app/persona.py` owns Caroline's own identity — curated Caroline/Peter profiles, custom personas,
+name/gender/age/bio/photos — and `persona_system_prompt_append()` enforces self-reference and
+grammatical-gender agreement in the system prompt (added after a confirmed live bug: without it,
+Russian self-reference drifted into the wrong grammatical gender). `app/owner_profile.py` is the
+complementary piece for the *user's own* side: a deliberately small, always-injected cache
+(name/gender/age) so the model can address the owner correctly — not the user's full profile, which
+lives in a "Caroline:Profile" Notes folder instead; kept small after a past incident where inlining
+a full Notes profile into every system prompt overflowed Windows' `CreateProcess` command-line
+length limit (~32K characters) and broke every tab at once.
 
-1. **`own-anthropic-oauth`** — the bundled CLI's own `claude auth login` OAuth session, if logged in.
-2. **`own-anthropic-key`** — a manually pasted `ANTHROPIC_API_KEY` (Settings → Account & Billing).
-3. **`sw-proxy`** — SquirrelWisdom's own account, if logged in: `ANTHROPIC_BASE_URL` points at
-   `squirrelwisdom.com`, billed against the user's PIA wallet (see reforce's
-   `Api2AnthropicProxy.py`, which forwards to OpenRouter's Anthropic-Messages-shaped endpoint).
-4. **`none`** — the CLI's own request just fails; that failure is what triggers the
-   credentials-needed UI, not a separate first-run check.
+## Plugins & tools (`app/plugins/`)
 
-**Own-Anthropic exhaustion fallback**: "available" above means "logged in", not "currently has
-room left" — a rate-limited or credit-depleted own-Anthropic account used to make `resolveMode()`
-keep re-picking it forever, even with a paid, logged-in SW account sitting unused. Per explicit
-instruction (2026-09-08): once own-Anthropic is CONFIRMED exhausted on a real request (a
-`billing_error`, or a rejected `rate_limit_event`), `markOwnAnthropicExhausted()` records it
-(honoring the SDK's own `resetsAt` when the failure supplied one, else a 30-minute default
-cooldown), and `resolveMode()` skips straight to `sw-proxy` while that lasts. Only applies when SW
-is logged in; with no SW account there's nowhere to fall back to, so it just keeps retrying
-own-Anthropic as before.
+A plugin is any module directly under `app/plugins/` exposing a module-level `PLUGIN` object (a
+`Plugin` dataclass: `name`, a list of `PluginTool`s, optional `usage_instructions`). Every tool is
+a plain async `handler(args, report_progress)` — `app/plugins/loader.py`'s `wrap_tool()` routes
+every call through `app/operations.py`'s `dispatch()`, giving every tool the same start/status/stop
+contract (fast calls return their real result immediately; slow ones return an `operation_id` to
+poll) and the same call/result/duration logging, so individual plugins never implement polling or
+logging themselves. `discover_plugins()` reloads every plugin module fresh on each turn's `query()`
+build, so a plugin edit is live within one turn, no restart. `usage_instructions` is never injected
+into the system prompt automatically — it's fetched on demand through the shared
+`get_tool_instructions` tool, alongside `check_operation_status`/`stop_operation`/
+`describe_own_backend` (`caroline-operations`, registered once at the engine level).
 
-Switching back is active, not just a wait for the cooldown to expire — confirmed live the same day
-that real availability can flap faster than the SDK's own `resetsAt` suggests (five switches in one
-morning), so `resolveMode()` lets a real attempt through to own-Anthropic every
-`OWN_ANTHROPIC_RECHECK_INTERVAL_MS` (2 minutes) regardless of how far off the nominal cooldown still
-is. If that attempt reaches the CLI's `init` message, `clearOwnAnthropicExhausted()` (called from
-server.ts's `init` handler, same trust level as its own connState recovery) treats that as
-confirmation and lifts the block; if it fails again, whichever detection path catches it just
-re-arms `markOwnAnthropicExhausted()` with a fresh cooldown, same as any other failure.
+Rough roster by category:
 
-`lastRateLimitInfo` (crash-attribution memory for a silent stream death, see its own doc comment)
-is cleared whenever a deliberate chat-source switch happens — before this fix it survived the
-switch to sw-proxy and misattributed that source's own, unrelated failures to "still exhausted on
-own-Anthropic" in the logs/status text, which was wrong information even though the resulting
-chatSource choice happened to still be correct.
+- **Messaging** — `telegram_plugin.py`, `whatsapp_plugin.py`, `signal_plugin.py`,
+  `discord_plugin.py`, `slack_plugin.py` (thin tool layers, see "Messenger channels" below);
+  `ratatosk_plugin.py` (SquirrelWisdom's own messenger, as the owner's account or Caroline's own
+  separate auto-generated account); `email_plugin.py` + `email_batch_plugin.py`; `companion_plugin.py`
+  + `companion_api.py` (real SMS send/read and phone contacts from a paired Android phone).
+- **Memory & notes** — `memory_plugin.py` (current `save_info`/`request_info`, dispatched to the
+  server-side microagents — see below); `notes_plugin.py` (direct Notes CRUD); `event_memory_plugin.py`
+  (a durable record of things Caroline arranged); `contacts_plugin.py`. `memory_search_plugin.py`,
+  `topics_plugin.py`, and `working_memory_plugin.py` are deprecated, superseded by `memory_plugin.py`
+  (`app/deprecated_memory.py`), kept read-only for continuity.
+- **Automation** — `mouse_plugin.py`, `keyboard_plugin.py`, `inspect_plugin.py`, `chain_plugin.py`
+  (a linear GUI-automation step interpreter), `screenshot_plugin.py` and their window-targeted
+  twins, plus Linux ports (`_x11_input.py`, `_x11_window.py`, excluded from discovery by their
+  leading underscore).
+- **Browser** — `app_browser_plugin.py` + `app_browser_cdp.py`: one persistent, labeled WebView2
+  window per site, driven over a real CDP connection, not simulated input.
+- **Voice** — `voice_api.py` (TTS/STT/translation/reply-review/permission-guard calls — see below),
+  `speech_plugin.py`, `voice_playback_plugin.py` (including Visual Mode talking-head playback).
+- **Misc** — `login_plugin.py`/`sw_api.py` (SquirrelWisdom login + shared v2 client),
+  `consult_plugin.py` (a GPT-5-class second opinion for high-stakes wording), `files_plugin.py`,
+  `shell_plugin.py`, `scheduler_plugin.py`, `viewer_plugin.py`/`office_editor.py` (embedded
+  OnlyOffice docx/xlsx/pptx/pdf editing), `reforce_plugin.py` (Wikipedia search/fact extraction),
+  `image_gen_plugin.py`.
 
-**"Prompt is too long" under sw-proxy/own-anthropic-key**: traced (2026-09-08) to the CLI's own
-automatic-compaction feature, which needs the real OAuth ("firstParty") auth path specifically --
-under an env-overridden `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` (every chatSource except
-own-anthropic-oauth) it fails outright with "Not logged in -- Please run /login", even though the
-main chat completion works fine through that very same override; when compaction can't then shrink
-a big prompt, the turn fails with "Prompt is too long" instead. Confirmed live: every occurrence
-that day traced back to a session on `sw-proxy`. Fixed by passing
-`settings: { autoCompactEnabled: false }` in `Options` for every chatSource except
-own-anthropic-oauth (untouched -- not known broken there) -- Caroline already has its own
-context-aging mechanism (`compaction.ts`) independent of the CLI's native one, so this isn't a bare
-gap for the sources it's turned off for.
+## Messenger channels vs. plugins
 
-A depleted **SW** balance (`handleBalanceExhausted`, source `"sw"`) never retries against a
-different source — there isn't one — so it explains what happened (status-bar/system_notice UI
-chrome, always English, not a chat reply) and opens a Revolut-hosted top-up checkout window
-directly (`createTopupCheckoutUrl`).
+For every messenger (Telegram/WhatsApp/Signal/Discord/Slack), an `app/*_channel.py` module owns
+the always-running connection/session — login, reconnects, the two-account model where relevant
+(Caroline's own "self" account and the human owner's "owner" account), and encrypts session state
+at rest via `app/secret_store.py`. The matching `app/plugins/*_plugin.py` is a thin, per-turn tool
+layer that imports functions directly from its channel module and exposes them to the model —
+consistently the same split across all five integrations.
 
-## SquirrelWisdom-backed tools and the login gate
+## SquirrelWisdom-gated features and login
 
-Several features need the user's own SquirrelWisdom account, separate from which account pays
-for chat. `swGate.ts`'s `SW_GATED_FEATURES` is the single registry of which tools need it, and
-`requireSwOrPrompt()` is the shared gate every one of them calls: on a gated tool's **first**
-refusal it auto-opens the native login/sign-up window; on any further refusal it just says so
-without reopening — only `ensure_squirrelwisdom_login` (an explicit user request) or Settings'
-"Log in" button reopen it after that. Credentials never pass through the chat/model context: the
-native login form posts straight to the backend over the app's own channel.
+`app/sw_gate.py`'s `require_sw_or_prompt()` is the shared gate: on a gated tool's first refusal it
+auto-opens the native login window; on repeat refusals it just says so without reopening.
+Credentials never pass through the model's context — the native login form posts straight to the
+backend over its own WebSocket control op (`login_submit`), persisted via `app/plugins/sw_api.py`'s
+`save_credentials()` to `~/.mcp-notes/credentials.json`, shared with every other SW-backed tool on
+the machine. Gated feature families (`SW_GATED_FEATURES`): `consult`, `ratatosk-owner`,
+`office-editor`, `notes`, `email`, `memory` (`save_info`/`request_info`/`save_document`), `speech`.
 
-SW-gated features today:
+SMS is no longer a per-user SMTP2GO account (that path was removed 2026-09-27) — it now sends and
+reads real SMS through a paired Android companion phone's own SIM instead (`companion_plugin.py`).
 
-- **Notes** (`caroline-notes`, external MCP, same binary as `backend/mcp-servers-src/notes`) —
-  long-term memory.
-  `notes_login` is explicitly hidden from the model (`disallowedTools`) because it would otherwise
-  ask for the password as a tool parameter, violating the hard "never type a password into chat"
-  rule; the native login window is the only path.
-- **Ratatosk messaging** (`caroline-ratatosk`, in-process) — every tool takes `as: "owner" |
-  "caroline"`. `"owner"` acts as the user's own SquirrelWisdom/Ratatosk session (broad standing
-  authorization, confirmed with the user, no per-message confirmation needed) and is what's
-  SW-gated; `"caroline"` acts through Caroline's own separate, auto-generated Ratatosk account
-  (`ratatoskOwnAccount.ts` — a real navlink.net mailbox + SquirrelWisdom account, no user input
-  needed) and is NOT gated, since it's Caroline's own identity, not the user's.
-- **`consult_large_model`** (`caroline-consult`, in-process) — asks a GPT-5-class model
-  (Camerlengo's `ai:resolve` with `model:"LARGE"`) for wording advice on high-complexity,
-  high-importance legal/commercial/social questions. Advice only, folded into Caroline's own
-  answer, never relayed verbatim.
-- **Office document editing** (`open_in_viewer`'s document branch, `caroline-viewer`) — docx/
-  xlsx/pptx/pdf open in a real embedded OnlyOffice editor (`officeEditor.ts` uploads to a
-  throwaway path on squirrelwisdom.com and gets back an editor session), since it needs the
-  document briefly hosted there.
-- **SMS** (`caroline-sms`, external MCP, same binary as `backend/mcp-servers-src/sms`) — see next
-  section.
+## Memory and microagents (the backing SquirrelWisdom/Camerlengo service)
 
-## SMS: per-user SMTP2GO accounts
+Several of Caroline's features don't reason with one big prompt — they hand a narrow, specific
+judgment call to a **microagent**: a small, separately-invoked model call with a strict input
+schema, a strict output schema, and exactly one job. Every microagent runs inside the backing
+SquirrelWisdom/Camerlengo service (`apps/microagents/` in the `reforce` repository), never inside
+Caroline's own process, and is reached from `backend-py` over the same versioned API every other
+SW-backed feature uses.
 
-Send/receive SMS is a general-purpose Camerlengo v2 capability (`sms:send`/`sms:viewReceived`,
-`API/Api2SMSCommands.py` in reforce), not Caroline-specific — `backend/mcp-servers-src/sms`
-(mirroring `backend/mcp-servers-src/notes`'s shared-login structure) and `caroline-sms` both call
-it. Per explicit design, **every user sends/receives through their own SMTP2GO account**, not a
-shared one:
+**Why a microagent instead of a bigger prompt or hand-written code.** Two things, confirmed
+independently, by different incidents: (1) a system-prompt instruction is a request, not a
+guarantee — it can be perfectly clear and still get missed a few turns later; a microagent is an
+independent check that doesn't share the main model's blind spot, because it isn't the same call.
+(2) Wherever a decision is genuinely fuzzy (does this name match that contact, does this reply
+leak something it shouldn't, did the user's reply actually mean yes) — that decision is always
+left to a model, never to hand-written string/keyword comparison, which quietly stops matching the
+day something is phrased a little differently.
 
-- Settings → "SMS account" lets a user paste their own SMTP2GO API key (+ optional dedicated
-  sending number). The key is verified against SMTP2GO's real API before being persisted
-  server-side (`sms_accounts` table, keyed by SquirrelWisdom login) — never echoed back, only
-  "is one set" + the sender number.
-- `sms:send`/`sms:viewReceived`, when called with a session, require a registered account (no
-  silent fallback to a shared one); without a session (internal/system calls) they fall back to
-  a shared account for backward compatibility.
-- Receiving is polling, not a webhook — SMTP2GO's "received" messages are replies to SMS you
-  sent. A background poller (`poll_received_sms`, started from `Camerlengo.py`) sweeps every
-  registered account each tick, each with its own independent persisted high-water-mark.
+**The escalation ladder.** Every microagent call starts on the cheapest model that can plausibly
+do the job (`nano`), and only escalates to a stronger one (`nano` again, told what failed; then
+`mini`) if the cheaper attempt's answer fails *validation* — malformed structure, a failed sanity
+check — never merely because an answer seemed debatable but was still well-formed. A single,
+shared `Runtime` (one adapter, one ladder, one concurrency limit) backs every microagent; each
+domain registers its own agents into it from its own point in the code, so unrelated domains never
+have to share files just to share the Runtime.
 
-## General-purpose tool roster
+**The microagents today:**
 
-**In-process SDK tools** (built straight into the backend, `server.ts`'s `mcpServers`):
-`caroline-scheduler` (reminders — `schedule_reminder`/`list_reminders`/`cancel_reminder`,
-persisted to `workspace/schedule.json`, survives app restarts, fires proactively via
-`injectProactive` even with no user message in flight), `caroline-files` (open a local file in
-its default Windows app), `caroline-viewer` (image/video/document viewer window,
-`open_in_viewer`/`close_viewer`), `caroline-login` (`ensure_squirrelwisdom_login`),
-`caroline-email` (own in-process fork of `backend/mcp-servers-src/email` — send/delete/move/mark/download return
-immediately and report their real outcome via a proactive follow-up rather than blocking the turn
-on a slow IMAP/SMTP round trip), `caroline-appbrowser` (the embedded multi-window browser, see
-below), `caroline-ratatosk`, `caroline-consult`.
+| Microagent | What it decides |
+|---|---|
+| `FactMemory` | What's actually worth remembering out of something the user said |
+| `AddressBook` | Whether a name in conversation is an existing contact, by meaning, not spelling |
+| `TopicMemory` | Which stored memories a new question is actually about |
+| `DocumentMemory` | How a saved document gets indexed and searched later |
+| `reply.review` | Whether an outbound reply is on-topic, free of internal leakage, and sounds human |
+| `turn.permission.guard` | Whether the assistant actually has the user's OK for what it's about to do |
 
-**Shared HTTP-mode utility servers** (`sharedMcpServers.ts`, one instance per backend process,
-`caroline-`-prefixed, ports 9401+): `caroline-notes`, `caroline-sms`, `caroline-time`,
-`caroline-voice`, `caroline-screen-video`, and the Windows-automation family
-(`caroline-windows-{screenshot,mouse,keyboard,inspect}` and their `window-*` window-targeted
-twins, `caroline-windows-chain`).
+The first four back `memory_plugin.py`'s `save_info`/`request_info`. The last two are newer and
+about trust rather than usefulness, added 2026-10-11 directly in response to observed failures:
 
-**Per-tab stdio** (`caroline-browser`): `appBrowser.ts`/`appBrowserCdp.ts` — one persistent,
-labeled WebView2 window per site (whatsapp/telegram/facebook/etc.), driven over a real CDP
-connection (snapshot/find/click/type/press_key/evaluate), not simulated input.
+- **`reply.review`** checks every outbound message — including the small "still working on it"
+  progress remarks — for three things: is it actually about the task, does it leak anything about
+  Caroline's own internal plumbing (a tool name, an internal retry, an internal error) instead of
+  just talking about the work, and does it read like a person rather than a system describing
+  itself. A failure on any of those gets rewritten before it reaches the user, not just asked
+  nicely not to happen. Called from `app/plugins/voice_api.py`'s `review_reply()`, right after
+  translation, at every real send site in `chat_session.py`.
+- **`turn.permission.guard`** closes a specific, observed gap: Caroline would ask a yes/no
+  permission question and then, a turn or two later, act anyway even though nobody had answered.
+  An unanswered (or ambiguous) yes/no question is now treated as a **refusal**, not permission by
+  default. The same strict rule applies even without a spoken question: anything that communicates
+  with a third party on the user's behalf, or touches the user's money, needs a clear, *specific*
+  approval already on record — a general "sure, go ahead" for the task doesn't count. When the
+  check (`app/plugins/voice_api.py`'s `check_permission_guard()`, called after every outbound
+  message and after every real user message) finds a live gap, `ChatSession.pending_unapproved_action`
+  is set; the very next tool call of any kind — the actual enforcement point is
+  `app/operations.py`'s `dispatch()`, which never even calls the real handler — stops the **whole
+  turn**, the same hard stop as the user's own Stop button, and the user's next message carries a
+  plain note explaining why and what needs a real answer.
 
-## Skills (`Skills/`, seeded from `backend/skills-src/`)
+Both are exposed as their own SW API commands (`reply:review`, `reply:permissionGuard`,
+`API/Api2ReplyCommands.py` in `reforce`), with their own billing label — deliberately not labeled
+"memory," since neither is about the user's own memory.
 
-Copied into the per-user workspace on every start (code-managed defaults, not gated behind a
-one-time marker, so a skill content update actually takes effect): `squirrelwisdom-login` (when/
-how to call `ensure_squirrelwisdom_login`, the hard no-password-in-chat rule),
-`vault-backups` (secrets policy below), `embedded-browser-troubleshooting`,
-`ratatosk-messenger`, `showing-files-in-chat`, `python-environment` (the isolated
-installer-provisioned Python, not system PATH), `analyzing-video`.
+## Security: secrets handling
 
-## Security: the vault policy
-
-`policies.ts`'s `vaultSecurityInstruction()`: secrets/passwords/API keys/tokens are never written
-to local files, chat history, or Skills files — always saved as a note in the "Caroline:Vault"
-Notes folder instead. Backed up there once an hour (`ensureRecurringBackup`) and once on app
-close (`shutdown_sync` control op, triggered from `chat.js`'s `pagehide` — the one point where
-WebView2 actually unloads rather than just minimizing to tray; best-effort, since the WPF shell
-doesn't wait for it before `Process.Kill()`).
+`app/secret_store.py` is a Windows-DPAPI-based encryption-at-rest helper
+(`CryptProtectData`/`CryptUnprotectData`, scoped to the current Windows user account), used for
+messenger integration credentials and session state (`<workspace>/messengers/<service>/`). Most
+other local state — SquirrelWisdom credentials, Ratatosk's own account file — is plain JSON on
+disk; broader secrets (API keys, tokens, passwords a user shares in conversation) are never
+written to local files, chat history, or Skills content at all — they're saved as a note in a
+dedicated SquirrelWisdom Notes "vault" folder instead, a server-side policy enforced through the
+system prompt (`app/policies.py`) rather than a client-side encryption boundary.
 
 ## OpenAI as a third answer source (Codex engine)
 
-A tab answers through Claude, SW or OpenAI, chosen with the `Claude / SW / OpenAI` text switcher in the native tab header (next to the tab name, the clear button and close; `MainWindow.xaml.cs`). The page (`chat.js`) owns the real state and mirrors it to the header with a `tab_state` web message; the header calls back `window.carolineSetChatMode` / `window.carolineRequestClear`. The mode is stored per tab (`durability.load_chat_mode`); `chat_mode_get` returns which sources are `available` and reverts a tab to Claude if OpenAI stopped being usable.
-
-**Engines.** `ChatSession` talks to an `AgentEngine` (`backend-py/app/engines/base.py`): `ClaudeEngine` wraps `ClaudeSDKClient`; `CodexEngine` runs one `codex-app-server` process per tab (JSON-RPC over stdio, `codex_rpc.py`) and adapts its thread/turn/item events into the same `claude_agent_sdk` message objects, so wire format, failure classification, status and history are shared. Caroline's plugin tools are handed to Codex as `dynamicTools` and answered over an in-process MCP client (`ToolBridge`), so a tool behaves the same under both engines. Caroline's system prompt is sent as developer instructions (appended to Codex's own prompt). Codex runs with approvals off and full-access sandbox, matching Claude's `bypassPermissions`.
-
-**Codex is embedded, not exposed.** Every launch adds `features.plugins=false`, `check_for_update_on_startup=false`, `analytics.enabled=false` (`BASE_CONFIG_OVERRIDES`): without them Codex clones a third-party plugin repository from GitHub into its home at startup. Its state lives in `<Caroline root>\codex-home`, separate from any Codex the user runs themselves.
-
-**Sign-in and account** (`openai_account.py`, ops `openai_status/login/logout/cancel_login`): ChatGPT subscription (browser), the same with a device code, or a pasted API key; credentials are Codex's own `auth.json`. Settings has an OpenAI block and a Models block: Claude (family aliases) and OpenAI (Codex's `model/list`) each default to Automatic, with an override (`claudeModel` / `openaiModel` in `subscription.json`).
-
-**Sessions and history.** Each tab keeps one resume id per engine in `tab-session-<tab>.json` (`sessionId`, `openaiThreadId`). The OpenAI engine writes a Claude-shaped transcript to `workspace/openai-transcripts/<threadId>.jsonl`, so `session_transcript_path` lets every history reader work unchanged. The recent-24h dialogue file merges every engine's transcript by timestamp, which is how a tab keeps its context across a switch. Claude-only machinery (forced compaction, transcript rotation, archive prune) is skipped for OpenAI tabs; Codex compacts itself, and a context overflow is compacted and retried once inside the engine. A usage limit reaches `ChatSession` as an assistant line the existing limit classifier already recognises.
-
-**Install.** `CodexInstaller.cs` (pinned version and sha256, mirrored like every dependency) puts `codex-app-server.exe` in `runtime\codex`; a failure there is logged and never blocks installing Caroline. `BackendProcess.cs` passes `CAROLINE_CODEX_PATH`. Without the file OpenAI is simply unavailable.
+A tab answers through Claude, SW, or OpenAI, chosen with the `Claude / SW / OpenAI` text switcher
+in the native tab header. `CodexEngine` runs one `codex-app-server` process per tab and is embedded
+rather than exposed — every launch disables Codex's own plugin system, update checks, and
+analytics, and its state lives under a dedicated `codex-home`, separate from any Codex the user
+runs themselves. Sign-in is a ChatGPT subscription, a device code, or a pasted API key
+(`openai_account.py`); install is a pinned, sha256-verified `codex-app-server.exe`
+(`CodexInstaller.cs`) under `runtime\codex` — missing it simply makes OpenAI unavailable, nothing
+else breaks.
 
 ## Settings screen (`chat.html`/`chat.js`)
 
 Personality (persona editor), Window (always-on-top), Voice (auto-send toggle), Visual mode,
 Claude account (OAuth login/logout/status), Account & Billing (resolved chat source, own-API-key,
-SquirrelWisdom login/balance/top-up), Ratatosk messenger (owner status + register Caroline's own
-account), SMS account (own SMTP2GO key/sender), MCP servers (list/add/remove — the standard
+SquirrelWisdom login/balance/top-up), OpenAI account, Ratatosk messenger (owner status + register
+Caroline's own account), phone companion pairing, MCP servers (list/add/remove — the standard
 Claude Code mechanism, not a custom config format).
 
 ## Build & deploy
 
-`build.bat` builds the backend, bundles MCP servers, and does a self-contained
-`dotnet publish` of the WPF shell into `dist/`. `Caroline.csproj`'s `SyncBackendDist` MSBuild
-target copies fresh `backend/dist/*.js` into the build output on every `dotnet build`.
-`build_installer.bat` builds `CarolineInstaller.exe`; `deploy.bat` uploads
-`Caroline.zip`/`.sha256`/`.version`/`CarolineInstaller.exe` to
-`downloader.multi-portal.org/apps/caroline/` over scp/ssh.
+The root `Makefile` builds the WPF shell, bundles the (still Node-built) default MCP servers from
+`backend/`, copies `backend-py/app` as "the live backend" into the installer output, and does a
+self-contained `dotnet publish` into `dist/`. `make installer` additionally zips `dist/` and
+publishes a self-extracting `CarolineInstaller.exe`; `make deploy` (private, `deploy.mk`,
+gitignored) uploads `Caroline.zip`/`.sha256`/`.version`/`CarolineInstaller.exe` to
+`downloader.multi-portal.org/apps/caroline/`.

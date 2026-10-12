@@ -30,6 +30,8 @@ _current_cli_pid_sink: contextvars.ContextVar[CliPidSinkFn | None] = contextvars
 _inject_proactive_by_tab: dict[str, InjectProactiveFn] = {}
 # Every live ChatSession's permission blocker by tab id (see register_permission_blocker).
 _permission_blocker_by_tab: dict[str, PermissionBlockerFn] = {}
+# Every live ChatSession's send() by tab id (see register_send_for_tab).
+_send_by_tab: dict[str, SendFn] = {}
 
 
 def get_send() -> SendFn:
@@ -117,6 +119,21 @@ def get_permission_block(tab_id: str | None) -> str | None:
     mutates anything, it just forwards to whatever the tab registered."""
     fn = _permission_blocker_by_tab.get(tab_id) if tab_id else None
     return fn() if fn else None
+
+
+def register_send_for_tab(tab_id: str, fn: SendFn) -> None:
+    """Per explicit instruction (2026-10-11): lets a background channel
+    loop (e.g. app/whatsapp_channel.py's sidecar event handler) push a WS
+    message to a specific tab -- a QR code to display, say -- without
+    being inside that tab's live turn context at all, unlike get_send()
+    above (which needs the contextvar set by whichever turn is currently
+    running). A later session of the same tab replaces it, same as
+    register_inject_proactive."""
+    _send_by_tab[tab_id] = fn
+
+
+def get_send_for_tab(tab_id: str | None) -> SendFn | None:
+    return _send_by_tab.get(tab_id) if tab_id else None
 
 
 def get_cli_pid_sink() -> CliPidSinkFn | None:

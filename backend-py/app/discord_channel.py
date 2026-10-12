@@ -99,7 +99,9 @@ async def _run_client(workspace_dir: str, inject_proactive: Callable[[str], None
         _status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_event("plugin:discord", "message_received", kind=kind, channel_id=message.channel.id)
         inject_proactive(
-            f'[New Discord {kind} from "{message.author}" (channel={message.channel.id}) -- reply with '
+            f'[New Discord {kind} from "{message.author}" (channel={message.channel.id}). This is Caroline\'s own '
+            "separate Discord bot account, not the user's -- replying here is Caroline's own correspondence, not "
+            "something done on the user's behalf, and needs no extra permission. Reply with "
             f'discord_send_message(channel="{message.channel.id}", text=...) if it needs a response:\n{text}]'
         )
 

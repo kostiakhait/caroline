@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from app import memory_turns
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
-from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
+from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app.stt_adaptation import apply_adaptation, observe_user_message
 from app.stt_sanity import STT_SANITY_MODEL, check_transcript
@@ -223,6 +223,10 @@ _resumed_unfinished_turn_for_tab: set[str] = set()
 # Same "once per process, not per reconnect" shape -- see
 # peek_pending_operations' own recovery block below.
 _resumed_pending_operations_for_tab: set[str] = set()
+# Same "once per process, not per reconnect" shape -- see peek_pending_api_retry/
+# peek_pending_one_shot_followup's own recovery block below (2026-10-12).
+_resumed_pending_api_retry_for_tab: set[str] = set()
+_resumed_pending_one_shot_followup_for_tab: set[str] = set()
 # Same "once per process, not per reconnect" shape as the set above -- see
 # ChatSession.needs_startup_compaction/_check_forced_compaction
 # (chat_session.py) for why forced compaction exists and what this flag
@@ -1862,6 +1866,44 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             )
             for op in stale_operations:
                 clear_pending_operation(WORKSPACE_DIR, tab_id, op["operation_id"])
+
+    # Per explicit instruction (2026-10-12, a real live incident -- "Почему
+    # вкладка 4 не продолжила задачу?"): a rate-limit/usage-cap retry armed
+    # by chat_session.py's _schedule_api_retry/_schedule_one_shot_followup_
+    # check is a plain in-memory timer -- a full app restart while one was
+    # still pending (confirmed live: it landed mid-wait during an unrelated
+    # restart) lost it completely, and the tab just went idle after
+    # reconnecting instead of ever retrying. Same "once per process, read-
+    # only peek, inject then clear" shape as the two recovery blocks above.
+    if tab_id not in _resumed_pending_api_retry_for_tab:
+        _resumed_pending_api_retry_for_tab.add(tab_id)
+        stale_retry = peek_pending_api_retry(WORKSPACE_DIR, tab_id)
+        if stale_retry:
+            log_event("engine", "resuming_stale_api_retry", tab_id=tab_id, reason=stale_retry.reason, scheduled_at_iso=stale_retry.scheduled_at_iso)
+            retry_lang = current_language_name(tab_id)
+            session.inject_proactive(
+                "[Caroline was restarted (app closed or crashed) while waiting to automatically retry a turn "
+                f"that an API/subscription limit had blocked (reason: {stale_retry.reason}). That wait is GONE -- "
+                "the restart wiped it, with no trace. Check the recent conversation for whatever you were doing "
+                f"when the limit hit, and continue or finish it now. Reply in {retry_lang}.]",
+                stale_retry.is_voice,
+            )
+            clear_pending_api_retry(WORKSPACE_DIR, tab_id)
+
+    if tab_id not in _resumed_pending_one_shot_followup_for_tab:
+        _resumed_pending_one_shot_followup_for_tab.add(tab_id)
+        stale_followup = peek_pending_one_shot_followup(WORKSPACE_DIR, tab_id)
+        if stale_followup:
+            log_event("engine", "resuming_stale_one_shot_followup", tab_id=tab_id, reason=stale_followup.reason, scheduled_at_iso=stale_followup.scheduled_at_iso)
+            followup_lang = current_language_name(tab_id)
+            session.inject_proactive(
+                "[Caroline was restarted (app closed or crashed) while waiting to automatically check back on a "
+                f"turn that had just reported a usage cap (reason: {stale_followup.reason}). That wait is GONE -- "
+                "the restart wiped it, with no trace. If the cap has reset, check the recent conversation for "
+                f"whatever you were doing and continue or finish it now. Reply in {followup_lang}.]",
+                stale_followup.is_voice,
+            )
+            clear_pending_one_shot_followup(WORKSPACE_DIR, tab_id)
 
     # Forced compaction's "at Caroline's startup" trigger (2026-09-11): once
     # per tab per PROCESS lifetime, not per reconnect -- ChatSession itself

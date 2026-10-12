@@ -328,10 +328,13 @@ DEFAULT_TOPUP_CURRENCY = "USD"
 async def create_topup_checkout_url() -> str:
     """Creates a Revolut-hosted top-up checkout session and returns its
     checkout_url -- the payment viewer window just navigates straight at
-    this. Uses the LEGACY session (verify_password's own v1-style
-    session, not mint_v2_session) because /revolut/topups is a
-    legacy-style REST endpoint resolving ?session= via the old
-    Authenticator -- unrelated to the v2 Api2Auth store."""
+    this. verify_password mints a V2 session
+    (user:verify -> Api2Auth.make_session); /revolut/topups is a
+    legacy-style REST endpoint, so Camerlengo has to resolve ?session=
+    against the v2 store too -- the two session stores are not
+    interchangeable, and when that route only asked the legacy
+    Authorizer it answered every Caroline top-up with a flat
+    401 UNAUTHORIZED (fixed in Camerlengo's resolveSessionLogin)."""
     creds = load_credentials()
     if not creds:
         raise RuntimeError("Not logged in to SquirrelWisdom.")

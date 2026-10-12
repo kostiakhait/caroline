@@ -120,6 +120,17 @@ async function start() {
         ? lastDisconnect.error.output?.statusCode
         : undefined;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      // 2026-10-11 diagnostic (confirmed live: connects, then closes and
+      // reconnects every ~5-6s indefinitely, sometimes re-requesting a QR mid-
+      // loop) -- statusCode/message were never surfaced before, so there was
+      // no way to tell a one-time expected restartRequired (515, Baileys'
+      // documented behavior right after a fresh pairing) from a real repeating
+      // failure. Surfaced via the existing "error" message type Python already
+      // logs (sidecar_reported_error), not a new wire message.
+      emit({
+        type: 'error',
+        message: `connection closed, reconnecting in 5s -- statusCode=${statusCode} loggedOut=${loggedOut} detail=${lastDisconnect && lastDisconnect.error ? String(lastDisconnect.error.message || lastDisconnect.error) : '(none)'}`,
+      });
       if (loggedOut) {
         emit({ type: 'loggedOut' });
       } else {

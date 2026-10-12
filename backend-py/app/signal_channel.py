@@ -1,25 +1,45 @@
-"""app/signal_channel.py -- Signal personal-account connection via
+"""app/signal_channel.py -- Signal personal-account connections via
 signal-cli, driven as a JSON-RPC daemon over a local TCP socket (NOT
 stdio, unlike the WhatsApp sidecar -- see app/sidecar_process.py's own
 doc comment for why that distinction matters here). Fifth and last of
 the planned messenger integrations (docs/MESSENGER_INTEGRATIONS_PLAN.md,
 2026-10-06).
 
+TWO separate accounts, not one (decision 2026-10-11, same shape as
+telegram_channel.py's own "self"/"owner" split, added once the
+single-account design shipped here turned out to just be incomplete, not
+a real protocol limitation): "self" is Caroline's OWN Signal account --
+her own number, linked once like any other Signal linked device, she may
+read and reply there as herself, no extra permission needed; "owner" is
+the human owner's own personal Signal account, linked so Caroline can read
+it and keep them posted, but may send AS the owner only when they have
+explicitly asked her to, for that specific message. Each account gets its
+own signal-cli `--config` directory and its own daemon TCP port -- two
+fully independent linked devices, same as running signal-cli for two
+different people would be. The one real external prerequisite, same class
+as Telegram's own app registration at my.telegram.org: "self" needs an
+actual second phone number with an active Signal installation to scan the
+link QR, whenever one is available -- the code is ready regardless.
+
 Signal has no bot/app API at all -- signal-cli (a widely-used, community-
 maintained tool, not Caroline-specific) is the standard way any third-
-party integration talks to a personal Signal account. Two phases:
+party integration talks to a personal Signal account. Two phases, per
+account:
 
 1. LINKING (one-time): `signal-cli link -n Caroline` prints a
-   "tsdevice:/..." URI on stdout; rendered to a QR code (same PNG-and-
-   open approach as whatsapp_channel.py) for the user to scan in
-   Signal's own app (Settings > Linked Devices > Link New Device). The
-   process exits once scanned, having registered a local account under
-   --config.
+   "tsdevice:/..." URI on stdout; rendered to a QR code (same
+   open-in-Caroline's-own-viewer approach as whatsapp_channel.py, fixed
+   2026-10-11 -- this used to pop the OS default image viewer) for the
+   user to scan in Signal's own app (Settings > Linked Devices > Link New
+   Device). The process exits once scanned, having registered a local
+   account under that account's own --config.
 2. DAEMON (every run after linking): `signal-cli -a <number> daemon
    --tcp 127.0.0.1:<port>` serves newline-delimited JSON-RPC 2.0 over a
    plain TCP socket -- connected to directly via asyncio.open_connection,
    no subprocess stdio piping needed for the IPC itself (the daemon
-   process is simply kept running in the background).
+   process is simply kept running in the background). Each account's
+   daemon binds its own port (DAEMON_PORT_BY_ACCOUNT) so both can run at
+   once without colliding.
 
 Exact signal-cli CLI flags and JSON-RPC method/notification shapes here
 follow its documented conventions as of this writing but have NOT been
@@ -36,20 +56,25 @@ import base64
 import json
 import os
 import subprocess
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
-from app.plugins.files_plugin import open_file_with_default_app
 from app.secret_store import messenger_secrets_dir
+from app.session_context import get_send_for_tab, get_tab_id
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
+ACCOUNTS = ("self", "owner")
+DEFAULT_ACCOUNT = "self"
+_ACCOUNT_LABEL = {"self": "your own", "owner": "the owner's"}
+
 JAVA_HOME = os.environ.get("CAROLINE_JAVA_HOME", "")
 SIGNAL_CLI_BAT = os.environ.get("CAROLINE_SIGNAL_CLI_BAT", "")
-DAEMON_PORT = 7592
+DAEMON_PORT_BY_ACCOUNT = {"self": 7592, "owner": 7593}
 DAEMON_READY_TIMEOUT_S = 20.0
 RPC_TIMEOUT_S = 30.0
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -69,23 +94,33 @@ class SignalError(Exception):
     pass
 
 
-def _config_dir(workspace_dir: str) -> Path:
-    d = messenger_secrets_dir(workspace_dir, "signal") / "config"
+def is_valid_account(account: str) -> bool:
+    return account in ACCOUNTS
+
+
+def _check_account(account: str) -> str:
+    if account not in ACCOUNTS:
+        raise SignalError(f'"account" must be one of {", ".join(ACCOUNTS)}, not {account!r}.')
+    return account
+
+
+def _config_dir(workspace_dir: str, account: str) -> Path:
+    d = messenger_secrets_dir(workspace_dir, "signal") / f"config_{account}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _number_file(workspace_dir: str) -> Path:
-    return messenger_secrets_dir(workspace_dir, "signal") / "linked_number.txt"
+def _number_file(workspace_dir: str, account: str) -> Path:
+    return messenger_secrets_dir(workspace_dir, "signal") / f"linked_number_{account}.txt"
 
 
-def _qr_image_path(workspace_dir: str) -> Path:
-    return messenger_secrets_dir(workspace_dir, "signal") / "link-qr.png"
+def _qr_image_path(workspace_dir: str, account: str) -> Path:
+    return messenger_secrets_dir(workspace_dir, "signal") / f"link-qr-{account}.png"
 
 
-def _linked_number(workspace_dir: str) -> str | None:
+def _linked_number(workspace_dir: str, account: str) -> str | None:
     try:
-        return _number_file(workspace_dir).read_text(encoding="utf-8").strip() or None
+        return _number_file(workspace_dir, account).read_text(encoding="utf-8").strip() or None
     except FileNotFoundError:
         return None
 
@@ -102,16 +137,22 @@ def _require_tooling() -> None:
         raise SignalError("Signal isn't set up in this build yet -- signal-cli/Java weren't provisioned. Reinstall Caroline.")
 
 
-async def start_login(workspace_dir: str) -> str:
+async def start_login(workspace_dir: str, account: str) -> str:
     """Runs `signal-cli link` as a one-shot subprocess, reads the pairing
-    URI from its stdout, and renders+opens it as a QR image -- same
-    reasoning as whatsapp_channel.py's own start_login for not blocking
-    synchronously on the user actually scanning it: this kicks off the
-    link attempt and returns immediately; the background loop notices
-    the resulting linked number and starts the daemon on its own next
-    pass."""
+    URI from its stdout, and renders+opens it as a QR image in Caroline's
+    own viewer window -- same reasoning as whatsapp_channel.py's own
+    start_login for not blocking synchronously on the user actually
+    scanning it: this kicks off the link attempt and returns immediately;
+    the background loop notices the resulting linked number and starts
+    the daemon on its own next pass.
+
+    Captures the calling tab's id (get_tab_id() is only valid here, inside
+    a real tool call) so the QR lands in the window of whichever tab
+    asked to connect, not an arbitrary one."""
+    _check_account(account)
     _require_tooling()
-    config_dir = _config_dir(workspace_dir)
+    _login_requested_tab_id[account] = get_tab_id()
+    config_dir = _config_dir(workspace_dir, account)
     proc = await asyncio.create_subprocess_exec(
         SIGNAL_CLI_BAT, "--config", str(config_dir), "link", "-n", "Caroline",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -125,41 +166,59 @@ async def start_login(workspace_dir: str) -> str:
             line = raw.decode("utf-8", errors="replace").strip()
             if line.startswith("tsdevice:") or line.startswith("sgnl://"):
                 uri_found = True
-                _render_and_open_qr(workspace_dir, line)
+                _render_and_open_qr(workspace_dir, account, line)
         code = await proc.wait()
         if code == 0:
-            await _record_linked_number(workspace_dir, config_dir)
-            log_event("plugin:signal", "link_succeeded")
+            await _record_linked_number(workspace_dir, account, config_dir)
+            log_event("plugin:signal", "link_succeeded", account=account)
+            _close_qr_viewer(workspace_dir, account)
         elif not uri_found:
             stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
-            log_event("plugin:signal", "link_failed_no_qr", stderr=stderr[:500])
+            log_event("plugin:signal", "link_failed_no_qr", account=account, stderr=stderr[:500])
         else:
-            log_event("plugin:signal", "link_process_exited_nonzero", code=code)
+            log_event("plugin:signal", "link_process_exited_nonzero", account=account, code=code)
 
     asyncio.create_task(_watch())
     return (
-        "Starting Signal linking -- a QR code image will open automatically in a moment. Scan it in the "
-        "Signal app on your phone (Settings > Linked Devices > Link New Device)."
+        f'Starting Signal linking ("{account}") -- a QR code image will open automatically in a moment. Scan it '
+        "in the Signal app on the phone for that account (Settings > Linked Devices > Link New Device)."
     )
 
 
-def _render_and_open_qr(workspace_dir: str, data: str) -> None:
+def _render_and_open_qr(workspace_dir: str, account: str, data: str) -> None:
+    """Opens in Caroline's own floating viewer window (fixed 2026-10-11,
+    same reuse-in-place fix as whatsapp_channel.py's own QR handling --
+    see MainWindow.xaml.cs's open_editor handler), not the OS default
+    image viewer this used to pop."""
     try:
         import qrcode
 
         img = qrcode.make(data)
-        path = _qr_image_path(workspace_dir)
+        path = _qr_image_path(workspace_dir, account)
         img.save(path)
-        log_event("plugin:signal", "qr_ready", path=str(path))
-        open_file_with_default_app(str(path))
+        log_event("plugin:signal", "qr_ready", account=account, path=str(path))
     except Exception as exc:
-        log_event("plugin:signal", "qr_render_failed", error=str(exc))
+        log_event("plugin:signal", "qr_render_failed", account=account, error=str(exc))
+        return
+    send = get_send_for_tab(_login_requested_tab_id.get(account))
+    if send is None:
+        log_event("plugin:signal", "qr_no_tab_to_notify", account=account)
+        return
+    asyncio.ensure_future(send({"type": "open_editor", "requestId": uuid.uuid4().hex, "path": str(path), "kind": "image"}))
 
 
-async def _record_linked_number(workspace_dir: str, config_dir: Path) -> None:
+def _close_qr_viewer(workspace_dir: str, account: str) -> None:
+    send = get_send_for_tab(_login_requested_tab_id.get(account))
+    if send is None:
+        return
+    asyncio.ensure_future(send({"type": "close_editor", "path": str(_qr_image_path(workspace_dir, account))}))
+
+
+async def _record_linked_number(workspace_dir: str, account: str, config_dir: Path) -> None:
     """`signal-cli listAccounts` reports every locally-registered account
-    under --config; we only ever link one, so the first (only) result is
-    the number the daemon should bind to."""
+    under --config; each account's --config dir here only ever links one
+    number, so the first (only) result is the number that account's
+    daemon should bind to."""
     proc = await asyncio.create_subprocess_exec(
         SIGNAL_CLI_BAT, "--config", str(config_dir), "listAccounts",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -172,13 +231,14 @@ async def _record_linked_number(workspace_dir: str, config_dir: Path) -> None:
     for line in text.splitlines():
         for token in line.split():
             if token.startswith("+") and token[1:].isdigit():
-                _number_file(workspace_dir).write_text(token, encoding="utf-8")
+                _number_file(workspace_dir, account).write_text(token, encoding="utf-8")
                 return
-    log_event("plugin:signal", "could_not_parse_linked_number", output=text[:500])
+    log_event("plugin:signal", "could_not_parse_linked_number", account=account, output=text[:500])
 
 
 @dataclass
 class SignalChannelStatus:
+    account: str = ""
     linked: bool = False
     connected: bool = False
     own_number: str | None = None
@@ -186,36 +246,39 @@ class SignalChannelStatus:
     last_error: str | None = None
 
 
-_status = SignalChannelStatus()
-_writer: asyncio.StreamWriter | None = None
-_pending: dict[int, asyncio.Future[Any]] = {}
-_next_id = 0
+_status: dict[str, SignalChannelStatus] = {account: SignalChannelStatus(account=account) for account in ACCOUNTS}
+_writer: dict[str, asyncio.StreamWriter | None] = {account: None for account in ACCOUNTS}
+_pending: dict[str, dict[int, asyncio.Future[Any]]] = {account: {} for account in ACCOUNTS}
+_next_id: dict[str, int] = {account: 0 for account in ACCOUNTS}
+# Which tab's start_login call should receive that account's QR window --
+# same reasoning as whatsapp_channel.py's own _login_requested_tab_id.
+_login_requested_tab_id: dict[str, str | None] = {account: None for account in ACCOUNTS}
 
 
-def get_signal_channel_status() -> dict[str, Any]:
-    return asdict(_status)
+def get_signal_channel_status() -> dict[str, dict[str, Any]]:
+    return {account: asdict(status) for account, status in _status.items()}
 
 
-def is_connected() -> bool:
-    return _writer is not None and _status.connected
+def is_connected(account: str) -> bool:
+    return _writer.get(account) is not None and _status[account].connected
 
 
-async def _rpc_call(method: str, params: dict[str, Any]) -> Any:
-    global _next_id
-    if not is_connected():
-        raise SignalError("Signal isn't connected yet -- use signal_login first.")
-    _next_id += 1
-    req_id = _next_id
+async def _rpc_call(account: str, method: str, params: dict[str, Any]) -> Any:
+    if not is_connected(account):
+        raise SignalError(f'Signal ("{account}") isn\'t connected yet -- use signal_login(account="{account}") first.')
+    _next_id[account] += 1
+    req_id = _next_id[account]
     fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-    _pending[req_id] = fut
+    _pending[account][req_id] = fut
     body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}) + "\n"
-    assert _writer is not None
-    _writer.write(body.encode("utf-8"))
-    await _writer.drain()
+    writer = _writer[account]
+    assert writer is not None
+    writer.write(body.encode("utf-8"))
+    await writer.drain()
     try:
         result = await asyncio.wait_for(fut, timeout=RPC_TIMEOUT_S)
     except asyncio.TimeoutError:
-        _pending.pop(req_id, None)
+        _pending[account].pop(req_id, None)
         raise SignalError(f"No response from signal-cli within {int(RPC_TIMEOUT_S)}s.")
     return result
 
@@ -229,13 +292,13 @@ def _is_group_id(target: str) -> bool:
     return not target.startswith("+")
 
 
-async def send_message(recipient: str, text: str) -> None:
+async def send_message(account: str, recipient: str, text: str) -> None:
     key = "groupId" if _is_group_id(recipient) else "recipient"
-    await _rpc_call("send", {key: [recipient], "message": text})
+    await _rpc_call(account, "send", {key: [recipient], "message": text})
 
 
-async def list_contacts() -> list[dict[str, Any]]:
-    result = await _rpc_call("listContacts", {})
+async def list_contacts(account: str) -> list[dict[str, Any]]:
+    result = await _rpc_call(account, "listContacts", {})
     return result if isinstance(result, list) else []
 
 
@@ -249,17 +312,17 @@ async def list_contacts() -> list[dict[str, Any]]:
 SIGNAL_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "signal_downloads"
 
 
-async def send_file(to: str, path: str, caption: str | None = None) -> None:
+async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
     if not Path(path).is_file():
         raise SignalError(f"No such local file: {path}")
     key = "groupId" if _is_group_id(to) else "recipient"
     params: dict[str, Any] = {key: [to], "attachment": [path]}
     if caption:
         params["message"] = caption
-    await _rpc_call("send", params)
+    await _rpc_call(account, "send", params)
 
 
-async def download_attachment(ref: str, save_path: str | None = None) -> str:
+async def download_attachment(account: str, ref: str, save_path: str | None = None) -> str:
     """`ref` is "<attachment id>|<source>" (the source recipient number or
     group id the attachment arrived from -- getAttachment requires one,
     mutually exclusive with the other, to look it up), as handed out in
@@ -269,7 +332,7 @@ async def download_attachment(ref: str, save_path: str | None = None) -> str:
     except ValueError:
         raise SignalError(f'Malformed attachment ref {ref!r} -- expected "<id>|<source>" from a proactive notification.')
     key = "groupId" if _is_group_id(source) else "recipient"
-    result = await _rpc_call("getAttachment", {"id": attachment_id, key: source})
+    result = await _rpc_call(account, "getAttachment", {"id": attachment_id, key: source})
     data = (result or {}).get("data") if isinstance(result, dict) else None
     if not data:
         raise SignalError(f"signal-cli returned no data for attachment {attachment_id}.")
@@ -286,7 +349,7 @@ async def download_attachment(ref: str, save_path: str | None = None) -> str:
 # (creating a local contact entry for them if one didn't exist yet, the
 # closest Signal equivalent to Telegram's telegram_add_contact); block/
 # unblock work on both individual recipients and groups.
-async def update_contact_name(recipient: str, name: str | None = None, given_name: str | None = None, family_name: str | None = None) -> None:
+async def update_contact_name(account: str, recipient: str, name: str | None = None, given_name: str | None = None, family_name: str | None = None) -> None:
     params: dict[str, Any] = {"recipient": recipient}
     if name:
         params["name"] = name
@@ -294,12 +357,12 @@ async def update_contact_name(recipient: str, name: str | None = None, given_nam
         params["givenName"] = given_name
     if family_name:
         params["familyName"] = family_name
-    await _rpc_call("updateContact", params)
+    await _rpc_call(account, "updateContact", params)
 
 
-async def set_block(target: str, block: bool) -> None:
+async def set_block(account: str, target: str, block: bool) -> None:
     key = "groupId" if _is_group_id(target) else "recipient"
-    await _rpc_call("block" if block else "unblock", {key: [target]})
+    await _rpc_call(account, "block" if block else "unblock", {key: [target]})
 
 
 # Groups (2026-10-11). Signal groups are fully decentralized -- every
@@ -308,8 +371,8 @@ async def set_block(target: str, block: bool) -> None:
 # Telegram, and unlike even WhatsApp's own best-effort). delete_group
 # below approximates the same way whatsapp_channel.py's own delete_group
 # does: remove every other member this account can, then quit for good.
-async def create_group(name: str, members: list[str]) -> str:
-    result = await _rpc_call("updateGroup", {"name": name, "member": members})
+async def create_group(account: str, name: str, members: list[str]) -> str:
+    result = await _rpc_call(account, "updateGroup", {"name": name, "member": members})
     group_id = (result or {}).get("groupId")
     if not group_id:
         raise SignalError("signal-cli didn't return a groupId for the new group.")
@@ -317,7 +380,7 @@ async def create_group(name: str, members: list[str]) -> str:
 
 
 async def update_group_members(
-    group_id: str, *, add: list[str] | None = None, remove: list[str] | None = None,
+    account: str, group_id: str, *, add: list[str] | None = None, remove: list[str] | None = None,
     promote: list[str] | None = None, demote: list[str] | None = None,
 ) -> None:
     params: dict[str, Any] = {"groupId": group_id}
@@ -329,55 +392,56 @@ async def update_group_members(
         params["admin"] = promote
     if demote:
         params["removeAdmin"] = demote
-    await _rpc_call("updateGroup", params)
+    await _rpc_call(account, "updateGroup", params)
 
 
-async def list_groups() -> list[dict[str, Any]]:
-    result = await _rpc_call("listGroups", {"detailed": True})
+async def list_groups(account: str) -> list[dict[str, Any]]:
+    result = await _rpc_call(account, "listGroups", {"detailed": True})
     return result if isinstance(result, list) else []
 
 
-async def quit_group(group_id: str, *, delete: bool = False, new_admins: list[str] | None = None) -> None:
+async def quit_group(account: str, group_id: str, *, delete: bool = False, new_admins: list[str] | None = None) -> None:
     params: dict[str, Any] = {"groupId": group_id, "delete": delete}
     if new_admins:
         params["admin"] = new_admins
-    await _rpc_call("quitGroup", params)
+    await _rpc_call(account, "quitGroup", params)
 
 
-async def delete_group(group_id: str) -> None:
-    groups = await list_groups()
+async def delete_group(account: str, group_id: str) -> None:
+    groups = await list_groups(account)
     members: list[str] = []
     for g in groups:
         if g.get("id") == group_id:
             members = [m.get("number") for m in (g.get("members") or []) if isinstance(m, dict) and m.get("number")]
             break
     if members:
-        await update_group_members(group_id, remove=members)
-    await quit_group(group_id, delete=True)
+        await update_group_members(account, group_id, remove=members)
+    await quit_group(account, group_id, delete=True)
 
 
-async def _spawn_daemon(workspace_dir: str) -> subprocess.Popen[bytes]:
-    number = _linked_number(workspace_dir)
+async def _spawn_daemon(workspace_dir: str, account: str) -> subprocess.Popen[bytes]:
+    number = _linked_number(workspace_dir, account)
     assert number
-    config_dir = _config_dir(workspace_dir)
+    config_dir = _config_dir(workspace_dir, account)
+    port = DAEMON_PORT_BY_ACCOUNT[account]
     return subprocess.Popen(
-        [SIGNAL_CLI_BAT, "--config", str(config_dir), "-a", number, "daemon", "--tcp", f"127.0.0.1:{DAEMON_PORT}"],
+        [SIGNAL_CLI_BAT, "--config", str(config_dir), "-a", number, "daemon", "--tcp", f"127.0.0.1:{port}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_env_for_subprocess(), creationflags=_NO_WINDOW,
     )
 
 
-async def _run_daemon_connection(workspace_dir: str, inject_proactive: Callable[[str], None], touch: Callable[[], None] = lambda: None) -> None:
+async def _run_daemon_connection(workspace_dir: str, account: str, inject_proactive: Callable[[str], None], touch: Callable[[], None] = lambda: None) -> None:
     """`touch()` is supervise()'s heartbeat callback (2026-10-11, after a
     real Telegram incident of the same shape -- see telegram_channel.py's
     own docstring for the full story). Called once the daemon connection
     is up, then on every received line for as long as it stays up."""
-    global _writer
     _require_tooling()
-    number = _linked_number(workspace_dir)
+    number = _linked_number(workspace_dir, account)
     if not number:
         return
 
-    daemon_proc = await _spawn_daemon(workspace_dir)
+    daemon_proc = await _spawn_daemon(workspace_dir, account)
+    port = DAEMON_PORT_BY_ACCOUNT[account]
     try:
         reader: asyncio.StreamReader | None = None
         writer: asyncio.StreamWriter | None = None
@@ -386,18 +450,18 @@ async def _run_daemon_connection(workspace_dir: str, inject_proactive: Callable[
             if daemon_proc.poll() is not None:
                 raise SignalError(f"signal-cli daemon exited early (code {daemon_proc.returncode}) before accepting connections.")
             try:
-                reader, writer = await asyncio.open_connection("127.0.0.1", DAEMON_PORT)
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
                 break
             except OSError:
                 await asyncio.sleep(0.5)
         if reader is None or writer is None:
-            raise SignalError(f"signal-cli daemon didn't start listening on 127.0.0.1:{DAEMON_PORT} within {int(DAEMON_READY_TIMEOUT_S)}s.")
+            raise SignalError(f"signal-cli daemon didn't start listening on 127.0.0.1:{port} within {int(DAEMON_READY_TIMEOUT_S)}s.")
 
-        _writer = writer
-        _status.connected = True
-        _status.linked = True
-        _status.own_number = number
-        log_event("plugin:signal", "daemon_connected", number=number)
+        _writer[account] = writer
+        _status[account].connected = True
+        _status[account].linked = True
+        _status[account].own_number = number
+        log_event("plugin:signal", "daemon_connected", account=account, number=number)
         touch()
 
         async def _pump_heartbeat() -> None:
@@ -423,23 +487,23 @@ async def _run_daemon_connection(workspace_dir: str, inject_proactive: Callable[
                     msg = json.loads(line)
                 except Exception:
                     continue
-                _dispatch_rpc_line(msg, inject_proactive)
+                _dispatch_rpc_line(account, msg, inject_proactive)
         finally:
             heartbeat_pump.cancel()
     finally:
-        _writer = None
-        _status.connected = False
-        for fut in _pending.values():
+        _writer[account] = None
+        _status[account].connected = False
+        for fut in _pending[account].values():
             if not fut.done():
                 fut.set_exception(SignalError("Signal daemon disconnected"))
-        _pending.clear()
+        _pending[account].clear()
         if daemon_proc.poll() is None:
             daemon_proc.terminate()
 
 
-def _dispatch_rpc_line(msg: dict[str, Any], inject_proactive: Callable[[str], None]) -> None:
-    if "id" in msg and msg.get("id") in _pending:
-        fut = _pending.pop(msg["id"])
+def _dispatch_rpc_line(account: str, msg: dict[str, Any], inject_proactive: Callable[[str], None]) -> None:
+    if "id" in msg and msg.get("id") in _pending[account]:
+        fut = _pending[account].pop(msg["id"])
         if fut.done():
             return
         if "error" in msg:
@@ -463,16 +527,28 @@ def _dispatch_rpc_line(msg: dict[str, Any], inject_proactive: Callable[[str], No
         name = envelope.get("sourceName") or source
         target = (group_info or {}).get("groupId") or source
         kind = f'group "{group_info.get("groupName") or target}"' if group_info else "DM"
-        _status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        log_event("plugin:signal", "message_received", source=source, kind=kind, has_media=bool(attachments))
-        note = f'[New Signal {kind} message from "{name}" ({source}):\n{text or "(no text)"}'
+        _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        log_event("plugin:signal", "message_received", account=account, source=source, kind=kind, has_media=bool(attachments))
+        note = f'[New Signal {kind} message in {_ACCOUNT_LABEL[account]} Signal account, from "{name}" ({source}, account="{account}"):\n{text or "(no text)"}'
         for att in attachments:
             att_id = att.get("id")
             if not att_id:
                 continue
             ref = f"{att_id}|{target}"
-            note += f'\nAttached: {_describe_attachment(att)}. Use signal_download_attachment(ref="{ref}") to save it locally first.'
-        note += f'\nReply with signal_send_message(to="{target}", text=...) if it needs a response.]'
+            note += f'\nAttached: {_describe_attachment(att)}. Use signal_download_attachment(ref="{ref}", account="{account}") to save it locally first.'
+        if account == "self":
+            note += (
+                "\nThis is Caroline's own separate Signal account, not the user's -- replying here is "
+                "Caroline's own correspondence, not something done on the user's behalf, and needs no extra "
+                f'permission. Reply with signal_send_message(to="{target}", text=..., account="self") if it '
+                "needs a response.]"
+            )
+        else:
+            note += (
+                "\nThis is the OWNER'S OWN correspondence, not yours -- read it and tell the owner about it if "
+                "it matters, but do not reply as them unless they have explicitly asked you to send this "
+                f'specific reply (signal_send_message(to="{target}", text=..., account="owner")).]'
+            )
         inject_proactive(note)
 
 
@@ -490,27 +566,37 @@ def _describe_attachment(att: dict[str, Any]) -> str:
     return f'file "{name}"' if name else "file"
 
 
-def start_signal_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:
-    async def _loop(touch: Callable[[], None]) -> None:
-        while True:
-            if not _linked_number(workspace_dir):
-                # Idly waiting for this account to ever be linked is
-                # normal, indefinite, healthy -- not a stall.
+def start_signal_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> list[asyncio.Task[None]]:
+    """Startup loop, one per account: if a number is already linked,
+    connect; otherwise re-check every 30s (cheap file read) until
+    start_login has recorded one. The two accounts are fully independent
+    -- one can be linked and running while the other has never logged in,
+    same as telegram_channel.py's own two loops."""
+    def _make_loop(account: str) -> Callable[[Callable[[], None]], Any]:
+        async def _loop(touch: Callable[[], None]) -> None:
+            while True:
+                if not _linked_number(workspace_dir, account):
+                    # Idly waiting for this account to ever be linked is
+                    # normal, indefinite, healthy -- not a stall.
+                    touch()
+                    await asyncio.sleep(30.0)
+                    continue
+                try:
+                    await _run_daemon_connection(workspace_dir, account, inject_proactive, touch)
+                except SignalError as exc:
+                    _status[account].last_error = str(exc)
+                    log_event("plugin:signal", "daemon_unavailable", account=account, error=str(exc))
+                    touch()  # a deliberate backoff wait, not a stall
+                    await asyncio.sleep(60.0)
+                    continue
+                except Exception as exc:
+                    _status[account].last_error = str(exc)
+                    log_event("plugin:signal", "daemon_failed", account=account, error=str(exc))
                 touch()
-                await asyncio.sleep(30.0)
-                continue
-            try:
-                await _run_daemon_connection(workspace_dir, inject_proactive, touch)
-            except SignalError as exc:
-                _status.last_error = str(exc)
-                log_event("plugin:signal", "daemon_unavailable", error=str(exc))
-                touch()  # a deliberate backoff wait, not a stall
-                await asyncio.sleep(60.0)
-                continue
-            except Exception as exc:
-                _status.last_error = str(exc)
-                log_event("plugin:signal", "daemon_failed", error=str(exc))
-            touch()
-            await asyncio.sleep(5.0)
+                await asyncio.sleep(5.0)
+        return _loop
 
-    return supervise("signal_channel", _loop, heartbeat_timeout_s=CHANNEL_HEARTBEAT_TIMEOUT_S)
+    return [
+        supervise(f"signal_channel_{account}", _make_loop(account), heartbeat_timeout_s=CHANNEL_HEARTBEAT_TIMEOUT_S)
+        for account in ACCOUNTS
+    ]

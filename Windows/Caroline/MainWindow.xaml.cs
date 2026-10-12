@@ -1110,6 +1110,23 @@ public partial class MainWindow : Window
             Logger.Log($"MainWindow: {type} requestId={requestId} path={path}");
             var viewerKey = path.Length > 0 ? path : requestId;
 
+            // An image viewer already open for this same path is updated in place
+            // instead of opening a second window -- confirmed live as the actual
+            // cause of a WhatsApp-link QR code (refreshed by the sidecar every
+            // 20-60s while unscanned) piling up duplicate windows: every open_editor
+            // for the same path used to just overwrite _viewerWindows[viewerKey]
+            // with a brand new window, silently leaking the old one on screen.
+            // Scoped to kind=="image" only -- document/office/code/slideshow have
+            // their own reopen semantics, untouched here.
+            if (type == "open_editor" && root.TryGetProperty("kind", out var earlyKindEl) && earlyKindEl.GetString() == "image"
+                && _viewerWindows.TryGetValue(viewerKey, out var existingImageViewer))
+            {
+                Logger.Log($"MainWindow: open_editor reusing existing image window path={path}");
+                existingImageViewer.UpdateImage(path);
+                existingImageViewer.Activate();
+                return;
+            }
+
             Action<ViewerOutcome, string?, string?> onDone = (outcome, resultPath, message) =>
             {
                 Dispatcher.Invoke(() =>

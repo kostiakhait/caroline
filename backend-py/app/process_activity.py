@@ -80,17 +80,37 @@ class ProcessActivityMonitor:
         self.last_cpu_percent: float | None = None
         self.last_rss_delta: int | None = None
         self.last_io_delta: int | None = None
+        if not self._try_activate():
+            self._available = False
+
+    def _try_activate(self) -> bool:
+        """Attempts the priming sequence; returns whether it succeeded. Split
+        out of __init__ (2026-10-12) so sample() can retry it instead of
+        `available=False` being a permanent verdict decided once, in the
+        single instant right after the subprocess was just opened -- a real
+        incident (tab 3, every one of 7 restart cycles over ~12 minutes)
+        showed the monitor unavailable 100% of the time, consistent with a
+        transient Windows handle/permissions race on a just-CreateProcess'd
+        pid (the sink callback in win_subprocess_patch.py constructs this
+        synchronously, essentially the same instant CreateProcess returns)
+        rather than a process that was ever genuinely unreadable -- a plain
+        retry a few seconds later (the next watchdog tick) is the correct,
+        minimal fix either way, independent of which exact transient cause
+        it turns out to be."""
         try:
-            self._process = psutil.Process(pid)
+            process = psutil.Process(self.pid)
             # Prime cpu_percent() -- psutil's own documented contract: the
             # FIRST call after construction always returns a meaningless
             # 0.0 (no prior sample to diff against). This call establishes
             # that baseline so the next real sample() call is accurate.
-            self._process.cpu_percent(interval=None)
-            self._last_rss = self._process.memory_info().rss
+            process.cpu_percent(interval=None)
+            self._last_rss = process.memory_info().rss
+            self._process = process
             self._last_io_bytes = self._read_io_bytes()
+            self._available = True
+            return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            self._available = False
+            return False
 
     def _read_io_bytes(self) -> int | None:
         if not self._io_supported or self._process is None:
@@ -116,8 +136,23 @@ class ProcessActivityMonitor:
         longer be read at all -- an unreadable process is a MONITORING
         failure, not evidence of a hang; the caller should fall back to
         another signal (see `available`) rather than treat "can't tell"
-        as "definitely hung"."""
+        as "definitely hung".
+
+        If construction never succeeded (or a previous sample lost the
+        process), retries the same priming sequence here (see
+        _try_activate's own docstring) before giving up for this tick --
+        self-heals from a transient failure instead of staying unavailable
+        for the rest of this connection's life. The tick that successfully
+        re-activates still returns True (its own cpu_percent() call is the
+        meaningless post-construction baseline, same as right after a fresh
+        __init__) -- real measurement starts the NEXT tick."""
         if not self._available or self._process is None:
+            if not self._try_activate():
+                return True
+            # Just (re)primed cpu_percent() this instant -- the fall-through
+            # below would call it a second time in the same tick and treat
+            # the near-zero elapsed interval as "no activity". Stop here;
+            # the baseline is set, real measurement starts next tick.
             return True
         try:
             cpu = self._process.cpu_percent(interval=None)
