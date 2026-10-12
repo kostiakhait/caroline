@@ -79,6 +79,8 @@ win_subprocess_patch.apply()
 from app.durability import (
     _sanitize_tab_id,
     claude_project_dir,
+    clear_pending_api_retry,
+    clear_pending_one_shot_followup,
     clear_pending_turn,
     clear_tab_continuity_archive,
     clear_tab_session_id,
@@ -90,6 +92,8 @@ from app.durability import (
     load_tab_continuity_archive,
     load_tab_session_id,
     save_discovered_foreign_tool_overlap,
+    save_pending_api_retry,
+    save_pending_one_shot_followup,
     save_pending_turn,
     save_tab_continuity_archive,
     save_tab_session_id,
@@ -1851,8 +1855,8 @@ class ChatSession:
         self.ended = True
         if self._watchdog_task:
             self._watchdog_task.cancel()
-        self._clear_api_retry_timer()
-        self._clear_one_shot_followup_timer()
+        self._clear_api_retry_timer(clear_persisted=False)
+        self._clear_one_shot_followup_timer(clear_persisted=False)
         self._clear_mcp_reconnect_timers()
         if self.client:
             asyncio.create_task(self._safe_interrupt())
@@ -3045,10 +3049,21 @@ class ChatSession:
             return False
         return self.turn_pending or (time.monotonic() - self.last_user_activity) < idle_threshold_s
 
-    def _clear_api_retry_timer(self) -> None:
+    def _clear_api_retry_timer(self, clear_persisted: bool = True) -> None:
+        """`clear_persisted=False` only from dispose(): a retry timer
+        cancelled because the PROCESS is tearing down (app closing,
+        restarting) must stay recorded on disk -- see durability.py's own
+        "pending API retry" section for the 2026-10-12 incident this
+        covers. Every other caller (Stop, an engine switch, a genuine
+        recovery, or _fire() itself once it has actually injected the
+        nudge) means the retry is genuinely no longer owed, so the default
+        clears the durability file too -- callers never have to remember
+        to do it themselves."""
         if self.api_retry_timer:
             self.api_retry_timer.cancel()
             self.api_retry_timer = None
+        if clear_persisted:
+            clear_pending_api_retry(self.workspace_dir, self.tab_id)
 
     def _stopped_by_user(self, what: str, reason: str) -> bool:
         """True after an explicit Stop, until the user's next real message
@@ -3068,6 +3083,12 @@ class ChatSession:
             log_event("engine", "api_retry_already_pending", tab_id=self.tab_id, reason=reason)
             return
         log_event("engine", "api_retry_scheduled", tab_id=self.tab_id, reason=reason, delay_ms=API_RETRY_INTERVAL_MS)
+        # Per explicit instruction (2026-10-12): survives a full app restart --
+        # see durability.py's own "pending API retry" section for the real
+        # incident this closes. Cleared by _clear_api_retry_timer (every
+        # caller of that except dispose()) or right below once this _fire()
+        # has actually injected the nudge.
+        save_pending_api_retry(self.workspace_dir, self.tab_id, reason, is_voice)
 
         def _fire() -> None:
             self.api_retry_timer = None
@@ -3083,6 +3104,7 @@ class ChatSession:
             # was no "working" indication at all. Also reuses
             # CONTINUE_OR_SILENT_NUDGE_TEMPLATE now (language-aware,
             # [[NO_UPDATE]]-aware) instead of bespoke text with neither.
+            clear_pending_api_retry(self.workspace_dir, self.tab_id)
             self.inject_proactive(
                 "[Internal: automatic recheck after an API/subscription limit blocked a previous turn.] "
                 f"{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=current_language_name(self.tab_id))}",
@@ -3131,12 +3153,17 @@ class ChatSession:
             "engine", "one_shot_followup_scheduled", tab_id=self.tab_id, reason=reason,
             delay_ms=ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS,
         )
+        # Per explicit instruction (2026-10-12): same restart-survival fix as
+        # _schedule_api_retry's own save_pending_api_retry -- see
+        # durability.py's own "pending API retry" section.
+        save_pending_one_shot_followup(self.workspace_dir, self.tab_id, reason, is_voice)
 
         def _fire() -> None:
             self.one_shot_followup_timer = None
             if self.ended:
                 return
             log_event("engine", "one_shot_followup_firing", tab_id=self.tab_id, reason=reason)
+            clear_pending_one_shot_followup(self.workspace_dir, self.tab_id)
             self.inject_proactive(
                 f"[Internal: automatic follow-up check -- your previous turn concluded by reporting a usage cap, "
                 f"and this check fires again every 90s until a real reply gets through. The user has not said "
@@ -3154,10 +3181,14 @@ class ChatSession:
         loop = asyncio.get_event_loop()
         self.one_shot_followup_timer = loop.call_later(ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS / 1000, _fire)
 
-    def _clear_one_shot_followup_timer(self) -> None:
+    def _clear_one_shot_followup_timer(self, clear_persisted: bool = True) -> None:
+        """Same `clear_persisted=False`-only-from-dispose() reasoning as
+        _clear_api_retry_timer's own docstring."""
         if self.one_shot_followup_timer:
             self.one_shot_followup_timer.cancel()
             self.one_shot_followup_timer = None
+        if clear_persisted:
+            clear_pending_one_shot_followup(self.workspace_dir, self.tab_id)
 
     def _clear_mcp_reconnect_timers(self) -> None:
         for t in self.mcp_reconnect_timers.values():

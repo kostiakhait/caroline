@@ -212,6 +212,105 @@ def clear_pending_operation(workspace_dir: str, tab_id: str, operation_id: str) 
         log_event("engine", "clear_pending_operation_failed", tab_id=tab_id, operation_id=operation_id, error=str(exc))
 
 
+# --- pending API retry / one-shot followup check, for restart recovery ----
+# Per explicit instruction (2026-10-12, "Почему вкладка 4 не продолжила
+# задачу?" -- a real live incident): chat_session.py's _schedule_api_retry
+# and _schedule_one_shot_followup_check each arm a plain asyncio timer
+# (loop.call_later) to re-poke a turn that was blocked by a rate limit/
+# usage cap -- pure in-memory state, same gap pending-turn/pending-
+# operations above already closed for OTHER kinds of in-flight work. A
+# full app restart while one of these timers is still pending (confirmed
+# live: it landed mid-wait during an unrelated app restart for an
+# unrelated install) loses the timer completely -- the tab reconnects,
+# finishes its own ordinary startup, and simply goes idle, because nothing
+# remembers a retry was ever owed. Same shape as pending-operations: saved
+# the moment a timer is armed, cleared the moment it's disarmed for ANY
+# reason (fired, cancelled by Stop, or made moot by a genuine recovery --
+# see chat_session.py's own _clear_api_retry_timer/
+# _clear_one_shot_followup_timer, the one place each of these is cleared
+# from, so callers never have to remember to clear the durability file
+# themselves).
+
+
+@dataclass
+class PendingRetry:
+    reason: str
+    is_voice: bool
+    scheduled_at_iso: str
+
+
+def _pending_api_retry_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"pending-api-retry-{_sanitize_tab_id(tab_id)}.json"
+
+
+def save_pending_api_retry(workspace_dir: str, tab_id: str, reason: str, is_voice: bool) -> None:
+    from datetime import datetime, timezone
+    try:
+        path = _pending_api_retry_path(workspace_dir, tab_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"reason": reason, "isVoice": is_voice, "scheduledAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "save_pending_api_retry_failed", tab_id=tab_id, error=str(exc))
+
+
+def clear_pending_api_retry(workspace_dir: str, tab_id: str) -> None:
+    try:
+        _pending_api_retry_path(workspace_dir, tab_id).unlink(missing_ok=True)
+    except Exception as exc:
+        log_event("engine", "clear_pending_api_retry_failed", tab_id=tab_id, error=str(exc))
+
+
+def peek_pending_api_retry(workspace_dir: str, tab_id: str) -> PendingRetry | None:
+    """Read-only, same "deletion isn't this function's job" reasoning as
+    peek_pending_turn/peek_pending_operations -- the caller clears it
+    (clear_pending_api_retry) only once the recovery nudge has actually
+    been injected."""
+    path = _pending_api_retry_path(workspace_dir, tab_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return PendingRetry(reason=data.get("reason", ""), is_voice=bool(data.get("isVoice")), scheduled_at_iso=data.get("scheduledAtIso", ""))
+    except Exception as exc:
+        log_event("engine", "peek_pending_api_retry_failed", tab_id=tab_id, error=str(exc))
+        return None
+
+
+def _pending_one_shot_followup_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"pending-one-shot-followup-{_sanitize_tab_id(tab_id)}.json"
+
+
+def save_pending_one_shot_followup(workspace_dir: str, tab_id: str, reason: str, is_voice: bool) -> None:
+    from datetime import datetime, timezone
+    try:
+        path = _pending_one_shot_followup_path(workspace_dir, tab_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"reason": reason, "isVoice": is_voice, "scheduledAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "save_pending_one_shot_followup_failed", tab_id=tab_id, error=str(exc))
+
+
+def clear_pending_one_shot_followup(workspace_dir: str, tab_id: str) -> None:
+    try:
+        _pending_one_shot_followup_path(workspace_dir, tab_id).unlink(missing_ok=True)
+    except Exception as exc:
+        log_event("engine", "clear_pending_one_shot_followup_failed", tab_id=tab_id, error=str(exc))
+
+
+def peek_pending_one_shot_followup(workspace_dir: str, tab_id: str) -> PendingRetry | None:
+    path = _pending_one_shot_followup_path(workspace_dir, tab_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return PendingRetry(reason=data.get("reason", ""), is_voice=bool(data.get("isVoice")), scheduled_at_iso=data.get("scheduledAtIso", ""))
+    except Exception as exc:
+        log_event("engine", "peek_pending_one_shot_followup_failed", tab_id=tab_id, error=str(exc))
+        return None
+
+
 def peek_pending_operations(workspace_dir: str, tab_id: str) -> list[dict]:
     """Read-only -- does NOT delete the file (same reasoning as
     peek_pending_turn's own docstring: deletion isn't this function's
