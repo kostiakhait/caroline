@@ -20,7 +20,7 @@ for node in tree.body:
 WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speech_state", "_client_quiet_for",
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
-          "_say_first_voice_remark"}
+          "_say_first_voice_remark", "_review_and_synthesize"}
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChatSession")
 funcs = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in WANTED]
 missing = WANTED - {f.name for f in funcs}
@@ -53,6 +53,14 @@ async def synthesize_speech(t, voice, language=None):
     await asyncio.sleep(1.5 * SCALE); state["live"] -= 1; return "AUDIO"
 voice_api.clean_text_for_speech = clean_text_for_speech; voice_api.synthesize_speech = synthesize_speech
 voice_api.voice_for_gender = lambda g: "Nova"
+# reply.review for a voice remark (VOICE_NARRATION_REVIEW). REVIEW_S=<seconds> gives it the
+# server's real latency (2.2-3.8s measured) to see what that does to the schedule; the
+# default 0 keeps the checks below about the scheduler alone.
+REVIEW_S = float(os.environ.get("REVIEW_S", "0"))
+async def review_reply(text, task, **kw):
+    await asyncio.sleep(REVIEW_S * SCALE)
+    return text
+voice_api.review_reply = review_reply
 async def generate_progress_comment_direct(task, activity, already_said, language, resolve, **kw):
     return await generate_progress_comment('', language, activity=activity, task=task, already_said=already_said)
 voice_api.generate_progress_comment_direct = generate_progress_comment_direct

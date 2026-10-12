@@ -313,6 +313,16 @@ NARRATION_FAILURE_RETRY_S = 15.0
 # speech queue quiet (speech_state, see on_client_speech_state). Text-only turns and
 # SDK-path turns keep PROGRESS_NARRATION_INTERVAL_MS unchanged.
 VOICE_NARRATION_TICK_S = 1.0
+# Per explicit instruction (2026-10-11, and again 2026-10-12 when its cost for the voice
+# loop was put to him: "он необходим для предотвращения ошибок модели, оставляем"): every
+# outbound text goes through the server's reply.review, a narration remark first of all.
+# Measured 2026-10-12: 2.2-3.8s per remark, on top of ~0.6s of drafting. It runs before
+# the remark's audio is made -- while the previous remark is still being spoken where
+# there is one, and inside the merge window for the first remark of a turn. Fail-open as
+# everywhere else, and bounded: a review that has not answered in this time lets the
+# remark go as it was drafted.
+VOICE_NARRATION_REVIEW = True
+VOICE_NARRATION_REVIEW_TIMEOUT_S = 6.0
 # No remark before this much of a turn has passed -- a quick turn answers on its own.
 VOICE_NARRATION_FIRST_S = 5.0
 # Drafting starts this early so the first remark is ready by VOICE_NARRATION_FIRST_S.
@@ -2449,9 +2459,10 @@ class ChatSession:
         self, persona: Any, text: str, lines: list[str], language: str,
     ) -> tuple[str | None, int | None, str | None, asyncio.Task[str | None] | None]:
         fast, start_tier, first_remark = await try_fast_answer(self.workspace_dir, persona, text, lines, language, True)
-        # The remark's audio too, while the window is still running -- in a task of its
-        # own: a turn that starts meanwhile must not wait for it before it gets to work.
-        audio = asyncio.create_task(self._synthesize_narration_audio(first_remark)) if first_remark else None
+        # The remark's review and audio too, while the window is still running -- in a
+        # task of its own: a turn that starts meanwhile must not wait for it before it
+        # gets to work. The task returns (the remark as reviewed, its audio).
+        audio = asyncio.create_task(self._review_and_synthesize(first_remark, text)) if first_remark else None
         return fast, start_tier, first_remark, audio
 
     async def _fast_lane_for_turn(
@@ -2710,7 +2721,10 @@ class ChatSession:
         # Per explicit instruction (2026-10-11): re-evaluate the permission
         # guard on every outbound message -- see _check_permission_guard's
         # own docstring for why this runs here too, not just in submit().
-        await self._check_permission_guard()
+        # Not awaited here (2026-10-12): it takes ~3s (measured), all it does is set
+        # a flag read at the next tool call, and this turn has none left -- the reply
+        # is ready. submit() starts the same check the same way.
+        asyncio.ensure_future(self._check_permission_guard())
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
         self._reset_voice_narration()
         _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
@@ -4063,6 +4077,26 @@ class ChatSession:
             log_event("engine", "voice_narration_tts_failed", tab_id=self.tab_id, error=str(exc))
             return None
 
+    async def _review_and_synthesize(self, comment: str, task: str) -> tuple[str, str | None]:
+        """A voice-loop remark on its way out: reply.review (see VOICE_NARRATION_REVIEW),
+        then the audio of what the review returned. Returns (the remark to say, its audio)."""
+        if VOICE_NARRATION_REVIEW:
+            started = time.monotonic()
+            reviewed: str | None = None
+            try:
+                from app.plugins.voice_api import review_reply
+
+                reviewed = await review_reply(comment, task=task, timeout=VOICE_NARRATION_REVIEW_TIMEOUT_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- fail-open, as review_reply itself is
+                log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
+            log_event("engine", "voice_narration_reviewed", tab_id=self.tab_id, ms=int((time.monotonic() - started) * 1000),
+                      answered=reviewed is not None, changed=bool(reviewed and reviewed != comment))
+            if reviewed:
+                comment = reviewed
+        return comment, await self._synthesize_narration_audio(comment)
+
     async def _send_narration_remark(self, comment: str, audio_base64: str | None = None) -> None:
         """Shows one narration remark -- shared by the 60s path above and the voice
         loop. isNarration (2026-10-09) lets chat.js drop a remark still waiting in its
@@ -4266,7 +4300,7 @@ class ChatSession:
         VOICE_NARRATION_FIRST_S -- that wait is for turns that may answer within
         seconds, and a decline says this one won't. Live before this, the first remark
         was heard 12.9s after the question."""
-        audio = await audio_task if audio_task is not None else await self._synthesize_narration_audio(remark)
+        remark, audio = await audio_task if audio_task is not None else await self._review_and_synthesize(remark, self._narration_task())
         if turn_seq != self._narration_turn_seq or self._prepared_narration is not None or self.turn_narration_remarks:
             return  # the turn is over, or the loop has a remark of its own by now
         self._prepared_narration = (remark, time.monotonic(), audio)
@@ -4335,7 +4369,7 @@ class ChatSession:
         # Synthesized here, while the previous remark is still playing (2026-10-10): seen
         # live, synthesis took 4-7s per remark -- every one of them dead air when the
         # client only asked for the audio once the remark had arrived.
-        audio = await self._synthesize_narration_audio(comment)
+        comment, audio = await self._review_and_synthesize(comment, task)
         if turn_seq != self._narration_turn_seq:
             log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=True)
             return
