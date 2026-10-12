@@ -29,6 +29,7 @@ from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_a
 from app.durability import clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app.stt_adaptation import apply_adaptation, observe_user_message
+from app.stt_sanity import STT_SANITY_MODEL, check_transcript
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
@@ -1020,7 +1021,23 @@ async def handle_control_request(
                 return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
         # Learned per-user mishearings (2026-10-10) -- see stt_adaptation.py.
         text = apply_adaptation(WORKSPACE_DIR, text)
-        log_event("engine", "stt_done", request_id=request_id, text_len=len(text))
+        # A pass for meaning and coherence (2026-10-11) -- see stt_sanity.py. What it
+        # drops comes back as an empty transcript, which chat.js already ignores.
+        language = current_language_name(session.tab_id) if session is not None else None
+        dialogue: list[str] = []
+        if session is not None:
+            from app.chat_session import _read_recent_dialogue_lines
+
+            dialogue = _read_recent_dialogue_lines(session.last_saved_session_id, session.tab_id, WORKSPACE_DIR, 4)
+
+        async def _sanity_model(prompt: str) -> str:
+            from app.small_model_engine import resolve_narration_prompt
+
+            return await resolve_narration_prompt(prompt, model=STT_SANITY_MODEL)
+
+        checked = await check_transcript(text, dialogue, language, _sanity_model)
+        text = checked.text
+        log_event("engine", "stt_done", request_id=request_id, text_len=len(text), sanity=checked.verdict, sanity_by=checked.by)
         return {"type": "control_response", "op": op, "ok": True, "stdout": text, "requestId": request_id}
     if op == "local_stt_get":
         stdout = json.dumps({"enabled": is_local_stt_enabled(WORKSPACE_DIR), "available": is_local_stt_available()})
