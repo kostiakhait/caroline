@@ -1187,6 +1187,7 @@
     if (!force && reportedSpeaking === speaking) return;
     reportedSpeaking = speaking;
     sendControl("speech_state", { speaking });
+    updateStopBtnVisibility();
   }
 
   // Starts synthesis for a queued item early (2026-10-09), while the item ahead of it is
@@ -1515,7 +1516,10 @@
   // first one.
   function updateStopBtnVisibility() {
     const busy = carolineStatus === "working" || carolineStatus === "recovering";
-    const show = busy || !!voiceSession;
+    // Also while a reply is being read aloud (2026-10-12): the turn is over by then, so
+    // the chat had no Stop at all for the voice -- seen live, the only Stop left was the
+    // one on the talking-head window.
+    const show = busy || !!voiceSession || reportedSpeaking === true;
     stopBtn.style.display = show ? "" : "none";
     // Sending stays enabled regardless while just a turn is busy -- the
     // backend queues a follow-up and runs it right after, so there's no
@@ -2815,7 +2819,9 @@
     stopActiveSpeech();
     clearSpeechQueue();
     dismissVisualWindow();
-    stopCurrentTurn();
+    // With no turn running the click was for the voice alone; "interrupt" then has
+    // nothing to stop, and stopCurrentTurn would still rearrange the turn queue.
+    if (carolineStatus === "working" || carolineStatus === "recovering") stopCurrentTurn();
   });
   inputEl.addEventListener("input", autoGrow);
   inputEl.addEventListener("keydown", (e) => {
