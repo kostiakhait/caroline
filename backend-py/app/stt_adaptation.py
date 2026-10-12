@@ -24,6 +24,11 @@ counts against it (apply only uses the net weight of a pair over its reverse).
 
 Stored as stt-adaptation.json in the workspace dir: text pairs only, never audio,
 and nothing leaves the machine.
+
+There is deliberately no setting to switch this off or to look at what was learned
+(decided 2026-10-11: "пока без отдельной настройки/переключателя"). If one is wanted
+later, it is one place each: apply_adaptation and observe_user_message are the only
+two entry points, both called from main.py, and the learned pairs are that one file.
 """
 
 from __future__ import annotations
