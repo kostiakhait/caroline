@@ -33,7 +33,7 @@ from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server,
 from app import memory_nudge
 from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
-from app.session_context import get_inject_proactive, get_tab_id
+from app.session_context import get_inject_proactive, get_permission_block, get_tab_id
 from app.workspace_dir import WORKSPACE_DIR
 
 # How long dispatch() waits before giving up on returning a "done" result
@@ -114,6 +114,17 @@ class OperationRegistry:
     def forget(self, operation_id: str) -> None:
         self._ops.pop(operation_id, None)
 
+    def running_for_tab(self, tab_id: str) -> list[Operation]:
+        """Operations genuinely still running for this tab right now --
+        the same ground truth cancel_for_tab (below) already uses, and
+        (2026-10-11) what the progress narrator's own fact-gathering was
+        missing: _pending_tool_calls (raw SDK ToolUseBlock tracking) only
+        covers the brief window before dispatch() answers with
+        {operation_id, status} and the real work moves here, so a tool
+        that's genuinely still running looked like "nothing running" to
+        the narrator for the tool's entire actual duration."""
+        return [op for op in self._ops.values() if op.tab_id == tab_id and op.status == "running"]
+
     def cancel_for_tab(self, tab_id: str, keep_tools: frozenset[str] = frozenset()) -> int:
         """Cancels every still-running operation tagged with this tab_id --
         called from ChatSession.stop() alongside client.interrupt() so
@@ -191,8 +202,25 @@ async def dispatch(
     still running" -- and a later "[Internal: a background operation ...]"
     turn to narrate. The operation stays registered while it runs, so Stop
     (REGISTRY.cancel_for_tab) still cancels it; the envelope's status is
-    then "cancelled"."""
-    op = REGISTRY.create(tool_name, tab_id=get_tab_id())
+    then "cancelled".
+
+    Per explicit instruction (2026-10-11): before anything else, ask the
+    calling ChatSession (via session_context's per-tab registration)
+    whether this tab currently has an un-approved action outstanding --
+    the SAME check, in front of EVERY plugin tool call in BOTH engines
+    (this function is the one place both wrap_tool() and
+    _make_executor_fn() funnel through), so there is exactly one place to
+    enforce it rather than duplicating a gate per call site. A positive
+    answer here also means the ChatSession itself just stopped the whole
+    turn (see get_permission_block's own caller-side docstring) -- the
+    real handler is never invoked for a blocked call, belt-and-suspenders
+    on top of that stop."""
+    tab_id = get_tab_id()
+    blocked_reason = get_permission_block(tab_id)
+    if blocked_reason:
+        log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved", tool=tool_name, reason=blocked_reason)
+        return {"operation_id": "", "status": "error", "error": f"Blocked: {blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}
+    op = REGISTRY.create(tool_name, tab_id=tab_id)
     memory_note = memory_nudge.note_tool_call(op.tab_id, tool_name)
 
     def report_progress(data: Any) -> None:

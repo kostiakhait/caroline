@@ -1114,10 +1114,14 @@ def _make_executor_fn(
         seen_calls[call_key] = seen_calls.get(call_key, 0) + 1
         count = seen_calls[call_key]
         log_event("engine", "small_model_tool_call", tab_id=tab_id, tool=name, args=args, repeat_count=count)
+        # Ported from a teammate's branch (afb8e0f): the narrator used to
+        # learn about a tool call only once it RETURNED -- live, the model's
+        # own thinking plus a web search left it nothing to say for ~16s.
+        # A failure here must never cost the actual call.
         if on_tool_start is not None:
             try:
                 on_tool_start(name, args)
-            except Exception:  # noqa: BLE001 -- a narration fact must never cost the call
+            except Exception:  # noqa: BLE001
                 pass
         if count > REPEATED_CALL_LIMIT:
             log_event("engine", "small_model_repeated_call_detected", tab_id=tab_id, tool=name, args=args, count=count)
@@ -1841,23 +1845,6 @@ async def run_small_model_turn(
             user_text=user_text, model=current_model["name"],
         )
 
-    # A fact when a tool call STARTS, not only when it returns (2026-10-10): live, a
-    # web search plus the model's thinking around it left the narrator nothing to say
-    # for ~16s. `emit` is defined below; this closure only runs once calls happen.
-    def on_tool_start(name: str, args: dict[str, Any]) -> None:
-        # Only calls that do the user's work -- the plan and operation bookkeeping is not
-        # news. A plugin's name ("memory", "email") tells the narrator in a plain word
-        # where the work is now, which a tool name like request_info does not: live
-        # (2026-10-11) a memory lookup started and the narrator found nothing to say.
-        plugin = registry.lookup[name][0] if name in registry.lookup else None
-        if plugin is None and name not in _WEB_SEARCH_TOOL_NAMES:
-            return
-        where = f'plugin "{plugin}"; ' if plugin else ""
-        emit(f"Tool call {name} started ({where}arguments: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
-
-    executor_fn = _make_executor_fn(registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage,
-                                    on_tool_start=on_tool_start)
-
     live_dialogue = [f"User: {user_text}"]
     if on_live_dialogue_update:
         on_live_dialogue_update(list(live_dialogue))
@@ -1874,6 +1861,24 @@ async def run_small_model_turn(
                 on_activity(line)
             except Exception:  # noqa: BLE001
                 pass
+
+    # Ported from a teammate's branch (afb8e0f): a fact when a tool call
+    # STARTS, not only once it returns -- live, the model's own thinking
+    # plus a web search left the narrator nothing to say for ~16s.
+    def on_tool_start(name: str, args: dict[str, Any]) -> None:
+        # Only calls that do the user's work -- the plan and operation bookkeeping is not
+        # news. A plugin's name ("memory", "email") tells the narrator in a plain word
+        # where the work is now, which a tool name like request_info does not: live
+        # (2026-10-11) a memory lookup started and the narrator found nothing to say.
+        plugin = registry.lookup[name][0] if name in registry.lookup else None
+        if plugin is None and name not in _WEB_SEARCH_TOOL_NAMES:
+            return
+        where = f'plugin "{plugin}"; ' if plugin else ""
+        emit(f"Tool call {name} started ({where}arguments: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
+
+    executor_fn = _make_executor_fn(
+        registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage, on_tool_start=on_tool_start,
+    )
 
     def on_progress(evt: dict[str, Any]) -> None:
         tracker.touch_progress()

@@ -60,8 +60,9 @@ CASES = [
                  "Time spent on the request so far: 24 s.", HEARD_NOTHING],
          said=["Ищу прогноз погоды на завтра в Киеве.", "Ищу прогноз в интернете."], expect="say", need=[]),
     # 2026-10-11, live: the narrator read a raw result out as the answer -- "максимум
-    # шестьдесят градусов" (60 F) for Kyiv in October. That something was found is
-    # progress; the figures are the answer's to give, converted.
+    # шестьдесят градусов" (60 F) for Kyiv in October. The rule since main's decision of
+    # the same day: a figure in a result may be said, but as something found and still
+    # being confirmed, never as the settled answer (hedge_if below).
     dict(name="answer unchecked", task="Сколько дней осталось до Нового года?",
          status=[ACTIVITY_START, TIER_1,
                  "Tool call get_current_time (arguments: {}); result: 2026-10-11 15:27",
@@ -78,10 +79,10 @@ CASES = [
                  'Tool call web_search (arguments: {"question": "weather forecast Kyiv tomorrow"}); result: '
                  "Tomorrow in Kyiv: cloudy with rain in the morning, high 60 F, low 52 F, wind 9 mph."],
          said=["Ищу прогноз погоды на завтра в Киеве.", "Ищу прогноз в интернете."], expect="say",
-         need=["наш", "прогноз", "есть"], forbid=["шестьдесят", "пятьдесят", "градус", "девят"]),
-    # 2026-10-11, live: with the figures masked, "Latest quote: N (-N%)" was narrated as
-    # "Нашла результаты поиска по курсу, но данные не загрузились полностью."
-    dict(name="masked figures", task="Какой сегодня курс доллара к гривне?",
+         need=["наш", "прогноз", "есть"], hedge_if=["шестьдесят", "пятьдесят", "градус", "девят"]),
+    # A found figure is not a failure of the data: with figures masked (this branch's
+    # first approach) "Latest quote: N (-N%)" was narrated as "данные не загрузились полностью".
+    dict(name="figure in a result", task="Какой сегодня курс доллара к гривне?",
          status=[ACTIVITY_START, TIER_1,
                  'Tool call web_search (arguments: {"question": "current USD to UAH exchange rate today"}); result: Web search '
                  "results for: current USD to UAH exchange rate today 1. USDUAH | Latest quote: 44.852664 (-0.11%) | As of "
@@ -91,8 +92,13 @@ CASES = [
                  "results for: current USD to UAH exchange rate today 1. USDUAH | Latest quote: 44.852664 (-0.11%) | As of "
                  "2026-10-11T20:25:10Z -- https://exa.ai/library/markets/forex/USDUAH # USDUAH The latest quote"],
          said=["Ищу курс доллара к гривне."], expect="say", need=["наш", "курс", "есть"],
-         forbid=["не загруз", "неполн", "не полност", "частичн", "ошибк", "сорок", "не удалось"]),
+         forbid=["не загруз", "неполн", "не полност", "частичн", "ошибк", "не удалось"], hedge_if=["сорок"]),
 ]
+
+# A figure from a result is said as found and still being confirmed: one of these with it
+# (the words of voice_api._FOUND_OR_CHECKING; "около" alone does not make it preliminary).
+HEDGES = ("нашл", "найден", "получил", "узнал", "выяснил", "вижу", "уточня", "проверя", "перепровер", "сверя", "подтвержд",
+          "убежда", "предварительн")
 
 FORBIDDEN = [
     ("machinery", re.compile(r"web_search|request_info|notes_|mail_search|инструмент|уровень|уровн[яе]|\btier\b|gpt|codex|nano|модел|верификац", re.I)),
@@ -139,6 +145,9 @@ def check(case, text):
     for word in case.get("forbid", ()):
         if word in text.lower().replace("ё", "е"):
             return False, f"says {word!r}"
+    low = text.lower().replace("ё", "е")
+    if any(w in low for w in case.get("hedge_if", ())) and not any(h in low for h in HEDGES):
+        return False, "a figure stated as settled"
     for prev in case["said"]:
         if is_repeat(text, prev):
             return False, "repeat"
