@@ -7,6 +7,8 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Caroline.NativeHost.Native;
 using Caroline.NativeHost.Services;
 using Microsoft.Web.WebView2.Core;
@@ -73,13 +75,38 @@ public partial class AppBrowserWindow : Window
     /// larger maxWidth when more detail is genuinely needed.</summary>
     private const int DefaultScreenshotMaxWidth = 1280;
 
+    // Same fix as Caroline.exe's own MainWindow.xaml.cs's ReinstallWindowIcon
+    // (2026-09-28): this process is headless (no tray icon, no MainWindow -- see
+    // this class's own doc comment), so every taskbar/Alt-Tab icon it shows comes
+    // from an AppBrowserWindow instance, and it can show the generic Windows
+    // placeholder instead of app.ico. Re-applied on a flat interval; stopped on
+    // Closed since, unlike Caroline.exe's MainWindow, one of these does not live
+    // for the whole process (a new one per labeled site, closed and reopened).
+    private static readonly TimeSpan IconReinstallInterval = TimeSpan.FromSeconds(10);
+    private readonly DispatcherTimer _iconReinstallTimer = new() { Interval = IconReinstallInterval };
+
     public AppBrowserWindow(string label, int cdpPort)
     {
         InitializeComponent();
         Label = label;
         CdpPort = cdpPort;
         TitleText.Text = $"Caroline Browser — {label}";
+        _iconReinstallTimer.Tick += (_, _) => ReinstallWindowIcon();
+        _iconReinstallTimer.Start();
+        Closed += (_, _) => _iconReinstallTimer.Stop();
         Logger.Log($"[app-browser-window:{label}] constructed (cdpPort={cdpPort})");
+    }
+
+    private void ReinstallWindowIcon()
+    {
+        try
+        {
+            Icon = BitmapFrame.Create(new Uri("pack://application:,,,/Resources/app.ico"));
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"[app-browser-window:{Label}] ReinstallWindowIcon failed: {ex.Message}");
+        }
     }
 
     /// <summary>

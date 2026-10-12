@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using Caroline.Services;
 
 namespace Caroline;
 
@@ -30,11 +31,34 @@ public partial class SplashWindow : Window
     private string[] _photos = Array.Empty<string>();
     private int _photoIndex;
 
+    // Same fix as MainWindow.xaml.cs's ReinstallWindowIcon (2026-09-28): the taskbar/
+    // Alt-Tab icon can show the generic Windows placeholder instead of app.ico, so the
+    // icon is re-applied on a flat interval rather than relying on the XAML Icon=
+    // attribute alone. Stopped on Closed since, unlike MainWindow, this window does not
+    // live for the whole process.
+    private static readonly TimeSpan IconReinstallInterval = TimeSpan.FromSeconds(10);
+    private readonly DispatcherTimer _iconReinstallTimer = new() { Interval = IconReinstallInterval };
+
     public SplashWindow()
     {
         InitializeComponent();
         StartPhotoCycle();
         _cycleTimer.Tick += (_, _) => ShowNextPhoto();
+        _iconReinstallTimer.Tick += (_, _) => ReinstallWindowIcon();
+        _iconReinstallTimer.Start();
+        Closed += (_, _) => _iconReinstallTimer.Stop();
+    }
+
+    private void ReinstallWindowIcon()
+    {
+        try
+        {
+            Icon = BitmapFrame.Create(new Uri("pack://application:,,,/Resources/app.ico"));
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"SplashWindow: ReinstallWindowIcon failed: {ex.Message}");
+        }
     }
 
     private void StartPhotoCycle()
