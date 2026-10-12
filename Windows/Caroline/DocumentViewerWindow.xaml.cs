@@ -49,6 +49,33 @@ public partial class DocumentViewerWindow : Window
     // longer claim "saved" for a document that was never actually opened.
     private string? _officeErrorMessage;
 
+    // Same fix as MainWindow.xaml.cs's ReinstallWindowIcon (2026-09-28): the taskbar
+    // button can show the generic Windows placeholder icon instead of app.ico, so the
+    // icon is re-applied on a flat interval rather than relying on the XAML Icon=
+    // attribute alone. Unlike MainWindow this window is created and closed repeatedly
+    // (one per viewer), so the timer is stopped on Closed to avoid leaking one per use.
+    private static readonly TimeSpan IconReinstallInterval = TimeSpan.FromSeconds(10);
+    private readonly System.Windows.Threading.DispatcherTimer _iconReinstallTimer = new() { Interval = IconReinstallInterval };
+
+    private void StartIconReinstallTimer()
+    {
+        _iconReinstallTimer.Tick += (_, _) => ReinstallWindowIcon();
+        _iconReinstallTimer.Start();
+        Closed += (_, _) => _iconReinstallTimer.Stop();
+    }
+
+    private void ReinstallWindowIcon()
+    {
+        try
+        {
+            Icon = BitmapFrame.Create(new Uri("pack://application:,,,/Resources/app.ico"));
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"DocumentViewerWindow: ReinstallWindowIcon failed: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Web-page viewers ("code" = Monaco, "slideshow"): the page is loaded from
     /// wwwroot and receives the backend's open_editor event (payloadJson) once it
@@ -57,6 +84,7 @@ public partial class DocumentViewerWindow : Window
     public DocumentViewerWindow(string title, string kind, string path, string payloadJson, Action<ViewerOutcome, string?, string?> onDone)
     {
         InitializeComponent();
+        StartIconReinstallTimer();
         _path = path;
         _kind = kind;
         _onDone = onDone;
@@ -68,6 +96,7 @@ public partial class DocumentViewerWindow : Window
     public DocumentViewerWindow(string path, string kind, Action<ViewerOutcome, string?, string?> onDone)
     {
         InitializeComponent();
+        StartIconReinstallTimer();
         _path = path;
         _kind = kind;
         _onDone = onDone;
@@ -118,6 +147,7 @@ public partial class DocumentViewerWindow : Window
     public DocumentViewerWindow(string path, OfficeEditorConfig config, Action<ViewerOutcome, string?, string?> onDone)
     {
         InitializeComponent();
+        StartIconReinstallTimer();
         _path = path;
         _kind = "office";
         _onDone = onDone;
@@ -148,6 +178,7 @@ public partial class DocumentViewerWindow : Window
     public DocumentViewerWindow(string? loginError, bool noAiAtAll, Action<string?, string?, bool, bool, bool> onLoginDone)
     {
         InitializeComponent();
+        StartIconReinstallTimer();
         _kind = "login";
         _onLoginDone = onLoginDone;
         TitleText.Text = "Log in to SquirrelWisdom";
