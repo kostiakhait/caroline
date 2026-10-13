@@ -228,6 +228,7 @@ $(OUT)/.whatsapp-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/pa
 
 $(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp camerlengo-vendor $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
+	@touch -m "$@"
 
 build: $(OUT)/Caroline.exe
 
