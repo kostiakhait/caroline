@@ -769,7 +769,7 @@ def _is_silent_reply_paraphrase(text: str) -> bool:
     return any(p.match(stripped) for p in _SILENT_REPLY_PARAPHRASE_PATTERNS)
 
 
-def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
+def _strip_no_update_from_wire(wire: dict[str, Any], tab_id: str | None = None) -> dict[str, Any] | None:
     """Per explicit instruction (2026-09-10): NOTHING containing the
     [[NO_UPDATE]] sentinel (see no_update_sentinel_instruction /
     CONTINUE_OR_SILENT_NUDGE_TEMPLATE) may ever reach the user-visible
@@ -784,21 +784,36 @@ def _strip_no_update_from_wire(wire: dict[str, Any]) -> dict[str, Any] | None:
     kind = wire.get("type")
     if kind == "assistant":
         content = wire.get("message", {}).get("content", [])
-        kept = [
+        dropped = [
             b for b in content
-            if not (isinstance(b, dict) and b.get("type") == "text"
-                    and isinstance(b.get("text"), str)
-                    and (_NO_UPDATE_SENTINEL in b["text"] or _is_silent_reply_paraphrase(b["text"])))
+            if isinstance(b, dict) and b.get("type") == "text"
+            and isinstance(b.get("text"), str)
+            and (_NO_UPDATE_SENTINEL in b["text"] or _is_silent_reply_paraphrase(b["text"]))
         ]
-        if len(kept) == len(content):
+        if not dropped:
             return wire
+        kept = [b for b in content if b not in dropped]
+        # Per explicit instruction (2026-10-13): this strip had NO logging
+        # at all -- a false-positive match (the sentinel/paraphrase check
+        # catching real, substantive content) would silently drop it with
+        # zero trace, while the model's own context still shows it as
+        # having been said. Logged here, not just on the terminal "whole
+        # message dropped" branch below, so a partial strip (one text
+        # block removed alongside real tool_use/other blocks that still
+        # go out) is just as visible.
+        log_event(
+            "engine", "no_update_stripped_from_wire", tab_id=tab_id,
+            dropped_texts=[b.get("text") for b in dropped], remaining_blocks=len(kept),
+        )
         if not any(isinstance(b, dict) and b.get("type") in ("text", "tool_use") for b in kept):
+            log_event("engine", "wire_dropped_entirely_after_strip", tab_id=tab_id)
             return None  # nothing left the user should see
         wire["message"]["content"] = kept
         return wire
     if kind == "result":
         result_text = wire.get("result")
         if isinstance(result_text, str) and (_NO_UPDATE_SENTINEL in result_text or _is_silent_reply_paraphrase(result_text)):
+            log_event("engine", "no_update_stripped_from_wire", tab_id=tab_id, dropped_texts=[result_text], remaining_blocks=0, kind="result")
             wire["result"] = ""
         return wire
     return wire
@@ -4010,7 +4025,17 @@ class ChatSession:
                 log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
                 translated = None
             if translated and translated != text:
-                log_event("engine", "wire_translate_applied", tab_id=self.tab_id, language=language, original_len=len(text), translated_len=len(translated))
+                # Per explicit instruction (2026-10-13): lengths alone
+                # don't say whether a translation actually preserved the
+                # content -- the real before/after text is what's needed
+                # to tell a legitimate (if shorter/longer) translation
+                # apart from one that silently dropped or mangled part of
+                # a real reply the model generated and believes it sent.
+                log_event(
+                    "engine", "wire_translate_applied", tab_id=self.tab_id, language=language,
+                    original_len=len(text), translated_len=len(translated),
+                    original_text=text, translated_text=translated,
+                )
                 block["text"] = translated
             # Per explicit instruction (2026-10-11): reply.review checks the
             # final text above (translated, or the original if translation
@@ -4035,6 +4060,23 @@ class ChatSession:
                 log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
                 reviewed = None
             if reviewed and reviewed != block["text"]:
+                # Bug fix (2026-10-13), per explicit instruction: unlike
+                # translate_text's own wire_translate_applied, a review
+                # rewrite that actually CHANGED the text was never logged
+                # at all -- only its failures were (review_reply_failed).
+                # review_reply's whole job is to rewrite/shorten a reply it
+                # judges off-task or leak-like; with no record of what it
+                # changed, a real reply the model generated (and still
+                # believes it sent, since this runs after the model's own
+                # turn finished) could be silently shortened or swapped for
+                # something unrecognizable here, with nothing in the log to
+                # show it happened -- exactly the kind of "something ate
+                # the output" gap this is meant to close.
+                log_event(
+                    "engine", "review_reply_applied", tab_id=self.tab_id,
+                    original_len=len(block["text"]), reviewed_len=len(reviewed),
+                    original_text=block["text"], reviewed_text=reviewed,
+                )
                 block["text"] = reviewed
             # Per explicit instruction (2026-10-11): re-evaluate the permission
             # guard on every outbound message -- see _check_permission_guard's
@@ -5844,7 +5886,7 @@ class ChatSession:
                     # bogus chat bubble -- suppress the whole stretch, not
                     # just the terminal ResultMessage.)
                     if wire is not None and not self.forced_compaction_result_pending and not (isinstance(message, ResultMessage) and result_is_fake):
-                        wire = _strip_no_update_from_wire(wire)
+                        wire = _strip_no_update_from_wire(wire, self.tab_id)
                         if wire is not None:
                             wire = await self._translate_wire_visible_text(wire)
                             # Bug fix (2026-09-10): confirmed live -- voice-reply
