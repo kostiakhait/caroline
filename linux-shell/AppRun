@@ -1,0 +1,12 @@
+#!/bin/bash
+# AppImage entry point for Caroline. Runs the Linux shell (plain Python --
+# needs the SYSTEM python3's python3-gi/gir1.2-webkit2-4.1 bindings, see
+# docs/LINUX_PORT_PLAN.md's Phase 4/5 notes on why those can't be bundled
+# into an isolated interpreter the way the backend's own runtime/python is)
+# against the bundled backend-py/runtime trees this AppDir carries
+# alongside it. See build_appimage.sh for how this gets into the AppDir.
+set -e
+HERE="$(dirname "$(readlink -f "${0}")")"
+APPDIR="${APPDIR:-$HERE}"
+export CAROLINE_APP_ROOT="$APPDIR"
+exec /usr/bin/python3 "$APPDIR/linux-shell/caroline_shell.py" "$@"

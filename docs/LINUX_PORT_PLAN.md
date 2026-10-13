@@ -402,12 +402,25 @@ Linux at all. The bullets below replace the original (now-stale) .NET-publish-ce
   `runtime/python` venv, and ran it directly (simulating a double-click) on the test box -- it
   launched, resolved every path correctly, and rendered the splash screen. FUSE is available on the
   test box (`/dev/fuse`, `fusermount`/`fusermount3`); `--appimage-extract-and-run` also works as a
-  fallback for environments without it. Not yet wired into the Makefile as a real target -- this was
-  a manual proof that the mechanism itself works, blocked from being a committed target by the same
-  `runtime/` provisioning gap (an AppImage with no backend runtime inside it would be genuinely
-  broken, not just untested). Also surfaced and fixed a real shell bug while testing this: a missing
-  bundled runtime used to fail with nothing visible at all (no window, no terminal output -- `log()`
-  only writes to the log file); fixed to show a GTK error dialog naming the expected path.
+  fallback for environments without it. Also surfaced and fixed a real shell bug while testing this:
+  a missing bundled runtime used to fail with nothing visible at all (no window, no terminal output --
+  `log()` only writes to the log file); fixed to show a GTK error dialog naming the expected path.
+  **Wired into the Makefile as a real target (2026-10-12)**: `make appimage-linux` (depends on
+  `dist-linux`), backed by two new scripts that capture the manual sequence above --
+  `linux-shell/AppRun` (the entry point itself) and `linux-shell/build_appimage.sh` (assembles the
+  AppDir, substitutes `caroline.desktop`'s `Exec=` for the AppImage convention, drops in
+  `linux-shell/icons/caroline.png` -- newly generated from `art/app.ico`, since nothing produced a
+  PNG for Linux before this -- downloads `appimagetool` into `linux-shell/.cache/` on first run, and
+  wraps the AppDir into a `.AppImage`). Same as `provision_runtime.sh`, this can't be exercised from
+  the Windows build machine (appimagetool is a Linux ELF binary) -- written and reviewed, not
+  independently re-run on a test box this session; still produces an AppImage that depends on the
+  HOST having `python3-gi`/`gir1.2-webkit2-4.1`/GTK3/WebKitGTK installed (see `build_appimage.sh`'s
+  own header for why bundling those shared libraries too is a separate, bigger, not-yet-attempted
+  effort). `caroline.desktop`'s own dangling `Icon=caroline` reference (noted as still-open in Phase
+  4 above) is resolved for the AppImage case specifically -- AppImage's own top-level-icon
+  convention just needs `caroline.png` at the AppDir root, which `build_appimage.sh` now provides --
+  but NOT yet for a plain (non-AppImage) install, which would still need an icon-theme-location
+  install step wherever that gets built.
 
 **Gap found 2026-10-05, `runtime/python` half resolved same day.** `CarolineInstaller` itself never
 installs anything -- it only downloads and extracts a pre-built `Caroline.zip`
