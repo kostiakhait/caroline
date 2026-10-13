@@ -68,7 +68,7 @@ LINUX_SHELL_SRC := $(shell find "$(LINUX_SHELL_DIR)" -type f 2>/dev/null)
 WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
 OUT_LINUX := $(SCRIPT_DIR)/dist-linux
 
-.PHONY: help build installer clean dist-linux
+.PHONY: help build installer clean dist-linux camerlengo-vendor
 
 help:
 	@echo "Targets: build, installer, clean, dist-linux"
@@ -96,6 +96,31 @@ $(BACKEND_DIR)/mcp-servers/.stamp: $(BACKEND_DIR)/dist/.stamp
 # servers, vendor/XcfaRenderer for Visual Mode), no reference to any other
 # repo at runtime.
 #
+# Split into independent stamp targets (2026-10-12, per explicit instruction),
+# replacing one monolithic $(OUT)/Caroline.exe recipe that rebuilt EVERYTHING
+# (both dotnet publishes, every copy step) whenever ANY of its prerequisites
+# changed -- confirmed live: a one-line backend-py edit cost the same full
+# rebuild as a real C# change, every time. Each stamp below depends only on
+# the inputs it actually reads, so e.g. a Python-only change now skips both
+# dotnet publishes entirely. $(OUT) itself is never wiped wholesale anymore
+# (that line used to double as "clean up anything removed since last build"
+# for the WHOLE tree in one shot) -- each stamp's own recipe now does that
+# narrower cleanup for just its own subtree before recopying, same effect,
+# scoped. `make clean` (full wipe) still exists for a genuine from-scratch
+# rebuild. touch -m advances each stamp's mtime past the FILES it just wrote
+# (a bare `touch "$@"` on a stamp inside the folder its own recipe just
+# recreated could otherwise race a slow filesystem's own mtime granularity).
+#
+# The two dotnet publishes (Caroline.exe + NativeHost) are genuinely
+# independent of each other -- backgrounded with & + wait in ONE recipe
+# below, same pattern already used for the backend/ copy steps further
+# down, rather than splitting them into two Make targets and trusting
+# `make -j` for the parallelism: GnuWin32 Make 3.81 is old enough that this
+# file already had to work around real Windows CreateProcess flakiness once
+# ($(shell) calls above) -- explicit &/wait in a shell recipe this Make
+# version already runs correctly is the safer source of parallelism here,
+# not its own job-pool scheduler.
+#
 # NOTE: -p:IncludeNativeLibrariesForSelfExtract=true is deliberately NOT
 # passed here -- confirmed live it silently drops wwwroot/assets/** (the
 # persona reference photos) from the publish output entirely, with no
@@ -106,44 +131,30 @@ $(BACKEND_DIR)/mcp-servers/.stamp: $(BACKEND_DIR)/dist/.stamp
 # publish as loose files next to Caroline.exe instead of being bundled into
 # the single-file exe for self-extraction -- harmless, still a working
 # self-contained single-file publish.
-# CAMERLENGO_VENDOR_STUBS/Config.py listed explicitly (2026-10-03 bug fix, confirmed
-# live): the vendoring recipe below copies it into dist/backend-py/camerlengo/Config.py,
-# but nothing above (BACKEND_PY_SRC only covers backend-py/app + run_server.py/
-# supervisor.py) ever told Make this target depends on it -- two deploys in a row
-# silently shipped a STALE dist/Caroline.exe with the old stub because Make saw no
-# changed prerequisite and skipped the entire rebuild recipe, including `rm -rf $(OUT)`.
-# NOTE: the actual vendored AI.py/etc. content (pulled live via `git show caroline:...`
-# from CAMERLENGO_REPO) still has NO file-based prerequisite here and can't easily get
-# one -- a change on the reforce side alone still requires `make clean` to force a
-# real rebuild; only the local stub file is now tracked automatically.
-$(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.stamp $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/Config.py
+$(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	@echo "=== Caroline Build ==="
-	rm -rf "$(OUT)"
-	dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)"
-	@echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"
-	dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)"
-	mkdir -p "$(OUT)/backend"
-	cp -r "$(BACKEND_DIR)/dist" "$(OUT)/backend/dist" & \
-	cp -r "$(BACKEND_DIR)/node_modules" "$(OUT)/backend/node_modules" & \
-	cp -r "$(BACKEND_DIR)/mcp-servers" "$(OUT)/backend/mcp-servers" & \
-	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend/skills-src" & \
-	cp -r "$(BACKEND_DIR)/python-scripts" "$(OUT)/backend/python-scripts" & \
+	mkdir -p "$(OUT)"
+	( rc=0; dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.caroline-exe.rc" ) & \
+	( echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"; \
+	  rc=0; dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.nativehost.rc" ) & \
 	wait
-	cp "$(BACKEND_DIR)/package.json" "$(OUT)/backend/package.json"
-	@echo "--- backend-py (the live backend -- see Native/SupervisorClient.cs) ---"
-	mkdir -p "$(OUT)/backend-py"
-	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT)/backend-py/app"
-	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT)/backend-py/run_server.py"
-	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT)/backend-py/supervisor.py"
-	find "$(OUT)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	mkdir -p "$(OUT)/backend-py/python-scripts"
-	cp "$(BACKEND_DIR)/python-scripts/local_tts_server.py" "$(OUT)/backend-py/python-scripts/local_tts_server.py"
-	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
-	@echo "--- whatsapp-sidecar (Baileys, Node -- see app/whatsapp_channel.py) ---"
-	mkdir -p "$(OUT)/whatsapp-sidecar"
-	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(OUT)/whatsapp-sidecar/package.json"
-	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
+	test "$$(cat "$(OUT)/.caroline-exe.rc")" = "0"
+	test "$$(cat "$(OUT)/.nativehost.rc")" = "0"
+	rm -f "$(OUT)/.caroline-exe.rc" "$(OUT)/.nativehost.rc"
+	touch -m "$@"
+
+# CAMERLENGO_VENDOR_STUBS/Config.py listed explicitly (2026-10-03 bug fix, confirmed
+# live): this recipe copies it into dist/backend-py/camerlengo/Config.py, but the
+# actual vendored AI.py/etc. content (pulled live via `git show caroline:...` from
+# CAMERLENGO_REPO) has no file it could depend on here -- a change on the reforce
+# side alone wouldn't otherwise be noticed. Made .PHONY instead (2026-10-12) rather
+# than chasing a fake file-based dependency: this step is a handful of `git show`
+# calls, cheap enough to just always re-run, and it fixes a real standing gap
+# (previously needed `make clean` to pick up a reforce-only change at all).
+.PHONY: camerlengo-vendor
+camerlengo-vendor: $(CAMERLENGO_VENDOR_STUBS)/Config.py
 	@echo "--- camerlengo (small-model primary path, see small_model_engine.py's own doc comment) ---"
+	@mkdir -p "$(OUT)"
 	@if git -C "$(CAMERLENGO_REPO)" cat-file -e caroline:AI.py 2>/dev/null; then \
 		mkdir -p "$(OUT)/backend-py/camerlengo"; \
 		for f in AI.py Cache.py EmailBasics.py Logger.py JSONStorage.py; do \
@@ -155,6 +166,54 @@ $(OUT)/Caroline.exe: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC) $(BACKEND_DIR
 		echo "WARNING: $(CAMERLENGO_REPO) has no reachable 'caroline' branch -- skipping camerlengo vendoring."; \
 		echo "         small_model_engine.py degrades to always-escalate on this build (never a hard dependency)."; \
 	fi
+
+# Split out of .backend-node.stamp (2026-10-12, confirmed live): node_modules
+# is 6415 files / ~285 MB -- `cp -r` through Git Bash on that many small files
+# is the single slowest step in the whole build (antivirus scans each file),
+# and the OLD combined stamp re-paid that cost on every npm/TS source change
+# via its mcp-servers/.stamp -> dist/.stamp -> BACKEND_SRC chain, even though
+# node_modules itself depends on nothing but package.json/package-lock.json
+# and almost never actually changes. Its own stamp, its own real dependency.
+$(OUT)/.backend-node-modules.stamp: $(BACKEND_DIR)/node_modules/.stamp
+	mkdir -p "$(OUT)/backend"
+	rm -rf "$(OUT)/backend/node_modules"
+	cp -r "$(BACKEND_DIR)/node_modules" "$(OUT)/backend/node_modules"
+	touch -m "$@"
+
+$(OUT)/.backend-node.stamp: $(BACKEND_DIR)/mcp-servers/.stamp
+	mkdir -p "$(OUT)/backend"
+	rm -rf "$(OUT)/backend/dist" "$(OUT)/backend/mcp-servers" "$(OUT)/backend/skills-src" "$(OUT)/backend/python-scripts"
+	cp -r "$(BACKEND_DIR)/dist" "$(OUT)/backend/dist" & \
+	cp -r "$(BACKEND_DIR)/mcp-servers" "$(OUT)/backend/mcp-servers" & \
+	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend/skills-src" & \
+	cp -r "$(BACKEND_DIR)/python-scripts" "$(OUT)/backend/python-scripts" & \
+	wait
+	cp "$(BACKEND_DIR)/package.json" "$(OUT)/backend/package.json"
+	touch -m "$@"
+
+# --- backend-py (the live backend -- see Native/SupervisorClient.cs) -------
+$(OUT)/.backend-py.stamp: $(BACKEND_PY_SRC)
+	@echo "--- backend-py (the live backend -- see Native/SupervisorClient.cs) ---"
+	rm -rf "$(OUT)/backend-py/app"
+	mkdir -p "$(OUT)/backend-py"
+	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT)/backend-py/app"
+	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT)/backend-py/run_server.py"
+	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT)/backend-py/supervisor.py"
+	find "$(OUT)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	mkdir -p "$(OUT)/backend-py/python-scripts"
+	cp "$(BACKEND_DIR)/python-scripts/local_tts_server.py" "$(OUT)/backend-py/python-scripts/local_tts_server.py"
+	rm -rf "$(OUT)/backend-py/skills-src"
+	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
+	touch -m "$@"
+
+$(OUT)/.whatsapp-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js
+	@echo "--- whatsapp-sidecar (Baileys, Node -- see app/whatsapp_channel.py) ---"
+	mkdir -p "$(OUT)/whatsapp-sidecar"
+	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(OUT)/whatsapp-sidecar/package.json"
+	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
+	touch -m "$@"
+
+$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp camerlengo-vendor $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
 
 build: $(OUT)/Caroline.exe

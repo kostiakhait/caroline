@@ -44,6 +44,7 @@ art/__pycache__/
 deploy.bat
 deploy_models.bat
 deploy.mk
+install-local.ps1
 
 # --- Ad-hoc test/diagnostic scripts (backend/) ------------------------------
 # One-off .mjs scripts run directly against dist/ or the SDK for live
