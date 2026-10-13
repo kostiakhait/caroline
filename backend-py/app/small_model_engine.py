@@ -2042,6 +2042,7 @@ async def run_small_model_turn(
     on_activity: Callable[[str], None] | None = None,
     start_tier: int | None = None,
     is_voice: bool = False,
+    on_candidate: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -2306,6 +2307,13 @@ async def run_small_model_turn(
         if _usable(candidate):
             log_event("engine", "small_model_tier_answered", tab_id=tab_id, tier=index, model=model, text_len=len(candidate), text=candidate)
             emit(f"Tier {index + 1} ({model}) produced an answer; moving on to checking it.")
+            # The answer as it will most likely go out (the verifier says "OK" to most): the
+            # caller can start on what it does with a final text while the check runs.
+            if on_candidate is not None:
+                try:
+                    on_candidate(candidate)
+                except Exception:  # noqa: BLE001 -- a head start must never cost the turn
+                    pass
             can_escalate = index < len(tiers) - 1
             try:
                 verified_text, needs_escalation = await verify_candidate(candidate, can_escalate, tier_trace)

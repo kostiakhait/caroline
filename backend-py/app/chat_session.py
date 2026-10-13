@@ -1503,6 +1503,9 @@ class ChatSession:
         # User messages waiting out USER_MESSAGE_MERGE_WINDOW_S (see submit_or_try_small_model).
         self._held_user_messages: list[tuple[str, list[Any], bool]] = []
         self._held_user_flush: asyncio.TimerHandle | None = None
+        # reply.review calls started before their text is known to be final -- see
+        # _review_ahead. (text, task) -> the call.
+        self._reviews_ahead: dict[tuple[str, str], asyncio.Task[str | None]] = {}
         # The fast lane already running on what is held (see _start_fast_lane_ahead):
         # what it was asked, and the task answering it.
         self._fast_lane_ahead: tuple[tuple[Any, ...], asyncio.Task[Any]] | None = None
@@ -2467,11 +2470,53 @@ class ChatSession:
         self, persona: Any, text: str, lines: list[str], language: str,
     ) -> tuple[str | None, int | None, str | None, asyncio.Task[str | None] | None]:
         fast, start_tier, first_remark = await try_fast_answer(self.workspace_dir, persona, text, lines, language, True)
+        # The answer's review as well, inside the window: it is the text that will go out
+        # when the turn starts, unless it still has to be translated.
+        if fast and answer_is_in_language(fast, language):
+            self._review_ahead(fast, text)
         # The remark's review and audio too, while the window is still running -- in a
         # task of its own: a turn that starts meanwhile must not wait for it before it
         # gets to work. The task returns (the remark as reviewed, its audio).
         audio = asyncio.create_task(self._review_and_synthesize(first_remark, text)) if first_remark else None
         return fast, start_tier, first_remark, audio
+
+    def _review_ahead(self, text: str, task: str) -> None:
+        """Starts reply.review for a text that will most likely be the final answer --
+        the fast lane's answer during the merge window, a tier's answer while the
+        verifier is still checking it (it says "OK" to most) -- so the answer does not
+        wait for the review after everything else is done. Measured 2026-10-12, one
+        simple question: tier 4s, verifier 3.8s, then the review 5s on top, 18s in all.
+        _reviewed takes the result if that exact text is what goes out; a call for a
+        text that did not go out is dropped."""
+        key = (text, task)
+        if key in self._reviews_ahead:
+            return
+
+        async def run() -> str | None:
+            from app.plugins.voice_api import review_reply
+
+            try:
+                return await review_reply(text, task=task)
+            except Exception as exc:  # noqa: BLE001 -- fail-open, as review_reply itself is
+                log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
+                return None
+
+        self._reviews_ahead[key] = asyncio.create_task(run())
+
+    async def _reviewed(self, text: str, task: str) -> str | None:
+        """reply.review's result for a final text: the call already under way for exactly
+        this text and task if there is one, a new call otherwise. Everything else started
+        ahead is for a text that is not going out, and is dropped."""
+        from app.plugins.voice_api import review_reply
+
+        ahead, self._reviews_ahead = self._reviews_ahead, {}
+        mine = ahead.pop((text, task), None)
+        for other in ahead.values():
+            other.cancel()
+        if mine is not None:
+            log_event("engine", "review_reply_ahead_used", tab_id=self.tab_id, ready=mine.done())
+            return await mine
+        return await review_reply(text, task=task)
 
     async def _fast_lane_for_turn(
         self, persona: Any, text: str, lines: list[str], language: str, is_voice: bool,
@@ -2656,6 +2701,11 @@ class ChatSession:
                     send=self.send, on_live_dialogue_update=on_live_dialogue_update,
                     get_new_user_comments=get_new_user_comments, on_activity=on_activity,
                     start_tier=start_tier, is_voice=is_voice,
+                    # Review of a tier's answer runs alongside its verification (_review_ahead).
+                    on_candidate=(
+                        (lambda candidate: self._review_ahead(candidate, text) if answer_is_in_language(candidate, language) else None)
+                        if is_real_user and CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE else None
+                    ),
                 )
                 if CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE:
                     translate_answer = not answer_is_in_language(result["text"], language)
@@ -2720,7 +2770,7 @@ class ChatSession:
         # mechanics leaks, and human-sounding tone -- fail-open to `text`
         # as is on any failure, same philosophy as translate_text above.
         try:
-            reviewed = await review_reply(text, task=question_text)
+            reviewed = await self._reviewed(text, question_text)
         except Exception as exc:
             log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
             reviewed = None
