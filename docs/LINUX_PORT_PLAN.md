@@ -220,9 +220,13 @@ Port, not rewrite-from-scratch, each existing WPF surface:
 - `VisualModeWindow.xaml(.cs)` + `VisualModeManager.cs` -- borderless/topmost/per-pixel-alpha; the
   one UI surface with no exact toolkit-level equivalent (X11 override-redirect + compositor alpha
   varies) -- prototype early, highest visual risk.
-- Tray icon -- DBus StatusNotifierItem, best-effort (GNOME needs the user's own extension, same as
-  every Linux tray app -- not something Caroline can paper over). **Untestable under WSLg** (no
-  panel/tray host exists there at all) -- needs a real desktop session.
+- Tray icon -- **done (2026-10-12)**, via `pystray` (vendored source, see `linux-shell/vendor/
+  pystray/NOTICE.md` for why -- PEP 668 blocks pip into the system python3 this shell runs under,
+  and pystray isn't an apt package). pystray itself tries AppIndicator, then GtkStatusIcon, then a
+  raw X11 icon window, in that order -- still best-effort on GNOME without the user's own
+  AppIndicator extension, same ceiling every Linux tray app has, not something Caroline can paper
+  over. **Untestable under WSLg** (no panel/tray host exists there at all) -- needs a real desktop
+  session to verify which backend actually renders something.
 - Global hotkey -- `XGrabKey`. Behavior under XWayland/WSLg specifically is uncertain, verify on a
   real X11 session, not just WSL.
 - Autostart -- `~/.config/autostart/*.desktop` (works across DEs, chosen over a systemd user unit
@@ -344,11 +348,15 @@ Windows" per explicit instruction):
 confirmed live by checking `_NET_WM_STATE` via `xprop` directly -- `set_keep_above(True)` actually
 adds `_NET_WM_STATE_ABOVE` on this WM (openbox), not just a no-op GTK call.
 
-Still open: tray, and packaging itself (actually wiring the `.desktop` file into an installer,
-bundling the icon it references, settings persistence). The emoji/icon-font gap (📎, 🎙️, etc.
-render as boxes) is tracked separately -- drawn replacement icons exist outside the repo pending a
-decision on light-background contrast, not yet wired in beyond the dark-background-only tab-strip
-hamburger (`linux-shell/icons/menu.png`).
+**Settings persistence, tray icon, and the window icon done (2026-10-12)** -- see
+`linux-shell/settings_service.py` (port of `Services/SettingsService.cs`) and `_build_tray_icon`/
+`APP_ICON_PATH` in `caroline_shell.py` (`linux-shell/icons/app.ico`, copied from `art/app.ico`).
+Still open: packaging itself (actually wiring the `.desktop` file into an installer, and installing
+`app.ico` into a proper icon theme location so `Icon=caroline` in `caroline.desktop` resolves to
+something -- today only the tray/window icons load it directly by path, the desktop-file reference
+is still dangling). The emoji/icon-font gap (📎, 🎙️, etc. render as boxes) is tracked separately --
+drawn replacement icons exist outside the repo pending a decision on light-background contrast, not
+yet wired in beyond the dark-background-only tab-strip hamburger (`linux-shell/icons/menu.png`).
 
 ### Phase 5 -- installer/packaging
 
@@ -507,10 +515,15 @@ equivalent box again:
   (`runtime/python` + `runtime/codex`) with room to spare (~14 GiB used of 52 GiB).
 - **Access**: root over SSH with a key pair (`~/.ssh/id_rsa` on the dev machine).
 - **Packages** (`apt-get install`): `xvfb`, `openbox`, `python3-gi`, `gir1.2-webkit2-4.1`,
-  `python3-xlib`, `desktop-file-utils`, `locales`, `ffmpeg`, `gstreamer1.0-plugins-good`,
-  `gstreamer1.0-plugins-bad`, `gstreamer1.0-plugins-ugly`, `gstreamer1.0-libav`.
-  (`python3-gi`/`gir1.2-webkit2-4.1`/`python3-xlib` went through apt rather than pip -- PEP 668
-  externally-managed-environment blocks pip into system python3 directly, see Phase 4's notes.)
+  `python3-xlib`, `python3-pil`, `python3-six`, `desktop-file-utils`, `locales`, `ffmpeg`,
+  `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-plugins-ugly`,
+  `gstreamer1.0-libav`. Optional, improves tray-icon fidelity on indicator-based desktops (KDE,
+  XFCE with the indicator plugin, Unity-likes): `gir1.2-ayatanaappindicator3-0.1` -- pystray
+  (vendored, see `linux-shell/vendor/pystray/NOTICE.md`) falls back through GtkStatusIcon to a raw
+  X11 icon window on its own if this isn't installed, so it's not required, just better when present.
+  (`python3-gi`/`gir1.2-webkit2-4.1`/`python3-xlib`/`python3-pil`/`python3-six` went through apt
+  rather than pip -- PEP 668 externally-managed-environment blocks pip into system python3
+  directly, see Phase 4's notes.)
 - **Locale**: `locale-gen ru_RU.UTF-8` (needed to verify real Russian date/time formatting and text
   rendering, not just English).
 - **Display**: `Xvfb :1 -screen 0 1920x1080x24 &` then `openbox &` against `DISPLAY=:1` -- a full

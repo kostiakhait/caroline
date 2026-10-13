@@ -34,6 +34,7 @@ import traceback
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import gi
 
@@ -48,6 +49,11 @@ from settings_service import AppSettings, SettingsService  # noqa: E402
 from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+# pystray is vendored here (see vendor/pystray/NOTICE.md for why: PEP 668
+# blocks pip into the system python3 this shell runs under, and pystray
+# isn't a Debian/Ubuntu apt package the way python3-xlib is) -- importing
+# it (done lazily, in _build_tray_icon) needs this on sys.path first.
+sys.path.insert(0, str(HERE / "vendor"))
 APP_ROOT = Path(os.environ.get("CAROLINE_APP_ROOT", HERE.parent))
 def _default_wwwroot() -> Path:
     """A packaged install bundles wwwroot as a sibling of linux-shell/ (see
@@ -72,6 +78,7 @@ MAX_TABS = 5
 LOG_PATH = Path(os.environ.get("CAROLINE_SHELL_LOG", Path.home() / ".local" / "share" / "Caroline" / "shell.log"))
 FONTS_DIR = HERE / "fonts"
 ICONS_DIR = HERE / "icons"
+APP_ICON_PATH = ICONS_DIR / "app.ico"
 
 # The page asks for "Segoe UI" (Windows). Selawik (SIL OFL, Microsoft) has the
 # same metrics and is shipped with the shell, so map Segoe UI's weights onto it.
@@ -562,6 +569,14 @@ class Shell:
         # equivalent saves while prepare() recreates the previously-open
         # tabs, so restoring them doesn't itself get recorded as a change.
         self._restoring_tabs = False
+        # Port of MainWindow's _exitRequested: a plain X-button close hides
+        # (tray keeps the app running, see _on_delete_event), same as
+        # Windows' OnClosing; only RequestExit (the tray's own "Exit" item,
+        # or SIGTERM/SIGINT) actually tears the app down.
+        self._exit_requested = False
+        # Set by main() right after construction, if a tray icon could be
+        # created at all (see _build_tray_icon) -- stopped from on_destroy.
+        self.tray_icon: Any = None
 
         self.window = Gtk.Window(title="Caroline")
         if settings.window_width is not None and settings.window_height is not None:
@@ -573,7 +588,13 @@ class Shell:
         geometry.min_height = 400
         self.window.set_geometry_hints(None, geometry, Gdk.WindowHints.MIN_SIZE)
         self.window.set_keep_above(settings.always_on_top)
+        if APP_ICON_PATH.exists():
+            try:
+                self.window.set_icon_from_file(str(APP_ICON_PATH))
+            except GLib.Error as exc:
+                log(f"Shell: set_icon_from_file failed: {exc}")
         self.window.connect("destroy", self.on_destroy)
+        self.window.connect("delete-event", self._on_delete_event)
 
         css = Gtk.CssProvider()
         css.load_from_data(TAB_STRIP_CSS)
@@ -646,13 +667,41 @@ class Shell:
 
     def toggle_visibility(self) -> None:
         """Port of ToggleVisibility: hide if shown, show+raise+focus if
-        hidden -- same global-hotkey toggle, bound in main() to Ctrl+Alt+C
-        by default (AppSettings.HotkeyModifiers/HotkeyVirtualKey's own
-        default, no settings persistence here yet to make it configurable)."""
+        hidden -- same global-hotkey toggle, bound in main() to
+        settings.hotkey_modifiers/hotkey_key (Ctrl+Alt+C by default, see
+        settings_service.py)."""
         if self.window.get_visible():
             self.window.hide()
         else:
             self.window.present()
+
+    def show_and_activate(self) -> None:
+        """Port of MainWindow's ShowAndActivate -- the tray's "Open
+        Caroline" item and its default (left-)click both use this rather
+        than toggle_visibility, matching Windows: always brings the window
+        to front, never hides an already-visible one."""
+        self.window.show_all()
+        self.window.deiconify()
+        self.window.present()
+
+    def _on_delete_event(self, _widget, _event) -> bool:
+        """Port of MainWindow's OnClosing: closing via the window's own X
+        button hides instead of quitting (the tray icon, when available,
+        is the way back in -- see _build_tray_icon -- and the global
+        hotkey always still works regardless of whether a tray host is
+        present on this desktop). Returning True tells GTK to cancel the
+        close; request_exit() is the only path that actually proceeds to
+        "destroy" (the tray's own "Exit" item, or SIGTERM/SIGINT)."""
+        if self._exit_requested:
+            return False
+        self.window.hide()
+        return True
+
+    def request_exit(self) -> None:
+        """Port of MainWindow's RequestExit: the one path that lets a
+        close through _on_delete_event instead of hiding."""
+        self._exit_requested = True
+        self.window.close()
 
     def toggle_voice_recording_from_hotkey(self) -> None:
         """Port of ToggleVoiceRecordingFromHotkey (Ctrl+Shift+C): same JS
@@ -983,6 +1032,11 @@ class Shell:
             self.settings_service.save(self.settings, caller="on_destroy")
         except Exception as exc:
             log(f"on_destroy: failed to persist window geometry: {exc}")
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception as exc:
+                log(f"on_destroy: tray_icon.stop() failed: {exc}")
         self.supervisor.stop()
         Gtk.main_quit()
 
@@ -1030,6 +1084,53 @@ def show_error_dialog(summary: str, detail: str) -> None:
     dialog.destroy()
 
 
+def _build_tray_icon(shell: Shell) -> Any:
+    """Port of Tray/TrayIconManager.cs: "Open Caroline" (also the default/
+    primary-click action) + Exit, same two-item menu. No single Linux API
+    covers every desktop the way Win32's NotifyIcon does (GNOME shows
+    nothing at all without the user's own AppIndicator extension, see
+    docs/LINUX_PORT_PLAN.md) -- pystray (vendored, see vendor/pystray/
+    NOTICE.md) already tries AppIndicator, then GtkStatusIcon, then a raw
+    X11 icon window, in that order, so this gets the best available
+    option on whatever desktop it's running on without this file needing
+    to know which one that is.
+
+    Best-effort: returns None (logged, not fatal -- the window is still
+    fully usable, just without a tray icon or a way to un-hide it besides
+    the global hotkey) if pystray or Pillow aren't actually importable, or
+    if construction fails for any other reason."""
+    try:
+        import pystray
+        from PIL import Image
+    except ImportError as exc:
+        log(f"tray: pystray/Pillow not importable, tray disabled: {exc}")
+        return None
+    try:
+        image = Image.open(APP_ICON_PATH)
+        image.size = (64, 64)
+        image.load()
+    except Exception as exc:
+        log(f"tray: could not load icon from {APP_ICON_PATH}, tray disabled: {exc}")
+        return None
+
+    def on_open(_icon: Any = None, _item: Any = None) -> None:
+        GLib.idle_add(shell.show_and_activate)
+
+    def on_exit(_icon: Any = None, _item: Any = None) -> None:
+        GLib.idle_add(shell.request_exit)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Caroline", on_open, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", on_exit),
+    )
+    try:
+        return pystray.Icon("caroline", image, "Caroline", menu)
+    except Exception as exc:
+        log(f"tray: pystray.Icon construction failed, tray disabled: {exc}")
+        return None
+
+
 def main() -> int:
     _install_global_exception_logging()
     GLib.set_prgname("caroline")
@@ -1057,6 +1158,13 @@ def main() -> int:
     settings = settings_service.load()
     shell = Shell(supervisor, settings, settings_service)
     shell.prepare()
+    shell.tray_icon = _build_tray_icon(shell)
+    if shell.tray_icon is not None:
+        # Per pystray's own docs: call run_detached() BEFORE entering the
+        # other library's main loop (Gtk.main(), at the end of this
+        # function) so its Linux backends integrate with that loop
+        # instead of spinning up their own.
+        shell.tray_icon.run_detached()
 
     splash = SplashWindow(on_dismissed=lambda: None)
     splash.show()
