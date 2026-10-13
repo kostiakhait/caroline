@@ -136,7 +136,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import register_inject_proactive, register_permission_blocker, register_reply_watch, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import get_recent_real_user_directives, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -1439,10 +1439,49 @@ def _format_exception_chain(exc: BaseException) -> str:
 
 
 class ChatSession:
-    def __init__(self, tab_id: str, workspace_dir: str, send: SendFn) -> None:
+    def __init__(
+        self, tab_id: str, workspace_dir: str, send: SendFn, *,
+        headless: bool = False, approval_bridge_tab_id: str | None = None,
+    ) -> None:
         self.tab_id = tab_id
         self.workspace_dir = workspace_dir
         self.send = send
+        # Per explicit instruction (2026-10-13): a session with no chat window
+        # of its own -- the Ratatosk owner-DM channel, and the new background/
+        # reminder-task session (see main.py's get_or_create_ratatosk_session/
+        # _get_background_session_sync). Gates the progress-narrator entirely
+        # (_check_progress_narration's own early-return) -- nobody is watching
+        # a headless session live, so there is nothing for it to narrate TO,
+        # and the paid generate_progress_comment call would be pure waste --
+        # and skips the wire-translate step inside _translate_wire_visible_text
+        # (current_language_name(tab_id) is only ever written by a REAL user's
+        # own submit(), which a headless session never has, so translating
+        # inside it would permanently stick at the English fallback; the one
+        # real translation happens once, at relay time, under the RECEIVING
+        # tab's own real language -- see deliver_relayed_reply).
+        self.headless = headless
+        # Per explicit instruction (2026-10-13): the approval/prohibition
+        # "bridge" -- the tab id (almost always the primary tab) whose recent
+        # real user messages this session's own permission-guard check should
+        # also see, via session_context.get_recent_real_user_directives. A
+        # headless background session has none of its own real user messages
+        # (nothing ever submits to it with is_real_user=True), so without this
+        # its own _check_permission_guard would have no way to know the user
+        # already approved something in their real conversation elsewhere.
+        # None for every ordinary user-facing tab (no bridging -- a real tab
+        # already sees its own real dialogue directly).
+        self.approval_bridge_tab_id = approval_bridge_tab_id
+        # Per explicit instruction (2026-10-13): pure in-process, time-pruned
+        # memory of this tab's own real user messages -- (epoch_ms, text)
+        # pairs, appended once per genuinely-new real submit() (see that
+        # method's own is_real_user branch), read (and the list itself pruned)
+        # by recent_real_user_directives_text. Deliberately NEVER touches disk
+        # or the session transcript file -- unlike PERMISSION_GUARD_DIALOGUE_
+        # WINDOW's line-count cap (confirmed live, 2026-10-13: a real approval
+        # scrolled out of that 60-line window in well under an hour on a
+        # high-traffic tab), this is immune to both traffic volume and context
+        # compaction by construction.
+        self.recent_real_user_messages: list[tuple[float, str]] = []
         # See _on_memory_upstream_no_funds: the turn to start again once the
         # memory service's provider has money, and the flat timer checking for that.
         self._memory_replay: dict[str, Any] | None = None
@@ -2313,6 +2352,15 @@ class ChatSession:
             # __init__ comment for the incident this fixes.
             self.consecutive_narration_count = 0
             self.last_real_user_question = text
+            # Per explicit instruction (2026-10-13): the approval/prohibition bridge's
+            # own raw material -- see self.recent_real_user_messages' own __init__
+            # comment. Every real user message, pruned to the last hour on each append
+            # so this never grows unbounded across a long-lived tab.
+            now_ms = time.time() * 1000
+            self.recent_real_user_messages.append((now_ms, text))
+            self.recent_real_user_messages = [
+                (t, m) for t, m in self.recent_real_user_messages if now_ms - t <= 3600_000
+            ]
             # A genuine new real-user message is also a fresh chance for the model --
             # see permission_guard_consecutive_blocks' own __init__ comment for why this
             # episode-scoped counter must not survive into a new real episode.
@@ -2902,7 +2950,18 @@ class ChatSession:
         if reason:
             self.pending_unapproved_action = None
             self.permission_guard_consecutive_blocks += 1
-            escalate = self.permission_guard_consecutive_blocks >= 2
+            # Per explicit instruction (2026-10-13): a headless session (see
+            # self.headless's own __init__ comment) has no delivery path for
+            # _send_permission_guard_direct_ask -- it calls self.send(...), which
+            # for a headless session reaches no chat window at all (confirmed:
+            # this was already a dormant bug for the Ratatosk session, which
+            # predates this flag -- a 2nd-consecutive block there silently asked
+            # a question nobody could ever see or answer, with the turn stuck
+            # fully stopped). Never escalate for a headless session; the ordinary
+            # note-to-the-model branch below folds the yes/no question into the
+            # model's own next real reply instead, which then flows out through
+            # the normal buffer-and-relay path like any other answer.
+            escalate = self.permission_guard_consecutive_blocks >= 2 and not self.headless
             log_event(
                 "engine", "permission_guard_stopped_turn", tab_id=self.tab_id, reason=reason,
                 consecutive=self.permission_guard_consecutive_blocks, escalated=escalate,
@@ -2955,6 +3014,40 @@ class ChatSession:
             "session_id": None, "parent_tool_use_id": None,
         }
         await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
+
+    async def deliver_relayed_reply(self, text: str, is_voice: bool = False) -> None:
+        """Per explicit instruction (2026-10-13), "Фоновые задачи... должны
+        мержиться только на уровне вывода пользователю": delivers a reply that
+        was generated and already reviewed inside a DIFFERENT (headless)
+        session -- e.g. the background/reminder-task session's own final
+        answer, relayed here by main.py's _background_session_send once that
+        session's turn genuinely ends -- into THIS session's own visible chat,
+        as if it were this session's own reply. Same bypass-the-model,
+        translate-then-send-as-wire pattern as _send_permission_guard_direct_
+        ask/_send_silence_fallback_notice. review_reply already ran inside the
+        ORIGINATING headless session (see _translate_wire_visible_text's own
+        headless branch) -- only translation into THIS tab's own real language
+        happens here, since the headless session that generated `text` has no
+        real language of its own to translate into."""
+        from app.plugins.voice_api import translate_text
+
+        try:
+            translated = await translate_text(
+                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                addressee_gender=get_owner_profile(self.workspace_dir).gender,
+            )
+        except Exception as exc:
+            log_event("engine", "deliver_relayed_reply_translate_failed", tab_id=self.tab_id, error=str(exc))
+            translated = None
+        final_text = translated or text
+        log_event("engine", "background_reply_relayed", tab_id=self.tab_id, text_len=len(final_text))
+        self.last_visible_output_at = time.monotonic()
+        wire = {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": final_text}], "model": None, "stop_reason": None},
+            "session_id": None, "parent_tool_use_id": None,
+        }
+        await self.send({"type": "sdk_message", "message": wire, "isVoice": is_voice})
 
     def _reset_after_stop(self) -> None:
         """The run loop's side of a Stop, once the killed engine's stream has
@@ -3651,8 +3744,33 @@ class ChatSession:
     def _narration_task(self) -> str:
         """The user's request for the current task -- the one thing the narrator
         needs to say where the task stands. Only the current real user request,
-        never older conversation history."""
+        never older conversation history.
+
+        Per explicit instruction (2026-10-13): a headless, bridge-enabled session
+        (see approval_bridge_tab_id's own __init__ comment) never has a real user
+        submit() of its own, so last_real_user_question would always be empty --
+        this starved review_reply/check_permission_guard of any task context for
+        EVERY background-task turn. pending_user_text is set unconditionally by
+        every submit(), real or not (see submit()'s own assignment), so it's the
+        right fallback specifically for a session that structurally never gets a
+        real one."""
+        if not self.last_real_user_question and self.approval_bridge_tab_id and self.pending_user_text:
+            return self.pending_user_text.strip()[:600]
         return (self.last_real_user_question or "").strip()[:600]
+
+    def recent_real_user_directives_text(self, within_hours: float = 1.0) -> str:
+        """Per explicit instruction (2026-10-13): the approval-bridge accessor --
+        see recent_real_user_messages' own __init__ comment. Registered (by tab
+        id) via session_context.register_recent_real_user_directives in
+        _run_loop, so a DIFFERENT (headless) session's own permission-guard check
+        can reach this tab's recent real approvals without importing main.py."""
+        cutoff = time.time() * 1000 - within_hours * 3600_000
+        lines = [m for t, m in self.recent_real_user_messages if t >= cutoff]
+        if not lines:
+            return ""
+        return "[Recent real user messages/approvals from the primary conversation, last hour:]\n" + "\n".join(
+            f"- {m}" for m in lines
+        )
 
     def _gather_recent_dialogue_for_narration(self, limit: int = RECENT_DIALOGUE_WINDOW) -> str:
         """Per explicit correction (2026-09-10): the first version of
@@ -3763,17 +3881,34 @@ class ChatSession:
         deliberately NO min_ts_ms floor -- every other caller of
         _read_recent_dialogue_lines already gets the unbounded default, and
         the guard belongs with them, not with the narrator's own
-        current-turn-only restriction."""
+        current-turn-only restriction.
+
+        Per explicit instruction (2026-10-13): confirmed live -- even this
+        wider window still isn't enough on a high-traffic tab (60 lines
+        consumed in well under an hour, scrolling out a real approval the
+        user had given just ~3 hours earlier). Rather than just raising the
+        number again (same failure mode on an even busier day), a session
+        with approval_bridge_tab_id set (a headless background/reminder-task
+        session -- see that field's own __init__ comment) also gets the
+        BRIDGED tab's own recent_real_user_directives_text prepended: pure
+        in-process, time-pruned, never touches disk, so it is immune to both
+        traffic volume and context compaction by construction."""
         if self.small_model_active and self.small_model_live_dialogue:
-            return "\n".join(self.small_model_live_dialogue[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
-        lines = _read_recent_dialogue_lines(
-            self.last_saved_session_id, self.tab_id, self.workspace_dir, PERMISSION_GUARD_DIALOGUE_WINDOW,
-        )
-        deduped: list[str] = []
-        for line in lines:
-            if not deduped or deduped[-1] != line:
-                deduped.append(line)
-        return "\n".join(deduped[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+            own = "\n".join(self.small_model_live_dialogue[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+        else:
+            lines = _read_recent_dialogue_lines(
+                self.last_saved_session_id, self.tab_id, self.workspace_dir, PERMISSION_GUARD_DIALOGUE_WINDOW,
+            )
+            deduped: list[str] = []
+            for line in lines:
+                if not deduped or deduped[-1] != line:
+                    deduped.append(line)
+            own = "\n".join(deduped[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
+        if self.approval_bridge_tab_id:
+            bridge = get_recent_real_user_directives(self.approval_bridge_tab_id)
+            if bridge:
+                return f"{bridge}\n{own}" if own else bridge
+        return own
 
     async def _check_permission_guard(self, extra_context: str | None = None) -> None:
         """Per explicit instruction (2026-10-11): re-evaluates
@@ -4094,7 +4229,16 @@ class ChatSession:
                 text = reviewed
                 block["text"] = text
             is_silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
-            if not is_silent:
+            # Per explicit instruction (2026-10-13): current_language_name(tab_id)
+            # is only ever written by refresh_language_in_background, called only
+            # from a REAL user's own submit() -- a headless session (see
+            # self.headless's own __init__ comment) never has one, so translating
+            # here would permanently stick at the hardcoded English fallback.
+            # review_reply above still runs (it keeps filtering internal-mechanics
+            # leaks before anything reaches the relay buffer) -- only the
+            # translate step is skipped; the one real translation happens once,
+            # under the RECEIVING tab's own real language, in deliver_relayed_reply.
+            if not is_silent and not self.headless:
                 try:
                     translated = await translate_text(
                         text, language, gender=get_persona_gender(self.workspace_dir),
@@ -4178,7 +4322,13 @@ class ChatSession:
         # wait, reacting to nothing real. Only narrate while actually
         # connected -- recovering/limited/restarting/billing_blocked all
         # mean there's genuinely nothing to narrate about right now.
-        if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected":
+        # Per explicit instruction (2026-10-13), "Фоновые задачи не должны иметь
+        # нарратора": a headless session (see self.headless's own __init__
+        # comment) has no chat window for a cosmetic stand-in remark to even
+        # reach -- gated here architecturally, not just left to have nowhere to
+        # go, so the paid generate_progress_comment call is never made for it at
+        # all.
+        if self.ended or not self.turn_pending or self.conn_state.get("kind") != "connected" or self.headless:
             return
         # Per explicit instruction (2026-10-07) -- NOT a revival of the
         # whole-category gate reverted just below on 2026-10-03: this is
@@ -5205,6 +5355,7 @@ class ChatSession:
         register_permission_blocker(self.tab_id, self._on_permission_block_checked)
         register_send_for_tab(self.tab_id, self.send)
         register_reply_watch(self.tab_id, self._on_outbound_message_sent)
+        register_recent_real_user_directives(self.tab_id, self.recent_real_user_directives_text)
         set_cli_pid_sink(self._on_cli_process_spawned)
         while not self.ended:
             try:

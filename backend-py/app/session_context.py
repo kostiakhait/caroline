@@ -22,6 +22,7 @@ InjectProactiveFn = Callable[[str], bool]
 CliPidSinkFn = Callable[[int], None]
 PermissionBlockerFn = Callable[[], "str | None"]
 ReplyWatchFn = Callable[[str, dict, Any], None]
+RecentDirectivesFn = Callable[[], str]
 
 _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("current_send", default=None)
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
@@ -35,6 +36,9 @@ _permission_blocker_by_tab: dict[str, PermissionBlockerFn] = {}
 _send_by_tab: dict[str, SendFn] = {}
 # Every live ChatSession's reply watch by tab id (see register_reply_watch).
 _reply_watch_by_tab: dict[str, ReplyWatchFn] = {}
+# Every live ChatSession's recent-real-user-directives text by tab id (see
+# register_recent_real_user_directives).
+_recent_directives_by_tab: dict[str, RecentDirectivesFn] = {}
 
 
 def get_send() -> SendFn:
@@ -156,6 +160,25 @@ def register_reply_watch(tab_id: str, fn: ReplyWatchFn) -> None:
 
 def get_reply_watch(tab_id: str | None) -> ReplyWatchFn | None:
     return _reply_watch_by_tab.get(tab_id) if tab_id else None
+
+
+def register_recent_real_user_directives(tab_id: str, fn: RecentDirectivesFn) -> None:
+    """Per explicit instruction (2026-10-13): lets a headless background
+    session's own permission-guard check reach a DIFFERENT tab's (the
+    primary tab's) recent real user messages -- the approval/prohibition
+    "bridge" that keeps a background task honoring an approval the user
+    gave in their real conversation, without background-task traffic ever
+    diluting that tab's own permission-guard window (see chat_session.py's
+    recent_real_user_directives_text, and ChatSession's approval_bridge_
+    tab_id). Mirrors register_permission_blocker exactly: same per-tab
+    dict, same non-fatal shape, a later session of the same tab replaces
+    it."""
+    _recent_directives_by_tab[tab_id] = fn
+
+
+def get_recent_real_user_directives(tab_id: str | None) -> str:
+    fn = _recent_directives_by_tab.get(tab_id) if tab_id else None
+    return fn() if fn else ""
 
 
 def get_cli_pid_sink() -> CliPidSinkFn | None:
