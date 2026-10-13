@@ -134,6 +134,19 @@ $(BACKEND_DIR)/mcp-servers/.stamp: $(BACKEND_DIR)/dist/.stamp
 $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	@echo "=== Caroline Build ==="
 	mkdir -p "$(OUT)"
+	# Bug fix (2026-10-12), confirmed live: dropping the old recipe's blanket
+	# `rm -rf $(OUT)` (replaced by each stamp's own narrower cleanup) left
+	# THIS stamp with none at all -- confirmed live, a `dotnet publish` reusing
+	# a not-freshly-cleaned output directory across separate invocations over
+	# time silently dropped loose native dependency DLLs (PresentationNative_
+	# cor3.dll, D3DCompiler_47_cor3.dll, WebView2Loader.dll) that a fully clean
+	# `make clean && make build` always produced correctly -- the app then
+	# crashed on startup with System.DllNotFoundException. Clears everything
+	# dotnet publish itself owns at $(OUT)'s top level, WITHOUT touching the
+	# subtrees/stamps the other targets below own (backend/, backend-py/,
+	# whatsapp-sidecar/, every *.stamp file) -- same "narrower cleanup, same
+	# effect, scoped" principle already applied to those, just missed here.
+	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend ! -name backend-py ! -name whatsapp-sidecar ! -name "*.stamp" -exec rm -rf {} +
 	( rc=0; dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.caroline-exe.rc" ) & \
 	( echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"; \
 	  rc=0; dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.nativehost.rc" ) & \
