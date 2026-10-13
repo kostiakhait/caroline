@@ -1742,6 +1742,16 @@ class ChatSession:
         # register_permission_blocker), which stops the whole turn the next time ANY tool
         # call is attempted while this is set -- see app/operations.py's dispatch().
         self.pending_unapproved_action: str | None = None
+        # Per explicit instruction (2026-10-13): counts consecutive permission-guard
+        # blocks since the last genuine real-user message (see submit()'s is_real_user
+        # branch, which resets this). The first block just asks the MODEL to ask the
+        # user and wait (PERMISSION_NOTE_TEXT_TEMPLATE) -- confirmed live the model can
+        # ignore that and retry the same blocked action anyway (a real incident: 8
+        # straight blocked attempts to email a third party, ~3 minutes, zero actual
+        # questions reaching the user). _on_permission_block_checked uses this counter
+        # to escalate: a SECOND consecutive block means the model didn't listen, so the
+        # guard asks the user directly itself instead, and the turn stays fully stopped.
+        self.permission_guard_consecutive_blocks: int = 0
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -2288,6 +2298,10 @@ class ChatSession:
             # __init__ comment for the incident this fixes.
             self.consecutive_narration_count = 0
             self.last_real_user_question = text
+            # A genuine new real-user message is also a fresh chance for the model --
+            # see permission_guard_consecutive_blocks' own __init__ comment for why this
+            # episode-scoped counter must not survive into a new real episode.
+            self.permission_guard_consecutive_blocks = 0
             # Per explicit instruction (2026-10-11): a just-given "yes" must clear
             # pending_unapproved_action before the model's NEXT turn starts, not
             # only the next time an outbound message triggers a re-check -- fire-
@@ -2840,12 +2854,30 @@ class ChatSession:
         they next happen to speak.
 
         One stop per violation: the flag is consumed (cleared) here, not
-        left set to re-trigger stop() again on every subsequent call."""
+        left set to re-trigger stop() again on every subsequent call.
+
+        Escalation (2026-10-13), per explicit instruction ("если модель её не
+        слушает, он должен сам спросить у пользователя, а ход полностью
+        остановить"): the first block of a real-user episode still just tells
+        the MODEL to ask and wait (inject_proactive(note_text) below, starting
+        a fresh turn so it gets a chance to actually do that). Confirmed live
+        the model can ignore that instruction and retry the same blocked
+        action anyway on the very next turn -- permission_guard_consecutive_
+        blocks (reset only by a genuine new real-user message, see submit())
+        counts this. From the SECOND consecutive block onward, the guard stops
+        asking the model and asks the user directly itself
+        (_send_permission_guard_direct_ask) -- and critically does NOT
+        inject_proactive() afterward, so no new turn starts and the model gets
+        no further chance to retry until a real user message answers."""
         reason = self.pending_unapproved_action
         if reason:
             self.pending_unapproved_action = None
-            log_event("engine", "permission_guard_stopped_turn", tab_id=self.tab_id, reason=reason)
-            note_text = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
+            self.permission_guard_consecutive_blocks += 1
+            escalate = self.permission_guard_consecutive_blocks >= 2
+            log_event(
+                "engine", "permission_guard_stopped_turn", tab_id=self.tab_id, reason=reason,
+                consecutive=self.permission_guard_consecutive_blocks, escalated=escalate,
+            )
 
             def _stop_and_explain() -> None:
                 if self.ended:
@@ -2856,10 +2888,44 @@ class ChatSession:
                 # anything) and would otherwise show up ALONGSIDE the permission note
                 # below. The permission note already says everything that matters.
                 self._stop_note_pending = False
-                self.inject_proactive(note_text)
+                if escalate:
+                    asyncio.ensure_future(self._send_permission_guard_direct_ask(reason))
+                else:
+                    self.inject_proactive(PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason))
 
             asyncio.get_event_loop().call_soon(_stop_and_explain)
         return reason
+
+    async def _send_permission_guard_direct_ask(self, reason: str) -> None:
+        """The escalation path _on_permission_block_checked falls to once the
+        model has already ignored one PERMISSION_NOTE_TEXT_TEMPLATE instruction
+        and retried the same unapproved action anyway. Bypasses the model
+        entirely and asks the real user directly -- same bypass-the-model,
+        translate-then-send-as-wire pattern as _send_silence_fallback_notice.
+        The caller does not inject_proactive() after this: no new turn starts,
+        so there is nothing left to retry the blocked action until a genuine
+        user message (submit() with is_real_user=True) answers it."""
+        from app.plugins.voice_api import translate_text
+
+        text = f"I need to stop and ask you directly: {reason} Please tell me yes or no before I continue."
+        try:
+            translated = await translate_text(
+                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                addressee_gender=get_owner_profile(self.workspace_dir).gender,
+            )
+        except Exception as exc:
+            log_event("engine", "permission_guard_direct_ask_translate_failed", tab_id=self.tab_id, error=str(exc))
+            translated = None
+        if translated:
+            text = translated
+        log_event("engine", "permission_guard_asked_user_directly", tab_id=self.tab_id, reason=reason)
+        self.last_visible_output_at = time.monotonic()
+        wire = {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}], "model": None, "stop_reason": None},
+            "session_id": None, "parent_tool_use_id": None,
+        }
+        await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
 
     def _reset_after_stop(self) -> None:
         """The run loop's side of a Stop, once the killed engine's stream has
