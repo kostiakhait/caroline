@@ -480,7 +480,7 @@ async def _start_ratatosk_background_loops() -> None:
     from app import http_tls
     asyncio.create_task(http_tls.warm_up())
     asyncio.create_task(_prune_redundant_archives_in_background())
-    start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
+    start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _inject_from_ratatosk_owner_account, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
     # 2026-10-06) -- a no-op loop (just rechecks every 30s) until
@@ -1012,6 +1012,24 @@ def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
     _ratatosk_turn_origin_group_ids.extend(origin_group_ids)
     _ratatosk_turn_replied_group_ids.clear()
 
+    async def _do() -> None:
+        session = await get_or_create_ratatosk_session()
+        session.inject_proactive(text)
+
+    asyncio.create_task(_do())
+
+
+def _inject_from_ratatosk_owner_account(text: str) -> None:
+    """Per explicit instruction (2026-10-13): the owner's OWN Ratatosk
+    account's new-message notification -- read-only/informational (see
+    ratatosk_channel.py's own account="owner" framing), unlike
+    _inject_from_ratatosk_owner above (which is "self" -- Caroline's own
+    account -- despite this module's naming). Deliberately does NOT touch
+    _ratatosk_turn_origin_group_ids/_ratatosk_turn_replied_group_ids: that
+    "did Caroline actually reply" tracking belongs only to her own account's
+    turns -- if this reused the same callback (even with an empty group-id
+    list), it could clear the self account's still-pending tracking for the
+    SAME poll cycle before that turn even started."""
     async def _do() -> None:
         session = await get_or_create_ratatosk_session()
         session.inject_proactive(text)
