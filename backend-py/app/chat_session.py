@@ -4272,23 +4272,34 @@ class ChatSession:
             return None
 
     async def _review_and_synthesize(self, comment: str, task: str) -> tuple[str, str | None]:
-        """A voice-loop remark on its way out: reply.review (see VOICE_NARRATION_REVIEW),
-        then the audio of what the review returned. Returns (the remark to say, its audio)."""
+        """A voice-loop remark on its way out: reply.review (see VOICE_NARRATION_REVIEW)
+        and its audio. Returns (the remark to say, its audio).
+
+        The two run side by side: the review returns the remark unchanged far more often
+        than not, and then the audio made meanwhile is the audio of the reviewed text.
+        Only a remark the review did change is synthesized again. One after the other
+        they cost the schedule their sum on every remark (narrator_scheduler_sim with
+        REVIEW_S=3: longest gap 5.3s where the limit is 4.5s)."""
         if VOICE_NARRATION_REVIEW:
             started = time.monotonic()
             reviewed: str | None = None
+            audio_as_drafted = asyncio.create_task(self._synthesize_narration_audio(comment))
             try:
                 from app.plugins.voice_api import review_reply
 
                 reviewed = await review_reply(comment, task=task, timeout=VOICE_NARRATION_REVIEW_TIMEOUT_S)
             except asyncio.CancelledError:
+                audio_as_drafted.cancel()
                 raise
             except Exception as exc:  # noqa: BLE001 -- fail-open, as review_reply itself is
                 log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
+            changed = bool(reviewed and reviewed != comment)
             log_event("engine", "voice_narration_reviewed", tab_id=self.tab_id, ms=int((time.monotonic() - started) * 1000),
-                      answered=reviewed is not None, changed=bool(reviewed and reviewed != comment))
-            if reviewed:
-                comment = reviewed
+                      answered=reviewed is not None, changed=changed)
+            if not changed:
+                return comment, await audio_as_drafted
+            audio_as_drafted.cancel()
+            comment = reviewed
         return comment, await self._synthesize_narration_audio(comment)
 
     async def _send_narration_remark(self, comment: str, audio_base64: str | None = None) -> None:
