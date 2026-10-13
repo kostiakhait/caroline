@@ -26,7 +26,7 @@ from app.plugins.sw_api import API_URL, mint_v2_session
 # shouldn't also be able to verify arbitrary account passwords, and vice
 # versa. Minted on the production server directly, scoped to
 # "email:create" only, non-expiring.
-EMAIL_CREATE_KEY = "SVdTcM0PwAm1qmZD-ucFUqHpcEiClVGTuJXdHbOEajg"
+from app.sw_service_keys_local import EMAIL_SERVICE_KEY as EMAIL_CREATE_KEY  # noqa: E402
 
 
 def _credentials_path(workspace_dir: str) -> Path:

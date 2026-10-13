@@ -35,6 +35,7 @@ from app.openai_mode import get_own_openai_api_key, openai_available, set_own_op
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
+from app.origin_guard import is_cross_origin_browser_request
 from app.persona import get_persona, get_persona_edit_state, get_persona_gender, reset_profile, save_custom_persona, save_profile_override, set_profile_key
 from app.plugins.files_plugin import open_file_with_default_app
 from app.plugins.notes_api import load_credentials
@@ -142,7 +143,16 @@ REMOTE_PORT = int(os.environ.get("CAROLINE_REMOTE_PORT", "48768"))
 async def _require_remote_owner_session(request: Request, call_next):
     server = request.scope.get("server")
     if not server or server[1] != REMOTE_PORT:
-        return await call_next(request)  # local port: unchanged, no auth
+        # Loopback-bound, but that only blocks a remote network attacker,
+        # not a malicious web page -- browsers happily send cross-origin
+        # requests to 127.0.0.1 (see origin_guard.py's own doc comment).
+        # This port has no other auth at all, and /api/control reaches
+        # real actions (including shutdown_sync), so this is the one check
+        # standing between any site the user has open and this API.
+        if is_cross_origin_browser_request(request.headers.get("origin"), PORT):
+            log_event("engine", "local_api_rejected_cross_origin", origin=request.headers.get("origin"), path=request.url.path)
+            return JSONResponse({"ok": False, "error": "Cross-origin requests are not allowed."}, status_code=403)
+        return await call_next(request)
 
     owner_email = logged_in_email()
     if not owner_email:

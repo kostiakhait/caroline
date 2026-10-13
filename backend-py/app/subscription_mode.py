@@ -43,10 +43,11 @@ from app.workspace_dir import WORKSPACE_DIR
 
 SQUIRRELWISDOM_ORIGIN = "https://www.squirrelwisdom.com"
 
-# Scoped key for "caroline-desktop" (scopes: user:verify, wallet:getBalance)
+# Scoped key for "caroline-login-v2" (scopes: user:verify, wallet:getBalance)
 # -- narrow grant, not the account password. Only used now for the wallet
-# status/top-up UI; NOT for reaching Claude.
-SW_SERVICE_KEY = "fytZDwOTaBo8I173IS2DaY_qgzm0IFvqvnxJGvC5QrE"
+# status/top-up UI; NOT for reaching Claude. Real value in
+# sw_service_keys_local.py (gitignored) -- see sw_api.py's own import comment.
+from app.sw_service_keys_local import V2_LOGIN_SERVICE_KEY as SW_SERVICE_KEY
 
 ChatSource = Literal["own-anthropic-oauth", "own-anthropic-key", "none"]
 

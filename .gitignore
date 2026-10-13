@@ -44,6 +44,7 @@ art/__pycache__/
 deploy.bat
 deploy_models.bat
 deploy.mk
+install-local.ps1
 
 # --- Ad-hoc test/diagnostic scripts (backend/) ------------------------------
 # One-off .mjs scripts run directly against dist/ or the SDK for live
@@ -56,6 +57,11 @@ backend/*.mjs
 backend/*.ps1
 
 # --- backend-py (Python backend) --------------------------------------------
+# Real SquirrelWisdom/Camerlengo service keys for this machine's build --
+# see sw_service_keys_example.py's docstring (2026-10 public-key-exposure
+# incident). Never commit this file; sw_service_keys_example.py is the
+# committed template.
+backend-py/app/sw_service_keys_local.py
 # Local copy of Caroline's own bundled embeddable Python runtime + every pip
 # dependency installed into it -- the Python equivalent of backend/node_modules/,
 # same reasoning: huge, regenerable, never meant to ship in the repo itself.

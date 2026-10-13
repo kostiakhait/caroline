@@ -94,6 +94,8 @@ async def verify_and_save_login(email: str, password: str) -> LoginResult:
         return LoginResult(False, str(exc))
     save_credentials(email, password)
     reset_sw_auto_prompt_flag()
+    global _cached_v2_session
+    _cached_v2_session = None  # a new login invalidates any session cached for the previous account
     log_event("engine", "login_succeeded", email=email)
     return LoginResult(True)
 
@@ -146,6 +148,41 @@ async def get_v2_session() -> str:
     session = await mint_v2_session(creds["email"], creds["password"])
     log_event("engine", "v2_session_refreshed", email=creds["email"])
     return session
+
+
+# In-memory only (never disk), shared by every call site that just needs
+# *some* valid v2 session to attach to an otherwise-unbilled/unauthenticated
+# call (voice_api.py's language-detection/reply-guard calls, reforce_v2.py's
+# ai:*/file:* calls) -- these used to omit session entirely, which Camerlengo
+# treats as a free, unmetered "internal" call (see Api2AICommands.
+# _check_balance_or_error). Per explicit instruction (2026-10-12): once SW
+# subscription is mandatory there is no more a legitimate anonymous-free
+# tier, so every one of these now gets a real session too, same as every
+# user-initiated call already had. Mints once, reused until Camerlengo
+# rejects it (sliding 24h idle TTL) -- NOT re-minted on every call, which
+# would double the network cost of every narrator tick/background check for
+# no security benefit (model_key_provisioning.py's own _cached_key/
+# _cached_for_session already used exactly this shape for the OpenRouter-key
+# handout; this generalizes it for every other call site).
+_cached_v2_session: str | None = None
+
+
+async def get_cached_v2_session(force_refresh: bool = False) -> str | None:
+    """Like get_v2_session(), but cached in memory and None (not raised) on
+    any failure -- every call site using this is a best-effort background/
+    housekeeping call that must never block or fail the user-facing turn
+    just because SW is logged out or briefly unreachable."""
+    global _cached_v2_session
+    if force_refresh:
+        _cached_v2_session = None
+    if _cached_v2_session:
+        return _cached_v2_session
+    try:
+        _cached_v2_session = await get_v2_session()
+    except Exception as exc:
+        log_event("engine", "cached_v2_session_unavailable", error=str(exc))
+        return None
+    return _cached_v2_session
 
 
 # --- native login-window request tracking -----------------------------------

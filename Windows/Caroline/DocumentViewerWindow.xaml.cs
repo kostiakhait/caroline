@@ -333,6 +333,7 @@ public partial class DocumentViewerWindow : Window
     /// real file path is ever saveable (see viewer_plugin's show_code).</summary>
     private void OnWebPageMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
+        if (!WebViewOriginGuard.IsTrustedSource(e.Source)) return;
         using var doc = JsonDocument.Parse(e.WebMessageAsJson);
         var root = doc.RootElement;
         if (!root.TryGetProperty("type", out var typeEl) || typeEl.GetString() != "save") return;
@@ -422,6 +423,7 @@ public partial class DocumentViewerWindow : Window
     {
         try
         {
+            if (!WebViewOriginGuard.IsTrustedSource(e.Source)) return;
             using var doc = JsonDocument.Parse(e.WebMessageAsJson);
             var root = doc.RootElement;
             if (!root.TryGetProperty("type", out var typeEl) || typeEl.GetString() != "office_error") return;

@@ -28,4 +28,13 @@
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Same icon file as Caroline.exe (Windows/Caroline/Resources/app.ico), linked rather
+         than copied so the two never drift. AppBrowserWindow was showing the generic
+         Windows placeholder icon in the taskbar/Alt-Tab, having never referenced it at all. -->
+    <Resource Include="..\Caroline\Resources\app.ico">
+      <Link>Resources\app.ico</Link>
+    </Resource>
+  </ItemGroup>
+
 </Project>

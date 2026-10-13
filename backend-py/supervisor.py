@@ -40,11 +40,12 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.logging_setup import log_event  # noqa: E402
+from app.origin_guard import is_cross_origin_browser_request  # noqa: E402
 
 # --- Layout -------------------------------------------------------------
 # CarolineInstaller.AppPaths' layout: Root/app-<hash>/backend-py/
@@ -406,6 +407,18 @@ class Supervisor:
 
 supervisor = Supervisor()
 app = FastAPI()
+
+
+@app.middleware("http")
+async def _reject_cross_origin_browser_requests(request: Request, call_next):
+    """127.0.0.1-only blocks a remote attacker, not a malicious web page --
+    see origin_guard.py's own doc comment. /stop and /restart in particular
+    are a real local-DoS surface for any site the user happens to have
+    open, with no auth of any kind otherwise."""
+    if is_cross_origin_browser_request(request.headers.get("origin"), SUPERVISOR_PORT):
+        log_event("supervisor", "rejected_cross_origin", origin=request.headers.get("origin"), path=request.url.path)
+        return JSONResponse({"ok": False, "error": "Cross-origin requests are not allowed."}, status_code=403)
+    return await call_next(request)
 
 
 @app.on_event("startup")

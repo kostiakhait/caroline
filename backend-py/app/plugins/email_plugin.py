@@ -68,7 +68,7 @@ _sessions = SessionManager()
 # "caroline-email-provisioning" key (reforce's key_scopes table, id 20 --
 # previously scoped only to email:create) rather than mint a whole new
 # credential for the same feature area.
-EMAIL_SERVICE_KEY = "SVdTcM0PwAm1qmZD-ucFUqHpcEiClVGTuJXdHbOEajg"
+from app.sw_service_keys_local import EMAIL_SERVICE_KEY  # noqa: E402
 
 _ACCOUNT_PARAM_NOTE = (
     " Look up this mailbox's saved credentials first (see this plugin's own usage instructions) -- "
@@ -112,11 +112,36 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             extra["query"] = args["query"]
         if args.get("sinceIso"):
             extra["sinceDate"] = args["sinceIso"]
+        if args.get("untilIso"):
+            extra["untilDate"] = args["untilIso"]
         result = await call_v2("email:listMessages", **extra)
         return result.get("messages") or []
 
     messages = await _sessions.with_session(do)
     return {"text": json.dumps(messages, indent=2, ensure_ascii=False)}
+
+
+async def email_latest_uid(address: str, password: str, imap_host: str, folder: str = "INBOX") -> int | None:
+    """Per explicit instruction (2026-10-12): the reply-expected auto-
+    checker's own email probe (chat_session.py's _reply_watch_tick) needs
+    to know whether NEW mail has landed in a mailbox since a message was
+    sent, on a 5/15-minute cadence -- too fine-grained for IMAP's own
+    SINCE search (day granularity only, see Api2EmailCommands.py's
+    before_date/since_date). UIDs are monotonically increasing per folder
+    (RFC 3501), so "highest UID now > the UID captured right after
+    sending" is a simple, exact "something new arrived" check with no
+    date parsing at all. Internal helper, not a model-facing tool -- same
+    credentials shape as every other function here, called directly with
+    plain arguments rather than through the args-dict tool contract."""
+    async def do(session: str) -> Any:
+        result = await call_v2(
+            "email:listMessages", session=session, folder=folder, limit=1,
+            address=address, password=password, imapServer=imap_host,
+        )
+        messages = result.get("messages") or []
+        return int(messages[0]["uid"]) if messages else None
+
+    return await _sessions.with_session(do)
 
 
 async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -298,17 +323,18 @@ PLUGIN = Plugin(
             "email_list_messages",
             "Lists lightweight message metadata (uid, from, subject, date, flags) for a folder, newest "
             "first. Use `query` for a simple subject/from/body substring search, `unseenOnly` to "
-            "restrict to unread mail, or `sinceIso` (an ISO date, e.g. \"2026-10-01\") to restrict to "
-            "messages received on or after that date (day granularity only -- IMAP has no finer filter). "
-            "Checking more than one mailbox or folder at once? Use email_list_messages_batch instead -- "
-            "it does this concurrently in one call." + _ACCOUNT_PARAM_NOTE,
-            {**_CREDENTIAL_PARAMS, "folder": str | None, "limit": int | None, "unseenOnly": bool | None, "query": str | None, "sinceIso": str | None},
+            "restrict to unread mail, or `sinceIso`/`untilIso` (ISO dates, e.g. \"2026-10-01\") for a "
+            "[since, until) date interval (day granularity only -- IMAP has no finer filter). Need the "
+            "actual content (to/from/cc/body/attachments), not just this metadata, for every message in "
+            "a folder/date range? Use email_read_range instead of listing then fetching each uid one by "
+            "one. Checking more than one mailbox or folder at once? Use email_list_messages_batch." + _ACCOUNT_PARAM_NOTE,
+            {**_CREDENTIAL_PARAMS, "folder": str | None, "limit": int | None, "unseenOnly": bool | None, "query": str | None, "sinceIso": str | None, "untilIso": str | None},
             email_list_messages,
         ),
         PluginTool(
             "email_get_message",
-            "Fetches a single message's full content (subject, from, to, date, text/html body, attachment "
-            "list) by folder + uid." + _ACCOUNT_PARAM_NOTE,
+            "Fetches a single message's full content (subject, from, to, cc, date, text/html body, "
+            "attachment list) by folder + uid." + _ACCOUNT_PARAM_NOTE,
             {**_CREDENTIAL_PARAMS, "folder": str, "uid": int}, email_get_message,
         ),
         PluginTool(

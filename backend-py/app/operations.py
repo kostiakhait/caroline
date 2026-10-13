@@ -33,7 +33,7 @@ from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server,
 from app import memory_nudge
 from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
-from app.session_context import get_inject_proactive, get_permission_block, get_tab_id
+from app.session_context import get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
 from app.workspace_dir import WORKSPACE_DIR
 
 # How long dispatch() waits before giving up on returning a "done" result
@@ -53,6 +53,23 @@ FAST_PATH_TIMEOUT_S = 0.5
 # with check_operation_status, the notice is not sent (see
 # _notify_unless_collected).
 NOTIFY_GRACE_S = 10.0
+
+# Per explicit instruction (2026-10-12): every tool whose successful
+# completion means "Caroline just sent a message on a channel" -- the hook
+# point for the reply-expected auto-checker (see session_context.py's
+# register_reply_watch and chat_session.py's _on_outbound_message_sent).
+# Named here, the one place both engines' tool calls already funnel
+# through, rather than threading a call into each plugin's own send
+# handler individually.
+REPLY_WATCH_CHANNEL_BY_TOOL = {
+    "email_send": "email",
+    "discord_send_message": "discord",
+    "ratatosk_send_message": "ratatosk",
+    "signal_send_message": "signal",
+    "slack_send_message": "slack",
+    "telegram_send_message": "telegram",
+    "whatsapp_send_message": "whatsapp",
+}
 
 ReportProgress = Callable[[Any], None]
 ToolHandler = Callable[[dict[str, Any], ReportProgress], Awaitable[dict[str, Any]]]
@@ -231,6 +248,11 @@ async def dispatch(
             result = await handler(args, report_progress)
             op.status = "done"
             op.result = result
+            channel = REPLY_WATCH_CHANNEL_BY_TOOL.get(tool_name)
+            if channel:
+                watch = get_reply_watch(tab_id)
+                if watch:
+                    watch(channel, args, result)
             return result
         except asyncio.CancelledError:
             op.status = "cancelled"

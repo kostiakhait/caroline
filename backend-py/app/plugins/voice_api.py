@@ -12,6 +12,7 @@ import re
 from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
+from app.login_api import get_cached_v2_session
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json
 
 
@@ -21,6 +22,8 @@ class VoiceApiError(Exception):
 
 async def transcribe_audio(audio_base64: str, fmt: str, session: str | None = None) -> str:
     body: dict[str, Any] = {"command": "ai:stt", "key": CAROLINE_SW_KEY, "audio": audio_base64, "format": fmt}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     data = await _post_json(body)
@@ -65,7 +68,11 @@ async def detect_language(text: str) -> str | None:
     intentionally NOT this function -- see the dedicated
     resolve-based-language-detection redesign plan for that one."""
     try:
-        data = await _post_json({"command": "ai:detectLanguage", "key": CAROLINE_SW_KEY, "text": text})
+        body: dict[str, Any] = {"command": "ai:detectLanguage", "key": CAROLINE_SW_KEY, "text": text}
+        session = await get_cached_v2_session()
+        if session:
+            body["session"] = session
+        data = await _post_json(body)
     except Exception:
         return None
     if data.get(".status") != "ok" or not isinstance(data.get("language"), str):
@@ -122,6 +129,8 @@ async def resolve_user_language(recent_text: str, session: str | None = None) ->
         f"{recent_text}"
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -273,6 +282,8 @@ async def translate_text(
         "command": "ai:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
         "instructions": _gender_agreement_clause(gender, addressee_gender) or None,
     }
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -313,6 +324,8 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     fall back to the text it already had rather than block or drop a reply
     over this."""
     body: dict[str, Any] = {"command": "reply:review", "key": CAROLINE_SW_KEY, "text": text, "task": task}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -350,6 +363,8 @@ async def check_permission_guard(task: str, recent_dialogue: str, session: str |
     (chat_session.py) decides what to do with None -- typically, leave
     whatever gate state it already had untouched."""
     body: dict[str, Any] = {"command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -365,6 +380,76 @@ async def check_permission_guard(task: str, recent_dialogue: str, session: str |
         log_event("plugin:voice", "check_permission_guard_failed", reason="malformed")
         return None
     return {"needs_approval": output["needs_approval"], "reason": str(output.get("reason") or "")}
+
+
+async def check_refusal_guard(task: str, assistant_reply: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-12): a separate concern from
+    check_permission_guard -- that one is about a missing user APPROVAL;
+    this one is about the assistant itself voluntarily DECLINING a real
+    user task on its own judgment (a real incident the same day: declining
+    to modify/deploy its own permission-control code unsupervised). Backed
+    by a real microagent (server-side turn.refusal.guard).
+
+    Returns {"declined": bool, "reason": str} on a clean result, or None on
+    any error/timeout/malformed response (fail-open, same philosophy as
+    translate_text/check_permission_guard -- an infrastructure hiccup must
+    not be mistaken for a decline, nor paralyze Caroline). The caller
+    (chat_session.py) decides what to do with None -- typically, do nothing
+    further, same as if the reply were not a decline."""
+    body: dict[str, Any] = {"command": "reply:refusalGuard", "key": CAROLINE_SW_KEY, "task": task, "assistantReply": assistant_reply}
+    if not session:
+        session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("declined"), bool):
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="malformed")
+        return None
+    return {"declined": output["declined"], "reason": str(output.get("reason") or "")}
+
+
+async def check_reply_expected(task: str, channel: str, sent_message: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-12): after Caroline sends ANY
+    message (email or messenger), decide whether a reply is actually
+    expected -- a question/request left open versus a pure FYI nobody need
+    answer -- so chat_session.py can arm its own tapering follow-up checks
+    (email only; every messenger channel already notifies on arrival via
+    its own push connection or, for Ratatosk, a tight global poll, so
+    there is nothing useful to schedule there -- see
+    _on_outbound_message_sent's own docstring). Backed by a real
+    microagent (server-side turn.reply.expected).
+
+    Returns {"needs_reply": bool, "reason": str} on a clean result, or None
+    on any error/timeout/malformed response (fail-open, same philosophy as
+    check_permission_guard/check_refusal_guard -- an infrastructure hiccup
+    must not be mistaken for "no reply needed", it just means the caller
+    skips watching this once)."""
+    body: dict[str, Any] = {"command": "reply:replyExpected", "key": CAROLINE_SW_KEY, "task": task, "channel": channel, "sentMessage": sent_message}
+    if not session:
+        session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "check_reply_expected_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "check_reply_expected_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("needs_reply"), bool):
+        log_event("plugin:voice", "check_reply_expected_failed", reason="malformed")
+        return None
+    return {"needs_reply": output["needs_reply"], "reason": str(output.get("reason") or "")}
 
 
 # Guards against the failure modes seen live rather than trusting any
@@ -1121,6 +1206,8 @@ async def generate_progress_comment(
         "Reply now, wrapped in the tag."
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt, "model": "SMALL"}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -1266,6 +1353,8 @@ async def _synthesize_speech_locally(text: str, voice: str) -> str:
 
 async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str | None = None) -> str:
     body: dict[str, Any] = {"command": "ai:tts", "key": CAROLINE_SW_KEY, "text": text, "voice": voice}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     data = await _post_json(body)
@@ -1337,6 +1426,8 @@ async def clean_text_for_speech(text: str, session: str | None = None) -> str:
         f"Text:\n{text}"
     )
     body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
+    if not session:
+        session = await get_cached_v2_session()
     if session:
         body["session"] = session
     try:
@@ -1352,7 +1443,11 @@ async def describe_image_cheap(base64_png: str) -> dict[str, Any]:
     """Cheap image understanding (Camerlengo's ai:describeImage, a small
     model) as a deliberately CHEAPER alternative to putting raw image
     bytes into Claude's own context."""
-    data = await _post_json({"command": "ai:describeImage", "key": CAROLINE_SW_KEY, "content": base64_png, "type": "base64"})
+    body: dict[str, Any] = {"command": "ai:describeImage", "key": CAROLINE_SW_KEY, "content": base64_png, "type": "base64"}
+    session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    data = await _post_json(body)
     if data.get(".status") != "ok" or not isinstance(data.get("result"), dict):
         raise VoiceApiError(str(data.get(".reason") or "describeImage failed"))
     r = data["result"]

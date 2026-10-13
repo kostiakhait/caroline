@@ -23,6 +23,7 @@ from app.plugins.email_plugin import (
     _ACCOUNT_PARAM_NOTE,
     _CREDENTIAL_PARAMS,
     email_delete,
+    email_get_message,
     email_list_messages,
     email_mark,
     email_move,
@@ -104,6 +105,66 @@ def _message_label(item: dict[str, Any]) -> str:
     return f'{item.get("address", "?")} {item.get("folder", "?")}:{item.get("uid", "?")}'
 
 
+# Per explicit instruction (2026-10-12): reading a folder/date-range used to mean
+# listMessages (headers only) followed by one email_get_message call PER message --
+# slow, and easy to silently skip one. email_read_range does both steps itself: list
+# the range, then fetch every message's FULL content (to/from/cc/subject/body)
+# concurrently, same _run_batch machinery as the batch tools above. Attachments are
+# listed (filename/contentType), never downloaded automatically -- email_download_
+# attachment stays the on-request path for actual bytes, so a range read never pulls
+# megabytes of attachment content nobody asked for.
+BULK_READ_MAX_MESSAGES = 200
+
+
+async def email_read_range(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    folder = args.get("folder") or "INBOX"
+    creds = {k: args[k] for k in _CREDENTIAL_PARAMS if k in args}
+    limit = min(int(args.get("limit") or BULK_READ_MAX_MESSAGES), BULK_READ_MAX_MESSAGES)
+
+    list_args: dict[str, Any] = {**creds, "folder": folder, "limit": limit}
+    if args.get("sinceIso"):
+        list_args["sinceIso"] = args["sinceIso"]
+    if args.get("untilIso"):
+        list_args["untilIso"] = args["untilIso"]
+    if args.get("unseenOnly") is not None:
+        list_args["unseenOnly"] = args["unseenOnly"]
+    if args.get("query"):
+        list_args["query"] = args["query"]
+
+    headers = json.loads((await email_list_messages(list_args, None))["text"])
+    if not headers:
+        return {"text": f'No messages found in "{folder}" for that date range/filter.'}
+
+    items = [{**creds, "folder": folder, "uid": int(h["uid"])} for h in headers]
+    # _run_batch's own BATCH_MAX_ITEMS (50) is tuned for the lighter write-batch tools
+    # below -- chunked here (each chunk still concurrent within itself) so a busy
+    # folder/range up to BULK_READ_MAX_MESSAGES doesn't just hit that cap's ValueError.
+    outcomes: list[dict[str, Any]] = []
+    for start in range(0, len(items), BATCH_MAX_ITEMS):
+        chunk = items[start:start + BATCH_MAX_ITEMS]
+        outcomes.extend(await _run_batch(chunk, _message_label, lambda item: email_get_message(item, None)))
+
+    messages: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for outcome in outcomes:
+        if outcome["ok"]:
+            messages.append(json.loads(outcome["result"]["text"]))
+        else:
+            errors.append(f'{outcome["label"]}: {outcome["error"]}')
+    messages.sort(key=lambda m: int(m["uid"]), reverse=True)
+
+    lines = [f'{len(messages)}/{len(headers)} message(s) fetched in full from "{folder}".']
+    if len(headers) >= limit:
+        lines.append(
+            f"NOTE: the folder/range may hold MORE than the {limit} messages returned here (the list was "
+            "capped at `limit`) -- narrow sinceIso/untilIso or raise `limit` to be sure nothing was skipped."
+        )
+    if errors:
+        lines.append(f"{len(errors)} message(s) failed to fetch in full (shown as missing below):")
+        lines.extend(errors)
+    return {"text": "\n".join(lines) + "\n\n" + json.dumps(messages, indent=2, ensure_ascii=False)}
+
+
 async def email_mark_batch(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     items = args.get("items")
     if not isinstance(items, list) or not items:
@@ -152,7 +213,14 @@ def _usage_instructions() -> str:
         'accounts and folders: ["INBOX", "Sent"], not 16 separate email_list_messages calls.\n'
         "Each account entry takes the same credential fields as the single-item tools (look them up the same "
         "way, see email_plugin's own credentials instructions) plus an optional `label` to make the report "
-        "easier to read; without it the address is used.",
+        "easier to read; without it the address is used.\n"
+        "Need the actual CONTENT (to/from/cc/subject/body), not just headers, for every message in one "
+        "folder over a date range -- \"read everything in Inbox since Monday\", a digest, a sweep for "
+        "something specific? Use email_read_range instead of email_list_messages followed by one "
+        "email_get_message per uid: it does both steps itself, concurrently, so nothing gets missed and "
+        "nothing needs fetching one at a time. Attachments come back as a list (filename/type) only, never "
+        "their bytes -- call email_download_attachment yourself for a specific one only if its content is "
+        "actually needed, not for every attachment by default.",
         follow_explicit_parameters_instruction(),
     ))
 
@@ -174,6 +242,22 @@ PLUGIN = Plugin(
                 "unseenOnly": bool | None, "limit": int | None, "query": str | None, "sinceIso": str | None,
             },
             email_list_messages_batch,
+        ),
+        PluginTool(
+            "email_read_range",
+            "Reads every message's FULL content (to, from, cc, subject, body, attachment list) in one "
+            "folder over a date range, in one call -- no need to list headers then fetch each uid "
+            "separately, and nothing gets skipped. Use sinceIso/untilIso (ISO dates, e.g. \"2026-10-01\") "
+            "for a [since, until) interval, unseenOnly/query to narrow further, and limit to raise the "
+            f"cap above the default ({BULK_READ_MAX_MESSAGES}) if the reply says the range may hold more. "
+            "Attachments come back as {index, filename, contentType} only -- never their bytes; call "
+            "email_download_attachment yourself for one specific attachment only when its actual content "
+            "is needed." + _ACCOUNT_PARAM_NOTE,
+            {
+                **_CREDENTIAL_PARAMS, "folder": str | None, "sinceIso": str | None, "untilIso": str | None,
+                "unseenOnly": bool | None, "query": str | None, "limit": int | None,
+            },
+            email_read_range,
         ),
         PluginTool(
             "email_mark_batch",

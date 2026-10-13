@@ -21,6 +21,7 @@ SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 InjectProactiveFn = Callable[[str], bool]
 CliPidSinkFn = Callable[[int], None]
 PermissionBlockerFn = Callable[[], "str | None"]
+ReplyWatchFn = Callable[[str, dict, Any], None]
 
 _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("current_send", default=None)
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
@@ -32,6 +33,8 @@ _inject_proactive_by_tab: dict[str, InjectProactiveFn] = {}
 _permission_blocker_by_tab: dict[str, PermissionBlockerFn] = {}
 # Every live ChatSession's send() by tab id (see register_send_for_tab).
 _send_by_tab: dict[str, SendFn] = {}
+# Every live ChatSession's reply watch by tab id (see register_reply_watch).
+_reply_watch_by_tab: dict[str, ReplyWatchFn] = {}
 
 
 def get_send() -> SendFn:
@@ -134,6 +137,25 @@ def register_send_for_tab(tab_id: str, fn: SendFn) -> None:
 
 def get_send_for_tab(tab_id: str | None) -> SendFn | None:
     return _send_by_tab.get(tab_id) if tab_id else None
+
+
+def register_reply_watch(tab_id: str, fn: ReplyWatchFn) -> None:
+    """Per explicit instruction (2026-10-12): lets app/operations.py's
+    dispatch() tell the calling ChatSession, right after a send-type tool
+    call (email_send or any messenger `*_send_message`) completes
+    successfully, so it can judge whether a reply is expected and -- for
+    email, the one channel with no background polling of its own -- arm
+    its own tapering follow-up checks (see chat_session.py's
+    _on_outbound_message_sent). Mirrors register_permission_blocker
+    exactly: same per-tab dict, same non-fatal shape, a later session of
+    the same tab replaces it. `fn` must return immediately (fire-and-
+    forget its own async work) -- dispatch() calls it synchronously from
+    inside the tool call's own success path."""
+    _reply_watch_by_tab[tab_id] = fn
+
+
+def get_reply_watch(tab_id: str | None) -> ReplyWatchFn | None:
+    return _reply_watch_by_tab.get(tab_id) if tab_id else None
 
 
 def get_cli_pid_sink() -> CliPidSinkFn | None:

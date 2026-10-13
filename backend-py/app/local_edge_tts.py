@@ -149,6 +149,12 @@ async def _synth_chunk(text: str, opts: EdgeTtsOptions) -> bytes:
 
     import edge_tts
 
+    # Microsoft changed their Sec-MS-GEC token algorithm (2026-10-10);
+    # see edge_tts_token_patch.py's own docstring for the full incident.
+    from app.edge_tts_token_patch import apply as _apply_edge_tts_token_patch
+
+    _apply_edge_tts_token_patch()
+
     rate = _fmt_signed(opts.rate_percent, "%")
     pitch = _fmt_signed(opts.pitch_hz, "Hz")
     volume = _fmt_signed(opts.volume_percent, "%")
