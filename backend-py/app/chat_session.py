@@ -2552,21 +2552,15 @@ class ChatSession:
         # Same rule as the SDK path (_strip_no_update_from_wire): a silent
         # [[NO_UPDATE]] reply never reaches the visible dialog.
         silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
-        try:
-            translated = await translate_text(
-                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                addressee_gender=get_owner_profile(self.workspace_dir).gender,
-            )
-        except Exception as exc:
-            log_event("engine", "small_model_translate_failed", tab_id=self.tab_id, error=str(exc))
-            translated = None
-        if translated and translated != text:
-            log_event("engine", "small_model_translate_applied", tab_id=self.tab_id, original_len=len(text), translated_len=len(translated))
-            text = translated
-        # Per explicit instruction (2026-10-11): reply.review checks the
-        # final (translated-or-original) text for task relevance, internal-
-        # mechanics leaks, and human-sounding tone -- fail-open to `text`
-        # as is on any failure, same philosophy as translate_text above.
+        # Per explicit instruction (2026-10-13): review BEFORE translate, not
+        # after -- reply.review needs the real original content to judge task
+        # relevance/internal-mechanics leaks; reviewing already-translated text
+        # was confirmed live to produce broken, often English, output
+        # disconnected from what was actually said (review's own LLM defaulting
+        # to English when asked to rewrite non-English input with no
+        # instruction to preserve its language). Translating AFTER review
+        # instead means whatever review actually decides to show is what gets
+        # put into the right language, every time.
         try:
             reviewed = await review_reply(text, task=question_text)
         except Exception as exc:
@@ -2574,6 +2568,26 @@ class ChatSession:
             reviewed = None
         if reviewed and reviewed != text:
             text = reviewed
+        # review_reply can itself decide a message is internal-mechanics-only
+        # and rewrite it down to the [[NO_UPDATE]] sentinel (or a silent-reply
+        # paraphrase) -- confirmed live (2026-10-13): this was never checked
+        # for afterward, so a would-be-silent rewrite just got translated and
+        # shown anyway. Same rule as the original check above.
+        if not silent and (_NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)):
+            silent = True
+            log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
+        if not silent:
+            try:
+                translated = await translate_text(
+                    text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                )
+            except Exception as exc:
+                log_event("engine", "small_model_translate_failed", tab_id=self.tab_id, error=str(exc))
+                translated = None
+            if translated and translated != text:
+                log_event("engine", "small_model_translate_applied", tab_id=self.tab_id, original_len=len(text), translated_len=len(translated))
+                text = translated
         # Per explicit instruction (2026-10-11): re-evaluate the permission
         # guard on every outbound message -- see _check_permission_guard's
         # own docstring for why this runs here too, not just in submit().
@@ -3986,7 +4000,7 @@ class ChatSession:
         log_event("engine", "refusal_guard_retrying_via_sw", tab_id=self.tab_id, reason=result["reason"])
         self._start_small_model_turn(task, [], True, self.turn_is_voice)
 
-    async def _translate_wire_visible_text(self, wire: dict[str, Any]) -> dict[str, Any]:
+    async def _translate_wire_visible_text(self, wire: dict[str, Any]) -> dict[str, Any] | None:
         """Per explicit instruction (2026-09-15): forced translation used
         to be narration-only (generate_progress_comment) -- confirmed live
         this left a real gap: the real Claude model itself dropped a terse
@@ -3995,13 +4009,41 @@ class ChatSession:
         chain, and language_hint_instruction's system-prompt nudge is
         advisory, not a guarantee. Runs every REAL visible assistant text
         block through the same translate_text() forced-correction pass
-        narration already uses, targeting current_language_name(tab_id) --
-        same unconditional-pass philosophy (translate_text itself is a
-        no-op, text-preserving pass when the input is already in the
-        target language). Falls back to the ORIGINAL text per block on any
-        translation failure -- never blocks or drops a real reply over
-        this. Only touches "assistant" wire messages; "result"/"system"/
-        etc. are left exactly as they were."""
+        narration already uses, targeting current_language_name(tab_id).
+        Falls back to the ORIGINAL text per block on any translate/review
+        failure -- never blocks or drops a real reply over an
+        infrastructure hiccup. Only touches "assistant" wire messages;
+        "result"/"system"/etc. are left exactly as they were.
+
+        Per explicit instruction (2026-10-13): reply.review now runs
+        BEFORE translate, not after. Confirmed live: reviewing already-
+        translated text produced broken, often English, output
+        disconnected from what was actually said -- reply.review's own
+        LLM defaults to English when asked to rewrite non-English input
+        it has no instruction to preserve the language of. Real incident:
+        a correctly-Russian status line about the vault-note timestamp
+        came back from review as "Notes available. Current
+        persona/reminders saved to Caroline:Vault." -- unrelated-sounding
+        English boilerplate. Running translate on WHATEVER review decides
+        to keep means the final thing shown is always in the right
+        language, including review's own rewrites.
+
+        review_reply can itself decide a block is pure internal-mechanics
+        (or off-task) and rewrite it down to the [[NO_UPDATE]] sentinel or
+        a known silent-reply paraphrase -- the same incident's reviewed
+        text literally ended ". [[NO_UPDATE]]" on one occurrence. That was
+        never checked for afterward, so a would-be-silent rewrite just got
+        translated and shown anyway. Per explicit instruction (2026-10-13:
+        "Модель должна докладывать промежуточные итоги как и раньше, но
+        микроагентный фильтр должен отфильтровывать служебные сообщения"):
+        this is the filter doing exactly that, per block, not a blanket
+        suppression of intermediate replies -- a block review clears goes
+        out completely normally. A block review flags this way is dropped
+        from the wire entirely here, same as _strip_no_update_from_wire
+        already does for the model's OWN [[NO_UPDATE]] replies; if that
+        empties the message of everything worth showing, returns None --
+        callers must check for that the same way they already do for
+        _strip_no_update_from_wire's own result."""
         if wire.get("type") != "assistant":
             return wire
         content_blocks = wire.get("message", {}).get("content") or []
@@ -4010,6 +4052,16 @@ class ChatSession:
         from app.plugins.voice_api import review_reply, translate_text
 
         language = current_language_name(self.tab_id)
+        # Per explicit instruction (2026-10-12): _narration_task()
+        # (last_real_user_question), not self.pending_user_text -- that goes
+        # empty/stale deep into a long multi-step turn (it tracks the CURRENT
+        # turn's own text, not the standing task). A real incident showed
+        # reply.review silently passing a raw tool-result JSON blob straight
+        # through because it got task="" and had nothing to judge relevance
+        # against. Same stable task source every other review/guard call site
+        # here already uses.
+        task = self._narration_task()
+        dropped: list[dict[str, Any]] = []
         for block in content_blocks:
             if not (isinstance(block, dict) and block.get("type") == "text"):
                 continue
@@ -4017,49 +4069,11 @@ class ChatSession:
             if not text.strip():
                 continue
             try:
-                translated = await translate_text(
-                    text, language, gender=get_persona_gender(self.workspace_dir),
-                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
-                )
-            except Exception as exc:
-                log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
-                translated = None
-            if translated and translated != text:
-                # Per explicit instruction (2026-10-13): lengths alone
-                # don't say whether a translation actually preserved the
-                # content -- the real before/after text is what's needed
-                # to tell a legitimate (if shorter/longer) translation
-                # apart from one that silently dropped or mangled part of
-                # a real reply the model generated and believes it sent.
-                log_event(
-                    "engine", "wire_translate_applied", tab_id=self.tab_id, language=language,
-                    original_len=len(text), translated_len=len(translated),
-                    original_text=text, translated_text=translated,
-                )
-                block["text"] = translated
-            # Per explicit instruction (2026-10-11): reply.review checks the
-            # final text above (translated, or the original if translation
-            # failed) for task relevance, internal-mechanics leaks, and
-            # human-sounding tone -- fail-open to that text as is on any
-            # failure, same philosophy as translate_text just above.
-            #
-            # Bug fix (2026-10-12), confirmed live: this used to pass
-            # self.pending_user_text, which goes empty/stale deep into a
-            # long multi-step turn (it tracks the CURRENT turn's own text,
-            # not the standing task) -- a real incident showed reply.review
-            # silently passing a raw tool-result JSON blob straight through
-            # to the user because it got task="" and had nothing to judge
-            # relevance against. _narration_task() (last_real_user_question)
-            # is the same stable task source every other review/guard call
-            # site here already uses (narration's own review_reply call,
-            # _check_permission_guard) -- this call site was the one
-            # inconsistent holdout.
-            try:
-                reviewed = await review_reply(block["text"], task=self._narration_task())
+                reviewed = await review_reply(text, task=task)
             except Exception as exc:
                 log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
                 reviewed = None
-            if reviewed and reviewed != block["text"]:
+            if reviewed and reviewed != text:
                 # Bug fix (2026-10-13), per explicit instruction: unlike
                 # translate_text's own wire_translate_applied, a review
                 # rewrite that actually CHANGED the text was never logged
@@ -4074,14 +4088,47 @@ class ChatSession:
                 # the output" gap this is meant to close.
                 log_event(
                     "engine", "review_reply_applied", tab_id=self.tab_id,
-                    original_len=len(block["text"]), reviewed_len=len(reviewed),
-                    original_text=block["text"], reviewed_text=reviewed,
+                    original_len=len(text), reviewed_len=len(reviewed),
+                    original_text=text, reviewed_text=reviewed,
                 )
-                block["text"] = reviewed
+                text = reviewed
+                block["text"] = text
+            is_silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
+            if not is_silent:
+                try:
+                    translated = await translate_text(
+                        text, language, gender=get_persona_gender(self.workspace_dir),
+                        addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                    )
+                except Exception as exc:
+                    log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
+                    translated = None
+                if translated and translated != text:
+                    # Per explicit instruction (2026-10-13): lengths alone
+                    # don't say whether a translation actually preserved the
+                    # content -- the real before/after text is what's needed
+                    # to tell a legitimate (if shorter/longer) translation
+                    # apart from one that silently dropped or mangled part of
+                    # a real reply the model generated and believes it sent.
+                    log_event(
+                        "engine", "wire_translate_applied", tab_id=self.tab_id, language=language,
+                        original_len=len(text), translated_len=len(translated),
+                        original_text=text, translated_text=translated,
+                    )
+                    block["text"] = translated
             # Per explicit instruction (2026-10-11): re-evaluate the permission
             # guard on every outbound message -- see _check_permission_guard's
             # own docstring for why this runs here too, not just in submit().
             await self._check_permission_guard()
+            if is_silent:
+                log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
+                dropped.append(block)
+        if dropped:
+            kept = [b for b in content_blocks if b not in dropped]
+            if not any(isinstance(b, dict) and b.get("type") in ("text", "tool_use") for b in kept):
+                log_event("engine", "wire_dropped_entirely_after_review", tab_id=self.tab_id)
+                return None
+            wire["message"]["content"] = kept
         return wire
 
     def _narration_turn_marker(self) -> Any:
@@ -4291,8 +4338,48 @@ class ChatSession:
         except Exception as exc:
             log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
             reviewed = None
-        if reviewed:
+        if reviewed and reviewed != comment:
+            log_event(
+                "engine", "review_reply_applied", tab_id=self.tab_id,
+                original_len=len(comment), reviewed_len=len(reviewed),
+                original_text=comment, reviewed_text=reviewed,
+            )
             comment = reviewed
+            # Per explicit instruction (2026-10-13): generate_progress_comment
+            # produces `comment` already in the target language (passed
+            # straight to that call, unlike _translate_wire_visible_text's own
+            # separate translate step) -- but review's OWN rewrite is not
+            # guaranteed to preserve that language (same root cause as that
+            # function's own 2026-10-13 fix: review_reply's LLM defaults to
+            # English when rewriting). Only worth a translate pass when review
+            # actually changed something -- re-translating an unchanged
+            # comment would just be wasted cost.
+            try:
+                from app.plugins.voice_api import translate_text
+                translated = await translate_text(
+                    comment, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                )
+            except Exception as exc:
+                log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
+                translated = None
+            if translated and translated != comment:
+                log_event(
+                    "engine", "wire_translate_applied", tab_id=self.tab_id, language=current_language_name(self.tab_id),
+                    original_len=len(comment), translated_len=len(translated),
+                    original_text=comment, translated_text=translated,
+                )
+                comment = translated
+        # Per explicit instruction (2026-10-13): review_reply can itself decide
+        # this remark is pure internal-mechanics (or off-task) and rewrite it
+        # down to the [[NO_UPDATE]] sentinel or a known silent-reply paraphrase
+        # -- see _translate_wire_visible_text's own docstring for the real
+        # incident this same check fixes there. Treated the same way here:
+        # the narration attempt is still consumed (state above already
+        # updated), just nothing is actually shown.
+        if _NO_UPDATE_SENTINEL in comment or _is_silent_reply_paraphrase(comment):
+            log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=comment)
+            return
         # Per explicit instruction (2026-10-11): re-evaluate the permission
         # guard on every outbound message -- see _check_permission_guard's
         # own docstring for why this runs here too, not just in submit().
@@ -5889,101 +5976,110 @@ class ChatSession:
                         wire = _strip_no_update_from_wire(wire, self.tab_id)
                         if wire is not None:
                             wire = await self._translate_wire_visible_text(wire)
-                            # Bug fix (2026-09-10): confirmed live -- voice-reply
-                            # auto-play/animation (chat.js checks evt.isVoice on
-                            # the "result" event) never fired, because this send
-                            # site never attached isVoice at all. server.ts's
-                            # original does: { type: "sdk_message", message,
-                            # isVoice: this.turnIsVoice } specifically on the
-                            # "result" message -- ported that shape here; every
-                            # other message type is sent exactly as before.
-                            #
-                            # Bug fix (2026-09-13), confirmed live from a real
-                            # incident: a voice-originated turn that ran long
-                            # (several minutes of tool calls) DID produce a real,
-                            # visible mid-turn text reply (shown as a chat bubble)
-                            # -- but the SDK's own transport then hit an unrelated
-                            # failure ("JSON message exceeded maximum buffer size")
-                            # before ever reaching a clean ResultMessage, so
-                            # isVoice (previously attached ONLY to "result")
-                            # never reached the client at all -- nothing was ever
-                            # spoken/animated, even though the user had already
-                            # SEEN a real reply. Voice/Visual-Mode playback must
-                            # not depend on the turn eventually reaching a clean
-                            # result -- attach isVoice to EVERY sdk_message now
-                            # (self.turn_is_voice is stable for the whole logical
-                            # turn, including across a crash-triggered replay --
-                            # see its own "leave untouched"/"preserved" comments
-                            # below), so chat.js can speak/animate each visible
-                            # reply as it actually arrives.
-                            envelope: dict[str, Any] = {"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice}
-                            if wire.get("type") == "result":
-                                # Distinguishes a genuine turn's settlement from
-                                # OUR OWN internal post-turn completion check
-                                # re-asking itself (was_awaiting_post_turn_check_
-                                # reply, captured above -- see
-                                # _fire_post_turn_completion_check). A caller
-                                # that cares whether a settlement represents a
-                                # real externally-triggered turn (e.g. the
-                                # Ratatosk owner-channel's "did this actually
-                                # get replied to" fallback, app/main.py's
-                                # _ratatosk_session_send) needs this signal --
-                                # without it, a legitimately-silent internal
-                                # check-reply (a bare [[NO_UPDATE]] answering
-                                # our own nudge, not the owner) looks identical
-                                # to a real turn that genuinely never got
-                                # replied to. Nothing else currently reads it.
-                                envelope["wasInternalCheckReply"] = was_awaiting_post_turn_check_reply
-                            await self.send(envelope)
-                            if wire.get("type") in ("assistant", "result"):
-                                if not self.real_user_turn_answered:
-                                    self.real_user_turn_answered = True
-                                if wire.get("type") == "assistant":
-                                    # Bug fix (2026-09-13), confirmed live from the
-                                    # real session transcript (tab 1, "Основной
-                                    # диалог", 2026-09-13 ~14:04-14:08 UTC): dozens
-                                    # of consecutive assistant wire messages during
-                                    # a long multi-mailbox tool-calling stretch were
-                                    # tool_use-ONLY (no text block) -- chat.js's own
-                                    # hasToolUse check (mirrored server-side in
-                                    # history.py's _extract_entries_from_jsonl)
-                                    # suppresses exactly these as pre-tool narration
-                                    # the user never sees. This line used to bump
-                                    # last_visible_output_at on EVERY one of them
-                                    # regardless, repeatedly re-arming
-                                    # _check_progress_narration()'s 60s cooldown
-                                    # without the user ever actually seeing anything
-                                    # new -- the confirmed cause of a 5+ minute
-                                    # narrator silence with real work still running.
-                                    # Only a message carrying an actual visible text
-                                    # block should count as "the user just saw
-                                    # something new".
-                                    content_blocks = wire.get("message", {}).get("content") or []
-                                    has_visible_text = any(
-                                        isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
-                                        for b in content_blocks
-                                    )
-                                    has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content_blocks)
-                                    log_event(
-                                        "engine", "assistant_wire_sent", tab_id=self.tab_id,
-                                        has_visible_text=has_visible_text, has_tool_use=has_tool_use,
-                                        last_visible_output_updated=has_visible_text,
-                                    )
-                                    if has_visible_text:
-                                        self.last_visible_output_at = time.monotonic()
-                                        self.turn_saw_any_visible_text = True
-                                        self.consecutive_narration_count = 0
-                                        # Refusal-guard's own input (see
-                                        # _check_refusal_and_maybe_retry) --
-                                        # only for a real user turn; a
-                                        # proactive/internal one declining
-                                        # something is a different, not-yet
-                                        # in-scope case.
-                                        if self.pending_is_real_user:
-                                            self._turn_last_visible_text = "\n".join(
-                                                b.get("text", "") for b in content_blocks
-                                                if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
-                                            )
+                            if wire is not None:
+                                # Per explicit instruction (2026-10-13): reply.review (inside
+                                # _translate_wire_visible_text) can itself decide a block is
+                                # pure internal-mechanics and rewrite it down to [[NO_UPDATE]]/a
+                                # silent-reply paraphrase -- see that function's own docstring.
+                                # It returns None in exactly that case, same contract as
+                                # _strip_no_update_from_wire above; this mirrors that function's
+                                # own None-check rather than assuming wire is always still a dict.
+                                #
+                                # Bug fix (2026-09-10): confirmed live -- voice-reply
+                                # auto-play/animation (chat.js checks evt.isVoice on
+                                # the "result" event) never fired, because this send
+                                # site never attached isVoice at all. server.ts's
+                                # original does: { type: "sdk_message", message,
+                                # isVoice: this.turnIsVoice } specifically on the
+                                # "result" message -- ported that shape here; every
+                                # other message type is sent exactly as before.
+                                #
+                                # Bug fix (2026-09-13), confirmed live from a real
+                                # incident: a voice-originated turn that ran long
+                                # (several minutes of tool calls) DID produce a real,
+                                # visible mid-turn text reply (shown as a chat bubble)
+                                # -- but the SDK's own transport then hit an unrelated
+                                # failure ("JSON message exceeded maximum buffer size")
+                                # before ever reaching a clean ResultMessage, so
+                                # isVoice (previously attached ONLY to "result")
+                                # never reached the client at all -- nothing was ever
+                                # spoken/animated, even though the user had already
+                                # SEEN a real reply. Voice/Visual-Mode playback must
+                                # not depend on the turn eventually reaching a clean
+                                # result -- attach isVoice to EVERY sdk_message now
+                                # (self.turn_is_voice is stable for the whole logical
+                                # turn, including across a crash-triggered replay --
+                                # see its own "leave untouched"/"preserved" comments
+                                # below), so chat.js can speak/animate each visible
+                                # reply as it actually arrives.
+                                envelope: dict[str, Any] = {"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice}
+                                if wire.get("type") == "result":
+                                    # Distinguishes a genuine turn's settlement from
+                                    # OUR OWN internal post-turn completion check
+                                    # re-asking itself (was_awaiting_post_turn_check_
+                                    # reply, captured above -- see
+                                    # _fire_post_turn_completion_check). A caller
+                                    # that cares whether a settlement represents a
+                                    # real externally-triggered turn (e.g. the
+                                    # Ratatosk owner-channel's "did this actually
+                                    # get replied to" fallback, app/main.py's
+                                    # _ratatosk_session_send) needs this signal --
+                                    # without it, a legitimately-silent internal
+                                    # check-reply (a bare [[NO_UPDATE]] answering
+                                    # our own nudge, not the owner) looks identical
+                                    # to a real turn that genuinely never got
+                                    # replied to. Nothing else currently reads it.
+                                    envelope["wasInternalCheckReply"] = was_awaiting_post_turn_check_reply
+                                await self.send(envelope)
+                                if wire.get("type") in ("assistant", "result"):
+                                    if not self.real_user_turn_answered:
+                                        self.real_user_turn_answered = True
+                                    if wire.get("type") == "assistant":
+                                        # Bug fix (2026-09-13), confirmed live from the
+                                        # real session transcript (tab 1, "Основной
+                                        # диалог", 2026-09-13 ~14:04-14:08 UTC): dozens
+                                        # of consecutive assistant wire messages during
+                                        # a long multi-mailbox tool-calling stretch were
+                                        # tool_use-ONLY (no text block) -- chat.js's own
+                                        # hasToolUse check (mirrored server-side in
+                                        # history.py's _extract_entries_from_jsonl)
+                                        # suppresses exactly these as pre-tool narration
+                                        # the user never sees. This line used to bump
+                                        # last_visible_output_at on EVERY one of them
+                                        # regardless, repeatedly re-arming
+                                        # _check_progress_narration()'s 60s cooldown
+                                        # without the user ever actually seeing anything
+                                        # new -- the confirmed cause of a 5+ minute
+                                        # narrator silence with real work still running.
+                                        # Only a message carrying an actual visible text
+                                        # block should count as "the user just saw
+                                        # something new".
+                                        content_blocks = wire.get("message", {}).get("content") or []
+                                        has_visible_text = any(
+                                            isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                                            for b in content_blocks
+                                        )
+                                        has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content_blocks)
+                                        log_event(
+                                            "engine", "assistant_wire_sent", tab_id=self.tab_id,
+                                            has_visible_text=has_visible_text, has_tool_use=has_tool_use,
+                                            last_visible_output_updated=has_visible_text,
+                                        )
+                                        if has_visible_text:
+                                            self.last_visible_output_at = time.monotonic()
+                                            self.turn_saw_any_visible_text = True
+                                            self.consecutive_narration_count = 0
+                                            # Refusal-guard's own input (see
+                                            # _check_refusal_and_maybe_retry) --
+                                            # only for a real user turn; a
+                                            # proactive/internal one declining
+                                            # something is a different, not-yet
+                                            # in-scope case.
+                                            if self.pending_is_real_user:
+                                                self._turn_last_visible_text = "\n".join(
+                                                    b.get("text", "") for b in content_blocks
+                                                    if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                                                )
 
                     if isinstance(message, ResultMessage):
                         if result_is_fake:
