@@ -1068,7 +1068,7 @@ async def handle_control_request(
             # Caroline anything. Best-effort: a sync failure here shouldn't
             # also swallow the close notification.
             try:
-                await finish_office_edit_session(req["remotePath"], path)
+                await finish_office_edit_session(req["remotePath"], path, req.get("key"))
             except Exception as exc:
                 log_event("engine", "editor_result_sync_failed", path=path, error=str(exc))
         outcome_text = {

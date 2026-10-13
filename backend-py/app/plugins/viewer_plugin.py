@@ -73,7 +73,10 @@ async def open_in_viewer(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             config, remote_path = await prepare_office_edit_session(path)
         except OfficeEditorError as exc:
             return {"text": f"Could not open {path} for editing: {exc}", "is_error": True}
-        _open_requests[request_id] = {"path": path, "remotePath": remote_path}
+        _open_requests[request_id] = {
+            "path": path, "remotePath": remote_path,
+            "key": config.get("key") if config.get("editable") else None,
+        }
         await send({"type": "open_office_editor", "requestId": request_id, "path": path, "config": config})
     else:
         _open_requests[request_id] = {"path": path}
