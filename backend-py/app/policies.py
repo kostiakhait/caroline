@@ -175,6 +175,33 @@ def complex_task_execution_instruction() -> str:
     )
 
 
+def no_unrequested_send_confirmation_instruction() -> str:
+    """Per explicit instruction (2026-10-13), a real live incident: asked to
+    write and send an email, Caroline stopped to ask "does this text and
+    tone work for you?" -- unprompted, the user never asked for a text
+    review -- then, after the user answered, hit the SAME kind of stop
+    again before actually sending. turn.permission.guard (see
+    PermissionGuard.py) already treats a direct order as sticky approval
+    that survives in-between steps like finding an address; this is the
+    companion rule for Caroline's own conversational behavior, not that
+    microagent's judgment -- she must not manufacture a confirmation step
+    that was never asked for in the first place."""
+    return (
+        "When the user gives a direct, specific instruction to send a communication (an email, a message, a "
+        "reply) -- naming who it goes to and/or what it should say -- that instruction is itself the "
+        "approval. Draft it, find whatever you're missing yourself (the address from notes or prior "
+        "correspondence, for instance), and send it -- do not pause partway through to ask the user whether "
+        "the text or tone looks right unless THEY asked you to show them a draft first. Example: the user "
+        "says 'write to Anita and thank her for X' -- compose it, find her address, send it; do not stop to "
+        "ask 'does this text and tone work for you?' If the user does review and approve something along the "
+        "way ('the text is fine', 'yes, send it'), that is them answering a question you should not have had "
+        "to ask again -- proceed immediately, don't ask a second time in different words. Only ask the user "
+        "something genuinely missing that you cannot find yourself (no address anywhere in context, for "
+        "example) -- never re-ask what they already told you, and never invent a review step they never "
+        "requested."
+    )
+
+
 def learn_from_mistakes_instruction() -> str:
     return (
         "After resolving a real problem or mistake of your own -- something you did wrong, misunderstood, or "
@@ -916,6 +943,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     credentials_check_notes_first_instruction,
     memory_check_first_instruction,
     event_memory_check_first_instruction,
+    no_unrequested_send_confirmation_instruction,
 )
 
 
