@@ -422,6 +422,22 @@ Linux at all. The bullets below replace the original (now-stale) .NET-publish-ce
   but NOT yet for a plain (non-AppImage) install, which would still need an icon-theme-location
   install step wherever that gets built.
 
+**Auto-update done (2026-10-12)**: `linux-shell/update_checker.py`, port of
+`Services/UpdateChecker.cs` adapted to AppImage's single-file distribution (no separate installer --
+self-update downloads a fresh AppImage, verifies its sha256, replaces the running file in place via
+`os.replace` -- Linux allows this while it's still executing -- and relaunches it). Only runs when
+launched from a real AppImage (`$APPIMAGE`, set by the AppImage runtime); a dev-tree/plain
+`dist-linux` run has nothing to self-replace, so it's a no-op there. Same once-per-session Yes/No
+dialog, tray "Update to {version}" item (via the new tray icon's dynamic menu rebuild), and
+`update_status` broadcast into every open tab's status bar (chat.js's existing handler, shared code,
+unchanged) as Windows. **No release artifacts are published at `downloader.multi-portal.org/apps/
+caroline/Caroline-x86_64.AppImage{,.sha256,.version}` yet** -- `build_appimage.sh` produces the file,
+but uploading it there is a separate, not-yet-done publishing step; until it exists every check just
+finds nothing published and stays silent, same fail-open shape as every other network check here.
+Written and reviewed, not independently tested live (no GTK on the Windows build machine, same
+limitation as everything else in `linux-shell/`) -- the plain sha256-hashing/fetch helper logic was
+sanity-checked in isolation (verified against a real file's hash, outside the `gi`-dependent class).
+
 **Gap found 2026-10-05, `runtime/python` half resolved same day.** `CarolineInstaller` itself never
 installs anything -- it only downloads and extracts a pre-built `Caroline.zip`
 (`DownloadsInfo.cs`/`Downloader.cs`) that already contains a working `runtime/python` (with

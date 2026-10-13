@@ -13,10 +13,13 @@ allows: each tab is its own WebKit2.WebView loaded at chat.html?port=...
 already expects, with a name button plus a hamburger menu (Mode submenu /
 Clear / Close). Window position/size, always-on-top, open-tab-ids/
 tab-names and the toggle-visibility hotkey now persist too, via
-settings_service.py (port of Services/SettingsService.cs). Still not
-ported from that file: the tray icon (so there is no "minimize and keep
-running" on Linux yet -- closing the window quits the app outright), the
-update-available banner, and the OnlyOffice document editor.
+settings_service.py (port of Services/SettingsService.cs). A tray icon
+(pystray, vendored -- see vendor/pystray/NOTICE.md) now gives Linux the
+same "minimize and keep running" closing behavior Windows has, and
+update_checker.py (port of Services/UpdateChecker.cs, adapted to
+AppImage's single-file self-replace model) handles background
+self-update when running from a real AppImage. Still not ported from
+that file: the OnlyOffice document editor.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
 
 from hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, GlobalHotkeyListener  # noqa: E402
 from settings_service import AppSettings, SettingsService  # noqa: E402
+from update_checker import UpdateChecker  # noqa: E402
 from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -577,6 +581,10 @@ class Shell:
         # Set by main() right after construction, if a tray icon could be
         # created at all (see _build_tray_icon) -- stopped from on_destroy.
         self.tray_icon: Any = None
+        # Set by main() right after construction (see update_checker.py).
+        self.update_checker: Any = None
+        self._tray_update_version: str | None = None
+        self._update_popup_shown_this_download = False
 
         self.window = Gtk.Window(title="Caroline")
         if settings.window_width is not None and settings.window_height is not None:
@@ -702,6 +710,63 @@ class Shell:
         close through _on_delete_event instead of hiding."""
         self._exit_requested = True
         self.window.close()
+
+    def show_update_available(self, version: str) -> None:
+        """Port of MainWindow's ShowUpdateAvailable: adds (or updates the
+        label of) an "Update to {version}" tray item -- stays available
+        after the Yes/No dialog is dismissed/declined, same as Windows,
+        so the user can still trigger it manually later."""
+        self._tray_update_version = version
+        self._rebuild_tray_menu()
+
+    def hide_update_available(self) -> None:
+        """Port of MainWindow's HideUpdateAvailable: removed the moment
+        it's clicked (an update is now in flight with its own status-bar
+        progress, see broadcast_update_status) -- avoids double-triggering
+        update_now() via a second click."""
+        self._tray_update_version = None
+        self._rebuild_tray_menu()
+
+    def _rebuild_tray_menu(self) -> None:
+        if self.tray_icon is None:
+            return
+        import pystray
+
+        def on_open(_icon: Any = None, _item: Any = None) -> None:
+            GLib.idle_add(self.show_and_activate)
+
+        def on_update(_icon: Any = None, _item: Any = None) -> None:
+            self.hide_update_available()
+            if self.update_checker:
+                GLib.idle_add(self.update_checker.update_now)
+
+        def on_exit(_icon: Any = None, _item: Any = None) -> None:
+            GLib.idle_add(self.request_exit)
+
+        items = [pystray.MenuItem("Open Caroline", on_open, default=True)]
+        if self._tray_update_version:
+            items.append(pystray.MenuItem(f"Update to {self._tray_update_version}", on_update))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Exit", on_exit))
+        self.tray_icon.menu = pystray.Menu(*items)
+        self.tray_icon.update_menu()
+
+    def broadcast_update_status(self, text: str) -> None:
+        """Port of MainWindow's BroadcastUpdateStatus: a one-time tray
+        notification the moment a download starts (pystray's best-effort
+        notify(), same "may not work everywhere" ceiling as the tray icon
+        itself), plus the SAME "update_status" message chat.js already
+        knows how to render in every open tab's status bar -- shared
+        code, no chat.js changes needed for this to work on Linux too."""
+        if not self._update_popup_shown_this_download:
+            self._update_popup_shown_this_download = True
+            if self.tray_icon is not None:
+                try:
+                    self.tray_icon.notify("Update ongoing... this may take a couple of minutes.", "Caroline")
+                except Exception as exc:
+                    log(f"broadcast_update_status: tray notify failed (non-fatal): {exc}")
+        for tab in self.tabs:
+            self._dispatch(tab, {"type": "update_status", "text": text})
 
     def toggle_voice_recording_from_hotkey(self) -> None:
         """Port of ToggleVoiceRecordingFromHotkey (Ctrl+Shift+C): same JS
@@ -1165,6 +1230,12 @@ def main() -> int:
         # function) so its Linux backends integrate with that loop
         # instead of spinning up their own.
         shell.tray_icon.run_detached()
+
+    shell.update_checker = UpdateChecker(
+        log=log, on_update_available=shell.show_update_available,
+        on_status_changed=shell.broadcast_update_status, on_restart=shell.request_exit,
+    )
+    shell.update_checker.start()
 
     splash = SplashWindow(on_dismissed=lambda: None)
     splash.show()
