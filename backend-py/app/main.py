@@ -60,6 +60,7 @@ from app.plugins.companion_sms_store import (
     list_threads as companion_list_threads,
     load_store as companion_load_sms_store,
 )
+from app.plugins.memory_plugin import start_save_drain_loop, start_topic_prefetch_loop
 from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -493,6 +494,15 @@ async def _start_ratatosk_background_loops() -> None:
     # due while the app was closed); a reminder is only marked fired once
     # it's actually been injected into a live session (see _on_reminder_due).
     start_due_check_loop(_on_reminder_due)
+    # Per explicit instruction (2026-10-13): the durable save-queue drain and
+    # the background topic-prefetch loop -- see memory_plugin.py's own
+    # start_save_drain_loop/start_topic_prefetch_loop docstrings. Plain
+    # data-layer background loops, not routed through any ChatSession/
+    # tool-call machinery (including the background/reminder-task session
+    # above) -- they only ever call memory_plugin's own _memory()-backed
+    # helpers directly, same as _refresh_topics_if_stale already does.
+    start_save_drain_loop()
+    start_topic_prefetch_loop()
     # Android companion app: drain phone-originated messages from
     # tabs/<tabId>/inbox into live sessions, and mirror recent history back
     # out to tabs/<tabId>/history. No-op while not logged into SW.

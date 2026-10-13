@@ -60,15 +60,17 @@ from typing import Any
 import httpx
 
 from app.http_tls import ssl_context
+from app import memory_save_queue
 from app import memory_turns
 from app.logging_setup import log_event
-from app.memory_topics import is_stale, replace_topics, update_topic
+from app.memory_topics import cached_topic_detail, is_stale, recent_topics, replace_topics, topic_description, update_topic
 from app.operations import REGISTRY as OPERATIONS
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager
 from app.plugins.sw_api import API_URL, CAROLINE_SW_KEY, SessionExpiredError, SwApiError
 from app.session_context import get_inject_proactive, get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
+from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
 _sessions = SessionManager()
@@ -90,6 +92,25 @@ SAVE_WAIT_LIMIT_S = 400.0               # a save is given up on as "outcome unkn
 SAVE_POLL_RETRIES = 5                   # consecutive failed polls tolerated (flat pause between them)
 SAVE_POLL_RETRY_PAUSE_S = 3.0
 OUTCOME_UNKNOWN = "outcome_unknown"
+# Per explicit instruction (2026-10-13): the durable save queue's own
+# background drain tick -- cheap (a memory:savePoll against an already-
+# started job costs nothing extra), so this can run often; it's the pure
+# durability backstop for the eager _drain_one every save_info already fires
+# (see save_info's own docstring) -- a no-op on almost every tick.
+SAVE_DRAIN_INTERVAL_S = 15.0
+# Per explicit instruction (2026-10-13): the background topic-prefetch
+# loop's own tick. Not the main cache-warming mechanism -- every ordinary
+# save_info/request_info(query=...) already warms the cache for free (see
+# _cache_topics_from_parts) -- this only catches a "today"-tier topic this
+# process never happened to touch yet (e.g. last updated from a different
+# tab; topic memory is shared process-wide). 10 minutes: frequent enough
+# that a newly-surfaced cold topic is warm well before it's likely to be
+# asked about; not shorter than STALE_AFTER_S (memory_topics.py, 15 min --
+# the slim "today" list itself doesn't change faster than that, so scanning
+# more often is pure waste). A cost/latency knob, not a derived value --
+# lower it if live use shows the model hitting a cold topic before prefetch
+# gets to it (a one-time fallback-latency cost, not a correctness problem).
+PREFETCH_INTERVAL_S = 600.0
 LATE_FACTS_HEADER = "[Additional facts from memory"
 LATE_READ_TOOL = "request_info (continued)"   # its operation is cancelled by Stop like any tool call
 MAX_FILE_BYTES = 25 * 1024 * 1024       # the server refuses larger documents
@@ -149,15 +170,23 @@ async def _memory(command: str, **params: Any) -> dict[str, Any]:
     )
 
 
-async def _save_job(start_command: str, **params: Any) -> dict[str, Any]:
-    """Starts a save on the server and waits for its outcome with short
-    polls. Returns the service's reply, as a plain memory:save would -- or
-    the refusal the start gave, or an error with code OUTCOME_UNKNOWN when
-    the outcome could not be learned (never to be taken for "not saved")."""
-    started = await _memory(start_command, **params)
-    job_id = started.get("jobId")
-    if not job_id:
-        return started
+async def _start_save(start_command: str, **params: Any) -> dict[str, Any]:
+    """memory:saveStart only -- the raw reply (may lack "jobId": refused
+    before it ever ran, e.g. no funds). Factored out of the old _save_job
+    (2026-10-13) so the durable save queue (memory_save_queue.py) can
+    persist job_id the moment it's known, BEFORE polling begins -- see
+    _drain_one's own docstring for why that ordering is what makes a
+    restart resume the SAME server job instead of starting a duplicate."""
+    return await _memory(start_command, **params)
+
+
+async def _poll_save(job_id: str) -> dict[str, Any]:
+    """Waits for a started save's outcome with short polls. Returns the
+    service's reply, as a plain memory:save would -- or an error with code
+    OUTCOME_UNKNOWN when the outcome could not be learned (never to be
+    taken for "not saved"). Unchanged polling logic, factored out of the
+    old _save_job (2026-10-13) as the half that needs to be resumable
+    across a restart (see _start_save's own docstring)."""
     deadline = time.monotonic() + SAVE_WAIT_LIMIT_S
     failures = 0
     while time.monotonic() < deadline:
@@ -165,7 +194,7 @@ async def _save_job(start_command: str, **params: Any) -> dict[str, Any]:
             reply = await _memory("memory:savePoll", jobId=job_id, wait=POLL_WAIT_S)
         except Exception as exc:  # noqa: BLE001 -- a lost poll is not a lost save
             if "No such memory request" in str(exc):
-                return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": "the server no longer knows this save (it may have restarted)"}}
+                return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": "the server no longer knows this save (it may have restarted)", "job_lost": True}}
             failures += 1
             if failures > SAVE_POLL_RETRIES:
                 return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": f"the server stopped answering about this save: {exc}"}}
@@ -175,6 +204,20 @@ async def _save_job(start_command: str, **params: Any) -> dict[str, Any]:
         if reply.get("done"):
             return reply
     return {"status": "error", "error": {"code": OUTCOME_UNKNOWN, "message": f"the save did not report its outcome within {int(SAVE_WAIT_LIMIT_S)} s"}}
+
+
+async def _save_job(start_command: str, **params: Any) -> dict[str, Any]:
+    """Starts a save and waits for its outcome -- the original one-shot
+    shape, kept for save_owner_profile_text (the owner's profile isn't
+    durably queued; a lost follow-up there is lower-stakes and that call
+    site predates this module's queue). save_info itself no longer calls
+    this -- see _drain_one, which calls _start_save/_poll_save directly so
+    it can persist job_id between the two."""
+    started = await _start_save(start_command, **params)
+    job_id = started.get("jobId")
+    if not job_id:
+        return started
+    return await _poll_save(job_id)
 
 
 def _language() -> str | None:
@@ -367,44 +410,129 @@ async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     params: dict[str, Any] = {"text": text, "traceId": uuid.uuid4().hex, "language": _language()}
     if materials:
         params["materials"] = materials
-    # Not awaited: the model has what it saves in the conversation already.
-    # A plain task, not an operation of the tab, so Stop does not cancel it.
-    task = asyncio.create_task(_save_in_background(params, get_inject_proactive()))
+    # Per explicit instruction (2026-10-13): durably enqueued BEFORE
+    # anything else -- see memory_save_queue.py's own module docstring for
+    # the restart-survival this fixes. Then an eager _drain_one fires right
+    # away (not awaited: the model has what it saves in the conversation
+    # already), same responsiveness as before -- the periodic drain loop
+    # (start_save_drain_loop) is the pure durability backstop, a no-op on
+    # almost every tick since this eager attempt already finishes first in
+    # the overwhelming majority of cases. A plain task, not an operation of
+    # the tab, so Stop does not cancel it.
+    entry_id = memory_save_queue.enqueue(WORKSPACE_DIR, params)
+    task = asyncio.create_task(_drain_one(entry_id, get_inject_proactive()))
     _background_saves.add(task)
     task.add_done_callback(_background_saves.discard)
-    log_event("plugin:memory", "save_started", trace_id=params["traceId"], materials=len(materials))
+    log_event("plugin:memory", "save_started", trace_id=params["traceId"], materials=len(materials), queue_id=entry_id)
     return {"text": "Saving to memory in the background; you do not need to wait for it. You will be told only if it fails."}
 
 
 _background_saves: set[asyncio.Task[Any]] = set()   # strong references: a bare task may be collected mid-way
+# Per explicit instruction (2026-10-13): entry ids currently being drained in
+# THIS process -- guards against the eager _drain_one (fired straight from
+# save_info) and the periodic sweep (start_save_drain_loop) both picking up
+# the same still-in-flight entry and double-polling/double-starting it.
+_draining: set[str] = set()
 
 
-async def _save_in_background(params: dict[str, Any], inject: Any) -> None:
-    started = time.monotonic()
+async def _drain_one(entry_id: str, inject: Any = None) -> None:
+    """Processes one durably-queued save to completion (or to a retryable
+    OUTCOME_UNKNOWN, left queued for the next tick). Per explicit
+    instruction (2026-10-13): resumes an existing job_id if one was already
+    persisted (a restart recovering mid-save) instead of starting a fresh
+    memory:saveStart -- the fix for the old "saved the same text four
+    times" duplicate-save risk across a restart specifically. Replaces the
+    old _save_in_background; same aftermath (topic-cache update, failure
+    notification), now keyed off the durable queue entry instead of a bare
+    in-memory params dict."""
+    if entry_id in _draining:
+        return
+    _draining.add(entry_id)
     try:
-        reply = await _save_job("memory:saveStart", **params)
-    except Exception as exc:  # noqa: BLE001 -- reported to the model below, never raised into nothing
-        reply = {"status": "error", "error": {"code": "exception", "message": str(exc)}}
-    try:
-        # Only the top-up window: the turn that called save_info may be long
-        # over, so an upstream no-funds must not stop and replay it (the
-        # model is told below that the save failed).
-        reaction = await _react_to_status(reply) if reply.get("status") in (STATUS_OK, STATUS_EMPTY, STATUS_NO_FUNDS_USER) else None
-        for result in (reply.get("output") or {}).get("results") or []:
-            if result.get("source") == SOURCE_TOPICS and result.get("status") == STATUS_OK:
-                update_topic(WORKSPACE_DIR, (result.get("output") or {}).get("topic") or {})
-        await _refresh_topics_if_stale()
-    except Exception as exc:  # noqa: BLE001
-        reaction = None
-        log_event("plugin:memory", "save_aftermath_failed", error=str(exc))
-    log_event("plugin:memory", "save_finished", trace_id=params["traceId"], status=reply.get("status"),
-              ms=round((time.monotonic() - started) * 1000), error=reply.get("error"))
-    failure = _failure_text(reply, "Saving to memory in the background")
-    if failure and inject is not None:
-        inject(
-            "[Service message about a save_info you called earlier. " + " ".join(filter(None, [failure, reaction]))
-            + f"\nWhat was to be saved: {params['text'][:2000]}\nTell the user only if it matters to them.]"
-        )
+        entry = memory_save_queue.get(WORKSPACE_DIR, entry_id)
+        if entry is None:
+            return
+        params = entry["params"]
+        started = time.monotonic()
+        job_id = entry.get("job_id")
+        try:
+            if not job_id:
+                start_reply = await _start_save("memory:saveStart", **params)
+                job_id = start_reply.get("jobId")
+                if job_id:
+                    memory_save_queue.set_job_id(WORKSPACE_DIR, entry_id, job_id)
+                    reply = await _poll_save(job_id)
+                else:
+                    reply = start_reply  # refused before it ever ran (e.g. no funds) -- nothing to poll
+            else:
+                reply = await _poll_save(job_id)
+        except Exception as exc:  # noqa: BLE001 -- reported to the model below, never raised into nothing
+            reply = {"status": "error", "error": {"code": "exception", "message": str(exc)}}
+
+        try:
+            # Only the top-up window: the turn that called save_info may be long
+            # over, so an upstream no-funds must not stop and replay it (the
+            # model is told below that the save failed).
+            reaction = await _react_to_status(reply) if reply.get("status") in (STATUS_OK, STATUS_EMPTY, STATUS_NO_FUNDS_USER) else None
+            for result in (reply.get("output") or {}).get("results") or []:
+                if result.get("source") == SOURCE_TOPICS and result.get("status") == STATUS_OK:
+                    update_topic(WORKSPACE_DIR, (result.get("output") or {}).get("topic") or {})
+            await _refresh_topics_if_stale()
+        except Exception as exc:  # noqa: BLE001
+            reaction = None
+            log_event("plugin:memory", "save_aftermath_failed", error=str(exc))
+        log_event("plugin:memory", "save_finished", trace_id=params.get("traceId"), status=reply.get("status"),
+                  ms=round((time.monotonic() - started) * 1000), error=reply.get("error"), queue_id=entry_id)
+
+        error = reply.get("error") or {}
+        if error.get("code") == OUTCOME_UNKNOWN:
+            memory_save_queue.mark_attempt(WORKSPACE_DIR, entry_id)
+            if error.get("job_lost"):
+                memory_save_queue.clear_job_id(WORKSPACE_DIR, entry_id)
+            failure = _failure_text(reply, "Saving to memory in the background")
+            # Notify once, not on every ~15s retry tick while it stays unknown.
+            if failure and inject is not None and not entry.get("notified_failure_at"):
+                memory_save_queue.mark_notified(WORKSPACE_DIR, entry_id, time.time())
+                inject(
+                    "[Service message about a save_info you called earlier. " + failure
+                    + f"\nWhat was to be saved: {params['text'][:2000]}\nTell the user only if it matters to them.]"
+                )
+            return  # stays queued -- drained again on the next tick
+
+        memory_save_queue.remove(WORKSPACE_DIR, entry_id)  # genuinely done: success OR a definitive failure
+        failure = _failure_text(reply, "Saving to memory in the background")
+        if failure and inject is not None:
+            inject(
+                "[Service message about a save_info you called earlier. " + " ".join(filter(None, [failure, reaction]))
+                + f"\nWhat was to be saved: {params['text'][:2000]}\nTell the user only if it matters to them.]"
+            )
+    finally:
+        _draining.discard(entry_id)
+
+
+def start_save_drain_loop(interval_s: float = SAVE_DRAIN_INTERVAL_S) -> "asyncio.Task[None]":
+    """Per explicit instruction (2026-10-13): the durable save queue's own
+    background drain -- the pure durability backstop for save_info's own
+    eager _drain_one (see that function's docstring). Runs once immediately
+    (drains anything left over from a crash, right at backend startup)
+    before settling into its own flat interval. get_inject_proactive()
+    returns None outside a live ChatSession turn (confirmed via
+    session_context.py's own documented no-context behavior) -- _drain_one
+    already tolerates inject=None, same as every other call site here."""
+
+    async def _tick() -> None:
+        for entry in memory_save_queue.all_entries(WORKSPACE_DIR):
+            if entry["id"] not in _draining:
+                await _drain_one(entry["id"], get_inject_proactive())
+
+    async def _loop() -> None:
+        await _tick()
+        while True:
+            await asyncio.sleep(interval_s)
+            await _tick()
+
+    log_event("plugin:memory", "save_drain_loop_starting", interval_s=interval_s)
+    return supervise("memory_save_drain", _loop)
 
 
 async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -416,14 +544,32 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         if not topic:
             return {"text": 'To read a material in full give both "topic" and "material" (their ids from an earlier request_info reply).', "is_error": True}
         return await _read_material(topic, material, args.get("offset"), args.get("save_file_to"))
+    # Per explicit instruction (2026-10-13): topic given ALONE (no material)
+    # used to fall straight through to the query branch below and fail with
+    # a usage error -- there was no fast "give me this track's current
+    # state" path at all, even though the model already has the topic's id
+    # from the system prompt's own topic list. See _read_topic.
+    if topic:
+        return await _read_topic(topic)
     if args.get("document"):
         return await _read_document(args["document"], args.get("section"), args.get("offset"), args.get("save_file_to"))
     query = (args.get("query") or "").strip()
     if not query:
         return {"text": 'request_info needs "query": what you want to recall.', "is_error": True}
+    return await _run_memory_query(query, args.get("history"))
+
+
+async def _run_memory_query(query: str, history: int | None = None) -> dict[str, Any]:
+    """memory:requestStart + soft-timeout polling + late-background
+    continuation -- exactly what request_info(query=...) always did,
+    factored out (2026-10-13) so it's shared with the topic(=id) cold
+    fallback (_fetch_and_cache_topic) and the background prefetch loop
+    (start_topic_prefetch_loop). Warms the local full-topic cache from
+    every topics-source part it sees (_cache_topics_from_parts) -- ordinary
+    query= usage keeps the cache warm too, not just the dedicated paths."""
     params: dict[str, Any] = {"query": query, "traceId": uuid.uuid4().hex, "language": _language()}
-    if args.get("history"):
-        params["history"] = int(args["history"])
+    if history:
+        params["history"] = int(history)
     started = await _memory("memory:requestStart", **params)
     if not started.get("jobId"):  # refused before it ran: no funds
         log_event("plugin:memory", "request_refused", trace_id=params["traceId"], status=started.get("status"), error=started.get("error"))
@@ -441,6 +587,7 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return {"text": f"The memory request failed while reading: {exc}" + (f"\nFound before that: {json.dumps({'results': found}, ensure_ascii=False)}" if found else ""),
                 "is_error": True}
     await _refresh_topics_if_stale()
+    _cache_topics_from_parts(read.parts)
     results = _merge_parts(read.parts)
     if read.final is None:
         _continue_in_background(read)
@@ -461,6 +608,102 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if not results:
         return {"text": f'Memory holds nothing relevant to "{query}".'}
     return {"text": json.dumps({"status": final.get("status"), "results": results}, ensure_ascii=False)}
+
+
+def _cache_topics_from_parts(parts: list[dict[str, Any]]) -> None:
+    """Feeds every topics-source part into update_topic, warming the local
+    full-topic cache (memory_topics.py) from ordinary request_info(query=...)
+    usage, not just the dedicated fast-path/prefetch writers. Defensive about
+    shape: a save_info reply's own topics-result carries one singular
+    "topic" (confirmed live); a broader search matching several distinct
+    tracks may plausibly carry a "topics" list instead -- handled, but not
+    confirmed against a real multi-topic search reply this session."""
+    for part in parts:
+        if part.get("source") != SOURCE_TOPICS:
+            continue
+        output = part.get("output") or {}
+        candidates = output.get("topics") if isinstance(output.get("topics"), list) else [output.get("topic")]
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("id"):
+                update_topic(WORKSPACE_DIR, candidate)
+
+
+async def _read_topic(topic_id: str) -> dict[str, Any]:
+    """request_info(topic=<id>) alone (no "material"): cache-FIRST, always --
+    per explicit instruction, never race or wait on the server when
+    something is already cached, however old. The reply carries cached_at/
+    age_s so the model itself can judge staleness and fall back to
+    query=... if it suspects something changed. Falls back to a real search
+    only the first time nothing at all is cached yet for this id."""
+    cached = cached_topic_detail(WORKSPACE_DIR, topic_id)
+    if cached is not None:
+        age_s = time.time() - float(cached.get("cached_at") or 0.0)
+        log_event("plugin:memory", "topic_fast_path_hit", topic_id=topic_id, age_s=round(age_s))
+        return {"text": json.dumps({
+            "status": STATUS_OK,
+            "results": [{"source": SOURCE_TOPICS, "output": {
+                "topic": cached["topic"], "cached_at": cached.get("cached_at"), "age_s": round(age_s),
+            }}],
+        }, ensure_ascii=False)}
+    log_event("plugin:memory", "topic_fast_path_miss", topic_id=topic_id)
+    return await _fetch_and_cache_topic(topic_id)
+
+
+async def _fetch_and_cache_topic(topic_id: str, description: str | None = None) -> dict[str, Any]:
+    """The only way to get one topic's full detail cold: there is no server
+    command narrower than the general memory:requestStart search (confirmed
+    against docs/MICROAGENTS_PLAN.md sections 2.6/2.6.1 -- memory:topics
+    only ever returns the slim tiered listing, nothing more targeted
+    exists). Uses the topic's own cached short description as the query
+    text. Shared by _read_topic's cold path and the background prefetch
+    loop; both warm the cache through _run_memory_query the same way
+    ordinary query= usage does."""
+    if description is None:
+        description = topic_description(WORKSPACE_DIR, topic_id)
+    query = (description or "").strip()
+    if not query:
+        return {"text": f'Topic {topic_id} is not in local memory (no cached description to search with) -- '
+                         "use request_info(query=...) instead.", "is_error": True}
+    return await _run_memory_query(query)
+
+
+async def _prefetch_tick() -> None:
+    """One pass of the background prefetch loop -- see start_topic_prefetch_
+    loop's own docstring. Only the "today" tier (recent_topics()'s first
+    element); "week"-tier topics are deliberately skipped, per explicit
+    instruction (already lower priority for the prompt, prefetching them
+    would just add cost for little benefit)."""
+    today, _week = recent_topics(WORKSPACE_DIR)
+    now = time.time()
+    for topic in today:
+        topic_id = topic.get("id")
+        if not topic_id:
+            continue
+        age = topic_detail_age_s(WORKSPACE_DIR, topic_id, now)
+        if age is not None and age <= DETAIL_STALE_AFTER_S:
+            continue  # already warm -- ordinary save/query usage keeps cached_at fresh
+        try:
+            reply = await _fetch_and_cache_topic(topic_id, topic.get("description"))
+            log_event("plugin:memory", "topic_prefetched", topic_id=topic_id, ok=not reply.get("is_error"))
+        except Exception as exc:  # noqa: BLE001 -- one bad topic must not stop the rest of the tick
+            log_event("plugin:memory", "topic_prefetch_failed", topic_id=topic_id, error=str(exc))
+
+
+def start_topic_prefetch_loop(interval_s: float = PREFETCH_INTERVAL_S) -> "asyncio.Task[None]":
+    """Per explicit instruction (2026-10-13): proactively warms the local
+    full-topic cache for active ("today"-tier) tracks before the model ever
+    asks -- see PREFETCH_INTERVAL_S/DETAIL_STALE_AFTER_S's own comments for
+    the interval/staleness tradeoffs. Process-wide, not routed through any
+    ChatSession/tool-call machinery -- a plain data-layer sync loop, same
+    shape as _refresh_topics_if_stale's own opportunistic calls."""
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(interval_s)  # let the slim "today" list populate before the first tick
+            await _prefetch_tick()
+
+    log_event("plugin:memory", "topic_prefetch_loop_starting", interval_s=interval_s)
+    return supervise("memory_topic_prefetch", _loop)
 
 
 class _Read:
@@ -522,6 +765,8 @@ def _continue_in_background(read: _Read) -> None:
         try:
             while read.final is None and time.monotonic() < until:
                 new = await read.poll(POLL_WAIT_S)
+                if new:
+                    _cache_topics_from_parts(new)  # late-arriving topic facts warm the cache too
                 if new and inject is not None:
                     inject(_late_text(read.query, new))
                     log_event("plugin:memory", "late_facts_injected", parts=len(new))
@@ -675,6 +920,12 @@ _USAGE_INSTRUCTIONS = (
     "text; add \"history\": N to also get its last N episodes. To read one material in full call "
     "request_info(topic=<topic id>, material=<material id>); long texts come in pages (\"next_offset\" -> pass "
     "it as \"offset\"); add \"save_file_to\": <path> to also get a document's file written there.\n"
+    "request_info(topic=<topic id>) ALONE (no \"material\"): the current state of one track -- its summary, "
+    "results, open questions, materials -- by the id you already have from your own topic list in the system "
+    "prompt. Usually answers INSTANTLY from your local cache, no server wait: the reply carries \"cached_at\"/"
+    "\"age_s\" so you can judge how fresh it is -- call request_info(query=...) instead if you suspect it has "
+    "moved since. The very first time a topic has no local cache yet, this runs a normal search instead, same "
+    "as query=.\n"
     "Call request_info BEFORE searching Notes, mail or old conversation for something you may already know, and "
     "before asking the user to repeat it.\n"
     "DOCUMENTS. save_document(path, note?) puts a whole FILE into your document memory: a contract, a resume, a "
@@ -718,10 +969,11 @@ PLUGIN = Plugin(
             "Call this at the START of every turn that concerns anything specific, before answering, acting "
             "or searching elsewhere, and before ever saying you do not know or remember something. "
             "Recalls from your memory: facts, topics (summary, decisions, open questions, their letters and "
-            "documents), credentials. Not the owner's profile -- that is owner_profile_recall. Give \"query\" in plain words; or \"topic\" and "
-            "\"material\" ids from an earlier reply to read one letter/document in full; or \"document\" (and "
-            "\"section\") ids to read a kept document's outline or one part of it. Call this before searching "
-            "Notes or mail for something you may already know.",
+            "documents), credentials. Not the owner's profile -- that is owner_profile_recall. Give \"query\" in plain words; or \"topic\" "
+            "ALONE (an id from your own topic list) for that track's current state -- usually instant, from local "
+            "cache; or \"topic\" and \"material\" ids from an earlier reply to read one letter/document in full; "
+            "or \"document\" (and \"section\") ids to read a kept document's outline or one part of it. Call this "
+            "before searching Notes or mail for something you may already know.",
             {
                 "query": str | None, "history": int | None, "topic": str | None, "material": str | None,
                 "document": str | None, "section": str | None, "offset": int | None, "save_file_to": str | None,
