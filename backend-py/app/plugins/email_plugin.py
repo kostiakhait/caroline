@@ -40,11 +40,14 @@ source's exact wording doesn't match this tool's own parameter name.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+from email.utils import getaddresses
 from pathlib import Path
 import json
 from typing import Any
 
+from app.plugins.contacts_plugin import upsert_contacts_from_emails
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, call_v2
 from app.policies import follow_explicit_parameters_instruction, notes_folder_fallback_instruction, read_content_not_headers_instruction
@@ -150,6 +153,14 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return {k: v for k, v in result.items() if k not in (".status", ".msgid")}
 
     data = await _sessions.with_session(do)
+    # Per explicit instruction (2026-10-13): save every sender/addressee on a message Caroline
+    # actually reads -- see upsert_contacts_from_emails' own docstring. "from"/"to" here are
+    # already flattened "Name <addr>, addr2" display strings (Api2EmailCommands.py's own
+    # _address_text), the exact shape email.utils.getaddresses is for. Excludes the mailbox
+    # being read -- it's the owner's own account, not a new contact. Fire-and-forget: never
+    # worth delaying the read over this.
+    pairs = getaddresses([data.get("from") or "", data.get("to") or ""])
+    asyncio.ensure_future(upsert_contacts_from_emails(pairs, exclude={args.get("address") or ""}))
     return {"text": json.dumps(data, indent=2, ensure_ascii=False)}
 
 
@@ -238,6 +249,14 @@ async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return await call_v2("email:send", **extra)
 
     result = await _sessions.with_session(do)
+    # Per explicit instruction (2026-10-13): save every actual recipient of a message Caroline
+    # sends -- see upsert_contacts_from_emails' own docstring. to/cc/bcc are model-supplied
+    # strings, either bare addresses or "Name <addr>" -- getaddresses handles both. Excludes the
+    # mailbox sent FROM (the owner's/Caroline's own account, never a new contact) and the no_reply
+    # relay identity used when no mailbox credentials were given.
+    pairs = getaddresses([*args["to"], *(args.get("cc") or []), *(args.get("bcc") or [])])
+    own_addresses = {args.get("address") or "", args.get("from") or "", "no_reply@partners.solutions"}
+    asyncio.ensure_future(upsert_contacts_from_emails(pairs, exclude=own_addresses))
     sent_note = f'Saved a copy to Sent.' if result.get("savedToSentFolder") else "Not saved to Sent (no address/credentials given, or no Sent folder)."
     return {"text": f'Sent to {", ".join(args["to"])} (subject: "{args["subject"]}"). Message-Id: {result.get("messageId")}. {sent_note}'}
 
