@@ -12,7 +12,8 @@ Run with Caroline's own Python (the model part makes real calls, a few cents):
   set CAROLINE_APP=<...>\backend-py
   set CAROLINE_CAMERLENGO_PATH=<install>\backend-py\camerlengo
   %LOCALAPPDATA%\Caroline\runtime\python\python.exe verifier_eval.py
-MODE=code runs the first part alone; RUNS=<n> repeats the model part."""
+MODE=code runs the first part alone; RUNS=<n> repeats the model part;
+VERIFIER_MODEL=<slug> puts another model in the verifier's place (as VERIFIER_FIRST_MODEL would)."""
 import asyncio, os, statistics, sys, time
 
 APP = os.environ["CAROLINE_APP"]
@@ -144,6 +145,10 @@ async def main():
     api_key = await e.get_model_provider_key()
     ai = e.camerlengo_ai.AI(adapter=e.camerlengo_ai.OpenRouterAdapter(api_key=api_key))
     cfg = e.camerlengo_ai.Config
+    if os.environ.get("VERIFIER_MODEL"):
+        class cfg:  # noqa: N801 -- stands in for Config with one name changed
+            AI_MODEL_MINI = os.environ["VERIFIER_MODEL"]
+        e.VERIFIER_REASONING_EFFORT = None
     rows = []
     for name, user_text, candidate, trace, can_escalate, want in MODEL_CASES * RUNS:
         raw, ms, twice = await run_model_case(ai, cfg, user_text, candidate, trace, can_escalate)

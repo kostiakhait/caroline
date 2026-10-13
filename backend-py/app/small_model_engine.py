@@ -1552,6 +1552,17 @@ def _usable(text: str) -> bool:
 
 VERIFIER_OK = "OK"
 VERIFIER_FINAL_TAG = "final"
+# A cheaper model asked first, with the same prompt (None: off, as shipped). It can only
+# approve: its "OK" sends the answer out, anything else -- an escalation, a correction, a
+# reply in no form -- goes to the verifier proper (AI_MODEL_MINI), which rules as before.
+# Why it is here: with the answer no longer rewritten, the verifier's own wait is what
+# is left between a tier's answer and the user -- live 2026-10-12, with the app's real
+# prompt, 5.9s, 8.3s and 10.3s. On the golden set (evals/verifier_eval.py, 3 runs)
+# google/gemini-2.5-flash-lite ruled all 33 as the verifier proper does, in 0.4s against
+# 2.9s; claude-haiku-4.5 got 30 (it rewrote a correct answer three times).
+# Off because that set is 11 cases with a short system prompt, and a wrong "OK" here is
+# an unfinished answer delivered: turning it on is a decision about the quality gate.
+VERIFIER_FIRST_MODEL: str | None = None
 _VERIFIER_OK = re.compile(r"^\W*OK\W*$", re.IGNORECASE)
 # The closing tag may be missing (a reply cut short): everything after the opening one is the text.
 _VERIFIER_FINAL = re.compile(rf"<{VERIFIER_FINAL_TAG}>(.*?)(?:</{VERIFIER_FINAL_TAG}>|\Z)", re.IGNORECASE | re.DOTALL)
@@ -2196,7 +2207,9 @@ async def run_small_model_turn(
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
     # is no longer only a final polish pass tacked on after the loop.
-    async def run_verifier(candidate_text: str, can_escalate: bool, trace: list[str], not_a_form: str | None = None) -> str:
+    async def run_verifier(
+        candidate_text: str, can_escalate: bool, trace: list[str], not_a_form: str | None = None, first_model: str | None = None,
+    ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace)})
@@ -2207,9 +2220,9 @@ async def run_small_model_turn(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
                 messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
-                model=cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage,
+                reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
             ),
             tab_id, emit,
         )
@@ -2222,6 +2235,22 @@ async def run_small_model_turn(
         the caller, which turns it into the same honest final answer regardless of
         whether funds ran out on a tier call or here."""
         emit("Checking the result (no tools).")
+        if VERIFIER_FIRST_MODEL and _usable(candidate_text):
+            started = time.monotonic()
+            try:
+                first = await run_verifier(candidate_text, can_escalate, trace or [], first_model=VERIFIER_FIRST_MODEL)
+            except _FundsExhaustedGivingUp:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the verifier proper decides
+                log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt="first model", error=str(exc), error_type=type(exc).__name__)
+                first = ""
+            approved = bool(_VERIFIER_OK.match(first.strip()))
+            log_event("engine", "small_model_verification_first", tab_id=tab_id, model=VERIFIER_FIRST_MODEL, approved=approved,
+                      ms=int((time.monotonic() - started) * 1000), reply=first[:200])
+            if approved:
+                log_event("engine", "small_model_verification_done", tab_id=tab_id, how="ok_by_first_model", text_len=len(candidate_text),
+                          text=candidate_text, verifier_reply=VERIFIER_OK)
+                return candidate_text, False
         verified = ""
         for attempt in (1, 2):
             log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate)
