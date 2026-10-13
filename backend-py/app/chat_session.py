@@ -3951,8 +3951,20 @@ class ChatSession:
             # failed) for task relevance, internal-mechanics leaks, and
             # human-sounding tone -- fail-open to that text as is on any
             # failure, same philosophy as translate_text just above.
+            #
+            # Bug fix (2026-10-12), confirmed live: this used to pass
+            # self.pending_user_text, which goes empty/stale deep into a
+            # long multi-step turn (it tracks the CURRENT turn's own text,
+            # not the standing task) -- a real incident showed reply.review
+            # silently passing a raw tool-result JSON blob straight through
+            # to the user because it got task="" and had nothing to judge
+            # relevance against. _narration_task() (last_real_user_question)
+            # is the same stable task source every other review/guard call
+            # site here already uses (narration's own review_reply call,
+            # _check_permission_guard) -- this call site was the one
+            # inconsistent holdout.
             try:
-                reviewed = await review_reply(block["text"], task=self.pending_user_text or "")
+                reviewed = await review_reply(block["text"], task=self._narration_task())
             except Exception as exc:
                 log_event("engine", "review_reply_failed", tab_id=self.tab_id, error=str(exc))
                 reviewed = None
