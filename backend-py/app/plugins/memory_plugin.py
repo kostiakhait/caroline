@@ -607,6 +607,7 @@ async def _run_memory_query(query: str, history: int | None = None) -> dict[str,
                 "is_error": True}
     if not results:
         return {"text": f'Memory holds nothing relevant to "{query}".'}
+    await _expand_notes_candidates(results)
     return {"text": json.dumps({"status": final.get("status"), "results": results}, ensure_ascii=False)}
 
 
@@ -725,6 +726,62 @@ class _Read:
         if reply.get("done"):
             self.final = reply
         return new
+
+
+NOTES_SOURCE_PREFIX = "notes."
+# How many further id/title-only candidates to auto-fetch in full, beyond the
+# one the main search already gives full text -- see _expand_notes_candidates.
+NOTES_AUTO_EXPAND_EXTRA = 1
+
+
+async def _expand_notes_candidates(results: list[dict[str, Any]]) -> None:
+    """Per explicit instruction (2026-10-14): NotesAdapter's own top-1-only
+    ranking (see its own 2026-10-14 fix, reforce-microagents/apps/microagents/
+    NotesAdapter.py) judges by title/folder alone and can genuinely misrank a
+    vague query -- confirmed live against the real incident's own vague query,
+    where the actually-right note came back SECOND, as id/title only, while a
+    stale, superficially-similar-titled note won first place. Rather than
+    leaning on the calling model to notice the top pick is wrong and re-ask
+    (the whole reason this is unreliable in the first place: a cheap model
+    does not reliably do that), this automatically fetches the next id-only
+    candidate's own full text too -- one extra parallel round trip, not one
+    per candidate, and only when a part genuinely had more than one candidate.
+    Re-querying with that candidate's own exact title as the query reliably
+    makes THAT note rank first for ITS OWN query (prompt_select's own
+    specificity-wins rule), so no new server-side judgment agent is needed --
+    this stays entirely client-side, reusing the ordinary search path.
+
+    Mutates `results` in place, adding "text"/"truncated" to whichever
+    candidate stubs get confirmed. A follow-up that errors, times out, or
+    comes back without that same note's id leaves its original id/title-only
+    stub untouched -- fail-open, same philosophy as every other check here."""
+    pending: list[dict[str, Any]] = []
+    for part in results:
+        source = part.get("source") or ""
+        if not source.startswith(NOTES_SOURCE_PREFIX):
+            continue
+        notes = (part.get("output") or {}).get("notes")
+        if not isinstance(notes, list):
+            continue
+        for candidate in notes[1 : 1 + NOTES_AUTO_EXPAND_EXTRA]:
+            if isinstance(candidate, dict) and "text" not in candidate and candidate.get("title"):
+                pending.append(candidate)
+    if not pending:
+        return
+    replies = await asyncio.gather(*(_run_memory_query(candidate["title"]) for candidate in pending), return_exceptions=True)
+    for candidate, reply in zip(pending, replies):
+        if isinstance(reply, BaseException) or not isinstance(reply, dict):
+            continue
+        try:
+            payload = json.loads(reply.get("text") or "{}")
+        except (ValueError, TypeError):
+            continue
+        for sub_part in payload.get("results") or []:
+            for note in (sub_part.get("output") or {}).get("notes") or []:
+                if isinstance(note, dict) and note.get("id") == candidate.get("id") and "text" in note:
+                    candidate["text"] = note["text"]
+                    candidate["truncated"] = note.get("truncated", False)
+                    break
 
 
 def _merge_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -909,7 +966,12 @@ _USAGE_INSTRUCTIONS = (
     "then kept once.\n"
     "save_info returns at once and saves in the background: carry on, you are told only if it fails.\n"
     "request_info(query): ask in plain words what you want to recall. The reply lists what each memory found, "
-    "marked by \"source\" (facts, topics, documents, contacts -- the address book --, notes.vault, ...); combine them yourself. A search that takes long "
+    "marked by \"source\" (facts, topics, documents, contacts -- the address book --, notes.vault, ...); combine them yourself. "
+    "For notes.memory/notes.vault specifically: the best-matching note (first in its \"notes\" list) carries "
+    "full \"text\", and when there was more than one plausible candidate the next one does too (fetched "
+    "automatically, in case the first guess was wrong); any further ones beyond that give only \"id\"/\"title\"/"
+    "\"folder\". If neither of those two is what you need, call request_info(query=...) again with a MORE "
+    "SPECIFIC query -- name the exact account, service or subject -- so it ranks first instead. A search that takes long "
     f"answers with what was found in its first {int(SOFT_READ_TIMEOUT_S)} seconds (status \"partial\"); the rest "
     f"reaches you later in a service message starting with \"{LATE_FACTS_HEADER}\" -- use it then. A fact comes "
     "with \"people\": the gender of the people it names, where memory knows it -- use it to speak of them "

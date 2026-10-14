@@ -1116,7 +1116,27 @@ def _make_executor_fn(
                 tracker.pending_operation_ids.add(op_id)
             return f"Operation {op_id} is still running."
         result = envelope.get("result")
-        return (result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)) + note
+        # Bug fix (2026-10-14), confirmed live: the established plugin-handler
+        # contract (every plugin returns {"text": ...}, see loader.py's own
+        # _envelope_to_mcp_response for the SDK/Claude path's equivalent) means
+        # `result` is almost always a dict whose "text" value is the string the
+        # model should read -- and for memory_plugin's structured tools
+        # (request_info in particular), that string is itself ALREADY a
+        # JSON-formatted blob. json.dumps()-ing the whole dict here re-escapes
+        # that already-JSON string a second time, producing a backslash-heavy
+        # mess a cheap model (this engine runs tier-1 on openai/gpt-5.1-codex-
+        # mini) could not parse -- confirmed live: a real IEEE-credentials
+        # lookup had its answer sitting right there in the tool result, but the
+        # model told the user it "couldn't be extracted". Extracting the plain
+        # "text" string, same as the SDK path effectively does, removes that
+        # extra escaping layer entirely.
+        if isinstance(result, str):
+            text = result
+        elif isinstance(result, dict) and isinstance(result.get("text"), str):
+            text = result["text"]
+        else:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        return text + note
 
     return executor_fn
 
