@@ -2575,6 +2575,7 @@ class ChatSession:
         # reviewed when the turn starts (the review comes before any translation).
         if fast:
             self._review_ahead(fast, text)
+            self._speech_ahead(fast, language)
         # The remark's review and audio too, while the window is still running -- in a
         # task of its own: a turn that starts meanwhile must not wait for it before it
         # gets to work. The task returns (the remark as reviewed, its audio).
@@ -2603,6 +2604,19 @@ class ChatSession:
                 return None
 
         self._reviews_ahead[key] = asyncio.create_task(run())
+
+    def _speech_ahead(self, text: str, language: str) -> None:
+        """The first pieces of a spoken reply synthesized while it is still being checked
+        -- see speech_ahead.py. Only for a text that will go out as it is: one that still
+        has to be translated is not the text chat.js will read."""
+        if not answer_is_in_language(text, language):
+            return
+        from app import speech_ahead
+
+        try:
+            speech_ahead.prepare(text, get_persona_gender(self.workspace_dir), {"Russian": "ru", "English": "en"}.get(language))
+        except Exception as exc:  # noqa: BLE001 -- a head start must never cost the turn
+            log_event("engine", "speech_ahead_failed", tab_id=self.tab_id, error=str(exc)[:200])
 
     async def _reviewed(self, text: str, task: str) -> str | None:
         """reply.review's result for a final text: the call already under way for exactly
@@ -2804,7 +2818,10 @@ class ChatSession:
                     get_new_user_comments=get_new_user_comments, on_activity=on_activity,
                     start_tier=start_tier, is_voice=is_voice,
                     # Review of a tier's answer runs alongside its verification (_review_ahead).
-                    on_candidate=(lambda candidate: self._review_ahead(candidate, text)) if is_real_user else None,
+                    on_candidate=(
+                        (lambda candidate: (self._review_ahead(candidate, text), is_voice and self._speech_ahead(candidate, language)))
+                        if is_real_user else None
+                    ),
                 )
                 if CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE:
                     translate_answer = not answer_is_in_language(result["text"], language)

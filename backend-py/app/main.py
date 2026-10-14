@@ -1206,6 +1206,22 @@ async def handle_control_request(
         if not text:
             return {"type": "control_response", "op": op, "ok": False, "stderr": "tts requires text", "requestId": request_id}
         log_event("engine", "tts_requested", request_id=request_id, text_len=len(text))
+        # Made ahead while the reply was still being checked (speech_ahead.py)? A head start
+        # must never cost the speech itself: any trouble with it and the piece is made here.
+        ahead = None
+        try:
+            from app import speech_ahead
+
+            ahead = speech_ahead.take(text)
+        except Exception as exc:  # noqa: BLE001
+            log_event("engine", "tts_ahead_failed", request_id=request_id, error=str(exc)[:200])
+        if ahead is not None:
+            try:
+                audio_b64 = await ahead
+                log_event("engine", "tts_ahead_used", request_id=request_id, ready=True, audio_bytes=len(audio_b64))
+                return {"type": "control_response", "op": op, "ok": True, "stdout": audio_b64, "requestId": request_id}
+            except Exception as exc:  # noqa: BLE001 -- made again below, as if never made ahead
+                log_event("engine", "tts_ahead_failed", request_id=request_id, error=str(exc)[:200])
         try:
             # The session bills the model call that cleans the text, and the Camerlengo
             # fallback. Minting it is a login round trip (0.5-0.8s, measured 2026-10-11) that
