@@ -112,6 +112,20 @@
   // whether to show the "connect SquirrelWisdom too" hint, which depends on BOTH.
   let lastChatSource = null;
   let lastSwLoggedIn = null;
+  // Per explicit instruction (2026-10-13), a real incident ("засерено в
+  // переключателе вкладки"): the tab-header mode switcher (native
+  // MainWindow, fed by chat_mode_get's own "available" field) only gets
+  // refreshed on a specific list of trigger events (connect, login_submit,
+  // auth_login/logout, openai_key_set, a closed top-up window, ...) -- the
+  // sw_status handler below was NOT one of them, even though chat_mode_
+  // eligible's own SW-side condition (logged in AND a positive balance) is
+  // exactly what that handler already receives on every poll. If SW login/
+  // balance became valid some other way (e.g. the periodic background
+  // sw_status poll simply catching up, not one of the explicit trigger
+  // flows), the switcher stayed stuck greyed-out until the tab reconnected.
+  // Tracked separately from lastSwLoggedIn above (that one only tracks
+  // login, not balance) so a transition is detected on EITHER changing.
+  let lastSwUsable = null;
 
   // Per explicit instruction (2026-09-07): a user paying via their own Claude
   // account has no reason to know SquirrelWisdom exists, let alone that logging
@@ -1780,9 +1794,18 @@
         lastSwLoggedIn = !!s.loggedIn;
         swLoginBtn.style.display = s.loggedIn ? "none" : "";
         swTopUpBtn.style.display = s.loggedIn ? "" : "none";
+        // Per explicit instruction (2026-10-13): mirrors chat_mode_eligible's
+        // own SW-side condition exactly (logged in AND a positive balance) --
+        // see lastSwUsable's own declaration for the incident this fixes.
+        // Only refetch on an actual transition, not every poll tick (sw_status
+        // polls repeatedly; chat_mode_get isn't free to spam).
+        const usable = !!s.loggedIn && !s.balanceError && Number(s.balancePia) > 0;
+        if (lastSwUsable !== null && usable !== lastSwUsable) sendControl("chat_mode_get");
+        lastSwUsable = usable;
       } catch {
         swAccountStatus.textContent = "Status unavailable.";
         lastSwLoggedIn = null;
+        lastSwUsable = null;
       }
       renderSwUpsellHint();
     } else if (evt.op === "chat_mode_get") {
