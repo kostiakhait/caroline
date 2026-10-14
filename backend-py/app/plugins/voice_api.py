@@ -416,6 +416,47 @@ async def check_refusal_guard(task: str, assistant_reply: str, session: str | No
     return {"declined": output["declined"], "reason": str(output.get("reason") or "")}
 
 
+async def check_background_relay_worth(text: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-14): a real incident the same
+    morning -- three of four messages relayed from Caroline's own headless
+    background/reminder-chore session into the user's primary chat (via
+    ChatSession.deliver_relayed_reply) were routine "nothing happened" status
+    noise (a Telegram check, an in-progress mailbox cleanup, a backup
+    confirmation), not genuine findings. reply.review (review_reply) already
+    ran on this text inside the ORIGINATING headless session and left it
+    alone -- it is clean, on-task, human-sounding text, so review_reply has
+    no reason to touch it; newsworthiness is a different question it was
+    never designed to answer. Backed by a real microagent (server-side
+    turn.background.relay.worth), called once more here, at the actual relay
+    chokepoint, where the fact that this is about to become a STANDALONE,
+    UNPROMPTED interruption is known.
+
+    Returns {"worth_relaying": bool, "reason": str} on a clean result, or
+    None on any error/timeout/malformed response (fail-open, same philosophy
+    as every other check_*/translate_text here -- an infrastructure hiccup
+    must default to SHOWING the message, never to silently swallowing one
+    that might have mattered). The caller (ChatSession.deliver_relayed_reply)
+    treats None the same as worth_relaying=True."""
+    body: dict[str, Any] = {"command": "reply:backgroundRelayWorth", "key": CAROLINE_SW_KEY, "text": text}
+    if not session:
+        session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "check_background_relay_worth_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "check_background_relay_worth_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("worth_relaying"), bool):
+        log_event("plugin:voice", "check_background_relay_worth_failed", reason="malformed")
+        return None
+    return {"worth_relaying": output["worth_relaying"], "reason": str(output.get("reason") or "")}
+
+
 async def check_reply_expected(task: str, channel: str, sent_message: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
     """Per explicit instruction (2026-10-12): after Caroline sends ANY
     message (email or messenger), decide whether a reply is actually

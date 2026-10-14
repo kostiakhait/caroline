@@ -3028,17 +3028,47 @@ class ChatSession:
         ORIGINATING headless session (see _translate_wire_visible_text's own
         headless branch) -- only translation into THIS tab's own real language
         happens here, since the headless session that generated `text` has no
-        real language of its own to translate into."""
-        from app.plugins.voice_api import translate_text
+        real language of its own to translate into.
 
-        try:
-            translated = await translate_text(
-                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                addressee_gender=get_owner_profile(self.workspace_dir).gender,
+        Bug fix (2026-10-14), confirmed live: review_reply only filters
+        internal-mechanics leaks/off-task/robotic tone -- it has no opinion
+        on whether `text` is worth this interruption at all, and three of
+        four messages relayed one morning were routine "nothing happened"
+        status noise that passed review_reply untouched (it's clean,
+        on-task, human-sounding text -- exactly what review_reply is
+        supposed to let through). check_background_relay_worth is the
+        separate, dedicated check for that; runs before translation so a
+        suppressed message costs nothing further."""
+        from app.plugins.voice_api import check_background_relay_worth, translate_text
+
+        verdict = await check_background_relay_worth(text)
+        if verdict is not None and not verdict["worth_relaying"]:
+            log_event(
+                "engine", "background_relay_suppressed_as_routine", tab_id=self.tab_id,
+                text_len=len(text), reason=verdict["reason"],
             )
-        except Exception as exc:
-            log_event("engine", "deliver_relayed_reply_translate_failed", tab_id=self.tab_id, error=str(exc))
-            translated = None
+            return
+
+        # Bug fix (2026-10-14), confirmed live: translate_text_failed
+        # (reason=request_failed, a plain transient infra hiccup) hit at the
+        # exact moment of a real relay, and this is the ONLY translation
+        # opportunity a relayed background message ever gets (the
+        # originating headless session never translates its own output --
+        # see this method's own docstring above) -- a single failed attempt
+        # here means an untranslated, wrong-language message reaching the
+        # user with no second chance. One retry before falling back.
+        translated = None
+        for attempt in range(2):
+            try:
+                translated = await translate_text(
+                    text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                )
+            except Exception as exc:
+                log_event("engine", "deliver_relayed_reply_translate_failed", tab_id=self.tab_id, error=str(exc), attempt=attempt)
+                translated = None
+            if translated:
+                break
         final_text = translated or text
         log_event("engine", "background_reply_relayed", tab_id=self.tab_id, text_len=len(final_text))
         self.last_visible_output_at = time.monotonic()
