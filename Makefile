@@ -68,10 +68,10 @@ LINUX_SHELL_SRC := $(shell find "$(LINUX_SHELL_DIR)" -type f 2>/dev/null)
 WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
 OUT_LINUX := $(SCRIPT_DIR)/dist-linux
 
-.PHONY: help build installer clean dist-linux camerlengo-vendor
+.PHONY: help build installer clean dist-linux appimage-linux camerlengo-vendor
 
 help:
-	@echo "Targets: build, installer, clean, dist-linux"
+	@echo "Targets: build, installer, clean, dist-linux, appimage-linux"
 	@echo "(deploy, deploy-models: available only when deploy.mk is present -- see its header comment)"
 
 # --- 1. Backend: npm install only when package.json/lockfile change --------
@@ -228,6 +228,7 @@ $(OUT)/.whatsapp-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/pa
 
 $(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp camerlengo-vendor $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
+	@touch -m "$@"
 
 build: $(OUT)/Caroline.exe
 
@@ -276,6 +277,21 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	@echo "      linux-shell/provision_runtime.sh $(OUT_LINUX)"
 
 dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
+
+# AppImage wrapping (Phase 5 of docs/LINUX_PORT_PLAN.md) -- same "can't run
+# the real tool from Windows" shape as provision_runtime.sh above: appimagetool
+# is a Linux ELF binary, so this target only documents the two commands a
+# Linux host actually runs, same as dist-linux's own NOTE does for
+# provision_runtime.sh. Produces an AppImage that still depends on the HOST
+# having python3-gi/gir1.2-webkit2-4.1/GTK3/WebKitGTK installed (see
+# linux-shell/build_appimage.sh's own header comment for why a fully
+# self-contained one -- bundling those shared libraries too -- is a
+# separate, bigger, not-yet-attempted effort).
+appimage-linux: dist-linux
+	@echo "AppImage wrapping can't run on this build machine (appimagetool is a Linux ELF binary)."
+	@echo "On a Linux host, after this dist-linux output has runtime/python + runtime/codex:"
+	@echo "      linux-shell/provision_runtime.sh $(OUT_LINUX)"
+	@echo "      linux-shell/build_appimage.sh $(OUT_LINUX) $(OUT_LINUX)/../Caroline-x86_64.AppImage"
 
 # --- 5. Zip + hash + version stamp (was build_installer.bat, steps 1-2) ----
 #

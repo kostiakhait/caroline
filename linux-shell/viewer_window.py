@@ -69,6 +69,7 @@ class ViewerWindow:
         self._result_reported = False
         self._path = ""
         self._kind = ""
+        self._trusted_webview: WebKit2.WebView | None = None
 
         self.window = Gtk.Window(title="Caroline Viewer")
         self.window.set_default_size(900, 700)
@@ -118,6 +119,24 @@ class ViewerWindow:
         self._add_close_button()
         self._load_html(f'<video src="file://{urllib.parse.quote(path)}" controls autoplay style="max-width:100%;max-height:100vh;display:block;margin:auto;"></video>')
 
+    def show_payment(self, checkout_url: str) -> None:
+        """Port of DocumentViewerWindow's "payment" kind: navigates a plain
+        WebView straight at the checkout URL reforce's Revolut.create_topup
+        already returns -- no custom checkout page of our own, and no
+        result to report back other than "the user is done browsing this"
+        (Revolut's own webhook confirms completion server-side, not this
+        window closing). Deliberately a BARE WebKit2.WebView with no
+        UserContentManager/shim injected (unlike show_web_page) -- this
+        page is third-party content, not one of Caroline's own, so it gets
+        none of the local-page script/style injection."""
+        self._path, self._kind = checkout_url, "payment"
+        self.title_label.set_label("Top up SquirrelWisdom balance")
+        self._add_close_button()
+        webview = WebKit2.WebView()
+        self.content.pack_start(webview, True, True, 0)
+        webview.load_uri(checkout_url)
+        webview.show_all()
+
     def show_web_page(self, title: str, kind: str, path: str, payload: dict) -> None:
         """code/slideshow: loads the SAME wwwroot page the WPF build uses
         (monaco_viewer.html/slideshow.html) from the local HTTP server, and
@@ -128,6 +147,7 @@ class ViewerWindow:
         self._add_close_button()
         page = "monaco_viewer.html" if kind == "code" else "slideshow.html"
         webview = self._make_webview()
+        self._trusted_webview = webview
         self.content.pack_start(webview, True, True, 0)
 
         def on_load_changed(wv, event):
@@ -226,6 +246,14 @@ class ViewerWindow:
         return WebKit2.WebView(user_content_manager=manager)
 
     def _on_page_message(self, _manager, js_result) -> None:
+        # Port of WebViewOriginGuard.IsTrustedSource: this handler is only
+        # ever registered on the one webview show_web_page creates (code/
+        # slideshow, loaded from the local HTTP server) -- reject anything
+        # if that webview has somehow navigated away from it, the same
+        # defensive check caroline_shell.py's on_page_message makes.
+        trusted_prefix = f"http://127.0.0.1:{self._page_port}/"
+        if self._trusted_webview is None or not (self._trusted_webview.get_uri() or "").startswith(trusted_prefix):
+            return
         try:
             msg = json.loads(js_result.get_js_value().to_string())
         except Exception:

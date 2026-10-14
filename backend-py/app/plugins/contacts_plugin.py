@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, SwApiError, call_v2
 
@@ -210,6 +211,45 @@ async def _address_book(command: str, doing: str, **params: Any) -> dict[str, An
     return reply
 
 
+async def upsert_contacts_from_emails(pairs: list[tuple[str | None, str]], exclude: set[str] | None = None) -> None:
+    """Per explicit instruction (2026-10-13): "Кэролайн должна сохранять в адресной книге
+    емейлы всех адресатов и отправителей писем, которые отсылает или читает" -- a
+    deterministic, tool-level enforcement of the SAME obligation _USAGE_INSTRUCTIONS already
+    states for the model ("save or update it with contact_create/contact_update yourself,
+    unprompted"), because relying on the model to always remember and act on that, turn after
+    turn, isn't reliable (the same lesson as this session's permission.guard escalation fix --
+    a standing instruction the model CAN ignore needs a deterministic backstop). Called by
+    email_plugin.py's email_send/email_get_message, fire-and-forget, after a real send/read
+    actually succeeds.
+
+    Goes through the SAME paid contact:put microagent contact_create/contact_update already
+    use (explicit instruction, same call): comparing by MEANING, not exact string, so "Vasya"
+    and a later "Vasily Petrov" sharing one address merge into a single contact instead of
+    becoming two -- cheap exact-match dedup can't do that. `exclude` is the mailbox's own
+    address being sent-from/read (see call sites) -- the OWNER's/Caroline's own account
+    showing up as a "recipient" or "sender" on their own mail is not a new contact to learn.
+
+    Fire-and-forget by design: never worth failing (or even delaying) a real email send/read
+    over this side-channel bookkeeping, so every failure is logged, never raised."""
+    exclude_lower = {e.strip().lower() for e in (exclude or set()) if e}
+    seen: set[str] = set()
+    for name, addr in pairs:
+        addr = (addr or "").strip()
+        if not addr or "@" not in addr:
+            continue
+        key = addr.lower()
+        if key in exclude_lower or key in seen:
+            continue
+        seen.add(key)
+        contact = {"name": (name or "").strip() or addr, "emails": [{"value": addr}]}
+        try:
+            reply = await _address_book("contact:put", "Saving a contact seen in email", contact=contact)
+            if reply.get("is_error"):
+                log_event("plugin", "contacts_email_autosave_failed", address=key, error=reply.get("text"))
+        except Exception as exc:  # noqa: BLE001 -- side-channel bookkeeping, must never raise into the caller
+            log_event("plugin", "contacts_email_autosave_failed", address=key, error=str(exc))
+
+
 async def contact_search(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     query = (args.get("query") or "").strip()
     if not query:
@@ -302,7 +342,10 @@ _USAGE_INSTRUCTIONS = (
     "physical address, company/title, birthday, or anything else that would belong on a contact card -- "
     "and it isn't already recorded here (or is recorded but now stale/incomplete), save or update it with "
     "contact_create/contact_update yourself, unprompted. Don't wait to be asked, and don't just let it sit "
-    "in conversation history where it'll be hard to find again. Before asking the user for someone's "
+    "in conversation history where it'll be hard to find again. (Every sender/recipient of a message sent "
+    "via email_send or opened via email_get_message is already saved here automatically -- no need to "
+    "contact_create those yourself, just everyone else you learn about: SMS, other messengers, conversation.) "
+    "Before asking the user for someone's "
     "contact info, ALWAYS check here first with contact_search/contact_get -- only ask if it's genuinely "
     "not here. Tags (e.g. \"family\", \"work\", \"bank\") are the organizing concept here, not folders -- "
     "apply the ones that fit, don't invent an elaborate taxonomy. Photos attach via contact_attach_photo, "

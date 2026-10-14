@@ -66,6 +66,16 @@
     setStatus("Saved");
   });
 
+  // Bug fix (2026-10-13): this page only ever sent "save" on the explicit
+  // button click above -- closing the window without clicking it first
+  // silently lost any edits. DocumentViewerWindow.xaml.cs's OnClosing now
+  // calls this (via ExecuteScriptAsync) to flush whatever's in the editor
+  // right before the window actually closes, for every close path (X
+  // button, Alt+F4, programmatic Close()), not just an explicit Save click.
+  window.getPendingContent = function () {
+    return (editor && editable) ? editor.getValue() : null;
+  };
+
   window.chrome.webview.addEventListener("message", function (e) {
     const msg = e.data;
     if (msg && msg.type === "open_editor") open(msg);

@@ -62,6 +62,7 @@ from app.plugins.companion_sms_store import (
     list_threads as companion_list_threads,
     load_store as companion_load_sms_store,
 )
+from app.plugins.memory_plugin import start_save_drain_loop, start_topic_prefetch_loop
 from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -108,6 +109,21 @@ PRIMARY_TAB_ID = "1"
 # that never opted into the Ratatosk integration never pays a whole extra
 # MCP-heavy query() session for nothing.
 RATATOSK_TAB_ID = "ratatosk"
+# Per explicit instruction (2026-10-13): "Фоновые задачи должны выполняться в
+# отдельном потоке (как в отдельной вкладке), и мержиться только на уровне
+# вывода пользователю" -- a second headless session (same shape as Ratatosk
+# above), carrying every reminder/scheduled background chore (vault backup,
+# periodic mailbox sweep, self-Telegram check -- see _on_reminder_due) OUT of
+# whichever tab happens to be primary. Confirmed live, 2026-10-13: on one busy
+# tab this traffic was 115 submit()s + 22 reminder deliveries in ~3 hours,
+# which (a) diluted turn.permission.guard's own dialogue window fast enough
+# that a real user approval scrolled out of it in well under an hour, causing
+# a false-positive block of an already-approved action, and (b) regularly
+# leaked the background task's own internal bookkeeping ("now updating the
+# vault note timestamp"...) into the user's real chat, because the model
+# doesn't reliably obey "don't narrate" prompt instructions on its own. See
+# _background_session_send/_get_background_session_sync below.
+BACKGROUND_TAB_ID = "background"
 
 # Ported verbatim from server.ts's own BACKUP_NUDGE -- seeded (idempotently,
 # via the "vault-backup-hourly" kind tag) unconditionally at module load,
@@ -257,16 +273,25 @@ _language_refreshed_for_tab: set[str] = set()
 
 
 def _on_reminder_due(reminder: dict[str, Any]) -> bool:
-    """Ported from server.ts's startDueCheckLoop callback. Always the
-    PRIMARY tab -- reminders are Caroline's own proactive behavior (memory
-    backup, checking things), not something that should fire once per open
-    tab. Background tasks wait for a quiet moment instead of interrupting a
-    live back-and-forth; priority tasks (the default) fire regardless."""
+    """Ported from server.ts's startDueCheckLoop callback. Reminders are
+    Caroline's own proactive behavior (memory backup, checking things), not
+    something that should fire once per open tab -- and, per explicit
+    instruction (2026-10-13), not something that should run in the PRIMARY
+    tab's own live conversation at all anymore (see BACKGROUND_TAB_ID's own
+    comment for why). Still checked against the primary tab's own live-dialog
+    state below (has_live_dialog) -- whether it's a good moment to surface a
+    RELAYED reply is still exactly the primary tab's own concern, unchanged by
+    where the underlying work actually runs. Background tasks wait for a quiet
+    moment instead of interrupting a live back-and-forth; priority tasks (the
+    default) fire regardless."""
     primary = primary_session()
     if reminder.get("priority") == "background" and primary is not None and primary.has_live_dialog():
         return False
     if primary is None:
         return False
+    background = _get_background_session_sync()
+    if background is None:
+        return False  # still starting up -- the scheduler retries on its own next tick
     # Bug fix (2026-09-11), per explicit instruction: used to pass
     # is_backup_nudge as inject_proactive()'s old "silent" flag -- a
     # whole-session switch that (a) couldn't actually force quiet once a
@@ -304,8 +329,8 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
         )
     # Nobody's message is behind this turn: for the memory service's money
     # rules it is a turn of its own (memory_turns.py).
-    memory_turns.start_service_turn(primary.tab_id)
-    delivered = primary.inject_proactive(
+    memory_turns.start_service_turn(background.tab_id)
+    delivered = background.inject_proactive(
         f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n{instruction}",
         suppress_narration=True,
     )
@@ -457,7 +482,7 @@ async def _start_ratatosk_background_loops() -> None:
     from app import http_tls
     asyncio.create_task(http_tls.warm_up())
     asyncio.create_task(_prune_redundant_archives_in_background())
-    start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _ratatosk_stop_session)
+    start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _inject_from_ratatosk_owner_account, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
     # 2026-10-06) -- a no-op loop (just rechecks every 30s) until
@@ -471,6 +496,15 @@ async def _start_ratatosk_background_loops() -> None:
     # due while the app was closed); a reminder is only marked fired once
     # it's actually been injected into a live session (see _on_reminder_due).
     start_due_check_loop(_on_reminder_due)
+    # Per explicit instruction (2026-10-13): the durable save-queue drain and
+    # the background topic-prefetch loop -- see memory_plugin.py's own
+    # start_save_drain_loop/start_topic_prefetch_loop docstrings. Plain
+    # data-layer background loops, not routed through any ChatSession/
+    # tool-call machinery (including the background/reminder-task session
+    # above) -- they only ever call memory_plugin's own _memory()-backed
+    # helpers directly, same as _refresh_topics_if_stale already does.
+    start_save_drain_loop()
+    start_topic_prefetch_loop()
     # Android companion app: drain phone-originated messages from
     # tabs/<tabId>/inbox into live sessions, and mirror recent history back
     # out to tabs/<tabId>/history. No-op while not logged into SW.
@@ -881,11 +915,98 @@ async def get_or_create_ratatosk_session() -> ChatSession:
     global _ratatosk_session
     if _ratatosk_session is not None:
         return _ratatosk_session
-    session = ChatSession(tab_id=RATATOSK_TAB_ID, workspace_dir=WORKSPACE_DIR, send=_ratatosk_session_send)
+    # headless=True (2026-10-13): no chat window ever renders this conversation
+    # (see RATATOSK_TAB_ID's own comment) -- also fixes a dormant bug this flag
+    # was introduced for: without it, a 2nd-consecutive permission-guard block
+    # here would escalate to _send_permission_guard_direct_ask, which calls
+    # self.send(...) straight into the void (_ratatosk_session_send only
+    # watches for specific tool_use/result shapes, nothing renders an
+    # "assistant" wire anywhere) -- the question could never reach anyone, and
+    # the turn stayed stuck fully stopped. headless=True keeps it on the
+    # ordinary note-to-the-model branch instead, same as the new background
+    # session below.
+    session = ChatSession(tab_id=RATATOSK_TAB_ID, workspace_dir=WORKSPACE_DIR, send=_ratatosk_session_send, headless=True)
     sessions[RATATOSK_TAB_ID] = session
     await session.start()
     _ratatosk_session = session
     return session
+
+
+# Per explicit instruction (2026-10-13), see BACKGROUND_TAB_ID's own comment.
+_background_session: ChatSession | None = None
+_background_session_starting = False
+# The in-progress background turn's own latest real visible text -- overwritten
+# by each new one, never accumulated, so only the LAST thing the background
+# session said before its turn genuinely ended ever gets relayed (the "merge
+# only at the level of output" the user asked for -- not a running commentary).
+_background_turn_last_visible_text: str | None = None
+
+
+async def _background_session_send(event: dict[str, Any]) -> None:
+    """`send` for the headless background/reminder-task session -- there is no
+    chat window to render this conversation in (same shape as
+    _ratatosk_session_send). Tracks the turn's own latest real visible text as
+    it streams in; once a genuine `result` event arrives (the wire-send gate in
+    chat_session.py's own run loop already never forwards a FAKE result here --
+    see that gate's own `result_is_fake` check, the only place any session's
+    send() is ever called with an assistant/result sdk_message at all -- so
+    anything that reaches this branch is a real turn completion), relays
+    whatever was last said into the primary tab's own visible chat via
+    ChatSession.deliver_relayed_reply. A turn that never said anything visible
+    (every reply was [[NO_UPDATE]] -- the normal, expected outcome for most
+    routine background chores) relays nothing at all."""
+    global _background_turn_last_visible_text
+    log_event("engine", "background_session_event", event_type=event.get("type"))
+    if event.get("type") != "sdk_message":
+        return
+    message = event.get("message") or {}
+    if message.get("type") == "assistant":
+        blocks = (message.get("message") or {}).get("content") or []
+        text = "\n".join(
+            b.get("text", "") for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+        ).strip()
+        if text:
+            _background_turn_last_visible_text = text
+    elif message.get("type") == "result":
+        text, _background_turn_last_visible_text = _background_turn_last_visible_text, None
+        if not text:
+            return
+        primary = primary_session()
+        if primary is None:
+            log_event("engine", "background_reply_dropped_no_primary", text_len=len(text))
+            return
+        asyncio.create_task(primary.deliver_relayed_reply(text, is_voice=bool(event.get("isVoice"))))
+
+
+def _get_background_session_sync() -> ChatSession | None:
+    """Lazily creates the background session, same spirit as
+    get_or_create_ratatosk_session -- but synchronous and non-blocking, because
+    its one caller (_on_reminder_due) is itself a synchronous callback that
+    must return a bool immediately (scheduler_plugin.start_due_check_loop's
+    contract). Returns None (and the caller reports the reminder as not yet
+    delivered, same as the existing "if primary is None: return False" case a
+    few lines above it in _on_reminder_due) while the session is still
+    starting up -- the scheduler simply retries on its own next tick (~20s)."""
+    global _background_session, _background_session_starting
+    if _background_session is not None:
+        return _background_session
+    if not _background_session_starting:
+        _background_session_starting = True
+
+        async def _create() -> None:
+            global _background_session, _background_session_starting
+            session = ChatSession(
+                tab_id=BACKGROUND_TAB_ID, workspace_dir=WORKSPACE_DIR, send=_background_session_send,
+                headless=True, approval_bridge_tab_id=PRIMARY_TAB_ID,
+            )
+            sessions[BACKGROUND_TAB_ID] = session
+            await session.start()
+            _background_session = session
+            _background_session_starting = False
+
+        asyncio.create_task(_create())
+    return None
 
 
 def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
@@ -893,6 +1014,24 @@ def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
     _ratatosk_turn_origin_group_ids.extend(origin_group_ids)
     _ratatosk_turn_replied_group_ids.clear()
 
+    async def _do() -> None:
+        session = await get_or_create_ratatosk_session()
+        session.inject_proactive(text)
+
+    asyncio.create_task(_do())
+
+
+def _inject_from_ratatosk_owner_account(text: str) -> None:
+    """Per explicit instruction (2026-10-13): the owner's OWN Ratatosk
+    account's new-message notification -- read-only/informational (see
+    ratatosk_channel.py's own account="owner" framing), unlike
+    _inject_from_ratatosk_owner above (which is "self" -- Caroline's own
+    account -- despite this module's naming). Deliberately does NOT touch
+    _ratatosk_turn_origin_group_ids/_ratatosk_turn_replied_group_ids: that
+    "did Caroline actually reply" tracking belongs only to her own account's
+    turns -- if this reused the same callback (even with an empty group-id
+    list), it could clear the self account's still-pending tracking for the
+    SAME poll cycle before that turn even started."""
     async def _do() -> None:
         session = await get_or_create_ratatosk_session()
         session.inject_proactive(text)
@@ -1106,7 +1245,7 @@ async def handle_control_request(
             # Caroline anything. Best-effort: a sync failure here shouldn't
             # also swallow the close notification.
             try:
-                await finish_office_edit_session(req["remotePath"], path)
+                await finish_office_edit_session(req["remotePath"], path, req.get("key"))
             except Exception as exc:
                 log_event("engine", "editor_result_sync_failed", path=path, error=str(exc))
         outcome_text = {

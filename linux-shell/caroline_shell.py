@@ -11,9 +11,15 @@ Tab strip mirrors Windows/Caroline/MainWindow.xaml.cs as closely as GTK
 allows: each tab is its own WebKit2.WebView loaded at chat.html?port=...
 &tab=<id>&alwaysOnTop=...&assetsVersion=..., same query contract chat.js
 already expects, with a name button plus a hamburger menu (Mode submenu /
-Clear / Close). Not yet ported from that file: persisted window position/
-open-tab-ids/tab-names (no SettingsService equivalent here yet), the
-update-available banner, and the file/image/office viewer windows.
+Clear / Close). Window position/size, always-on-top, open-tab-ids/
+tab-names and the toggle-visibility hotkey now persist too, via
+settings_service.py (port of Services/SettingsService.cs). A tray icon
+(pystray, vendored -- see vendor/pystray/NOTICE.md) now gives Linux the
+same "minimize and keep running" closing behavior Windows has, and
+update_checker.py (port of Services/UpdateChecker.cs, adapted to
+AppImage's single-file self-replace model) handles background
+self-update when running from a real AppImage. Still not ported from
+that file: the OnlyOffice document editor.
 """
 
 from __future__ import annotations
@@ -27,9 +33,11 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import gi
 
@@ -40,9 +48,16 @@ gi.require_version("WebKit2", "4.1")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
 
 from hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, GlobalHotkeyListener  # noqa: E402
+from settings_service import AppSettings, SettingsService  # noqa: E402
+from update_checker import UpdateChecker  # noqa: E402
 from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+# pystray is vendored here (see vendor/pystray/NOTICE.md for why: PEP 668
+# blocks pip into the system python3 this shell runs under, and pystray
+# isn't a Debian/Ubuntu apt package the way python3-xlib is) -- importing
+# it (done lazily, in _build_tray_icon) needs this on sys.path first.
+sys.path.insert(0, str(HERE / "vendor"))
 APP_ROOT = Path(os.environ.get("CAROLINE_APP_ROOT", HERE.parent))
 def _default_wwwroot() -> Path:
     """A packaged install bundles wwwroot as a sibling of linux-shell/ (see
@@ -62,10 +77,12 @@ PYTHON = Path(os.environ.get("CAROLINE_PYTHON", APP_ROOT / "runtime" / "python" 
 PAGE_PORT = 48767
 SUPERVISOR_PORT = 48766
 BACKEND_PORT = 48765
+SUPERVISOR_STATUS_POLL_INTERVAL_MS = 15_000
 MAX_TABS = 5
 LOG_PATH = Path(os.environ.get("CAROLINE_SHELL_LOG", Path.home() / ".local" / "share" / "Caroline" / "shell.log"))
 FONTS_DIR = HERE / "fonts"
 ICONS_DIR = HERE / "icons"
+APP_ICON_PATH = ICONS_DIR / "app.ico"
 
 # The page asks for "Segoe UI" (Windows). Selawik (SIL OFL, Microsoft) has the
 # same metrics and is shipped with the shell, so map Segoe UI's weights onto it.
@@ -216,6 +233,46 @@ def log(line: str) -> None:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {line}\n")
+
+
+def _install_global_exception_logging() -> None:
+    """Port of App.xaml.cs's InstallGlobalExceptionLogging: on Windows that
+    catches DispatcherUnhandledException (UI thread, marked Handled so the
+    app survives), AppDomain.UnhandledException, and TaskScheduler.
+    UnobservedTaskException, so nothing dies with zero trace in
+    caroline.log. The Python/GLib equivalents of those three: sys.
+    excepthook (uncaught exceptions on the main thread -- PyGObject routes
+    an exception raised inside a GTK/GLib signal callback through this the
+    same way a plain script would) and threading.excepthook (background
+    threads, e.g. Supervisor._pump_output -- there is no Python-level
+    "unobserved" concept for bare threading.Thread the way asyncio/Task
+    has one, so this is the closest equivalent). Logs only -- never
+    re-raises or exits, matching Windows' Handled=true behavior of
+    keeping the app alive."""
+    def log_main_thread_exception(exc_type, exc_value, exc_tb) -> None:
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log(f"UNHANDLED EXCEPTION (main thread):\n{detail}")
+
+    def log_background_thread_exception(args: threading.ExceptHookArgs) -> None:
+        detail = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        name = args.thread.name if args.thread else "?"
+        log(f"UNHANDLED EXCEPTION (thread {name}):\n{detail}")
+
+    sys.excepthook = log_main_thread_exception
+    threading.excepthook = log_background_thread_exception
+
+
+def _is_trusted_source(uri: str | None) -> bool:
+    """Port of WebViewOriginGuard.IsTrustedSource (Windows/Caroline/
+    Services/WebViewOriginGuard.cs): every webview this shell creates for
+    its own chat tabs only ever navigates to chat.html served from the
+    local HTTP server (see add_tab's own load_uri call) -- checked here
+    the same defensive way Windows checks its WebView2 message Source,
+    even though nothing untrusted is reachable today under the current
+    navigation policy."""
+    if not uri:
+        return False
+    return uri.startswith(f"http://127.0.0.1:{PAGE_PORT}/")
 
 
 class Supervisor:
@@ -504,19 +561,48 @@ def wait_for_backend_then_show(supervisor: Supervisor, splash: SplashWindow, rev
 
 
 class Shell:
-    def __init__(self, supervisor: Supervisor) -> None:
+    def __init__(self, supervisor: Supervisor, settings: AppSettings, settings_service: SettingsService) -> None:
         self.supervisor = supervisor
+        self.settings = settings
+        self.settings_service = settings_service
         self.tabs: list[ChatTab] = []
         self.active_tab: ChatTab | None = None
         self.viewer_windows: dict[str, ViewerWindow] = {}
+        self._gave_up_shown = False
+        # Port of MainWindow's _restoringTabs: suppresses PersistOpenTabIds-
+        # equivalent saves while prepare() recreates the previously-open
+        # tabs, so restoring them doesn't itself get recorded as a change.
+        self._restoring_tabs = False
+        # Port of MainWindow's _exitRequested: a plain X-button close hides
+        # (tray keeps the app running, see _on_delete_event), same as
+        # Windows' OnClosing; only RequestExit (the tray's own "Exit" item,
+        # or SIGTERM/SIGINT) actually tears the app down.
+        self._exit_requested = False
+        # Set by main() right after construction, if a tray icon could be
+        # created at all (see _build_tray_icon) -- stopped from on_destroy.
+        self.tray_icon: Any = None
+        # Set by main() right after construction (see update_checker.py).
+        self.update_checker: Any = None
+        self._tray_update_version: str | None = None
+        self._update_popup_shown_this_download = False
 
         self.window = Gtk.Window(title="Caroline")
-        self.window.set_default_size(420, 640)
+        if settings.window_width is not None and settings.window_height is not None:
+            self.window.set_default_size(int(settings.window_width), int(settings.window_height))
+        else:
+            self.window.set_default_size(420, 640)
         geometry = Gdk.Geometry()
         geometry.min_width = 320
         geometry.min_height = 400
         self.window.set_geometry_hints(None, geometry, Gdk.WindowHints.MIN_SIZE)
+        self.window.set_keep_above(settings.always_on_top)
+        if APP_ICON_PATH.exists():
+            try:
+                self.window.set_icon_from_file(str(APP_ICON_PATH))
+            except GLib.Error as exc:
+                log(f"Shell: set_icon_from_file failed: {exc}")
         self.window.connect("destroy", self.on_destroy)
+        self.window.connect("delete-event", self._on_delete_event)
 
         css = Gtk.CssProvider()
         css.load_from_data(TAB_STRIP_CSS)
@@ -543,20 +629,144 @@ class Shell:
         no WebView2 "airspace" bug forces a Show()/Hide() dance here first;
         a GTK window never shown at all is enough. Called while the splash
         is up so the chat page is already loading underneath it."""
-        self.add_tab("1", select=True)
+        self._restoring_tabs = True
+        tab_ids = self.settings.open_tab_ids or ["1"]
+        for i, tab_id in enumerate(tab_ids):
+            self.add_tab(tab_id, select=(i == 0))
+        self._restoring_tabs = False
+        self._persist_open_tab_ids()
+        GLib.timeout_add(SUPERVISOR_STATUS_POLL_INTERVAL_MS, self._poll_supervisor_status)
+
+    def _persist_open_tab_ids(self) -> None:
+        """Port of MainWindow's PersistOpenTabIds."""
+        if self._restoring_tabs:
+            return
+        self.settings.open_tab_ids = [t.id for t in self.tabs]
+        self.settings_service.save(self.settings, caller="_persist_open_tab_ids")
+
+    def _poll_supervisor_status(self) -> bool:
+        """Port of MainWindow.xaml.cs's PollSupervisorStatus: the
+        supervisor's own health-poll loop autonomously detects and
+        recovers a frozen/crashed backend (whole-process AND per-tab)
+        without any help from here. This only watches for the one case
+        still worth a human-visible dialog -- has it given up
+        auto-restarting (needed rescue more than MAX_RESTARTS_PER_WINDOW
+        times)? Shown exactly once per session, same as Windows. Returns
+        True/False the way every GLib.timeout_add callback in this file
+        does -- True to keep polling, False to stop."""
+        if self._gave_up_shown:
+            return False
+        raw = self.supervisor.status()
+        try:
+            body = json.loads(raw)
+        except (ValueError, TypeError):
+            return True
+        if body.get("gaveUp"):
+            self._gave_up_shown = True
+            log("Shell: supervisor reports it has given up auto-restarting the backend")
+            show_error_dialog("Caroline's backend keeps failing", f"Check {LOG_PATH}, or restart the app.")
+            return False
+        return True
 
     def reveal(self) -> None:
         self.window.show_all()
+        if self.settings.window_left is not None and self.settings.window_top is not None:
+            self.window.move(int(self.settings.window_left), int(self.settings.window_top))
 
     def toggle_visibility(self) -> None:
         """Port of ToggleVisibility: hide if shown, show+raise+focus if
-        hidden -- same global-hotkey toggle, bound in main() to Ctrl+Alt+C
-        by default (AppSettings.HotkeyModifiers/HotkeyVirtualKey's own
-        default, no settings persistence here yet to make it configurable)."""
+        hidden -- same global-hotkey toggle, bound in main() to
+        settings.hotkey_modifiers/hotkey_key (Ctrl+Alt+C by default, see
+        settings_service.py)."""
         if self.window.get_visible():
             self.window.hide()
         else:
             self.window.present()
+
+    def show_and_activate(self) -> None:
+        """Port of MainWindow's ShowAndActivate -- the tray's "Open
+        Caroline" item and its default (left-)click both use this rather
+        than toggle_visibility, matching Windows: always brings the window
+        to front, never hides an already-visible one."""
+        self.window.show_all()
+        self.window.deiconify()
+        self.window.present()
+
+    def _on_delete_event(self, _widget, _event) -> bool:
+        """Port of MainWindow's OnClosing: closing via the window's own X
+        button hides instead of quitting (the tray icon, when available,
+        is the way back in -- see _build_tray_icon -- and the global
+        hotkey always still works regardless of whether a tray host is
+        present on this desktop). Returning True tells GTK to cancel the
+        close; request_exit() is the only path that actually proceeds to
+        "destroy" (the tray's own "Exit" item, or SIGTERM/SIGINT)."""
+        if self._exit_requested:
+            return False
+        self.window.hide()
+        return True
+
+    def request_exit(self) -> None:
+        """Port of MainWindow's RequestExit: the one path that lets a
+        close through _on_delete_event instead of hiding."""
+        self._exit_requested = True
+        self.window.close()
+
+    def show_update_available(self, version: str) -> None:
+        """Port of MainWindow's ShowUpdateAvailable: adds (or updates the
+        label of) an "Update to {version}" tray item -- stays available
+        after the Yes/No dialog is dismissed/declined, same as Windows,
+        so the user can still trigger it manually later."""
+        self._tray_update_version = version
+        self._rebuild_tray_menu()
+
+    def hide_update_available(self) -> None:
+        """Port of MainWindow's HideUpdateAvailable: removed the moment
+        it's clicked (an update is now in flight with its own status-bar
+        progress, see broadcast_update_status) -- avoids double-triggering
+        update_now() via a second click."""
+        self._tray_update_version = None
+        self._rebuild_tray_menu()
+
+    def _rebuild_tray_menu(self) -> None:
+        if self.tray_icon is None:
+            return
+        import pystray
+
+        def on_open(_icon: Any = None, _item: Any = None) -> None:
+            GLib.idle_add(self.show_and_activate)
+
+        def on_update(_icon: Any = None, _item: Any = None) -> None:
+            self.hide_update_available()
+            if self.update_checker:
+                GLib.idle_add(self.update_checker.update_now)
+
+        def on_exit(_icon: Any = None, _item: Any = None) -> None:
+            GLib.idle_add(self.request_exit)
+
+        items = [pystray.MenuItem("Open Caroline", on_open, default=True)]
+        if self._tray_update_version:
+            items.append(pystray.MenuItem(f"Update to {self._tray_update_version}", on_update))
+        items.append(pystray.Menu.SEPARATOR)
+        items.append(pystray.MenuItem("Exit", on_exit))
+        self.tray_icon.menu = pystray.Menu(*items)
+        self.tray_icon.update_menu()
+
+    def broadcast_update_status(self, text: str) -> None:
+        """Port of MainWindow's BroadcastUpdateStatus: a one-time tray
+        notification the moment a download starts (pystray's best-effort
+        notify(), same "may not work everywhere" ceiling as the tray icon
+        itself), plus the SAME "update_status" message chat.js already
+        knows how to render in every open tab's status bar -- shared
+        code, no chat.js changes needed for this to work on Linux too."""
+        if not self._update_popup_shown_this_download:
+            self._update_popup_shown_this_download = True
+            if self.tray_icon is not None:
+                try:
+                    self.tray_icon.notify("Update ongoing... this may take a couple of minutes.", "Caroline")
+                except Exception as exc:
+                    log(f"broadcast_update_status: tray notify failed (non-fatal): {exc}")
+        for tab in self.tabs:
+            self._dispatch(tab, {"type": "update_status", "text": text})
 
     def toggle_voice_recording_from_hotkey(self) -> None:
         """Port of ToggleVoiceRecordingFromHotkey (Ctrl+Shift+C): same JS
@@ -592,7 +802,8 @@ class Shell:
         if len(self.tabs) >= MAX_TABS:
             log(f"add_tab: refused, already at MAX_TABS ({MAX_TABS})")
             return
-        tab = ChatTab(tab_id, f"Tab {tab_id}")
+        saved_name = self.settings.tab_names.get(tab_id)
+        tab = ChatTab(tab_id, saved_name or f"Tab {tab_id}")
         tab.webview = self._make_webview(tab)
         tab.header_button.connect("clicked", lambda _b, t=tab: self.select_tab(t))
         tab.header_button.connect("button-press-event", lambda _b, e, t=tab: self._maybe_rename(t, e))
@@ -601,11 +812,12 @@ class Shell:
         self.content_stack.add_named(tab.webview, tab.id)
         self.tabs.append(tab)
         self.rebuild_tab_strip()
+        self._persist_open_tab_ids()
 
         url = (
             f"http://127.0.0.1:{PAGE_PORT}/chat.html"
             f"?port={BACKEND_PORT}&tab={urllib.parse.quote(tab.id)}"
-            f"&alwaysOnTop=0&assetsVersion={_assets_version()}"
+            f"&alwaysOnTop={'1' if self.settings.always_on_top else '0'}&assetsVersion={_assets_version()}"
         )
         tab.webview.load_uri(url)
         tab.webview.show_all()
@@ -674,6 +886,8 @@ class Shell:
                     tab.name = new_name
                     tab.header_button.set_label(new_name)
                     log(f"tab {tab.id} renamed to {new_name!r}")
+                    self.settings.tab_names[tab.id] = new_name
+                    self.settings_service.save(self.settings, caller="_begin_rename")
 
         def on_key(_w, event) -> bool:
             if event.keyval == Gdk.KEY_Return:
@@ -729,8 +943,12 @@ class Shell:
             self.select_tab(self.tabs[0])
         else:
             self.rebuild_tab_strip()
+        self._persist_open_tab_ids()
 
     def on_page_message(self, tab: ChatTab, js_result) -> None:
+        if not _is_trusted_source(tab.webview.get_uri()):
+            log(f"[page:{tab.id}] on_page_message rejected untrusted source={tab.webview.get_uri()!r}")
+            return
         try:
             msg = json.loads(js_result.get_js_value().to_string())
         except Exception as exc:
@@ -740,7 +958,10 @@ class Shell:
         if kind == "client_log":
             log(f"[page:{tab.id}] {msg.get('message', '')}")
         elif kind == "set_always_on_top":
-            self.window.set_keep_above(bool(msg.get("value")))
+            value = bool(msg.get("value"))
+            self.window.set_keep_above(value)
+            self.settings.always_on_top = value
+            self.settings_service.save(self.settings, caller="set_always_on_top")
         elif kind == "tab_state":
             mode = msg.get("mode")
             if isinstance(mode, str):
@@ -754,6 +975,8 @@ class Shell:
             self._on_editor_message(tab, msg)
         elif kind == "open_login":
             self._open_login_viewer(tab, msg)
+        elif kind == "open_payment":
+            self._open_payment_viewer(tab, msg)
         elif kind == "visual_speech_audio":
             # Visual Mode (XcfaRenderer-based talking-head rendering) isn't
             # ported -- that library is a vendored C# ProjectReference with
@@ -803,6 +1026,31 @@ class Shell:
         self.viewer_windows[viewer_key] = viewer
         viewer.show()
 
+    PAYMENT_WINDOW_KEY = "squirrelwisdom-payment"
+
+    def _open_payment_viewer(self, tab: ChatTab, msg: dict) -> None:
+        """Port of MainWindow.OnOpenPayment: one payment viewer at a time,
+        a bare WebView pointed at the Revolut checkout URL, replying with
+        payment_result the moment the window closes for any reason (no
+        outcome to distinguish -- Revolut's own webhook is the real source
+        of truth for completion, same as Windows)."""
+        checkout_url = msg.get("checkoutUrl", "")
+        if not checkout_url:
+            log(f"[page:{tab.id}] open_payment with no checkoutUrl, ignored")
+            return
+        existing = self.viewer_windows.get(self.PAYMENT_WINDOW_KEY)
+        if existing:
+            existing.close()
+
+        def on_done(_result: ViewerResult) -> None:
+            self.viewer_windows.pop(self.PAYMENT_WINDOW_KEY, None)
+            self._dispatch(tab, {"type": "payment_result"})
+
+        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, PAGE_CSS, on_done=on_done)
+        viewer.show_payment(checkout_url)
+        self.viewer_windows[self.PAYMENT_WINDOW_KEY] = viewer
+        viewer.show()
+
     LOGIN_WINDOW_KEY = "squirrelwisdom-login"
 
     def _open_login_viewer(self, tab: ChatTab, msg: dict) -> None:
@@ -835,6 +1083,25 @@ class Shell:
             )
 
     def on_destroy(self, _widget) -> None:
+        """Port of MainWindow's Cleanup: persists window geometry before
+        tearing down. Querying position/size here (GtkWidget::destroy,
+        not after the widget is actually gone) is the same pattern
+        wait_for_backend_then_show etc. already rely on GLib callbacks
+        for -- the window is still a valid, queryable widget at this
+        point in the signal."""
+        try:
+            left, top = self.window.get_position()
+            width, height = self.window.get_size()
+            self.settings.window_left, self.settings.window_top = float(left), float(top)
+            self.settings.window_width, self.settings.window_height = float(width), float(height)
+            self.settings_service.save(self.settings, caller="on_destroy")
+        except Exception as exc:
+            log(f"on_destroy: failed to persist window geometry: {exc}")
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception as exc:
+                log(f"on_destroy: tray_icon.stop() failed: {exc}")
         self.supervisor.stop()
         Gtk.main_quit()
 
@@ -882,7 +1149,55 @@ def show_error_dialog(summary: str, detail: str) -> None:
     dialog.destroy()
 
 
+def _build_tray_icon(shell: Shell) -> Any:
+    """Port of Tray/TrayIconManager.cs: "Open Caroline" (also the default/
+    primary-click action) + Exit, same two-item menu. No single Linux API
+    covers every desktop the way Win32's NotifyIcon does (GNOME shows
+    nothing at all without the user's own AppIndicator extension, see
+    docs/LINUX_PORT_PLAN.md) -- pystray (vendored, see vendor/pystray/
+    NOTICE.md) already tries AppIndicator, then GtkStatusIcon, then a raw
+    X11 icon window, in that order, so this gets the best available
+    option on whatever desktop it's running on without this file needing
+    to know which one that is.
+
+    Best-effort: returns None (logged, not fatal -- the window is still
+    fully usable, just without a tray icon or a way to un-hide it besides
+    the global hotkey) if pystray or Pillow aren't actually importable, or
+    if construction fails for any other reason."""
+    try:
+        import pystray
+        from PIL import Image
+    except ImportError as exc:
+        log(f"tray: pystray/Pillow not importable, tray disabled: {exc}")
+        return None
+    try:
+        image = Image.open(APP_ICON_PATH)
+        image.size = (64, 64)
+        image.load()
+    except Exception as exc:
+        log(f"tray: could not load icon from {APP_ICON_PATH}, tray disabled: {exc}")
+        return None
+
+    def on_open(_icon: Any = None, _item: Any = None) -> None:
+        GLib.idle_add(shell.show_and_activate)
+
+    def on_exit(_icon: Any = None, _item: Any = None) -> None:
+        GLib.idle_add(shell.request_exit)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Caroline", on_open, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", on_exit),
+    )
+    try:
+        return pystray.Icon("caroline", image, "Caroline", menu)
+    except Exception as exc:
+        log(f"tray: pystray.Icon construction failed, tray disabled: {exc}")
+        return None
+
+
 def main() -> int:
+    _install_global_exception_logging()
     GLib.set_prgname("caroline")
     lock = acquire_single_instance_lock()
     if lock is None:
@@ -904,16 +1219,31 @@ def main() -> int:
         )
         return 1
     serve_wwwroot()
-    shell = Shell(supervisor)
+    settings_service = SettingsService(log=log)
+    settings = settings_service.load()
+    shell = Shell(supervisor, settings, settings_service)
     shell.prepare()
+    shell.tray_icon = _build_tray_icon(shell)
+    if shell.tray_icon is not None:
+        # Per pystray's own docs: call run_detached() BEFORE entering the
+        # other library's main loop (Gtk.main(), at the end of this
+        # function) so its Linux backends integrate with that loop
+        # instead of spinning up their own.
+        shell.tray_icon.run_detached()
+
+    shell.update_checker = UpdateChecker(
+        log=log, on_update_available=shell.show_update_available,
+        on_status_changed=shell.broadcast_update_status, on_restart=shell.request_exit,
+    )
+    shell.update_checker.start()
 
     splash = SplashWindow(on_dismissed=lambda: None)
     splash.show()
     wait_for_backend_then_show(supervisor, splash, shell.reveal)
 
     hotkeys = GlobalHotkeyListener()
-    if not hotkeys.register(MOD_CONTROL | MOD_ALT, "c", shell.toggle_visibility):
-        log("[hotkey] registration failed -- already in use, or this keyboard layout has no 'c' keycode")
+    if not hotkeys.register(settings.hotkey_modifiers, settings.hotkey_key, shell.toggle_visibility):
+        log("[hotkey] registration failed -- already in use, or this keyboard layout has no matching keycode")
     if not hotkeys.register(MOD_CONTROL | MOD_SHIFT, "c", shell.toggle_voice_recording_from_hotkey):
         log("[hotkey] voice-record hotkey registration failed -- already in use by another app?")
     hotkeys.start()

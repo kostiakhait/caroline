@@ -41,6 +41,10 @@ public partial class DocumentViewerWindow : Window
     private readonly Action<ViewerOutcome, string?, string?>? _onDone;
     private readonly Action<string?, string?, bool, bool, bool>? _onLoginDone;
     private bool _resultReported;
+    // Set once OnClosing has already flushed a pending code-view edit and
+    // re-invoked Close() -- without this, the second Closing (raised by
+    // that Close() call) would try to flush again and never actually close.
+    private bool _closingAfterFlush;
     private WebView2? _officeWebView;
     private string? _pagePayloadJson;
     // Set by OnOfficeWebMessage the moment OnlyOffice's own iframe reports it
@@ -337,12 +341,16 @@ public partial class DocumentViewerWindow : Window
         using var doc = JsonDocument.Parse(e.WebMessageAsJson);
         var root = doc.RootElement;
         if (!root.TryGetProperty("type", out var typeEl) || typeEl.GetString() != "save") return;
+        SaveCode(root.GetProperty("content").GetString() ?? "");
+    }
+
+    private void SaveCode(string content)
+    {
         if (string.IsNullOrEmpty(_path))
         {
             ShowError("This code has no file to save to.");
             return;
         }
-        var content = root.GetProperty("content").GetString() ?? "";
         try
         {
             if (File.Exists(_path)) File.Copy(_path, _path + ".bak", overwrite: true);
@@ -448,7 +456,7 @@ public partial class DocumentViewerWindow : Window
         Close();
     }
 
-    private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    private async void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
         try { VideoView.Stop(); } catch { /* not playing */ }
         if (_resultReported) return;
@@ -457,6 +465,34 @@ public partial class DocumentViewerWindow : Window
             // Closed via the X button without submitting -- same as Cancel.
             _resultReported = true;
             _onLoginDone!(null, null, true, false, false);
+            return;
+        }
+        // Bug fix (2026-10-13), confirmed live: a manual code edit was
+        // silently lost on close unless the page's own Save button was
+        // clicked first -- monaco_viewer.html only ever sent its "save"
+        // message on that explicit click, never on window close. Flush
+        // whatever's currently in the editor before actually letting the
+        // window close, the same way "office" below already treats close
+        // as an implicit save (OnlyOffice syncs server-side on its own).
+        // Cancel first, do the async flush, then re-invoke Close() --
+        // _closingAfterFlush stops this same branch from re-triggering on
+        // the Closing event that Close() raises.
+        if (_kind == "code" && !_closingAfterFlush && _officeWebView?.CoreWebView2 != null)
+        {
+            e.Cancel = true;
+            _closingAfterFlush = true;
+            try
+            {
+                var json = await _officeWebView.CoreWebView2.ExecuteScriptAsync(
+                    "window.getPendingContent ? window.getPendingContent() : null");
+                var pending = JsonSerializer.Deserialize<string>(json);
+                if (pending != null) SaveCode(pending);
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"DocumentViewerWindow: OnClosing flush failed: {ex}");
+            }
+            Close();
             return;
         }
         // Closed via the window's own X button rather than a toolbar button --

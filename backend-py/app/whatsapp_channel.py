@@ -390,6 +390,26 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
     try:
         await closed_event.wait()
     finally:
+        # Bug fix (2026-10-13), confirmed live: this used to only clear
+        # Python's own bookkeeping (_sidecar[account] = None) and never
+        # actually terminated the Node.js child process. closed_event is
+        # only ever set by on_closed (the sidecar's OWN stdout pipe
+        # closing) -- if THIS coroutine instead exits because it was
+        # CANCELLED from outside (e.g. task_supervisor.py's supervise()
+        # deciding the loop stalled and restarting it), closed_event never
+        # fires, so the Node process this function spawned was never asked
+        # to stop -- it kept running, orphaned, holding the exact same
+        # WhatsApp session the next _run_sidecar call immediately spawns a
+        # NEW process for. Confirmed live via `Get-CimInstance Win32_Process`:
+        # 4 whatsapp-sidecar/index.js processes running at once (2 per
+        # account instead of 1), all children of the same backend, each
+        # pair endlessly kicking the other off WhatsApp's servers
+        # (statusCode=440 "Stream Errored (conflict)", every ~5-10s,
+        # forever) -- not two separate incidents, the same orphan fighting
+        # its own replacement. sidecar.stop() is idempotent (checks
+        # poll() first), so calling it here even when on_closed already
+        # fired (the process is already gone) is a safe no-op.
+        sidecar.stop()
         heartbeat_pump.cancel()
         _sidecar[account] = None
         _status[account].connected = False
