@@ -2989,7 +2989,7 @@ class ChatSession:
         model has already ignored one PERMISSION_NOTE_TEXT_TEMPLATE instruction
         and retried the same unapproved action anyway. Bypasses the model
         entirely and asks the real user directly -- same bypass-the-model,
-        translate-then-send-as-wire pattern as _send_silence_fallback_notice.
+        translate-then-send-as-wire pattern as deliver_relayed_reply.
         The caller does not inject_proactive() after this: no new turn starts,
         so there is nothing left to retry the blocked action until a genuine
         user message (submit() with is_real_user=True) answers it."""
@@ -3024,7 +3024,7 @@ class ChatSession:
         session's turn genuinely ends -- into THIS session's own visible chat,
         as if it were this session's own reply. Same bypass-the-model,
         translate-then-send-as-wire pattern as _send_permission_guard_direct_
-        ask/_send_silence_fallback_notice. review_reply already ran inside the
+        ask. review_reply already ran inside the
         ORIGINATING headless session (see _translate_wire_visible_text's own
         headless branch) -- only translation into THIS tab's own real language
         happens here, since the headless session that generated `text` has no
@@ -3734,43 +3734,6 @@ class ChatSession:
             lines.append(f"Steps completed so far this turn: {len(finished) - failed} succeeded, {failed} failed")
         return "\n".join(lines)
 
-    async def _send_silence_fallback_notice(self) -> None:
-        """Hard ceiling on narrator silence (2026-10-12, explicit instruction:
-        "Нарратор не имеет право молчать дольше минуты") -- fires in place of a
-        real progress comment when _check_progress_narration has nothing concrete
-        to report (_narration_action_facts() is None) but is already at its own
-        60s-of-silence gate (PROGRESS_NARRATION_INTERVAL_MS). Deliberately bypasses
-        generate_progress_comment entirely: that pipeline needs real facts to work
-        from, and feeding it none is exactly the failure mode the 2026-10-03 "no
-        facts -> stay silent" fix was written to avoid (asked to comment on
-        nothing, it invents specifics that sound plausible but aren't true). A
-        fixed, honest, content-free line carries no such risk, so it also skips
-        review_reply -- nothing task-specific in it to leak or mistone."""
-        from app.plugins.voice_api import translate_text
-
-        text = "Still working on this -- nothing new to report yet."
-        try:
-            translated = await translate_text(
-                text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                addressee_gender=get_owner_profile(self.workspace_dir).gender,
-            )
-        except Exception as exc:
-            log_event("engine", "progress_narration_fallback_translate_failed", tab_id=self.tab_id, error=str(exc))
-            translated = None
-        if translated:
-            text = translated
-        log_event("engine", "progress_narration_sent_fallback_no_facts", tab_id=self.tab_id)
-        self.last_visible_output_at = time.monotonic()
-        self.turn_narration_remarks.append(text)
-        del self.turn_narration_remarks[:-20]
-        self.pending_interim_notes.append(text)
-        wire = {
-            "type": "assistant",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": text}], "model": None, "stop_reason": None},
-            "session_id": None, "parent_tool_use_id": None,
-        }
-        await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
-
     def _narration_task(self) -> str:
         """The user's request for the current task -- the one thing the narrator
         needs to say where the task stands. Only the current real user request,
@@ -4435,22 +4398,21 @@ class ChatSession:
         # incident this fixes) so a slow/hung attempt fails fast and this
         # loop gets a real chance to try again within the SAME tick.
         # Narrator sees only real facts about a running small-model turn. No facts
-        # -> used to stay silent indefinitely (2026-10-03: filler without facts
-        # misleads the user). Per explicit instruction (2026-10-12), "Нарратор не
-        # имеет право молчать дольше минуты": that left the user staring at total
-        # silence for as long as the turn had genuinely nothing to report (a real
-        # incident: tab 3's hang/restart loop produced zero tool-call facts for
-        # ~12 minutes straight, 7 cycles, narrator silent the whole time). This
-        # function only ever reaches this point once at least PROGRESS_NARRATION_
-        # INTERVAL_MS has already elapsed since the last visible output (the gate
-        # above) -- so "no facts" here means the user is exactly at that minute-
-        # of-silence boundary. Send one honest, generic, nothing-invented notice
-        # instead of returning silently; NOT a revival of the 2026-10-03 filler --
-        # that fix was about not fabricating SPECIFIC false claims from stale
-        # dialogue, which this fixed, content-free line cannot do.
+        # -> stay silent (2026-10-03: filler without facts misleads the user).
+        # Bug fix (2026-10-14), per explicit instruction: the 2026-10-12 "Нарратор
+        # не имеет право молчать дольше минуты" fallback (a fixed "still working,
+        # nothing new" line, sent in place of a real comment whenever a minute
+        # passed with no concrete tool activity to report) was meant for a
+        # genuinely STUCK turn looking dead for minutes on end -- but it fired on
+        # every ordinary no-activity minute too (the model just thinking/
+        # generating, no tool calls), turning into repeated, content-free spam.
+        # That rule was only ever meant to cover active work, not silence while
+        # nothing is actually running -- reverted to simply staying silent here;
+        # a genuinely hung turn is check_hang_tick's own job to detect and
+        # recover from, not this cosmetic narrator's.
         activity = self._narration_action_facts()
         if activity is None:
-            await self._send_silence_fallback_notice()
+            log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
             return
         # Ported from a teammate's branch (807b3ea): how long this request has
         # been running is a real fact too ("this one is taking a while"), but
