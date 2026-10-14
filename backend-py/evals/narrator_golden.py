@@ -63,6 +63,19 @@ CASES = [
     # шестьдесят градусов" (60 F) for Kyiv in October. The rule since main's decision of
     # the same day: a figure in a result may be said, but as something found and still
     # being confirmed, never as the settled answer (hedge_if below).
+    # 2026-10-14, live: two minutes into a turn, nine remarks said, nothing new for a while.
+    # Every draft was rejected as a repeat of some earlier remark and the user heard nothing
+    # for 31.7s. Only the last two remarks count then (VOICE_NARRATION_STALE_REPEAT_WINDOW).
+    dict(name="long turn, silent again", task="Какой сегодня курс доллара к гривне?",
+         status=[ACTIVITY_START, TIER_1, "Tier 1 (openai/gpt-5-nano) produced an answer; moving on to checking it.",
+                 "Checking the result (no tools).", "The check did not confirm the task was done; escalating to tier 2.",
+                 "Tier 2 (openai/gpt-5.1-codex-mini) is working.", "Time spent on the request so far: 104 s.",
+                 "Nothing new has happened since the last remark, and the user has heard nothing for about 10 s."],
+         said=["Ищу курс доллара к гривне.", "Ищу курс в интернете.", "Нашла курс и сейчас его проверяю.",
+               "Всё ещё проверяю курс доллара к гривне.", "Продолжаю искать курс на сайте банка.",
+               "Работа над курсом ещё идёт.", "Пока всё ещё уточняю курс.", "Ищу данные о курсе на другом сайте.",
+               "Всё ещё работаю над вашим вопросом про курс."],
+         repeat_window=2, expect="say", need=[]),
     dict(name="answer unchecked", task="Сколько дней осталось до Нового года?",
          status=[ACTIVITY_START, TIER_1,
                  "Tool call get_current_time (arguments: {}); result: 2026-10-11 15:27",
@@ -148,7 +161,8 @@ def check(case, text):
     low = text.lower().replace("ё", "е")
     if any(w in low for w in case.get("hedge_if", ())) and not any(h in low for h in HEDGES):
         return False, "a figure stated as settled"
-    for prev in case["said"]:
+    # As voice_api.generate_progress_comment_direct with repeat_window (the stale case).
+    for prev in case["said"][-case["repeat_window"]:] if case.get("repeat_window") else case["said"]:
         if is_repeat(text, prev):
             return False, "repeat"
     if case["need"] and not any(n in text.lower().replace("ё", "е") for n in case["need"]):

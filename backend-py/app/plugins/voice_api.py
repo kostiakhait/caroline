@@ -1323,6 +1323,7 @@ async def generate_progress_comment(
 async def generate_progress_comment_direct(
     task: str, activity: str, already_said: list[str], language: str,
     resolve: Callable[[str], Awaitable[str]], gender: str | None = None, addressee_gender: str | None = None,
+    repeat_window: int | None = None,
 ) -> str | None:
     """One-call narration (2026-10-10): drafted straight in `language` by the model
     behind `resolve` (prompt -> raw reply), checked exactly like
@@ -1359,7 +1360,10 @@ async def generate_progress_comment_direct(
     if _looks_like_narration_garbage(text, language) or _is_echo_of_prompt_example(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300], direct=True)
         return None
-    if already_said and any(_is_repeat(text, prev) for prev in already_said):
+    # repeat_window: how many of the latest remarks a new one may not repeat; None, all of
+    # them. See chat_session.py's _step_voice_narration for when it is narrowed.
+    recent = already_said[-repeat_window:] if repeat_window else already_said
+    if recent and any(_is_repeat(text, prev) for prev in recent):
         log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300], direct=True)
         return ""
     if _FINISH_CLAIM.search(text):

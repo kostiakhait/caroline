@@ -317,6 +317,13 @@ NARRATION_FAILURE_RETRY_S = 15.0
 # speech queue quiet (speech_state, see on_client_speech_state). Text-only turns and
 # SDK-path turns keep PROGRESS_NARRATION_INTERVAL_MS unchanged.
 VOICE_NARRATION_TICK_S = 1.0
+# When nothing new has happened and the user has heard nothing for VOICE_NARRATION_STALE_S,
+# a remark only may not repeat the last this many remarks (instead of any said this turn).
+# Live 2026-10-14: a 2-minute turn had 9 remarks behind it, every new draft of both models
+# was rejected as a repeat of one of them, and the user heard nothing for 31.7s right
+# before the answer. Saying again, in other words, that the work goes on -- after half a
+# minute -- is what a person would do; silence on a call sounds like a hang.
+VOICE_NARRATION_STALE_REPEAT_WINDOW = 2
 # Per explicit instruction (2026-10-11, and again 2026-10-12 when its cost for the voice
 # loop was put to him: "он необходим для предотвращения ошибок модели, оставляем"): every
 # outbound text goes through the server's reply.review, a narration remark first of all.
@@ -5050,7 +5057,8 @@ class ChatSession:
         if self._first_voice_remark is not None and self._first_voice_remark not in already_said:
             already_said.append(self._first_voice_remark)  # known already, even if not out yet
         self._narration_draft_task = asyncio.create_task(
-            self._draft_voice_narration(self._narration_turn_seq, facts_for_model, self._narration_task(), already_said)
+            self._draft_voice_narration(self._narration_turn_seq, facts_for_model, self._narration_task(), already_said,
+                                        stale=nothing_new)
         )
 
     async def _say_first_voice_remark(self, turn_seq: int, remark: str, audio_task: asyncio.Task[str | None] | None) -> None:
@@ -5068,14 +5076,14 @@ class ChatSession:
         log_event("engine", "voice_narration_drafted", tab_id=self.tab_id, comment=remark, first=True)
         self._voice_narration_wake.set()
 
-    async def _draft_voice_narration(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
+    async def _draft_voice_narration(self, turn_seq: int, facts: str, task: str, already_said: list[str], stale: bool = False) -> None:
         try:
-            await self._draft_voice_narration_body(turn_seq, facts, task, already_said)
+            await self._draft_voice_narration_body(turn_seq, facts, task, already_said, stale)
         finally:
             if turn_seq == self._narration_turn_seq:
                 self._narration_draft_task = None
 
-    async def _draft_voice_narration_body(self, turn_seq: int, facts: str, task: str, already_said: list[str]) -> None:
+    async def _draft_voice_narration_body(self, turn_seq: int, facts: str, task: str, already_said: list[str], stale: bool = False) -> None:
         from app.plugins.voice_api import generate_progress_comment
 
         language = current_language_name(self.tab_id)
@@ -5092,6 +5100,7 @@ class ChatSession:
                     comment = await draft_narration_remark(
                         task, facts, already_said, language,
                         gender=get_persona_gender(self.workspace_dir), addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                        repeat_window=VOICE_NARRATION_STALE_REPEAT_WINDOW if stale else None,
                     )
                 except asyncio.CancelledError:
                     raise

@@ -42,7 +42,8 @@ async def main():
             t0 = time.monotonic()
             try:
                 if MODE == "ladder":  # what the app does: the cheap model first, the fast one when it is silent
-                    text = await eng.draft_narration_remark(case["task"], activity, list(case["said"]), "Russian", gender="female")
+                    text = await eng.draft_narration_remark(case["task"], activity, list(case["said"]), "Russian", gender="female",
+                                                         repeat_window=case.get("repeat_window"))
                 elif MODE == "direct":
                     text = await v.generate_progress_comment_direct(
                         case["task"], activity, list(case["said"]), "Russian", RESOLVE,

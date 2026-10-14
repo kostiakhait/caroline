@@ -2015,6 +2015,7 @@ async def resolve_narration_prompt(prompt: str, model: str | None = None, reason
 
 async def draft_narration_remark(
     task: str, facts: str, already_said: list[str], language: str, gender: str | None = None, addressee_gender: str | None = None,
+    repeat_window: int | None = None,
 ) -> str | None:
     """One narration remark by the ladder: NARRATOR_FIRST_MODEL, then NARRATOR_MODEL when
     the first has nothing or is rejected. Same contract as
@@ -2024,12 +2025,14 @@ async def draft_narration_remark(
     async def first(prompt: str) -> str:
         return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
 
-    remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender)
+    remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
+                                                    repeat_window=repeat_window)
     if remark:
         log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
         return remark
     remark = await generate_progress_comment_direct(
         task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
+        repeat_window=repeat_window,
     )
     log_event("engine", "narration_drafted", by="second", model=NARRATOR_MODEL, said=bool(remark))
     return remark
