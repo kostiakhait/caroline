@@ -339,4 +339,28 @@ public partial class VisualModeWindow : Window
     /// just mean "done, unblock whatever's awaiting playbackEnded".
     /// </summary>
     public void TriggerStop() => PlaybackEnded?.Invoke();
+
+    /// <summary>
+    /// Silences the clip at once. The audio is muxed into the video playing inside the
+    /// WebView2, and Close() alone leaves it playing until the WebView2 is torn down --
+    /// live (2026-10-14), Stop pressed in the chat closed this window 2ms later and the
+    /// user still heard the rest of the phrase. This window's own Stop button always
+    /// paused the video first (OnStopClick); every other way of closing it now does the
+    /// same, and mutes the WebView2 too, which takes effect without waiting for script.
+    /// </summary>
+    public void SilenceNow()
+    {
+        try
+        {
+            var core = _webView?.CoreWebView2;
+            if (core == null) return;
+            core.IsMuted = true;
+            _ = core.ExecuteScriptAsync(
+                "(function(){var v=document.getElementById('vid'); v.pause(); v.removeAttribute('src'); v.load();})()");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"VisualModeWindow: SilenceNow failed: {ex.Message}");
+        }
+    }
 }

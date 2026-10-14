@@ -525,6 +525,8 @@ public sealed class VisualModeManager
         if (_activeWindow == window) _activeWindow = null;
         if (_lingeringWindow == window) _lingeringWindow = null;
         Logger.Log("VisualModeManager: CloseWindow -- closing the window.");
+        // Not a sound after this point -- see VisualModeWindow.SilenceNow.
+        window.SilenceNow();
         try { window.Close(); } catch (Exception ex) { Logger.Log($"VisualModeManager: window.Close() threw: {ex}"); }
     }
 }
