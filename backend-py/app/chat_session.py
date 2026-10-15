@@ -276,7 +276,11 @@ MAX_CONSECUTIVE_NARRATION_COMMENTS = 3
 # 4th attempt succeeded), each one previously costing most of a minute of
 # silence even though the tick itself fired exactly on schedule. Flat, no
 # backoff (matches this codebase's own no-exponential-backoff convention).
-NARRATION_GENERATION_RETRY_ATTEMPTS = 3
+# Raised 3 -> 4 (2026-10-15), per explicit instruction, same incident as
+# NARRATION_NETWORK_TIMEOUT_S's own 2026-10-15 note just below: more
+# attempts per burst gives a flaky SMALL-model endpoint more chances to
+# land one success before a long-running turn's own watchdog tick moves on.
+NARRATION_GENERATION_RETRY_ATTEMPTS = 4
 
 # Bug fix (2026-09-22), per explicit instruction ("Нарратор должен
 # срабатывать КАЖДУЮ МИНУТУ"): confirmed live -- a single narration
@@ -289,7 +293,17 @@ NARRATION_GENERATION_RETRY_ATTEMPTS = 3
 # generate_progress_comment/translate_text, which forward it to sw_api.
 # py's _post_json) makes a slow/hung attempt fail fast so the OUTER retry
 # loop above gets a real chance to try again within the same minute.
-NARRATION_NETWORK_TIMEOUT_S = 30.0
+# Raised 30.0 -> 45.0 (2026-10-15), per explicit instruction, after a real
+# incident: the SMALL model's own ai:resolve endpoint degraded for a couple
+# of hours (41 of 104 narration attempts that day failed with a flat 30.0s
+# ReadTimeout, Camerlengo itself confirmed healthy -- the bottleneck is
+# upstream of it), leaving long stretches of a still-running turn with no
+# narration at all despite 3-4 retries, since every attempt hit the same
+# wall before the model had a chance to actually answer. Deliberately
+# accepts a looser "every minute" promise during a degraded patch like this
+# one over guaranteed silence -- the explicit tradeoff chosen when this was
+# raised.
+NARRATION_NETWORK_TIMEOUT_S = 45.0
 
 # Bug fix (2026-09-22), same instruction: _check_progress_narration used
 # to claim the 60s interval (last_visible_output_at) BEFORE attempting
@@ -301,7 +315,14 @@ NARRATION_NETWORK_TIMEOUT_S = 30.0
 # instead -- long enough to not hammer, short enough that the user isn't
 # left with a full extra silent minute on top of the one that already
 # produced nothing.
-NARRATION_FAILURE_RETRY_S = 15.0
+# Lowered 15.0 -> 8.0 (2026-10-15), same incident/instruction as the two
+# constants above: a fully-exhausted burst (now up to 4 x 45s = 180s worst
+# case) already spaces attempts out plenty on its own during a real outage;
+# the extra 15s on top of that, repeated every burst for the lifetime of a
+# long turn, was pure additional silence for no real benefit to backing off
+# -- shortened so a still-running turn gets more total bursts, and each one
+# more chances to land a comment.
+NARRATION_FAILURE_RETRY_S = 8.0
 
 # Per explicit instruction (2026-09-13/2026-09-14): was a process-wide kill
 # switch (SMALL_MODEL_ENABLED, always False) while the small-model path's
