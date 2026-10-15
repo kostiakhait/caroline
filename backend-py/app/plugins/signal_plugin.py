@@ -46,6 +46,7 @@ from app.signal_channel import (
 )
 from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
 
 
 def _account_or_error(args: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -171,6 +172,21 @@ async def signal_list_groups(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     except SignalError as exc:
         return {"text": str(exc), "is_error": True}
     return {"text": str(groups)}
+
+
+async def signal_find_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'signal_find_group needs "query".', "is_error": True}
+    try:
+        groups = await list_groups(account)
+    except SignalError as exc:
+        return {"text": str(exc), "is_error": True}
+    matches = await find_by_name(query, groups)
+    return {"text": str(matches)}
 
 
 async def signal_create_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -342,6 +358,15 @@ PLUGIN = Plugin(
             "Lists an account's Signal groups with their ids and members. `account`: \"self\" (default) or "
             "\"owner\".",
             {"account": str | None}, signal_list_groups,
+        ),
+        PluginTool(
+            "signal_find_group",
+            "Finds the group(s) matching a name/description, by MEANING (transliteration, diminutives, typos, "
+            "word order) -- never exact text. Use this instead of signal_list_groups whenever you're looking "
+            "for one specific group rather than browsing. Returns the same row shape as signal_list_groups, "
+            "only the ones that actually match -- possibly empty if genuinely nothing fits. `account`: "
+            "\"self\" (default) or \"owner\".",
+            {"query": str, "account": str | None}, signal_find_group,
         ),
         PluginTool(
             "signal_create_group",

@@ -28,6 +28,7 @@ import json
 from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
 from app.plugins.notes_api import load_credentials
 from app.plugins.ratatosk_api import find_or_create_dm, get_recent_messages, list_conversations, send_message
 from app.plugins.ratatosk_own_account import (
@@ -89,6 +90,16 @@ async def ratatosk_list_conversations(args: dict[str, Any], _rp: Any) -> dict[st
     return {"text": json.dumps(conversations, ensure_ascii=False)}
 
 
+async def ratatosk_find_conversation(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"text": 'ratatosk_find_conversation needs "query".', "is_error": True}
+    session, sender_email = await resolve_ratatosk_session(args.get("account") or DEFAULT_ACCOUNT)
+    conversations = await list_conversations(session, sender_email)
+    matches = await find_by_name(query, conversations)
+    return {"text": json.dumps(matches, ensure_ascii=False)}
+
+
 async def ratatosk_get_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     session, _sender_email = await resolve_ratatosk_session(args.get("account") or DEFAULT_ACCOUNT)
     messages = await get_recent_messages(session, args["groupId"], args.get("days") or 2)
@@ -137,6 +148,15 @@ PLUGIN = Plugin(
             "Lists Ratatosk conversations (each a group, including 2-person DMs) for the given identity. "
             + _ACCOUNT_DESC,
             {"account": str | None}, ratatosk_list_conversations,
+        ),
+        PluginTool(
+            "ratatosk_find_conversation",
+            "Finds the conversation(s) matching a name/description, by MEANING (transliteration, diminutives, "
+            "typos, word order) -- never exact text. Use this instead of ratatosk_list_conversations whenever "
+            "you're looking for one specific person/group rather than browsing. Returns the same row shape as "
+            "ratatosk_list_conversations, only the ones that actually match -- possibly empty if genuinely "
+            "nothing fits. " + _ACCOUNT_DESC,
+            {"query": str, "account": str | None}, ratatosk_find_conversation,
         ),
         PluginTool(
             "ratatosk_get_messages",

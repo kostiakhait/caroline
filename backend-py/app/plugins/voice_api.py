@@ -343,7 +343,10 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     return output["text"]
 
 
-async def check_permission_guard(task: str, recent_dialogue: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+async def check_permission_guard(
+    task: str, recent_dialogue: str, previous_block_reason: str | None = None,
+    session: str | None = None, timeout: float = 15.0,
+) -> dict[str, Any] | None:
     """Per explicit instruction (2026-10-11): Caroline often asks a yes/no
     permission question and then, a turn or two later, does the thing
     anyway even though the user never answered -- silence must be treated
@@ -355,14 +358,27 @@ async def check_permission_guard(task: str, recent_dialogue: str, session: str |
     instruction -- deciding whether approval was actually given needs real
     judgment over the dialogue, not a keyword check.
 
-    Returns {"needs_approval": bool, "reason": str} on a clean result, or
-    None on any error/timeout/malformed response (fail-open, same
-    philosophy as translate_text/review_reply: an infrastructure hiccup
-    must not paralyze Caroline -- this is defense-in-depth on top of the
-    system prompt, not the only line of defense). The caller
-    (chat_session.py) decides what to do with None -- typically, leave
-    whatever gate state it already had untouched."""
-    body: dict[str, Any] = {"command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue}
+    `previous_block_reason` (2026-10-15): the reason string from this
+    session's own last block, if any -- lets the agent judge whether the
+    action it is flagging NOW is the SAME one as before (needed so the
+    client can keep its own escalation counter running across a user's
+    CLARIFICATION of the same still-pending action, instead of resetting on
+    every new message). Judged by the agent itself, semantically, from the
+    whole dialogue it already reads -- never a hardcoded string comparison
+    on this end, confirmed live to be unsafe: the SAME action's own reason
+    text genuinely drifted in wording across two consecutive real calls.
+
+    Returns {"needs_approval": bool, "reason": str, "same_action_as_before":
+    bool} on a clean result, or None on any error/timeout/malformed response
+    (fail-open, same philosophy as translate_text/review_reply: an
+    infrastructure hiccup must not paralyze Caroline -- this is
+    defense-in-depth on top of the system prompt, not the only line of
+    defense). The caller (chat_session.py) decides what to do with None --
+    typically, leave whatever gate state it already had untouched."""
+    body: dict[str, Any] = {
+        "command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue,
+        "previousBlockReason": previous_block_reason or "",
+    }
     if not session:
         session = await get_cached_v2_session()
     if session:
@@ -379,7 +395,54 @@ async def check_permission_guard(task: str, recent_dialogue: str, session: str |
     if not isinstance(output, dict) or not isinstance(output.get("needs_approval"), bool):
         log_event("plugin:voice", "check_permission_guard_failed", reason="malformed")
         return None
-    return {"needs_approval": output["needs_approval"], "reason": str(output.get("reason") or "")}
+    return {
+        "needs_approval": output["needs_approval"], "reason": str(output.get("reason") or ""),
+        "same_action_as_before": bool(output.get("same_action_as_before")),
+    }
+
+
+async def fuzzy_match(query: str, candidates: list[dict[str, str]], session: str | None = None, timeout: float = 15.0) -> list[str] | None:
+    """Per explicit instruction (2026-10-15): confirmed live -- messenger
+    chat/contact lookups across this backend were doing hardcoded, literal
+    substring matching (app/plugins/companion_contacts_store.py's own
+    search_contacts()) or just dumping a raw, un-matched list back to the
+    model to eyeball itself (every messenger's own *_list_chats/*_list_
+    channels tool) -- "Mikhail Murashov" never found a real contact named
+    "Mikhail Murashev" (one letter off). Backed by a real, domain-agnostic
+    microagent (server-side search.fuzzy_match, apps/microagents/Search.py)
+    -- matching is the model's own semantic judgment (transliteration,
+    diminutives, typos, word order), never a hardcoded string/substring
+    comparison here or on the server.
+
+    `candidates`: a list of {"label": <a short id/number the caller can map
+    back to its own data, unique per call>, "text": <what the model should
+    judge the candidate by -- a name, plus any other identifying detail>}.
+
+    Returns the list of matched labels (possibly empty, meaning no
+    candidate fit -- not an error), in best-match-first order, or None on
+    any error/timeout/malformed response (fail-open, same philosophy as
+    every other check_*/translate_text here). The caller decides what None
+    means for its own flow -- typically, fall back to whatever cruder
+    matching it already had, rather than treating "couldn't ask" the same
+    as "found nothing"."""
+    body: dict[str, Any] = {"command": "search:fuzzyMatch", "key": CAROLINE_SW_KEY, "query": query, "candidates": candidates}
+    if not session:
+        session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "fuzzy_match_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "fuzzy_match_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("matches"), list):
+        log_event("plugin:voice", "fuzzy_match_failed", reason="malformed")
+        return None
+    return [str(m) for m in output["matches"]]
 
 
 async def check_refusal_guard(task: str, assistant_reply: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:

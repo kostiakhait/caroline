@@ -46,6 +46,7 @@ from app.whatsapp_channel import (
 )
 from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
 
 
 def _to_jid(raw: str) -> str:
@@ -88,6 +89,21 @@ async def whatsapp_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     except WhatsAppError as exc:
         return {"text": str(exc), "is_error": True}
     return {"text": str(chats)}
+
+
+async def whatsapp_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'whatsapp_find_chat needs "query".', "is_error": True}
+    try:
+        chats = await list_chats(account)
+    except WhatsAppError as exc:
+        return {"text": str(exc), "is_error": True}
+    matches = await find_by_name(query, chats)
+    return {"text": str(matches)}
 
 
 async def whatsapp_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -269,8 +285,9 @@ def _usage_instructions() -> str:
         "automatically, never a guessed name. whatsapp_login(account=...) is one-time setup per account (a QR "
         "code image opens automatically to scan) -- call it only when the user has explicitly asked to "
         "connect that account, and make sure they understand the risk stated above before doing so, never on "
-        "your own initiative. WhatsApp has no model-facing search here -- whatsapp_list_chats only returns "
-        "chats already seen since that account's connection came up (Baileys keeps no history by default).\n"
+        "your own initiative. whatsapp_find_chat(query) finds a chat by name/description, judged by meaning -- "
+        "use it instead of whatsapp_list_chats when looking for one specific chat; both only ever see chats "
+        "already seen since that account's connection came up (Baileys keeps no history by default).\n"
         "Unlike Telegram, WhatsApp needs no prior contact/dialog to message a number cold -- any registered "
         "number can be messaged directly, no add-contact step. whatsapp_check_number is purely an optional "
         "preflight (is this number even on WhatsApp); whatsapp_block_user/whatsapp_unblock_user are the real "
@@ -305,6 +322,15 @@ PLUGIN = Plugin(
             "Lists an account's WhatsApp chats seen since the connection came up, each with its jid -- the id "
             "to use for whatsapp_send_message. `account`: \"self\" (default) or \"owner\".",
             {"account": str | None}, whatsapp_list_chats,
+        ),
+        PluginTool(
+            "whatsapp_find_chat",
+            "Finds the chat(s) matching a name/description, by MEANING (transliteration, diminutives, typos, "
+            "word order) -- never exact text. Use this instead of whatsapp_list_chats whenever you're looking "
+            "for one specific person/group rather than browsing. Returns the same row shape as "
+            "whatsapp_list_chats, only the ones that actually match -- possibly empty if genuinely nothing "
+            "fits. `account`: \"self\" (default) or \"owner\".",
+            {"query": str, "account": str | None}, whatsapp_find_chat,
         ),
         PluginTool(
             "whatsapp_send_message",

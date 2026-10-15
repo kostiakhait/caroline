@@ -30,6 +30,7 @@ from app.slack_channel import (
 )
 from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
 
 
 def _account_or_error(args: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -78,6 +79,30 @@ async def slack_list_channels(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         kind = "dm" if ch.get("is_im") else "group_dm" if ch.get("is_mpim") else "private_channel" if ch.get("is_private") else "channel"
         rows.append({"id": ch["id"], "name": ch.get("name") or ch.get("user") or ch["id"], "kind": kind})
     return {"text": str(rows)}
+
+
+async def slack_find_channel(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'slack_find_channel needs "query".', "is_error": True}
+    try:
+        result = await client.conversations_list(
+            types="public_channel,private_channel,mpim,im", exclude_archived=True, limit=200,
+        )
+    except SlackApiError as exc:
+        return {"text": f"Slack API error: {exc.response.get('error', str(exc))}", "is_error": True}
+    rows = []
+    for ch in result.get("channels", []):
+        kind = "dm" if ch.get("is_im") else "group_dm" if ch.get("is_mpim") else "private_channel" if ch.get("is_private") else "channel"
+        rows.append({"id": ch["id"], "name": ch.get("name") or ch.get("user") or ch["id"], "kind": kind})
+    matches = await find_by_name(query, rows)
+    return {"text": str(matches)}
 
 
 async def slack_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -168,6 +193,15 @@ PLUGIN = Plugin(
             "to (or, for \"self\", was invited to), each with its raw conversation id -- the id to use for "
             "slack_send_message/slack_search_messages. `account`: \"self\" (default) or \"owner\".",
             {"account": str | None}, slack_list_channels,
+        ),
+        PluginTool(
+            "slack_find_channel",
+            "Finds the channel/DM(s) matching a name/description, by MEANING (transliteration, diminutives, "
+            "typos, word order) -- never exact text. Use this instead of slack_list_channels whenever you're "
+            "looking for one specific channel/person rather than browsing. Returns the same row shape as "
+            "slack_list_channels, only the ones that actually match -- possibly empty if genuinely nothing "
+            "fits. `account`: \"self\" (default) or \"owner\".",
+            {"query": str, "account": str | None}, slack_find_channel,
         ),
         PluginTool(
             "slack_send_message",

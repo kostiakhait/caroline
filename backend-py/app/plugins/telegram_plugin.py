@@ -59,6 +59,7 @@ from app.telegram_channel import (
 )
 from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
 
 
 # Bug fix (2026-10-11), seen live: with the application not registered,
@@ -165,6 +166,30 @@ async def telegram_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         for d in dialogs
     ]
     return {"text": str(rows)}
+
+
+async def telegram_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'telegram_find_chat needs "query".', "is_error": True}
+    client = get_live_client(account)
+    # A much higher cap than telegram_list_chats' own default (50) -- this
+    # tool exists specifically so a chat far down the dialog list is still
+    # found, not just whatever happens to be most recently active.
+    limit = int(args.get("limit") or 500)
+    dialogs = await client.get_dialogs(limit=limit)
+    rows = [
+        {"id": d.id, "name": d.name, "isGroup": d.is_group, "isChannel": d.is_channel, "unread": d.unread_count}
+        for d in dialogs
+    ]
+    matches = await find_by_name(query, rows)
+    return {"text": str(matches)}
 
 
 async def telegram_add_contact(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -490,6 +515,16 @@ PLUGIN = Plugin(
             "for telegram_send_message/telegram_search_messages. `account`: \"self\" (default, your own "
             "account) or \"owner\" (the owner's own account).",
             {"limit": int | None, "account": str | None}, telegram_list_chats,
+        ),
+        PluginTool(
+            "telegram_find_chat",
+            "Finds the chat(s) matching a name/description, by MEANING (transliteration, diminutives, typos, "
+            "word order) -- never exact text. Use this instead of telegram_list_chats whenever you're looking "
+            "for one specific person/group rather than browsing: a near-miss spelling, a nickname, or a chat "
+            "further down the list than telegram_list_chats' own default would still be found. Returns the "
+            "same row shape as telegram_list_chats, only the ones that actually match -- possibly empty if "
+            "genuinely nothing fits. `account`: \"self\" (default) or \"owner\".",
+            {"query": str, "limit": int | None, "account": str | None}, telegram_find_chat,
         ),
         PluginTool(
             "telegram_add_contact",

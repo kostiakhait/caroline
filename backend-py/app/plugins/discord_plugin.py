@@ -17,6 +17,7 @@ import discord
 from app.discord_channel import get_live_client, has_discord_token, set_discord_token
 from app.workspace_dir import WORKSPACE_DIR
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
 
 
 async def discord_set_token(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -44,6 +45,24 @@ async def discord_list_channels(_args: dict[str, Any], _rp: Any) -> dict[str, An
         if isinstance(dm, discord.DMChannel) and dm.recipient is not None:
             rows.append({"id": dm.id, "name": f"DM: {dm.recipient}", "kind": "dm"})
     return {"text": str(rows)}
+
+
+async def discord_find_channel(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    client = get_live_client()
+    if client is None:
+        return {"text": "Discord isn't connected yet -- use discord_set_token first.", "is_error": True}
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'discord_find_channel needs "query".', "is_error": True}
+    rows = []
+    for guild in client.guilds:
+        for channel in guild.text_channels:
+            rows.append({"id": channel.id, "name": f"{guild.name}#{channel.name}", "kind": "channel"})
+    for dm in client.private_channels:
+        if isinstance(dm, discord.DMChannel) and dm.recipient is not None:
+            rows.append({"id": dm.id, "name": f"DM: {dm.recipient}", "kind": "dm"})
+    matches = await find_by_name(query, rows)
+    return {"text": str(matches)}
 
 
 async def discord_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -110,6 +129,15 @@ PLUGIN = Plugin(
             "Lists every text channel in a server the bot has joined, plus any open DMs, each with its "
             "numeric id -- the id to use for discord_send_message/discord_search_messages.",
             {}, discord_list_channels,
+        ),
+        PluginTool(
+            "discord_find_channel",
+            "Finds the channel(s)/DM(s) matching a name/description, by MEANING (transliteration, diminutives, "
+            "typos, word order) -- never exact text. Use this instead of discord_list_channels whenever you're "
+            "looking for one specific channel/person rather than browsing. Returns the same row shape as "
+            "discord_list_channels, only the ones that actually match -- possibly empty if genuinely nothing "
+            "fits.",
+            {"query": str}, discord_find_channel,
         ),
         PluginTool(
             "discord_send_message",

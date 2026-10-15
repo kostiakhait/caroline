@@ -104,6 +104,7 @@ from app.plugins.companion_contacts_store import load_store as load_contacts_sto
 from app.plugins.companion_contacts_store import search_contacts as search_contacts_local
 from app.plugins.companion_sms_store import last_synced_at, list_all_threads, list_messages, list_threads, load_store, search_messages
 from app.plugins.loader import Plugin, PluginTool
+from app.plugins.voice_api import fuzzy_match
 from app.policies import follow_explicit_parameters_instruction
 from app.session_context import get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
@@ -308,6 +309,24 @@ async def companion_search_contacts_local(args: dict[str, Any], report_progress:
         except (AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
             return {"text": _device_error_text(exc), "is_error": True}
     results = search_contacts_local(store, query, device_id=device_id)
+    if not results:
+        # Bug fix (2026-10-15), confirmed live: search_contacts_local is a plain
+        # case-insensitive SUBSTRING match (companion_contacts_store.py's own
+        # search_contacts()) -- "Mikhail Murashov" never found a real contact
+        # named "Mikhail Murashev" (one letter off). Falls back to the
+        # search.fuzzy_match microagent over the FULL local pool (an empty
+        # query to search_contacts_local returns everything, scoped to the
+        # same device_id) only once the cheap/free substring match already
+        # found nothing -- the common case stays instant and free.
+        pool = search_contacts_local(store, "", device_id=device_id)
+        if pool:
+            candidates = [
+                {"label": str(i), "text": f"{c['name']} ({', '.join(c['numbers'])})" if c.get("numbers") else c["name"]}
+                for i, c in enumerate(pool)
+            ]
+            matched_labels = await fuzzy_match(query, candidates)
+            if matched_labels:
+                results = [pool[int(label)] for label in matched_labels if label.isdigit() and int(label) < len(pool)]
     return {"text": _json({"lastSyncedAt": contacts_last_synced_at(store), "contacts": results})}
 
 
