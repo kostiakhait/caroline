@@ -177,6 +177,21 @@ else:
 
 ESCALATION_SENTINEL = "[[NEED_ESCALATION]]"
 
+# Per explicit instruction (2026-10-15): the inverse of ESCALATION_SENTINEL --
+# the verifier's own judgment that what's LEFT to do, specifically, is simple
+# enough for a weaker tier, not a mechanical signal. Only the verifier emits
+# this (see _build_verification_prompt/verify_candidate); a tier's own worker
+# run never does, since there's no mid-task handoff point within a single
+# resolve_agentic() call.
+DEESCALATION_SENTINEL = "[[CAN_DEESCALATE]]"
+
+# Anti-bounce safety valve for the de-escalation mechanic: caps how many times
+# a single turn may step back down the ladder, so a tier A -> tier B -> tier A
+# -> tier B cycle (B judges "simple enough for A", A then re-escalates back to
+# B) cannot loop indefinitely -- same spirit as REPEATED_CALL_LIMIT below, just
+# for cross-tier bouncing instead of same-tier tool-call repetition.
+MAX_DEESCALATIONS = 2
+
 # Per explicit instruction (2026-09-12): NOT a task-complexity budget --
 # resolve_agentic()'s own doc comment documents this same thing. Set high
 # enough that real use should NEVER hit it; the two escalation mechanisms
@@ -1141,7 +1156,10 @@ def _make_executor_fn(
     return executor_fn
 
 
-def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None) -> str:
+def _build_verification_prompt(
+    tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
+    can_deescalate: bool = False,
+) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
     any work. It checks the candidate against the mechanical facts below.
 
@@ -1163,7 +1181,16 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
     called -- and (confirmed live) concluded the reply was fabricated even when 8 real
     IMAP calls had just happened. This is the SAME tier_trace the tier loop already
     tracks for its own continuation notes, passed straight through before it's
-    cleared."""
+    cleared.
+
+    `can_deescalate` (2026-10-15, "если продолжение по мнению самой модели может
+    быть сделано более простой моделью - спускаемся на один уровень по лестнице"):
+    True for every tier except the first one actually tried this turn. The mirror
+    image of `can_escalate` -- unfinished work isn't automatically harder than
+    what was just tried; sometimes a stronger tier already did the hard part and
+    what's left is mechanical. Mutually exclusive with escalating up for any given
+    verifier reply: the verifier picks exactly one of "still hard, escalate up",
+    "what's left is simple, step down", or "it's actually done"."""
     parts = [
         "The reply above is from another assistant that worked on the user's request. You are a verifier only: "
         "you have no tools and must not try to do or finish any work. Check the reply against the facts below."
@@ -1196,13 +1223,30 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
             "These tool operations were started but never confirmed as finished: "
             + ", ".join(sorted(tracker.pending_operation_ids))
         )
-    if can_escalate:
+    if can_escalate or can_deescalate:
+        branches = []
+        if can_escalate:
+            branches.append(
+                "The remaining work is still genuinely hard (the kind of thing the model that just tried this "
+                f'struggled with) -- reply with EXACTLY this and nothing else: "{ESCALATION_SENTINEL} <one short '
+                'sentence saying what is still missing or wrong>". A stronger model will pick it up from exactly '
+                "that point, with the full tool-call history so far."
+            )
+        if can_deescalate:
+            branches.append(
+                "The remaining work is simple and mechanical -- a clearly weaker, cheaper model could finish it "
+                f'from here -- reply with EXACTLY this and nothing else: "{DEESCALATION_SENTINEL} <one short '
+                'sentence saying what is left to do>". A less capable model will pick it up from exactly that '
+                "point, with the full tool-call history so far. Only choose this when you are confident the "
+                "SPECIFIC remaining steps are easy, not merely because the task as a whole seemed simple -- when "
+                "in doubt, do not use this."
+            )
         parts.append(
             "If, based on the reply and the facts above, the task is genuinely NOT finished yet -- real work "
-            f'still needed, not just a wording issue -- reply with EXACTLY this and nothing else: "{ESCALATION_SENTINEL} '
-            '<one short sentence saying what is still missing or wrong>". A stronger model will pick it up from '
-            "exactly that point, with the full tool-call history so far. Only do this for genuinely unfinished "
-            "work -- if it's actually done, write the final reply instead, as described below."
+            "still needed, not just a wording issue -- judge which of these applies:\n- "
+            + "\n- ".join(branches)
+            + "\n\nUse exactly one of the signals above, and only for genuinely unfinished work -- if it's "
+            "actually done, write the final reply instead, as described below."
         )
     parts.append(
         "Your reply is the final message the user will read. Write it fresh, clearly and to the point, directly "
@@ -1210,7 +1254,7 @@ def _build_verification_prompt(tracker: _TurnTracker, final_text: str, can_escal
         "work as a report. Do not claim anything is done unless the reply and facts above show it."
         + (
             ""
-            if can_escalate
+            if (can_escalate or can_deescalate)
             else (
                 " If the task genuinely could not be completed, say so plainly -- what was done, what was not, "
                 "and why -- and stop there. Do not tell the user what to do, do not suggest steps for them to "
@@ -1258,12 +1302,16 @@ _COMPLEXITY_PROMPT = (
 
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
     """Pre-assessment: a complex multi-step tool task starts directly at the second
-    tier (mini) instead of the first (nano). AI_MODEL_SMALL is used only for this
-    one-word service call -- it's also tier 0 of the real cascade, just invoked here
-    tool-free and in isolation."""
+    tier (mini) instead of the first (nano). Per explicit instruction (2026-10-15,
+    "Предварительную оценку задачи делаем gpt-5.1-mini, не nano"): this one-word
+    classification call itself now runs on AI_MODEL_MINI rather than AI_MODEL_SMALL
+    (nano) -- a sturdier judgment call for deciding whether nano is even worth
+    trying, at the cost of this one extra service call being a little more
+    expensive than before. AI_MODEL_SMALL remains tier 0 of the real cascade; it's
+    just no longer used for this pre-assessment itself."""
     try:
         raw = await asyncio.wait_for(
-            asyncio.to_thread(ai.resolve, _COMPLEXITY_PROMPT + user_text[:2000], model=cfg.AI_MODEL_SMALL, no_fallback=True),
+            asyncio.to_thread(ai.resolve, _COMPLEXITY_PROMPT + user_text[:2000], model=cfg.AI_MODEL_MINI, no_fallback=True),
             timeout=COMPLEXITY_TIMEOUT_S,
         )
         verdict = str(raw or "").strip().upper()
@@ -1290,17 +1338,24 @@ async def run_small_model_turn(
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
 
-    Three-tier cascade (nano -> mini -> AI_MODEL_ALTERNATE/Sonnet), carrying the
-    previous tier's real tool-call trace forward on every escalation. A tier
-    escalates mechanically (ESCALATION_SENTINEL, NeedsEscalation, _TurnStalled)
-    same as before, AND a verifier (AI_MODEL_MINI, tool-free -- a separate role)
-    checks every tier's
-    "done" candidate against the mechanical facts (undone plan steps, unconfirmed
-    operations): if it finds the task genuinely unfinished and a later tier still
-    exists, that is ALSO an escalation, not a final answer. Only once the last tier
-    has been tried and verified does the verifier write the actual final user-facing
-    text -- a real answer if it's done, or a plain, honest "could not complete this"
-    if it still isn't, with no unsolicited instructions/tasks for the user either way.
+    Four-tier cascade (nano -> mini -> AI_MODEL_ALTERNATE/Sonnet -> AI_MODEL_OPUS),
+    carrying the previous tier's real tool-call trace forward on every hand-off in
+    either direction. A tier escalates mechanically (ESCALATION_SENTINEL,
+    NeedsEscalation, _TurnStalled) same as before, AND a verifier (AI_MODEL_MINI,
+    tool-free -- a separate role) checks every tier's "done" candidate against the
+    mechanical facts (undone plan steps, unconfirmed operations): if it finds the
+    task genuinely unfinished and a later tier still exists, that is ALSO an
+    escalation, not a final answer. Per explicit instruction (2026-10-15, "если
+    продолжение по мнению самой модели может быть сделано более простой моделью -
+    спускаемся на один уровень по лестнице"): the same verifier can ALSO judge the
+    opposite -- the remaining work is simple enough for a weaker tier -- via
+    DEESCALATION_SENTINEL, stepping the cascade back down one tier instead of up
+    (capped at MAX_DEESCALATIONS per turn, so a tier can't bounce back and forth
+    indefinitely). Only once a tier's candidate is verified as actually done (or
+    the last tier has been tried and verified with no de-escalation left to try)
+    does the verifier write the actual final user-facing text -- a real answer if
+    it's done, or a plain, honest "could not complete this" if it still isn't, with
+    no unsolicited instructions/tasks for the user either way.
 
     on_live_dialogue_update(lines), if given, is called every time this turn's
     own live exchange changes -- feeds the progress narrator. get_new_user_comments(),
@@ -1423,10 +1478,9 @@ async def run_small_model_turn(
     def on_usage(usage: dict[str, Any]) -> None:
         log_event("engine", "small_model_usage", tab_id=tab_id, **usage)
 
-    # Final tier: AI_MODEL_ALTERNATE (Sonnet) used here WITH tools as a real
-    # escalation worker -- a distinct role from AI_MODEL_MINI's OTHER, tool-free
-    # use below as the verifier.
-    tiers = [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE]
+    # Final tier: AI_MODEL_OPUS used here WITH tools as a real escalation worker --
+    # a distinct role from AI_MODEL_MINI's OTHER, tool-free use below as the verifier.
+    tiers = [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS]
     log_event("engine", "small_model_resolved", tab_id=tab_id, tiers=tiers, tool_count=len(registry.tool_defs))
 
     # Verification (AI_MODEL_MINI, no tools) runs after every tier that
@@ -1434,10 +1488,10 @@ async def run_small_model_turn(
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
     # is no longer only a final polish pass tacked on after the loop.
-    async def run_verifier(candidate_text: str, can_escalate: bool, trace: list[str]) -> str:
+    async def run_verifier(candidate_text: str, can_escalate: bool, can_deescalate: bool, trace: list[str]) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
-        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace)})
+        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate)})
         return await _call_with_funds_wait(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
@@ -1449,19 +1503,22 @@ async def run_small_model_turn(
             tab_id, emit,
         )
 
-    async def verify_candidate(candidate_text: str, can_escalate: bool, trace: list[str] | None = None) -> tuple[str, bool]:
-        """Returns (text, needs_escalation). A technical verifier failure (empty
-        reply/exception on both attempts) is never treated as an escalation signal --
-        it just falls back to the candidate as-is, same as before this change.
-        _FundsExhaustedGivingUp is NOT a technical failure -- let it propagate to
-        the caller, which turns it into the same honest final answer regardless of
-        whether funds ran out on a tier call or here."""
+    async def verify_candidate(
+        candidate_text: str, can_escalate: bool, can_deescalate: bool = False, trace: list[str] | None = None,
+    ) -> tuple[str, str]:
+        """Returns (text, action), action one of "done"/"up"/"down". A technical
+        verifier failure (empty reply/exception on both attempts) is never treated
+        as an escalation or de-escalation signal -- it just falls back to the
+        candidate as-is, same as before this change. _FundsExhaustedGivingUp is NOT
+        a technical failure -- let it propagate to the caller, which turns it into
+        the same honest final answer regardless of whether funds ran out on a tier
+        call or here."""
         emit("Checking the result (no tools).")
         verified = ""
         for attempt in (1, 2):
-            log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate)
+            log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate, can_deescalate=can_deescalate)
             try:
-                verified = await run_verifier(candidate_text, can_escalate, trace or [])
+                verified = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [])
             except _FundsExhaustedGivingUp:
                 raise
             except Exception as exc:  # noqa: BLE001 -- verifier failure is a retry, never silence
@@ -1471,18 +1528,22 @@ async def run_small_model_turn(
                 break
         if not verified.strip():
             log_event("engine", "small_model_verification_fallback_candidate", tab_id=tab_id, text_len=len(candidate_text))
-            return candidate_text, False
+            return candidate_text, "done"
         if can_escalate and ESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=verified.replace(ESCALATION_SENTINEL, "").strip()[:200])
-            return verified, True
+            return verified, "up"
+        if can_deescalate and DEESCALATION_SENTINEL in verified:
+            log_event("engine", "small_model_verification_deescalating", tab_id=tab_id, note=verified.replace(DEESCALATION_SENTINEL, "").strip()[:200])
+            return verified, "down"
         log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
-        return verified, False
+        return verified, "done"
 
     start_index = await _start_tier_index(ai, cfg, user_text)
     final_text = ""
-    for index, model in enumerate(tiers):
-        if index < start_index:
-            continue
+    index = start_index
+    deescalations_used = 0
+    while index < len(tiers):
+        model = tiers[index]
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
         emit(f"Tier {index + 1} ({model}) is working.")
         current_model["name"] = model
@@ -1516,19 +1577,27 @@ async def run_small_model_turn(
             log_event("engine", "small_model_tier_answered", tab_id=tab_id, tier=index, model=model, text_len=len(candidate), text=candidate)
             emit(f"Tier {index + 1} ({model}) produced an answer; moving on to checking it.")
             can_escalate = index < len(tiers) - 1
+            can_deescalate = index > 0 and deescalations_used < MAX_DEESCALATIONS
             try:
-                verified_text, needs_escalation = await verify_candidate(candidate, can_escalate, tier_trace)
+                verified_text, action = await verify_candidate(candidate, can_escalate, can_deescalate, tier_trace)
             except _FundsExhaustedGivingUp as exc:
                 log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
                 return _answer(_funds_exhausted_final_answer(exc.reason))
-            if not needs_escalation:
+            if action == "done":
                 final_text = verified_text
                 break
-            emit(f"The check did not confirm the task was done; escalating to tier {index + 2}.")
             if tier_trace:
                 messages.append({"role": "user", "content": _continuation_note(tier_trace)})
                 tier_trace.clear()
+            if action == "down":
+                deescalations_used += 1
+                emit(f"The check found the remaining work simple enough for a weaker tier; stepping down to tier {index}.")
+                messages.append({"role": "user", "content": f"[Verifier checked the previous attempt and judged what's left simple enough for a less capable model: {verified_text.replace(DEESCALATION_SENTINEL, '').strip()}]"})
+                index -= 1
+                continue
+            emit(f"The check did not confirm the task was done; escalating to tier {index + 2}.")
             messages.append({"role": "user", "content": f"[Verifier checked the previous attempt and found it not actually finished: {verified_text.replace(ESCALATION_SENTINEL, '').strip()}]"})
+            index += 1
             continue
 
         emit(f"Tier {index + 1} ({model}) did not manage; moving on to the next tier.")
@@ -1536,13 +1605,14 @@ async def run_small_model_turn(
         if tier_trace:
             messages.append({"role": "user", "content": _continuation_note(tier_trace)})
             tier_trace.clear()
+        index += 1
 
     if not final_text:
         # No tier ever produced a usable candidate (all stalled/errored/escalated
-        # mechanically) -- one last, non-escalating verification pass so the user
-        # still gets a real, honest answer instead of silence.
+        # mechanically) -- one last, non-escalating, non-de-escalating verification
+        # pass so the user still gets a real, honest answer instead of silence.
         try:
-            verified_text, _ = await verify_candidate(final_text, can_escalate=False, trace=tier_trace)
+            verified_text, _ = await verify_candidate(final_text, can_escalate=False, can_deescalate=False, trace=tier_trace)
         except _FundsExhaustedGivingUp as exc:
             log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=None, model=None, reason=exc.reason)
             return _answer(_funds_exhausted_final_answer(exc.reason))

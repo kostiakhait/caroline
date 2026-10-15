@@ -48,6 +48,8 @@ AI_MODEL_ALTERNATE = "anthropic/claude-sonnet-5"
 AI_MODEL_MINI = "openai/gpt-5.1-codex-mini"
 AI_MODEL_CODEX_MAX = "openai/gpt-5.1-codex-max"
 AI_MODEL_SMALL = "openai/gpt-5-nano"
+# 4th, final small-model-path escalation tier (2026-10-15).
+AI_MODEL_OPUS = "anthropic/claude-opus-5.5"
 AI_MODEL_CODE_LARGE = "anthropic/claude-sonnet-4.5"
 AI_FLEXIBLE_MODEL_USE = True
 AI_BALANCE_THRESHOLD_TRANSLATION = 3.0
