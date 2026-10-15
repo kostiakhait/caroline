@@ -319,7 +319,25 @@ public sealed class AppBrowserHost : IDisposable
             // started, not block on a heavy SPA's full load.
             if (!string.IsNullOrEmpty(url)) await win.StartNavigateAsync(url);
             Logger.Log($"[app-browser-host] Dispatch(/open): done, returning (window is visible, navigation may still be in flight, cdpPort={win.CdpPort})");
-            return (200, JsonSerializer.Serialize(new { ok = true, url = win.CurrentUrl, cdpPort = win.CdpPort }));
+            // Bug fix (2026-10-15), confirmed live: win.CurrentUrl read
+            // immediately after the deliberately non-blocking
+            // StartNavigateAsync (see its own doc comment) almost always
+            // still reports the window's PRE-navigation state (about:blank
+            // for a freshly created window) -- WebView2 hasn't had a chance
+            // to update CoreWebView2.Source yet. A real incident: the
+            // small-model path saw "ok": true, "url": "about:blank" on
+            // every single open_app_browser call for a job-application task
+            // and, reading that as "the navigation didn't work", gave up and
+            // opened a NEW window under a new label each time instead of
+            // just checking again a moment later -- 4 orphaned browser
+            // windows, nothing actually accomplished. Report the URL we
+            // were just asked to navigate to (known-accurate -- Navigate()
+            // was just called with it) instead of the stale CurrentUrl
+            // snapshot when a url was given; CurrentUrl is still the right
+            // answer for a bare re-open/focus with no url (nothing new was
+            // just kicked off to be ahead of).
+            var reportedUrl = !string.IsNullOrEmpty(url) ? url : win.CurrentUrl;
+            return (200, JsonSerializer.Serialize(new { ok = true, url = reportedUrl, cdpPort = win.CdpPort }));
         }
 
         if (path == "/get_port")
