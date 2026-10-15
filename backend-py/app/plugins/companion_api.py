@@ -713,9 +713,6 @@ GetActiveTabIds = Callable[[], list[str]]
 # session right now (e.g. between a companion inbox drain and the tab
 # actually starting up) -- nothing gets published for it that tick.
 TabStatusSnapshot = Callable[[str], dict[str, str] | None]
-# Global (not per-tab) Ratatosk-channel lamp source, matching
-# ratatosk_channel.get_ratatosk_channel_status() exactly.
-ChannelStatusSnapshot = Callable[[], dict[str, Any]]
 
 
 def _history_cursor_path(workspace_dir: str) -> Path:
@@ -816,22 +813,26 @@ async def _sync_history(workspace_dir: str, get_active_tab_ids: GetActiveTabIds,
         log_event("plugin:companion", "history_sync_failed", error=str(exc))
 
 
-async def _sync_status(
-    get_active_tab_ids: GetActiveTabIds, tab_status_snapshot: TabStatusSnapshot, channel_status_snapshot: ChannelStatusSnapshot,
-) -> None:
+async def _sync_status(get_active_tab_ids: GetActiveTabIds, tab_status_snapshot: TabStatusSnapshot) -> None:
     """Mirrors the SAME lamp/status-bar state the desktop app's own
     {type:"status"} WS message drives (chat_session.py's
-    _compute_public_status()) out to the phone, per tab, plus the one
-    global Ratatosk-channel lamp -- per explicit instruction (2026-09-15):
-    the phone should show exactly what the desktop shows, not just chat
-    text. No cursor/dedup needed here (unlike history) -- each status blob
-    is tiny, and always overwriting the same key is simpler and cheap."""
+    _compute_public_status()) out to the phone, per tab -- per explicit
+    instruction (2026-09-15): the phone should show exactly what the desktop
+    shows, not just chat text. No cursor/dedup needed here (unlike history)
+    -- each status blob is tiny, and always overwriting the same key is
+    simpler and cheap.
+
+    Bug fix (2026-10-14): used to also publish a global "channel_status" key
+    (Ratatosk's own channel-poll lamp, matching the desktop's dedicated
+    status indicator) -- removed along with that desktop lamp for
+    consistency: no other messenger (Telegram, WhatsApp, Discord, Slack) got
+    one, desktop or phone, despite each having its own equivalent
+    *_channel_status control op."""
     try:
         for tab_id in get_active_tab_ids():
             status = tab_status_snapshot(tab_id)
             if status is not None:
                 await set_mine(f"tabs/{tab_id}/status", status)
-        await set_mine("channel_status", channel_status_snapshot())
     except Exception as exc:  # noqa: BLE001 -- best effort, never break the loop
         log_event("plugin:companion", "status_sync_failed", error=str(exc))
 
@@ -1020,7 +1021,7 @@ async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None
 
 async def _inbox_loop_tick(
     workspace_dir: str, get_active_tab_ids: GetActiveTabIds, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
-    tab_status_snapshot: TabStatusSnapshot, channel_status_snapshot: ChannelStatusSnapshot,
+    tab_status_snapshot: TabStatusSnapshot,
 ) -> None:
     if not is_logged_in():
         return  # not paired to any SW account yet -- nothing to sync
@@ -1030,12 +1031,12 @@ async def _inbox_loop_tick(
     await _drain_inbox(inject_to_tab, tab_ids)
     await _sync_tab_list(workspace_dir)
     await _sync_history(workspace_dir, get_active_tab_ids, history_snapshot)
-    await _sync_status(get_active_tab_ids, tab_status_snapshot, channel_status_snapshot)
+    await _sync_status(get_active_tab_ids, tab_status_snapshot)
 
 
 def start_companion_inbox_loop(
     workspace_dir: str, get_active_tab_ids: GetActiveTabIds, inject_to_tab: InjectToTab, history_snapshot: HistorySnapshot,
-    tab_status_snapshot: TabStatusSnapshot, channel_status_snapshot: ChannelStatusSnapshot,
+    tab_status_snapshot: TabStatusSnapshot,
     interval_s: float = INBOX_LOOP_INTERVAL_S,
 ) -> "asyncio.Task[None]":
     """Started once from main.py's startup hook (needs a running loop),
@@ -1049,7 +1050,7 @@ def start_companion_inbox_loop(
             try:
                 await _inbox_loop_tick(
                     workspace_dir, get_active_tab_ids, inject_to_tab, history_snapshot,
-                    tab_status_snapshot, channel_status_snapshot,
+                    tab_status_snapshot,
                 )
             except Exception as exc:  # noqa: BLE001 -- a bad tick must never kill the loop
                 log_event("plugin:companion", "inbox_loop_tick_failed", error=str(exc))

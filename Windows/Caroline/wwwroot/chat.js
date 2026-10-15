@@ -63,7 +63,6 @@
   const messagesEl = document.getElementById("messages");
   const statusBarText = document.getElementById("statusBarText");
   const lampBackend = document.getElementById("lampBackend");
-  const lampChannel = document.getElementById("lampChannel");
   const inputEl = document.getElementById("input");
   const sendBtn = document.getElementById("sendBtn");
   const stopBtn = document.getElementById("stopBtn");
@@ -245,7 +244,7 @@
     }
   }
 
-  // Lamp 1 (backend/connection): red = carolineStatus "error" (genuinely
+  // Lamp (backend/connection): red = carolineStatus "error" (genuinely
   // blocked -- billing/balance, needs the user to act), yellow = either the
   // WebSocket itself is down, or carolineStatus is "recovering" (backend
   // knows it's broken and is fixing itself -- dehydration restart, a
@@ -375,25 +374,6 @@
     else if (state !== "working" && wasWorking) stopHeartbeat();
   }
 
-  // Lamp 2 (Ratatosk channel -- every group Caroline's own account is a
-  // member of, not just one DM, see ratatoskChannel.ts): yellow = not
-  // connected/configured/monitored, red = the channel's most recent poll
-  // tick threw, green = monitoring with nothing new, green-blinking = the
-  // most recent tick actually found and injected new message(s). Polled (no
-  // push exists for this today) at the same cadence as the channel's own
-  // poll interval -- see ratatoskChannel.ts's POLL_INTERVAL_MS.
-  function updateChannelLamp(status) {
-    let color;
-    if (!status || !status.enabled) color = "yellow";
-    else if (status.lastTickOutcome && status.lastTickOutcome.startsWith("threw:")) color = "red";
-    else if (status.lastTickOutcome && status.lastTickOutcome.includes("injecting into headless session")) color = "green-blink";
-    else color = "green";
-    lampChannel.className = "lamp lamp-" + color;
-  }
-
-  function pollChannelStatus() {
-    sendControl("ratatosk_channel_status");
-  }
 
   function scrollToEnd() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1409,7 +1389,6 @@
           attachmentNames: JSON.stringify(attachmentNames),
         });
       }
-      pollChannelStatus();
       sendControl("visual_mode_get");
       // Bug fix (2026-09-22), confirmed live: chat_mode_get used to only be
       // requested when Settings was open (it used to feed nothing else) --
@@ -1875,12 +1854,6 @@
         setStatusBarText(s.stopped ? "Stopped the current Ratatosk turn." : "Nothing was running on Ratatosk to stop.", 3000);
       } catch {
         setStatusBarText("Ratatosk stop request sent.", 3000);
-      }
-    } else if (evt.op === "ratatosk_channel_status") {
-      try {
-        updateChannelLamp(evt.ok ? JSON.parse(evt.stdout || "{}") : null);
-      } catch {
-        updateChannelLamp(null);
       }
     } else if (evt.op === "own_anthropic_key_get") {
       try {
@@ -2681,9 +2654,4 @@
 
   replayTranscript();
   connect();
-  // Lamp 2 has no push channel (see updateChannelLamp's doc comment) --
-  // polled at the channel's own cadence so the lamp never drifts far behind
-  // its actual state. pollChannelStatus() itself no-ops via sendControl
-  // whenever the WS happens to be down between reconnect attempts.
-  setInterval(pollChannelStatus, 15000);
 })();
