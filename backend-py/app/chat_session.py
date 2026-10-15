@@ -127,10 +127,11 @@ from app.owner_profile import get_owner_profile, owner_profile_system_prompt_cla
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app import agent_registry
+from app import pseudo_tab
 from app.agent_definitions import caroline_agents
 from app.policies import (
     ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction,
-    running_agents_pointer_instruction,
+    running_agents_pointer_instruction, pseudo_tab_pointer_instruction,
 )
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
@@ -1447,9 +1448,10 @@ class ChatSession:
         self.workspace_dir = workspace_dir
         self.send = send
         # Per explicit instruction (2026-10-13): a session with no chat window
-        # of its own -- the Ratatosk owner-DM channel, and the new background/
-        # reminder-task session (see main.py's get_or_create_ratatosk_session/
-        # _get_background_session_sync). Gates the progress-narrator entirely
+        # of its own -- the Ratatosk owner-DM channel, and every tab's own
+        # pseudo-session (see main.py's get_or_create_ratatosk_session/
+        # app/pseudo_tab.py's get_or_create_pseudo_session_sync). Gates the
+        # progress-narrator entirely
         # (_check_progress_narration's own early-return) -- nobody is watching
         # a headless session live, so there is nothing for it to narrate TO,
         # and the paid generate_progress_comment call would be pure waste --
@@ -3015,13 +3017,13 @@ class ChatSession:
         }
         await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
 
-    async def deliver_relayed_reply(self, text: str, is_voice: bool = False) -> None:
+    async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False) -> None:
         """Per explicit instruction (2026-10-13), "Фоновые задачи... должны
         мержиться только на уровне вывода пользователю": delivers a reply that
         was generated and already reviewed inside a DIFFERENT (headless)
-        session -- e.g. the background/reminder-task session's own final
-        answer, relayed here by main.py's _background_session_send once that
-        session's turn genuinely ends -- into THIS session's own visible chat,
+        session -- e.g. a real tab's own pseudo-session (app/pseudo_tab.py)
+        final answer, relayed here once that session's turn genuinely ends --
+        into THIS session's own visible chat,
         as if it were this session's own reply. Same bypass-the-model,
         translate-then-send-as-wire pattern as _send_permission_guard_direct_
         ask. review_reply already ran inside the
@@ -3029,6 +3031,11 @@ class ChatSession:
         headless branch) -- only translation into THIS tab's own real language
         happens here, since the headless session that generated `text` has no
         real language of its own to translate into.
+
+        `task` (2026-10-15): whatever `text` is actually supposed to be a
+        result OF (a reminder's own note, or a sub-agent's own brief) --
+        passed straight through to check_background_relay_worth so it can
+        judge the result against the task, not in isolation.
 
         Bug fix (2026-10-14), confirmed live: review_reply only filters
         internal-mechanics leaks/off-task/robotic tone -- it has no opinion
@@ -3041,7 +3048,7 @@ class ChatSession:
         suppressed message costs nothing further."""
         from app.plugins.voice_api import check_background_relay_worth, translate_text
 
-        verdict = await check_background_relay_worth(text)
+        verdict = await check_background_relay_worth(text, task=task)
         if verdict is not None and not verdict["worth_relaying"]:
             log_event(
                 "engine", "background_relay_suppressed_as_routine", tab_id=self.tab_id,
@@ -4601,12 +4608,42 @@ class ChatSession:
     def _track_background_tasks(self, message: Any) -> None:
         """Feeds agent_registry from the SDK's typed task lifecycle events (see that module's docstring for
         why). A background task can end with a TaskNotificationMessage OR only a TaskUpdatedMessage whose
-        status is terminal (e.g. a stopped task) -- either one clears it."""
+        status is terminal (e.g. a stopped task) -- either one clears it.
+
+        Bug fix (2026-10-15), confirmed live: a real sub-agent ("Periodic 8-mailbox sweep") finished with a
+        genuine TaskNotificationMessage.summary carrying its actual findings, but nothing here ever read
+        that field -- the launching session had already wrapped up its OWN turn with "NOTHING NEW" before
+        the sub-agent even finished, and its real report was lost for good. TaskNotificationMessage always
+        carries `summary` (can be empty); a terminal TaskUpdatedMessage does not carry one at all, so only
+        the TaskNotificationMessage branch can ever have something to report. On a non-empty summary, the
+        session that LAUNCHED the sub-agent (self -- a real tab or its own pseudo-session, see
+        app/pseudo_tab.py; this runs identically for either, no self.headless branching needed) is
+        reactivated with the sub-agent's own report via self.inject_proactive -- the same uniform mechanism
+        the user asked for: whichever session launched a sub-agent is the one that gets to react to it."""
         try:
             if isinstance(message, TaskStartedMessage):
                 agent_registry.register(self.workspace_dir, self.tab_id, message.task_id, message.description, message.task_type, message.tool_use_id)
             elif isinstance(message, TaskNotificationMessage):
+                running = agent_registry.running(self.workspace_dir, self.tab_id)
+                description = (running.get(message.task_id) or {}).get("description")  # read BEFORE finish() pops it
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status)
+                summary = (message.summary or "").strip()
+                if summary:
+                    if pseudo_tab.is_pseudo_tab_id(self.tab_id):
+                        real_tab_id = pseudo_tab.real_tab_id_from_pseudo(self.tab_id)
+                        pseudo_tab.set_pseudo_turn_task(real_tab_id, description)
+                        # Per explicit instruction (2026-10-15): stays on the SAME
+                        # engine as its real tab, even if that tab switched mode
+                        # since this pseudo-session was created/last ran.
+                        pseudo_tab.sync_pseudo_tab_engine(self.workspace_dir, real_tab_id)
+                    self.inject_proactive(
+                        f"[Your sub-agent (agentId {message.task_id}"
+                        f"{f', {description}' if description else ''}) just finished (status: {message.status}). "
+                        f"Its report:\n\n{summary}\n\nYou are being reactivated specifically because this is your "
+                        "own sub-agent's result -- decide what, if anything, to do with it now. If nothing further "
+                        "is needed, reply exactly [[NO_UPDATE]].]",
+                        suppress_narration=True,
+                    )
             elif isinstance(message, TaskUpdatedMessage) and (message.status or (message.patch or {}).get("status")) in TERMINAL_TASK_STATUSES:
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status or (message.patch or {}).get("status"))
         except Exception as exc:
@@ -5524,6 +5561,10 @@ class ChatSession:
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
                     running_agents_pointer_instruction(agent_registry.ensure_status_file(self.workspace_dir, self.tab_id)),
+                    pseudo_tab_pointer_instruction(
+                        agent_registry.ensure_status_file(self.workspace_dir, pseudo_tab.pseudo_tab_id(self.tab_id))
+                        if not self.headless else None
+                    ),
                     language_hint_instruction(self._system_prompt_language),
                     OPENAI_TOOL_HONESTY_INSTRUCTION if self.engine_kind == "openai" else None,
                 ]
