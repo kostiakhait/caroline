@@ -249,7 +249,7 @@ def _gender_agreement_clause(speaker_gender: str | None, addressee_gender: str |
 # know which variant answered.
 async def translate_text(
     text: str, language: str, session: str | None = None, timeout: float = 30.0,
-    gender: str | None = None, addressee_gender: str | None = None,
+    gender: str | None = None, addressee_gender: str | None = None, context: str | None = None,
 ) -> str | None:
     """Per explicit instruction (2026-09-13): the target language for a
     generated piece of text (progress narration, today) must come from
@@ -297,10 +297,27 @@ async def translate_text(
     contract, no extraction, and no multi-prompt retry -- one call, plain
     text/language params. The garbage filter stays as defense-in-depth
     (refusal/JSON-leak/wrong-script safety net), not the primary mechanism,
-    same philosophy as everywhere else it's used."""
+    same philosophy as everywhere else it's used.
+
+    `context` (2026-10-15), per explicit instruction ("ввести контекст в
+    перевод" -- not another hand-written special-case rule): AI.translateText
+    already accepts preceeding_context/following_context (used for exactly
+    this -- see its own docstring, "provided as a reference to improve
+    translation accuracy"), but this wrapper never passed anything through
+    them. Without real context, a general instruction like "a quoted/drafted
+    message belongs in someone else's voice" has nothing to ground itself
+    in beyond pattern-matching the bare text, which is exactly how a letter
+    Caroline drafted for the owner to send to his ex-wife came back with
+    the quoted half switched to English mid-translation (confirmed live,
+    2026-10-15) -- the translator had no idea who anyone in that text
+    actually was. Passed as preceeding_context: the real task this reply is
+    answering (the same string review_reply already receives as `task` at
+    every call site that has one), so the model translating has the same
+    grounding the review step already does, not a blind substring."""
     body: dict[str, Any] = {
         "command": "ai:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
         "instructions": _gender_agreement_clause(gender, addressee_gender) or None,
+        "preceeding_context": context or None,
     }
     if not session:
         session = await get_cached_v2_session()

@@ -2661,7 +2661,7 @@ class ChatSession:
             try:
                 translated = await translate_text(
                     text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender, context=question_text,
                 )
             except Exception as exc:
                 log_event("engine", "small_model_translate_failed", tab_id=self.tab_id, error=str(exc))
@@ -3100,7 +3100,7 @@ class ChatSession:
             try:
                 translated = await translate_text(
                     text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
                 )
             except Exception as exc:
                 log_event("engine", "deliver_relayed_reply_translate_failed", tab_id=self.tab_id, error=str(exc), attempt=attempt)
@@ -4254,12 +4254,22 @@ class ChatSession:
         # here already uses.
         task = self._narration_task()
         dropped: list[dict[str, Any]] = []
+        # Per explicit instruction (2026-10-15, "Кэролайн ДОЛЖНА ЗНАТЬ о том,
+        # какой текст отображается пользователю"): review_reply/translate_text
+        # below mutate block["text"] for what the USER sees, but the CLI engine
+        # (Claude Code or Codex -- see _patch_cli_transcript_text's own doc
+        # comment) already wrote its OWN, pre-mutation version of this exact
+        # text to its own on-disk session transcript by the time this runs --
+        # that file, not this in-memory wire, is what a resumed session reads
+        # back as "what I said". Collected here, patched once after the loop.
+        transcript_patches: list[tuple[str, str]] = []
         for block in content_blocks:
             if not (isinstance(block, dict) and block.get("type") == "text"):
                 continue
             text = block.get("text") or ""
             if not text.strip():
                 continue
+            original_text = text
             try:
                 reviewed = await review_reply(text, task=task)
             except Exception as exc:
@@ -4299,7 +4309,7 @@ class ChatSession:
                 try:
                     translated = await translate_text(
                         text, language, gender=get_persona_gender(self.workspace_dir),
-                        addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                        addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
                     )
                 except Exception as exc:
                     log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
@@ -4324,6 +4334,10 @@ class ChatSession:
             if is_silent:
                 log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
                 dropped.append(block)
+            elif block["text"] != original_text:
+                transcript_patches.append((original_text, block["text"]))
+        if transcript_patches:
+            await self._patch_cli_transcript_text(transcript_patches)
         if dropped:
             kept = [b for b in content_blocks if b not in dropped]
             if not any(isinstance(b, dict) and b.get("type") in ("text", "tool_use") for b in kept):
@@ -4331,6 +4345,79 @@ class ChatSession:
                 return None
             wire["message"]["content"] = kept
         return wire
+
+    async def _patch_cli_transcript_text(self, replacements: list[tuple[str, str]]) -> None:
+        """Rewrites the CLI engine's own just-written transcript entry so its
+        text matches what the user actually saw, not what the model originally
+        said before review_reply/translate_text changed it.
+
+        Per explicit instruction (2026-10-15, confirmed live): the user
+        corrected a reply that had come out partly in English; Caroline flatly
+        denied it ("the text is already fully in Russian... if you still see
+        English, that's a display issue on your side"), because she was right
+        about what SHE said and had no way to know a later pipeline step
+        changed it before it reached the screen. Her only memory of "what I
+        said" is this session's own transcript file, which the CLI process
+        (Claude Code or Codex -- both write their own session .jsonl
+        independently of this process; see durability.py's session_transcript_
+        path, which already resolves to whichever of the two actually holds
+        this session) wrote BEFORE review/translate ever ran. Applies equally
+        to both CLI engines -- same file shape, same gap, same fix; the
+        small-model engine needs none of this, since _append_small_model_
+        turn_to_session (this module) already writes the FINAL, already-
+        translated text itself, there being no separate CLI process for it to
+        diverge from in the first place.
+
+        Content-matched against the LAST transcript entry, not uuid-matched:
+        the Python SDK's own AssistantMessage dataclass (see wire.py's
+        message_to_wire) carries no uuid/parentUuid at all -- those are
+        CLI-transcript-only fields the SDK never exposes to this process. If
+        the last entry's text doesn't match what we expect to replace (a
+        race, an unexpected ordering), this leaves the file untouched rather
+        than risk corrupting the wrong entry. Best-effort: logged, never
+        raised -- a missed patch here is a history-accuracy gap, not a reason
+        to break a real reply already on its way to the user."""
+        if not self.last_saved_session_id:
+            return
+        path = session_transcript_path(self.workspace_dir, self.last_saved_session_id)
+        if not path.exists():
+            return
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            log_event("engine", "transcript_patch_read_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        lines = raw_text.splitlines()
+        for i in range(len(lines) - 1, -1, -1):
+            if not lines[i].strip():
+                continue
+            try:
+                entry = json.loads(lines[i])
+            except Exception:
+                log_event("engine", "transcript_patch_unparseable_last_line", tab_id=self.tab_id)
+                return
+            if entry.get("type") != "assistant":
+                log_event("engine", "transcript_patch_last_entry_not_assistant", tab_id=self.tab_id, entry_type=entry.get("type"))
+                return
+            content = (entry.get("message") or {}).get("content") or []
+            patched_any = False
+            for original_text, final_text in replacements:
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text") == original_text:
+                        block["text"] = final_text
+                        patched_any = True
+            if not patched_any:
+                log_event("engine", "transcript_patch_no_match", tab_id=self.tab_id)
+                return
+            lines[i] = json.dumps(entry, ensure_ascii=False)
+            try:
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except Exception as exc:
+                log_event("engine", "transcript_patch_write_failed", tab_id=self.tab_id, error=str(exc))
+                return
+            log_event("engine", "transcript_patched", tab_id=self.tab_id, replacement_count=len(replacements))
+            return
+        log_event("engine", "transcript_patch_empty_file", tab_id=self.tab_id)
 
     def _narration_turn_marker(self) -> Any:
         """Identifies the turn a narration remark is being written for: the
@@ -4564,7 +4651,7 @@ class ChatSession:
                 from app.plugins.voice_api import translate_text
                 translated = await translate_text(
                     comment, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
-                    addressee_gender=get_owner_profile(self.workspace_dir).gender,
+                    addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
                 )
             except Exception as exc:
                 log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
