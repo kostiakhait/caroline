@@ -416,7 +416,7 @@ async def check_refusal_guard(task: str, assistant_reply: str, session: str | No
     return {"declined": output["declined"], "reason": str(output.get("reason") or "")}
 
 
-async def check_background_relay_worth(text: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
+async def check_background_relay_worth(text: str, task: str | None = None, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:
     """Per explicit instruction (2026-10-14): a real incident the same
     morning -- three of four messages relayed from Caroline's own headless
     background/reminder-chore session into the user's primary chat (via
@@ -431,13 +431,20 @@ async def check_background_relay_worth(text: str, session: str | None = None, ti
     chokepoint, where the fact that this is about to become a STANDALONE,
     UNPROMPTED interruption is known.
 
+    `task` (2026-10-15): the reminder's own note, or a sub-agent's own brief --
+    whatever this text is actually supposed to be a result OF, when known. Lets
+    the microagent judge the result AGAINST the task instead of in isolation;
+    confirmed live, a session that merely DESCRIBED delegating work to its own
+    sub-agent ("I'll delegate X, then do Y myself") was judged worth relaying
+    on its own, even though it was a plan, not a result.
+
     Returns {"worth_relaying": bool, "reason": str} on a clean result, or
     None on any error/timeout/malformed response (fail-open, same philosophy
     as every other check_*/translate_text here -- an infrastructure hiccup
     must default to SHOWING the message, never to silently swallowing one
     that might have mattered). The caller (ChatSession.deliver_relayed_reply)
     treats None the same as worth_relaying=True."""
-    body: dict[str, Any] = {"command": "reply:backgroundRelayWorth", "key": CAROLINE_SW_KEY, "text": text}
+    body: dict[str, Any] = {"command": "reply:backgroundRelayWorth", "key": CAROLINE_SW_KEY, "task": task or "", "text": text}
     if not session:
         session = await get_cached_v2_session()
     if session:

@@ -23,10 +23,19 @@ from app.event_memory import forget_event_by_reminder_id, remember_event
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
 from app.policies import follow_explicit_parameters_instruction
+from app.session_context import get_tab_id
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
 
 BACKUP_KIND = "vault-backup-hourly"
+# Per explicit instruction (2026-10-15), part of the per-tab pseudo-session
+# rework (see app/pseudo_tab.py): every reminder now carries the real tab_id
+# of whichever session scheduled it, so it fires back into THAT tab's own
+# pseudo-session (main.py's _on_reminder_due), not a single shared one. A
+# reminder predating this field, or one scheduled by code that calls this
+# tool outside any real session's own turn, falls back to the primary tab --
+# the same tab the old shared background session always bridged to.
+_DEFAULT_TAB_ID = "1"
 
 # Per explicit instruction (2026-10-07), after a real incident: a reminder-
 # driven turn used to always both (a) get live progress-narrator chatter
@@ -53,9 +62,16 @@ def _load_reminders() -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        reminders = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
+    # Per explicit instruction (2026-10-15): a reminder scheduled before tabId
+    # existed defaults to the primary tab -- same in-memory default every
+    # caller would otherwise need its own copy of; never rewrites the file, a
+    # read must not silently mutate what's on disk.
+    for r in reminders:
+        r.setdefault("tabId", _DEFAULT_TAB_ID)
+    return reminders
 
 
 def _save_reminders(reminders: list[dict[str, Any]]) -> None:
@@ -199,6 +215,7 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         "priority": args.get("priority") or "priority",
         "cron": cron_text if cron else None,
         "eventType": event_type,
+        "tabId": get_tab_id() or _DEFAULT_TAB_ID,
     }
     reminders.append(reminder)
     _save_reminders(reminders)
@@ -292,6 +309,7 @@ def ensure_recurring_backup(note: str) -> None:
         "cron": cron,
         "kind": BACKUP_KIND,
         "eventType": "service",
+        "tabId": _DEFAULT_TAB_ID,
     })
     _save_reminders(reminders)
 

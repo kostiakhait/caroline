@@ -462,6 +462,26 @@ def running_agents_pointer_instruction(file_path: str | None) -> str:
     )
 
 
+def pseudo_tab_pointer_instruction(file_path: str | None) -> str:
+    """Per explicit instruction (2026-10-15), part of the per-tab pseudo-session
+    rework (see app/pseudo_tab.py): "основная модель вообще не должна заниматься
+    фоновыми задачами, только знать об их существовании" -- this tab's reminders
+    and any sub-agents ITS pseudo-session launches run entirely in that separate,
+    invisible session; the real tab's own model never orchestrates any of it,
+    only knows it exists (a read-only pointer, same shape as
+    running_agents_pointer_instruction above, which already covers sub-agents
+    THIS session itself launches directly)."""
+    if not file_path:
+        return ""
+    return (
+        f"This tab has its own invisible background pseudo-session, handling its reminders and any sub-agents "
+        f"IT launches on its own -- you never run those yourself. Its current activity is tracked in {file_path} "
+        "(same shape as your own agent registry above), purely so you know it exists. You never act on it "
+        "directly: anything it finds worth telling the user is merged into this chat automatically once it "
+        "decides so."
+    )
+
+
 def recent_dialogue_history_instruction(file_path: str | None) -> str:
     """Per explicit instruction (2026-09-14): dehydration strips old
     thinking/tool content and Claude's own native auto-compaction summarizes

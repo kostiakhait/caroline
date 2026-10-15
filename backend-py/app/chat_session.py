@@ -130,10 +130,11 @@ from app.owner_profile import get_owner_profile, owner_profile_system_prompt_cla
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app import agent_registry
+from app import pseudo_tab
 from app.agent_definitions import caroline_agents
 from app.policies import (
     ALWAYS_ON_INSTRUCTIONS, continuity_pointer_instruction, language_hint_instruction, recent_dialogue_history_instruction,
-    running_agents_pointer_instruction,
+    running_agents_pointer_instruction, pseudo_tab_pointer_instruction,
 )
 from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
@@ -1514,9 +1515,10 @@ class ChatSession:
         self.workspace_dir = workspace_dir
         self.send = send
         # Per explicit instruction (2026-10-13): a session with no chat window
-        # of its own -- the Ratatosk owner-DM channel, and the new background/
-        # reminder-task session (see main.py's get_or_create_ratatosk_session/
-        # _get_background_session_sync). Gates the progress-narrator entirely
+        # of its own -- the Ratatosk owner-DM channel, and every tab's own
+        # pseudo-session (see main.py's get_or_create_ratatosk_session/
+        # app/pseudo_tab.py's get_or_create_pseudo_session_sync). Gates the
+        # progress-narrator entirely
         # (_check_progress_narration's own early-return) -- nobody is watching
         # a headless session live, so there is nothing for it to narrate TO,
         # and the paid generate_progress_comment call would be pure waste --
@@ -1870,8 +1872,11 @@ class ChatSession:
         # call is attempted while this is set -- see app/operations.py's dispatch().
         self.pending_unapproved_action: str | None = None
         # Per explicit instruction (2026-10-13): counts consecutive permission-guard
-        # blocks since the last genuine real-user message (see submit()'s is_real_user
-        # branch, which resets this). The first block just asks the MODEL to ask the
+        # blocks on the SAME pending action (see permission_guard_last_reason below --
+        # 2026-10-15 bug fix: this used to reset on every genuine real-user message,
+        # see submit()'s own prior comment, which meant a user's own CLARIFICATION of
+        # the still-same pending action earned the model a fresh grace cycle it kept
+        # failing anyway). The first block just asks the MODEL to ask the
         # user and wait (PERMISSION_NOTE_TEXT_TEMPLATE) -- confirmed live the model can
         # ignore that and retry the same blocked action anyway (a real incident: 8
         # straight blocked attempts to email a third party, ~3 minutes, zero actual
@@ -1879,6 +1884,12 @@ class ChatSession:
         # to escalate: a SECOND consecutive block means the model didn't listen, so the
         # guard asks the user directly itself instead, and the turn stays fully stopped.
         self.permission_guard_consecutive_blocks: int = 0
+        # Per explicit instruction (2026-10-15): the reason string of this session's
+        # own last block, if any -- passed to turn.permission.guard as
+        # previous_block_reason so IT (never a hardcoded string/slug comparison here)
+        # judges whether a newly-flagged action is the same one still pending or a
+        # genuinely different one; see _check_permission_guard's own update.
+        self.permission_guard_last_reason: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -2469,10 +2480,13 @@ class ChatSession:
             self.recent_real_user_messages = [
                 (t, m) for t, m in self.recent_real_user_messages if now_ms - t <= 3600_000
             ]
-            # A genuine new real-user message is also a fresh chance for the model --
-            # see permission_guard_consecutive_blocks' own __init__ comment for why this
-            # episode-scoped counter must not survive into a new real episode.
-            self.permission_guard_consecutive_blocks = 0
+            # Bug fix (2026-10-15): used to unconditionally zero permission_guard_
+            # consecutive_blocks here -- removed. A genuine new real-user message is
+            # NOT, on its own, evidence the pending action changed (it's very often a
+            # CLARIFICATION of the exact same one) -- see permission_guard_last_reason's
+            # own __init__ comment: the counter now only resets in _check_permission_
+            # guard, when turn.permission.guard itself judges the action has actually
+            # changed (same_action_as_before=False), not merely because the user spoke.
             # Per explicit instruction (2026-10-11): a just-given "yes" must clear
             # pending_unapproved_action before the model's NEXT turn starts, not
             # only the next time an outbound message triggers a re-check -- fire-
@@ -2753,6 +2767,25 @@ class ChatSession:
             self._start_small_model_turn(text, attachments, True, is_voice)
 
     async def _run_small_model_turn(self, text: str, is_voice: bool, is_real_user: bool = True) -> None:
+        # Bug fix (2026-10-15), confirmed live ("вкладка 2, где нарратор?"):
+        # same root cause as the "sw chat mode" fix just above this method
+        # (search its own comment for "LOOKED dead while it wasn't") --
+        # conn_state is set to "limited"/"restarting"/etc. ONLY by the SDK
+        # engine's own message loop, and NOTHING ever reset it back to
+        # "connected" when a turn instead gets answered via this small-model
+        # fallback path (e.g. Codex hit its usage limit mid-turn, self-heal
+        # escalated to small_model_engine.py to actually finish the work).
+        # _check_progress_narration's own gate (`conn_state.get("kind") !=
+        # "connected"`) then stayed permanently closed for the rest of the
+        # session, even while this method's own real tool activity kept
+        # right on going underneath it -- the turn was never actually
+        # finished, but the narrator had no way to know that, because the
+        # one signal it trusts for "is anything really happening" was stuck
+        # reporting the OLD engine's failure. Reset here, not only at
+        # _finish_small_model_turn_answered's very end, so narration (and
+        # anything else gated on conn_state) is unblocked for the actual
+        # DURATION of this fallback's work, not just after it's already over.
+        self._set_conn_state("connected")
         persona = get_persona(self.workspace_dir)
         recent_dialogue_lines = _read_recent_dialogue_lines(
             self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW,
@@ -3297,13 +3330,13 @@ class ChatSession:
         }
         await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
 
-    async def deliver_relayed_reply(self, text: str, is_voice: bool = False) -> None:
+    async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False) -> None:
         """Per explicit instruction (2026-10-13), "Фоновые задачи... должны
         мержиться только на уровне вывода пользователю": delivers a reply that
         was generated and already reviewed inside a DIFFERENT (headless)
-        session -- e.g. the background/reminder-task session's own final
-        answer, relayed here by main.py's _background_session_send once that
-        session's turn genuinely ends -- into THIS session's own visible chat,
+        session -- e.g. a real tab's own pseudo-session (app/pseudo_tab.py)
+        final answer, relayed here once that session's turn genuinely ends --
+        into THIS session's own visible chat,
         as if it were this session's own reply. Same bypass-the-model,
         translate-then-send-as-wire pattern as _send_permission_guard_direct_
         ask. review_reply already ran inside the
@@ -3311,6 +3344,11 @@ class ChatSession:
         headless branch) -- only translation into THIS tab's own real language
         happens here, since the headless session that generated `text` has no
         real language of its own to translate into.
+
+        `task` (2026-10-15): whatever `text` is actually supposed to be a
+        result OF (a reminder's own note, or a sub-agent's own brief) --
+        passed straight through to check_background_relay_worth so it can
+        judge the result against the task, not in isolation.
 
         Bug fix (2026-10-14), confirmed live: review_reply only filters
         internal-mechanics leaks/off-task/robotic tone -- it has no opinion
@@ -3323,7 +3361,7 @@ class ChatSession:
         suppressed message costs nothing further."""
         from app.plugins.voice_api import check_background_relay_worth, translate_text
 
-        verdict = await check_background_relay_worth(text)
+        verdict = await check_background_relay_worth(text, task=task)
         if verdict is not None and not verdict["worth_relaying"]:
             log_event(
                 "engine", "background_relay_suppressed_as_routine", tab_id=self.tab_id,
@@ -4234,7 +4272,23 @@ class ChatSession:
         leaves pending_unapproved_action exactly as it was, same philosophy
         as translate_text/review_reply -- an infrastructure hiccup must not
         silently clear a real pending block, nor manufacture one that was
-        never there."""
+        never there.
+
+        Bug fix (2026-10-15), confirmed live: a user's own CLARIFICATION of
+        the SAME still-pending action ("я ж сказал ЕМУ пиши") used to reset
+        permission_guard_consecutive_blocks to 0 just by virtue of being a
+        new real-user message (see submit()'s own removed reset) -- the
+        model then got a fresh, and unreliable, "ask nicely yourself" grace
+        cycle for something it had already been told twice. Per explicit
+        instruction ("почему мы делаем строковое сравнение вместо LLM-
+        сравнения... бели маленькую модель и сравнивай"): sameness is now
+        judged by turn.permission.guard itself (same_action_as_before),
+        semantically, from the whole dialogue it already reads -- never a
+        hardcoded string/slug comparison here, which a confirmed live
+        wording drift (the SAME action described two different ways across
+        two consecutive real calls) would have broken anyway. The counter
+        only resets when the agent says this is a genuinely different
+        action (or there is nothing pending at all)."""
         from app.plugins.voice_api import check_permission_guard
 
         dialogue = self._gather_recent_dialogue_for_permission_guard()
@@ -4242,13 +4296,23 @@ class ChatSession:
             note = " ".join(extra_context.split())
             dialogue = f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
         try:
-            result = await check_permission_guard(self._narration_task(), dialogue)
+            result = await check_permission_guard(
+                self._narration_task(), dialogue, previous_block_reason=self.permission_guard_last_reason,
+            )
         except Exception as exc:
             log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
             return
         if result is None:
             return
-        self.pending_unapproved_action = result["reason"] if result["needs_approval"] else None
+        if result["needs_approval"]:
+            self.pending_unapproved_action = result["reason"]
+            if not result["same_action_as_before"]:
+                self.permission_guard_consecutive_blocks = 0
+            self.permission_guard_last_reason = result["reason"]
+        else:
+            self.pending_unapproved_action = None
+            self.permission_guard_consecutive_blocks = 0
+            self.permission_guard_last_reason = None
 
     def _on_outbound_message_sent(self, channel: str, args: dict[str, Any], result: Any) -> None:
         """Per explicit instruction (2026-10-12): registered with
@@ -4812,6 +4876,21 @@ class ChatSession:
         if _NO_UPDATE_SENTINEL in comment or _is_silent_reply_paraphrase(comment):
             log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=comment)
             return
+        # Bug fix (2026-10-14), confirmed live ("Нарратор работает после
+        # окончательного ответа"): the one _stale() check earlier (right after
+        # generate_progress_comment returns) left review_reply/translate_text
+        # above and _check_permission_guard below unguarded -- each is its own
+        # real network round trip, and the turn can finish DURING any of them
+        # just as easily as during generation itself. A real incident: the
+        # turn (and its own silent [[NO_UPDATE]] conclusion) had already ended
+        # by the time review_reply alone finished, and the stale "Всё ещё
+        # проверяю..." comment still reached the user's chat ~2s later, with
+        # no turn left for it to be commentary on. Re-checked here, before
+        # anything else runs or gets recorded as having been said.
+        stale = _stale()
+        if stale:
+            log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, stage="pre_send")
+            return
         # Per explicit instruction (2026-10-11): re-evaluate the permission
         # guard on every outbound message -- see _check_permission_guard's
         # own docstring for why this runs here too, not just in submit().
@@ -5179,12 +5258,42 @@ class ChatSession:
     def _track_background_tasks(self, message: Any) -> None:
         """Feeds agent_registry from the SDK's typed task lifecycle events (see that module's docstring for
         why). A background task can end with a TaskNotificationMessage OR only a TaskUpdatedMessage whose
-        status is terminal (e.g. a stopped task) -- either one clears it."""
+        status is terminal (e.g. a stopped task) -- either one clears it.
+
+        Bug fix (2026-10-15), confirmed live: a real sub-agent ("Periodic 8-mailbox sweep") finished with a
+        genuine TaskNotificationMessage.summary carrying its actual findings, but nothing here ever read
+        that field -- the launching session had already wrapped up its OWN turn with "NOTHING NEW" before
+        the sub-agent even finished, and its real report was lost for good. TaskNotificationMessage always
+        carries `summary` (can be empty); a terminal TaskUpdatedMessage does not carry one at all, so only
+        the TaskNotificationMessage branch can ever have something to report. On a non-empty summary, the
+        session that LAUNCHED the sub-agent (self -- a real tab or its own pseudo-session, see
+        app/pseudo_tab.py; this runs identically for either, no self.headless branching needed) is
+        reactivated with the sub-agent's own report via self.inject_proactive -- the same uniform mechanism
+        the user asked for: whichever session launched a sub-agent is the one that gets to react to it."""
         try:
             if isinstance(message, TaskStartedMessage):
                 agent_registry.register(self.workspace_dir, self.tab_id, message.task_id, message.description, message.task_type, message.tool_use_id)
             elif isinstance(message, TaskNotificationMessage):
+                running = agent_registry.running(self.workspace_dir, self.tab_id)
+                description = (running.get(message.task_id) or {}).get("description")  # read BEFORE finish() pops it
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status)
+                summary = (message.summary or "").strip()
+                if summary:
+                    if pseudo_tab.is_pseudo_tab_id(self.tab_id):
+                        real_tab_id = pseudo_tab.real_tab_id_from_pseudo(self.tab_id)
+                        pseudo_tab.set_pseudo_turn_task(real_tab_id, description)
+                        # Per explicit instruction (2026-10-15): stays on the SAME
+                        # engine as its real tab, even if that tab switched mode
+                        # since this pseudo-session was created/last ran.
+                        pseudo_tab.sync_pseudo_tab_engine(self.workspace_dir, real_tab_id)
+                    self.inject_proactive(
+                        f"[Your sub-agent (agentId {message.task_id}"
+                        f"{f', {description}' if description else ''}) just finished (status: {message.status}). "
+                        f"Its report:\n\n{summary}\n\nYou are being reactivated specifically because this is your "
+                        "own sub-agent's result -- decide what, if anything, to do with it now. If nothing further "
+                        "is needed, reply exactly [[NO_UPDATE]].]",
+                        suppress_narration=True,
+                    )
             elif isinstance(message, TaskUpdatedMessage) and (message.status or (message.patch or {}).get("status")) in TERMINAL_TASK_STATUSES:
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status or (message.patch or {}).get("status"))
         except Exception as exc:
@@ -6102,6 +6211,10 @@ class ChatSession:
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
                     running_agents_pointer_instruction(agent_registry.ensure_status_file(self.workspace_dir, self.tab_id)),
+                    pseudo_tab_pointer_instruction(
+                        agent_registry.ensure_status_file(self.workspace_dir, pseudo_tab.pseudo_tab_id(self.tab_id))
+                        if not self.headless else None
+                    ),
                     language_hint_instruction(self._system_prompt_language),
                     OPENAI_TOOL_HONESTY_INSTRUCTION if self.engine_kind == "openai" else None,
                 ]
