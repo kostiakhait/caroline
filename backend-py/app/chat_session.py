@@ -1799,8 +1799,11 @@ class ChatSession:
         # call is attempted while this is set -- see app/operations.py's dispatch().
         self.pending_unapproved_action: str | None = None
         # Per explicit instruction (2026-10-13): counts consecutive permission-guard
-        # blocks since the last genuine real-user message (see submit()'s is_real_user
-        # branch, which resets this). The first block just asks the MODEL to ask the
+        # blocks on the SAME pending action (see permission_guard_last_reason below --
+        # 2026-10-15 bug fix: this used to reset on every genuine real-user message,
+        # see submit()'s own prior comment, which meant a user's own CLARIFICATION of
+        # the still-same pending action earned the model a fresh grace cycle it kept
+        # failing anyway). The first block just asks the MODEL to ask the
         # user and wait (PERMISSION_NOTE_TEXT_TEMPLATE) -- confirmed live the model can
         # ignore that and retry the same blocked action anyway (a real incident: 8
         # straight blocked attempts to email a third party, ~3 minutes, zero actual
@@ -1808,6 +1811,12 @@ class ChatSession:
         # to escalate: a SECOND consecutive block means the model didn't listen, so the
         # guard asks the user directly itself instead, and the turn stays fully stopped.
         self.permission_guard_consecutive_blocks: int = 0
+        # Per explicit instruction (2026-10-15): the reason string of this session's
+        # own last block, if any -- passed to turn.permission.guard as
+        # previous_block_reason so IT (never a hardcoded string/slug comparison here)
+        # judges whether a newly-flagged action is the same one still pending or a
+        # genuinely different one; see _check_permission_guard's own update.
+        self.permission_guard_last_reason: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too
@@ -2363,10 +2372,13 @@ class ChatSession:
             self.recent_real_user_messages = [
                 (t, m) for t, m in self.recent_real_user_messages if now_ms - t <= 3600_000
             ]
-            # A genuine new real-user message is also a fresh chance for the model --
-            # see permission_guard_consecutive_blocks' own __init__ comment for why this
-            # episode-scoped counter must not survive into a new real episode.
-            self.permission_guard_consecutive_blocks = 0
+            # Bug fix (2026-10-15): used to unconditionally zero permission_guard_
+            # consecutive_blocks here -- removed. A genuine new real-user message is
+            # NOT, on its own, evidence the pending action changed (it's very often a
+            # CLARIFICATION of the exact same one) -- see permission_guard_last_reason's
+            # own __init__ comment: the counter now only resets in _check_permission_
+            # guard, when turn.permission.guard itself judges the action has actually
+            # changed (same_action_as_before=False), not merely because the user spoke.
             # Per explicit instruction (2026-10-11): a just-given "yes" must clear
             # pending_unapproved_action before the model's NEXT turn starts, not
             # only the next time an outbound message triggers a re-check -- fire-
@@ -2520,6 +2532,25 @@ class ChatSession:
             self._start_small_model_turn(text, attachments, True, is_voice)
 
     async def _run_small_model_turn(self, text: str, is_voice: bool, is_real_user: bool = True) -> None:
+        # Bug fix (2026-10-15), confirmed live ("вкладка 2, где нарратор?"):
+        # same root cause as the "sw chat mode" fix just above this method
+        # (search its own comment for "LOOKED dead while it wasn't") --
+        # conn_state is set to "limited"/"restarting"/etc. ONLY by the SDK
+        # engine's own message loop, and NOTHING ever reset it back to
+        # "connected" when a turn instead gets answered via this small-model
+        # fallback path (e.g. Codex hit its usage limit mid-turn, self-heal
+        # escalated to small_model_engine.py to actually finish the work).
+        # _check_progress_narration's own gate (`conn_state.get("kind") !=
+        # "connected"`) then stayed permanently closed for the rest of the
+        # session, even while this method's own real tool activity kept
+        # right on going underneath it -- the turn was never actually
+        # finished, but the narrator had no way to know that, because the
+        # one signal it trusts for "is anything really happening" was stuck
+        # reporting the OLD engine's failure. Reset here, not only at
+        # _finish_small_model_turn_answered's very end, so narration (and
+        # anything else gated on conn_state) is unblocked for the actual
+        # DURATION of this fallback's work, not just after it's already over.
+        self._set_conn_state("connected")
         persona = get_persona(self.workspace_dir)
         recent_dialogue_lines = _read_recent_dialogue_lines(
             self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW,
@@ -3952,7 +3983,23 @@ class ChatSession:
         leaves pending_unapproved_action exactly as it was, same philosophy
         as translate_text/review_reply -- an infrastructure hiccup must not
         silently clear a real pending block, nor manufacture one that was
-        never there."""
+        never there.
+
+        Bug fix (2026-10-15), confirmed live: a user's own CLARIFICATION of
+        the SAME still-pending action ("я ж сказал ЕМУ пиши") used to reset
+        permission_guard_consecutive_blocks to 0 just by virtue of being a
+        new real-user message (see submit()'s own removed reset) -- the
+        model then got a fresh, and unreliable, "ask nicely yourself" grace
+        cycle for something it had already been told twice. Per explicit
+        instruction ("почему мы делаем строковое сравнение вместо LLM-
+        сравнения... бели маленькую модель и сравнивай"): sameness is now
+        judged by turn.permission.guard itself (same_action_as_before),
+        semantically, from the whole dialogue it already reads -- never a
+        hardcoded string/slug comparison here, which a confirmed live
+        wording drift (the SAME action described two different ways across
+        two consecutive real calls) would have broken anyway. The counter
+        only resets when the agent says this is a genuinely different
+        action (or there is nothing pending at all)."""
         from app.plugins.voice_api import check_permission_guard
 
         dialogue = self._gather_recent_dialogue_for_permission_guard()
@@ -3960,13 +4007,23 @@ class ChatSession:
             note = " ".join(extra_context.split())
             dialogue = f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
         try:
-            result = await check_permission_guard(self._narration_task(), dialogue)
+            result = await check_permission_guard(
+                self._narration_task(), dialogue, previous_block_reason=self.permission_guard_last_reason,
+            )
         except Exception as exc:
             log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
             return
         if result is None:
             return
-        self.pending_unapproved_action = result["reason"] if result["needs_approval"] else None
+        if result["needs_approval"]:
+            self.pending_unapproved_action = result["reason"]
+            if not result["same_action_as_before"]:
+                self.permission_guard_consecutive_blocks = 0
+            self.permission_guard_last_reason = result["reason"]
+        else:
+            self.pending_unapproved_action = None
+            self.permission_guard_consecutive_blocks = 0
+            self.permission_guard_last_reason = None
 
     def _on_outbound_message_sent(self, channel: str, args: dict[str, Any], result: Any) -> None:
         """Per explicit instruction (2026-10-12): registered with
