@@ -354,7 +354,7 @@ VOICE_NARRATION_STALE_LEAD_S = 5.0
 # of them "Продолжаю ..." every ten seconds. Each further remark in a row with nothing new
 # waits this much longer than the one before, up to VOICE_NARRATION_STALE_MAX_S; the
 # first new fact puts it back to VOICE_NARRATION_STALE_S.
-VOICE_NARRATION_STALE_STEP_S = 4.0
+VOICE_NARRATION_STALE_STEP_S = 2.0
 
 
 def _spoken_duration(seconds: float) -> str:
@@ -366,7 +366,9 @@ def _spoken_duration(seconds: float) -> str:
     return f"about {minutes:g} minute{'s' if minutes != 1 else ''}"
 
 
-VOICE_NARRATION_STALE_MAX_S = 18.0
+# 14, not 18: with 18 the silences heard live reached 17-20s (the interval plus drafting
+# and review), which already sounds like a pause.
+VOICE_NARRATION_STALE_MAX_S = 14.0
 # A drafted remark not yet shown by then describes a state that has moved on.
 VOICE_NARRATION_MAX_AGE_S = 20.0
 # Shorter than NARRATION_FAILURE_RETRY_S: on a live call, 15s is itself the gap.
@@ -2936,6 +2938,12 @@ class ChatSession:
         # instruction to preserve its language). Translating AFTER review
         # instead means whatever review actually decides to show is what gets
         # put into the right language, every time.
+        # The final text's speech, alongside its review (2026-10-15): when the verifier
+        # corrected the answer, nothing had been made ahead for the corrected text, and
+        # live its first piece took 11.8s to synthesize after the review. The review
+        # leaves a text unchanged far more often than not.
+        if is_voice and not silent:
+            self._speech_ahead(text, current_language_name(self.tab_id))
         try:
             reviewed = await self._reviewed(text, question_text)
         except Exception as exc:
