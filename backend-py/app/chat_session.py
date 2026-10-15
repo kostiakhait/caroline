@@ -350,6 +350,23 @@ VOICE_NARRATION_STALE_S = 10.0
 # Drafting for that case starts this much sooner (2026-10-11): a draft plus its audio
 # takes 4-6s, and started only once the 10s were up it made the silence 14-15s.
 VOICE_NARRATION_STALE_LEAD_S = 5.0
+# A long turn with nothing new to tell (2026-10-15): live, 22 remarks in 4.5 minutes, most
+# of them "Продолжаю ..." every ten seconds. Each further remark in a row with nothing new
+# waits this much longer than the one before, up to VOICE_NARRATION_STALE_MAX_S; the
+# first new fact puts it back to VOICE_NARRATION_STALE_S.
+VOICE_NARRATION_STALE_STEP_S = 4.0
+
+
+def _spoken_duration(seconds: float) -> str:
+    """Elapsed time the way a person would say it (2026-10-15): given "104 s" the narrator
+    said "Уже сто четыре секунды ..."; past a minute it is half-minutes, "about 1.5 minutes"."""
+    if seconds < 60:
+        return f"{int(seconds)} s"
+    minutes = round(seconds / 30) / 2
+    return f"about {minutes:g} minute{'s' if minutes != 1 else ''}"
+
+
+VOICE_NARRATION_STALE_MAX_S = 18.0
 # A drafted remark not yet shown by then describes a state that has moved on.
 VOICE_NARRATION_MAX_AGE_S = 20.0
 # Shorter than NARRATION_FAILURE_RETRY_S: on a live call, 15s is itself the gap.
@@ -1924,6 +1941,10 @@ class ChatSession:
         self._first_voice_remark_covers_start = False
         self._first_voice_remark_task: asyncio.Task[None] | None = None
         self._prepared_narration_is_first = False
+        # Whether the prepared remark was drafted with nothing new to tell, and how many such
+        # remarks have gone out in a row (see VOICE_NARRATION_STALE_STEP_S).
+        self._prepared_narration_stale = False
+        self._stale_remarks_in_row = 0
         self._narration_facts_at_last_draft: str | None = None
         self._narration_last_draft_at: float | None = None
         self._voice_narration_failed_at: float | None = None
@@ -5001,6 +5022,8 @@ class ChatSession:
         self._first_voice_remark_covers_start = False
         self._prepared_narration = None
         self._prepared_narration_is_first = False
+        self._prepared_narration_stale = False
+        self._stale_remarks_in_row = 0
         self._narration_facts_at_last_draft = None
         self._narration_last_draft_at = None
         self._voice_narration_failed_at = None
@@ -5054,6 +5077,10 @@ class ChatSession:
         except asyncio.CancelledError:
             pass
 
+    def _stale_interval(self) -> float:
+        """Silence before the next remark with nothing new -- see VOICE_NARRATION_STALE_STEP_S."""
+        return min(VOICE_NARRATION_STALE_S + VOICE_NARRATION_STALE_STEP_S * self._stale_remarks_in_row, VOICE_NARRATION_STALE_MAX_S)
+
     async def _step_voice_narration(self) -> None:
         if not self._voice_narration_applies():
             return
@@ -5073,8 +5100,10 @@ class ChatSession:
                 (self._prepared_narration_is_first or now - started >= VOICE_NARRATION_FIRST_S)
                 and self._client_quiet_for(now) >= VOICE_NARRATION_AFTER_SPEECH_GAP_S
             ):
+                self._stale_remarks_in_row = self._stale_remarks_in_row + 1 if self._prepared_narration_stale else 0
                 self._prepared_narration = None
                 self._prepared_narration_is_first = False
+                self._prepared_narration_stale = False
                 log_event("engine", "voice_narration_sent", tab_id=self.tab_id, comment=comment, waited_s=round(now - drafted_at, 1), turn_s=round(now - started, 1))
                 await self._send_narration_remark(comment, audio)
                 # The client reports speaking for this remark shortly; until then it
@@ -5113,14 +5142,14 @@ class ChatSession:
             # Nothing new happened: at most one remark per VOICE_NARRATION_STALE_S,
             # counted from the later of the last draft and the end of the last speech.
             last = self._narration_last_draft_at or started
-            wait = VOICE_NARRATION_STALE_S - VOICE_NARRATION_STALE_LEAD_S
+            wait = self._stale_interval() - VOICE_NARRATION_STALE_LEAD_S
             if now - last < wait or self._client_quiet_for(now) < wait:
                 return
         self._narration_facts_at_last_draft = facts
         self._narration_last_draft_at = now
         # Elapsed time is a real fact too ("this one is taking a while"), but only for the
         # model: kept out of the comparison above, it would make every draft look new.
-        facts_for_model = f"{facts}\nTime spent on the request so far: {int(now - started)} s."
+        facts_for_model = f"{facts}\nTime spent on the request so far: {_spoken_duration(now - started)}."
         if new_lines and len(new_lines) < len(facts.splitlines()):
             # Which lines are new is known here exactly; left to work it out from ALREADY
             # SAID, the model answered "nothing new" to a step that had just begun.
@@ -5130,8 +5159,15 @@ class ChatSession:
             # alone, the model stayed silent three drafts running, 21s on a live call.
             facts_for_model += (
                 "\nNothing new has happened since the last remark, and the user has heard nothing for about "
-                f"{int(VOICE_NARRATION_STALE_S)} s."
+                f"{int(self._stale_interval())} s."
             )
+            if self._stale_remarks_in_row:
+                # Data, not a new rule: how many "still working" remarks went before, so the
+                # next one can say something else -- how long it has taken, where the work is.
+                facts_for_model += (
+                    f"\nRemarks in a row with nothing new so far: {self._stale_remarks_in_row} -- the user already knows "
+                    "the work is still going on; say how long it has taken so far, or which part is being done now."
+                )
         already_said = list(self.turn_narration_remarks)
         if self._first_voice_remark is not None and self._first_voice_remark not in already_said:
             already_said.append(self._first_voice_remark)  # known already, even if not out yet
@@ -5152,6 +5188,7 @@ class ChatSession:
             return  # the turn is over, or the loop has a remark of its own by now
         self._prepared_narration = (remark, time.monotonic(), audio)
         self._prepared_narration_is_first = True
+        self._prepared_narration_stale = False
         log_event("engine", "voice_narration_drafted", tab_id=self.tab_id, comment=remark, first=True)
         self._voice_narration_wake.set()
 
@@ -5222,6 +5259,7 @@ class ChatSession:
             log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=True)
             return
         self._prepared_narration = (comment, time.monotonic(), audio)
+        self._prepared_narration_stale = stale
         log_event("engine", "voice_narration_drafted", tab_id=self.tab_id, comment=comment)
         self._voice_narration_wake.set()
 

@@ -20,7 +20,11 @@ for node in tree.body:
 WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speech_state", "_client_quiet_for",
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
-          "_say_first_voice_remark", "_review_and_synthesize"}
+          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval"}
+# Module-level helpers of chat_session.py the copied methods call.
+HELPERS = {"_spoken_duration"}
+helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in HELPERS]
+assert {h.name for h in helpers} == HELPERS, HELPERS
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChatSession")
 funcs = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in WANTED]
 missing = WANTED - {f.name for f in funcs}
@@ -80,6 +84,7 @@ for k, v in list(consts.items()):  # scale every time constant
 mod = ast.Module(body=funcs, type_ignores=[])
 code = compile(ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(name="S", bases=[], keywords=[], body=funcs, decorator_list=[], type_params=[])], type_ignores=[])), SRC, "exec")
 exec(code, ns)
+exec(compile(ast.fix_missing_locations(ast.Module(body=helpers, type_ignores=[])), SRC, "exec"), ns)
 S = ns["S"]
 
 class Client:
@@ -114,6 +119,7 @@ def make_session(voice=True, reports=True):
     s.last_visible_output_at = None; s.consecutive_narration_count = 0; s.pending_interim_notes = []
     s._voice_narration_wake = asyncio.Event(); s._narration_turn_seq = 0
     s._narration_draft_task = None; s.turn_narration_remarks = []
+    s._prepared_narration_stale = False; s._stale_remarks_in_row = 0
     s._client_speaking = None; s._client_quiet_since = None; s._client_speech_reported_at = None
     s._last_narration_est_speech_s = 0.0
     s._first_voice_remark_task = None
