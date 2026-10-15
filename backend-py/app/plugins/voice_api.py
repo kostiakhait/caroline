@@ -573,7 +573,31 @@ async def check_reply_expected(task: str, channel: str, sent_message: str, sessi
 #    Russian conversation);
 #  - raw JSON, or a reply far longer than "one short sentence".
 # Any of these -> treat as no usable response, show nothing.
-_NARRATION_GARBAGE_PATTERNS = [
+# Split (2026-10-15) into two tiers:
+# - _NARRATION_DRAFT_GARBAGE_PATTERNS: the full set, for what this was all
+#   built catching in the first place -- narration-draft-specific tells
+#   that only matter when checking generate_progress_comment's raw draft
+#   before translation, where "Caroline wrote her own name" or "sounds
+#   like a recap of my own prompt" really is a reliable tell of a broken
+#   translation, where "Caroline wrote her own name" or "sounds like a
+#   recap of my own prompt" really is a reliable tell of a broken
+#   narration. Used by _looks_like_narration_garbage(draft_only=True).
+# - _GENERAL_GARBAGE_PATTERNS: the narrower subset safe to apply to ANY
+#   text (translate_text's post-translation output -- real replies,
+#   relayed background messages, permission-guard asks, not just
+#   narration drafts). Bug fix (2026-10-15), confirmed live: the full
+#   list's `\bCaroline\b` pattern (added for the narration-draft case,
+#   where her own name in third person means a broken remark) rejected a
+#   genuinely correct Russian translation of a real relayed reply that
+#   legitimately mentioned her by name ("...а не через Caroline") --
+#   translate_text fell back to the untranslated English original, which
+#   is exactly the English-leak bug this filter exists to prevent. Same
+#   reasoning for every other pattern here that's about the SHAPE of a
+#   narration draft specifically (third-person recap, "short remark",
+#   "<narration>" tag vocabulary, "which one should I") rather than a
+#   genuine cross-content failure (refusal, JSON leak, catalog/error
+#   leak) that can show up in any piece of text regardless of its origin.
+_GENERAL_GARBAGE_PATTERNS = [
     re.compile(r"\bi(?:'m| am)\s+sorry\b", re.IGNORECASE),
     re.compile(r"\bi\s+(?:can(?:'t|not)|won'?t|am unable to|cannot)\s+(?:help|assist|do that|provide|comply)", re.IGNORECASE),
     re.compile(r"\bas an? (?:ai|language model)\b", re.IGNORECASE),
@@ -584,6 +608,14 @@ _NARRATION_GARBAGE_PATTERNS = [
     re.compile(r"\bavailable catalog\b", re.IGNORECASE),
     re.compile(r"\berrcode\b", re.IGNORECASE),
     re.compile(r"^\s*[{\[]"),  # raw JSON/array leaking through
+    # Bug fix (2026-10-03): a literal "[tool_name(args)]" fragment leaking
+    # through is a genuine cross-content tell (echoed tool-call shape),
+    # not narration-draft-specific -- kept in the general set too.
+    re.compile(r"\[\s*\w+\([^)]*\)\s*\]"),
+]
+
+_NARRATION_DRAFT_GARBAGE_PATTERNS = [
+    *_GENERAL_GARBAGE_PATTERNS,
     # Bug fix (2026-09-13), confirmed live: a declarative "there's nothing
     # to say" meta-statement, distinct from the first-person refusals above
     # -- just as much a non-answer, still slipped through unfiltered.
@@ -655,13 +687,6 @@ _NARRATION_GARBAGE_PATTERNS = [
     re.compile(r"\bshort remark\b", re.IGNORECASE),
     re.compile(r"\breacting to (?:the|this|a) (?:given |real )?conversation\b", re.IGNORECASE),
     re.compile(r"\b(?:max|maximum) (?:one|two|three|1|2|3) (?:words?|sentences?)\b", re.IGNORECASE),
-    # Bug fix (2026-10-03), confirmed live: a literal "[tool_name(args)]"
-    # fragment leaked straight into a shown narration bubble -- the model
-    # echoed the shape of real tool-call text already present in the
-    # dialogue it was given, despite the prompt's own "no JSON" rule not
-    # covering this specific shape. Safety net for the prompt instruction
-    # added alongside this, not a replacement for it.
-    re.compile(r"\[\s*\w+\([^)]*\)\s*\]"),
     # Bug fix (2026-10-03), confirmed live ("вкладка 3 запустила эмулятор,
     # но сама этого не поняла"): this remark can never actually receive a
     # reply -- the real task keeps going regardless of what's written here
@@ -684,7 +709,15 @@ _CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 
 
-def _looks_like_narration_garbage(text: str, language: str = "", max_chars: int = _NARRATION_MAX_CHARS) -> bool:
+def _looks_like_narration_garbage(
+    text: str, language: str = "", max_chars: int = _NARRATION_MAX_CHARS, draft_only: bool = False,
+) -> bool:
+    """`draft_only=True` is for generate_progress_comment's own raw,
+    pre-translation small-model draft, where the fuller set of narration-
+    specific tells (self-reference, third-person recap, prompt-vocabulary
+    echoes) applies. Every other caller (translate_text's post-translation
+    check, applied to arbitrary real text) gets the narrower general set --
+    see the two pattern lists' own comments for why."""
     if len(text) > max_chars:
         return True
     if _CJK_RE.search(text) and not re.search(r"chin|japan|korea|mandarin|中文", language, re.IGNORECASE):
@@ -704,7 +737,8 @@ def _looks_like_narration_garbage(text: str, language: str = "", max_chars: int 
     if re.search(r"russ|ukrain|belarus|bulgar|serb|macedon", language, re.IGNORECASE):
         if _LATIN_LETTER_RE.search(text) and not _CYRILLIC_RE.search(text):
             return True
-    return any(p.search(text) for p in _NARRATION_GARBAGE_PATTERNS)
+    patterns = _NARRATION_DRAFT_GARBAGE_PATTERNS if draft_only else _GENERAL_GARBAGE_PATTERNS
+    return any(p.search(text) for p in patterns)
 
 
 # Bug fix (2026-09-16), confirmed live: an echo of an ENGLISH prompt
@@ -1188,7 +1222,7 @@ async def generate_progress_comment(
     # script-agnostic checks (refusals, meta-commentary, CJK) apply here;
     # the real post-translation Cyrillic check still runs correctly inside
     # translate_text() itself just below.
-    if _looks_like_narration_garbage(text):
+    if _looks_like_narration_garbage(text, draft_only=True):
         log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300])
         return None
     if _is_echo_of_dialogue(text, recent_dialogue):
