@@ -78,7 +78,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.partnerssolutions.caroline.companion.data.model.Attachment
-import com.partnerssolutions.caroline.companion.data.model.ChannelStatus
 import com.partnerssolutions.caroline.companion.data.model.ChatMessage
 import com.partnerssolutions.caroline.companion.data.model.TabStatus
 import com.partnerssolutions.caroline.companion.util.Logger
@@ -248,23 +247,23 @@ fun ChatScreen(tabId: String) {
                 }
             },
         )
-        StatusBar(tabStatus = viewModel.tabStatus, channelStatus = viewModel.channelStatus)
+        StatusBar(tabStatus = viewModel.tabStatus)
     }
 }
 
 /**
- * Mirrors the desktop app's own bottom status bar -- statusBarText + two
- * lamps (lampBackend, lampChannel) in chat.js/chat.html -- per explicit
+ * Mirrors the desktop app's own bottom status bar -- statusBarText + the
+ * backend lamp (lampBackend) in chat.js/chat.html -- per explicit
  * instruction (2026-09-15): the phone should show exactly what the
- * desktop shows, not just chat text. Same layout order (text left, lamps
+ * desktop shows, not just chat text. Same layout order (text left, lamp
  * right) and the same semantic colors/blink rule as chat.js's own
- * updateBackendLamp()/updateChannelLamp() -- see LampColor's own doc
- * comment for the one place chat.js's rule doesn't map 1:1 (there's no
- * "is the WebSocket itself connected" concept on the phone, only the
- * backend-reported state).
+ * updateBackendLamp() -- see LampColor's own doc comment for the one
+ * place chat.js's rule doesn't map 1:1 (there's no "is the WebSocket
+ * itself connected" concept on the phone, only the backend-reported
+ * state).
  */
 @Composable
-private fun StatusBar(tabStatus: TabStatus, channelStatus: ChannelStatus) {
+private fun StatusBar(tabStatus: TabStatus) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -281,7 +280,6 @@ private fun StatusBar(tabStatus: TabStatus, channelStatus: ChannelStatus) {
             modifier = Modifier.weight(1f),
         )
         Lamp(tabLampColor(tabStatus))
-        Lamp(channelLampColor(channelStatus), modifier = Modifier.padding(start = 6.dp))
     }
 }
 
@@ -301,14 +299,6 @@ private fun statusBarText(status: TabStatus): String = when (status.state) {
     "recovering" -> status.reason.ifBlank { "Recovering..." }
     "working" -> "Working..."
     else -> "connected"
-}
-
-// Matches chat.js's updateChannelLamp() exactly.
-private fun channelLampColor(status: ChannelStatus): LampColor = when {
-    !status.enabled -> LampColor.YELLOW
-    status.last_tick_outcome?.startsWith("threw:") == true -> LampColor.RED
-    status.last_tick_outcome?.contains("injecting into headless session") == true -> LampColor.GREEN_BLINK
-    else -> LampColor.GREEN
 }
 
 private enum class LampColor(val color: Color, val blinking: Boolean) {

@@ -6,7 +6,6 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.partnerssolutions.caroline.companion.data.model.Attachment
-import com.partnerssolutions.caroline.companion.data.model.ChannelStatus
 import com.partnerssolutions.caroline.companion.data.model.ChatMessage
 import com.partnerssolutions.caroline.companion.data.model.TabStatus
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
@@ -61,15 +60,13 @@ class ChatViewModel(
         private set
     var sendError by mutableStateOf<String?>(null)
         private set
-    // Mirrors the desktop app's own lamp 1 + status-bar text (this tab's
-    // own tabs/<tabId>/status) and lamp 2 (the global channel_status) --
-    // per explicit instruction (2026-09-15), the phone should show
-    // exactly what the desktop shows. Defaults are the "everything's
-    // fine, nothing known yet" state, same spirit as the desktop's own
-    // initial carolineStatus="ready" before the first real status lands.
+    // Mirrors the desktop app's own status lamp + status-bar text (this
+    // tab's own tabs/<tabId>/status) -- per explicit instruction
+    // (2026-09-15), the phone should show exactly what the desktop shows.
+    // Default is the "everything's fine, nothing known yet" state, same
+    // spirit as the desktop's own initial carolineStatus="ready" before
+    // the first real status lands.
     var tabStatus by mutableStateOf(TabStatus.READY)
-        private set
-    var channelStatus by mutableStateOf(ChannelStatus.UNKNOWN)
         private set
 
     // --- voice (ported from Ratatosk's pattern: tap mic -> record -> STT into the
@@ -271,12 +268,9 @@ class ChatViewModel(
     fun bindContext(context: Context) { appContext = context.applicationContext }
 
     /**
-     * Pulls this tab's own lamp-1/status-bar source plus the one global
-     * channel_status (lamp 2) -- separate try/catch from the history fetch
-     * above so a status hiccup never blanks out already-loaded messages,
-     * and vice versa. Best-effort: silently keeps the last-known value on
-     * failure rather than surfacing a second error UI on top of the
-     * message list's own.
+     * Pulls this tab's own lamp/status-bar source. Best-effort: silently
+     * keeps the last-known value on failure rather than surfacing a
+     * second error UI on top of the message list's own.
      */
     private suspend fun refreshStatus() {
         try {
@@ -288,19 +282,6 @@ class ChatViewModel(
             }
         } catch (exc: Exception) {
             Logger.e("tab status refresh failed for tab $tabId", exc)
-        }
-        try {
-            (repository.getMine("channel_status") as? Map<*, *>)?.let { raw ->
-                channelStatus = ChannelStatus(
-                    enabled = raw["enabled"] as? Boolean ?: false,
-                    tick_count = (raw["tick_count"] as? Double)?.toInt() ?: 0,
-                    last_tick_at_iso = raw["last_tick_at_iso"] as? String,
-                    last_tick_outcome = raw["last_tick_outcome"] as? String,
-                    caroline_email = raw["caroline_email"] as? String,
-                )
-            }
-        } catch (exc: Exception) {
-            Logger.e("channel status refresh failed", exc)
         }
     }
 
