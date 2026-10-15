@@ -4522,6 +4522,21 @@ class ChatSession:
         if _NO_UPDATE_SENTINEL in comment or _is_silent_reply_paraphrase(comment):
             log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=comment)
             return
+        # Bug fix (2026-10-14), confirmed live ("Нарратор работает после
+        # окончательного ответа"): the one _stale() check earlier (right after
+        # generate_progress_comment returns) left review_reply/translate_text
+        # above and _check_permission_guard below unguarded -- each is its own
+        # real network round trip, and the turn can finish DURING any of them
+        # just as easily as during generation itself. A real incident: the
+        # turn (and its own silent [[NO_UPDATE]] conclusion) had already ended
+        # by the time review_reply alone finished, and the stale "Всё ещё
+        # проверяю..." comment still reached the user's chat ~2s later, with
+        # no turn left for it to be commentary on. Re-checked here, before
+        # anything else runs or gets recorded as having been said.
+        stale = _stale()
+        if stale:
+            log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, stage="pre_send")
+            return
         # Per explicit instruction (2026-10-11): re-evaluate the permission
         # guard on every outbound message -- see _check_permission_guard's
         # own docstring for why this runs here too, not just in submit().
