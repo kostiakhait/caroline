@@ -203,6 +203,28 @@ MAX_ITERATIONS = 200
 # check, unrelated to task complexity (see module docstring point 2).
 REPEATED_CALL_LIMIT = 3
 
+# Soft/semantic loop detection (2026-10-15), per explicit instruction following a
+# real SW e2e test: a mailbox-sweep task had the model fetch a message uid from
+# ONE account, then call email_get_message with that SAME uid against 7 OTHER
+# accounts, failing "not found" every single time for several minutes straight --
+# REPEATED_CALL_LIMIT above never caught it, since every one of those calls had a
+# DIFFERENT "address" argument and so never hit the same exact call_key twice.
+# This is the semantic layer REPEATED_CALL_LIMIT can't be: once the SAME tool
+# NAME (regardless of its arguments) has been called this many times, a cheap
+# model judges whether the real arguments/results across those calls form a
+# stuck, unproductive pattern -- the same underlying mistake repeated against
+# different inputs -- rather than legitimate different attempts (e.g. the exact
+# same tool called once per account, each with its own real, different result,
+# is NOT a loop). Purely additive: the exact-match check above still runs first
+# and is free: this only ever adds coverage, never removes any.
+SOFT_LOOP_CHECK_MIN_CALLS = 4
+# Re-checked every this-many FURTHER calls past the minimum (4, 7, 10, ...)
+# rather than on every single call once the minimum is crossed -- a genuine loop
+# still gets caught quickly, but a long legitimate multi-account sweep (the exact
+# shape of the task that found this gap) doesn't pay for an extra model call on
+# every one of its own many, perfectly normal, same-tool-different-account calls.
+SOFT_LOOP_RECHECK_INTERVAL = 3
+
 # Per explicit instruction (2026-09-13), following a completeness audit
 # against the full SDK path ("я хочу, чтобы это работало не хуже Claude
 # SDK"): resolve_agentic() itself has THREE ways of giving up that return a
@@ -715,6 +737,34 @@ _WEB_SEARCH_TOOL_DEFS: list[dict[str, Any]] = [
 _WEB_SEARCH_TOOL_NAMES = {t["function"]["name"] for t in _WEB_SEARCH_TOOL_DEFS}
 
 
+_SOFT_LOOP_PROMPT = (
+    "An assistant with tools is calling the SAME tool repeatedly, with different arguments each time. Below are "
+    "its last attempts at this tool -- the real arguments and the real result, oldest first. Judge: is this a "
+    "STUCK, UNPRODUCTIVE pattern -- the same underlying mistake repeated against different inputs, with no real "
+    "progress -- or are these legitimate, meaningfully different attempts (e.g. the same tool used once per "
+    "account/item, each with its own distinct real outcome)? Reply with exactly one word: LOOP or PROGRESS.\n\n"
+)
+
+
+def _check_soft_repeat_loop(tool_name: str, history: list[str], ai: Any, cfg: Any) -> str | None:
+    """Returns a reason string if `history` (this tool name's own real calls so
+    far, oldest first) looks like a stuck/unproductive loop, else None. Never
+    raises into the turn -- a failed classification call just means no soft-loop
+    signal this time, same as every other "never a hard dependency" check in
+    this file (see SOFT_LOOP_CHECK_MIN_CALLS's own comment for the incident this
+    closes)."""
+    prompt = _SOFT_LOOP_PROMPT + f"Tool: {tool_name}\n\n" + "\n".join(history[-8:])
+    try:
+        raw = ai.resolve(prompt, model=cfg.AI_MODEL_SMALL, no_fallback=True)
+    except Exception as exc:  # noqa: BLE001 -- classification must never block the turn
+        log_event("engine", "small_model_soft_loop_check_failed", tool=tool_name, error=str(exc), error_type=type(exc).__name__)
+        return None
+    verdict = str(raw or "").strip().upper()
+    if verdict.startswith("LOOP"):
+        return f"tool '{tool_name}' called {len(history)} times with different arguments but the same underlying mistake each time -- likely a stuck loop"
+    return None
+
+
 def _run_web_search_tool(name: str, args: dict[str, Any], ai: Any, cfg: Any) -> str:
     question = str(args.get("question") or "").strip()
     if not question:
@@ -1039,6 +1089,9 @@ def _make_executor_fn(
     tracker records plan/pending-operation state as calls actually happen
     -- see _TurnTracker's own doc comment."""
     seen_calls: dict[tuple[str, str], int] = {}
+    # Per-tool-name (not per exact-args) call history for the soft loop check
+    # below -- see SOFT_LOOP_CHECK_MIN_CALLS's own comment.
+    tool_call_history: dict[str, list[str]] = {}
 
     def executor_fn(name: str, args: dict[str, Any]) -> str:
         args = args or {}
@@ -1112,10 +1165,10 @@ def _make_executor_fn(
         log_event("engine", "small_model_tool_result", tab_id=tab_id, tool=name, status=envelope.get("status"))
         note = f"\n{envelope['memory_note']}" if envelope.get("memory_note") else ""
         if envelope.get("status") == "error":
-            return f"ERROR: {envelope.get('error')}{note}"
-        if envelope.get("status") == "cancelled":
-            return f"ERROR: this tool call was cancelled before it finished.{note}"
-        if envelope.get("status") == "running":
+            text = f"ERROR: {envelope.get('error')}{note}"
+        elif envelope.get("status") == "cancelled":
+            text = f"ERROR: this tool call was cancelled before it finished.{note}"
+        elif envelope.get("status") == "running":
             # Genuinely normal (a slow tool call, e.g. a network-bound
             # plugin) -- NOT a signal of anything wrong. resolve_agentic()
             # has no polling concept of its own, so the best honest answer
@@ -1129,29 +1182,40 @@ def _make_executor_fn(
             op_id = envelope.get("operation_id")
             if op_id:
                 tracker.pending_operation_ids.add(op_id)
-            return f"Operation {op_id} is still running."
-        result = envelope.get("result")
-        # Bug fix (2026-10-14), confirmed live: the established plugin-handler
-        # contract (every plugin returns {"text": ...}, see loader.py's own
-        # _envelope_to_mcp_response for the SDK/Claude path's equivalent) means
-        # `result` is almost always a dict whose "text" value is the string the
-        # model should read -- and for memory_plugin's structured tools
-        # (request_info in particular), that string is itself ALREADY a
-        # JSON-formatted blob. json.dumps()-ing the whole dict here re-escapes
-        # that already-JSON string a second time, producing a backslash-heavy
-        # mess a cheap model (this engine runs tier-1 on openai/gpt-5.1-codex-
-        # mini) could not parse -- confirmed live: a real IEEE-credentials
-        # lookup had its answer sitting right there in the tool result, but the
-        # model told the user it "couldn't be extracted". Extracting the plain
-        # "text" string, same as the SDK path effectively does, removes that
-        # extra escaping layer entirely.
-        if isinstance(result, str):
-            text = result
-        elif isinstance(result, dict) and isinstance(result.get("text"), str):
-            text = result["text"]
+            text = f"Operation {op_id} is still running."
         else:
-            text = json.dumps(result, ensure_ascii=False, default=str)
-        return text + note
+            result = envelope.get("result")
+            # Bug fix (2026-10-14), confirmed live: the established plugin-handler
+            # contract (every plugin returns {"text": ...}, see loader.py's own
+            # _envelope_to_mcp_response for the SDK/Claude path's equivalent) means
+            # `result` is almost always a dict whose "text" value is the string the
+            # model should read -- and for memory_plugin's structured tools
+            # (request_info in particular), that string is itself ALREADY a
+            # JSON-formatted blob. json.dumps()-ing the whole dict here re-escapes
+            # that already-JSON string a second time, producing a backslash-heavy
+            # mess a cheap model (this engine runs tier-1 on openai/gpt-5.1-codex-
+            # mini) could not parse -- confirmed live: a real IEEE-credentials
+            # lookup had its answer sitting right there in the tool result, but the
+            # model told the user it "couldn't be extracted". Extracting the plain
+            # "text" string, same as the SDK path effectively does, removes that
+            # extra escaping layer entirely.
+            if isinstance(result, str):
+                text = result
+            elif isinstance(result, dict) and isinstance(result.get("text"), str):
+                text = result["text"]
+            else:
+                text = json.dumps(result, ensure_ascii=False, default=str)
+            text = text + note
+
+        history = tool_call_history.setdefault(name, [])
+        history.append(f"- args={json.dumps(args, ensure_ascii=False, default=str)[:200]} -> {text[:200]}")
+        call_count = len(history)
+        if call_count >= SOFT_LOOP_CHECK_MIN_CALLS and (call_count - SOFT_LOOP_CHECK_MIN_CALLS) % SOFT_LOOP_RECHECK_INTERVAL == 0:
+            loop_reason = _check_soft_repeat_loop(name, history, ai, cfg)
+            if loop_reason is not None:
+                log_event("engine", "small_model_soft_loop_detected", tab_id=tab_id, tool=name, call_count=call_count, reason=loop_reason)
+                raise NeedsEscalation(loop_reason)
+        return text
 
     return executor_fn
 
@@ -1298,6 +1362,40 @@ _COMPLEXITY_PROMPT = (
     "Reply with exactly one word: COMPLEX if it needs several dependent tool steps (check, then act, then verify), "
     "otherwise SIMPLE.\n\nRequest:\n"
 )
+
+
+_VERIFIER_INTENT_RECHECK_TIMEOUT_S = 12.0
+
+_VERIFIER_INTENT_PROMPT = (
+    "Below is a reply a VERIFIER wrote while checking whether another assistant's work on a task was actually "
+    "finished. Judge what the verifier ITSELF is saying about completeness -- not the task's own subject matter. "
+    "Does this reply say or clearly imply the task is NOT actually finished (real work is still needed), or does "
+    "it treat the task as done? Reply with exactly one word: UNFINISHED or DONE.\n\nVerifier's reply:\n"
+)
+
+
+async def _recheck_verifier_intent(ai: Any, cfg: Any, verified_text: str) -> bool:
+    """Returns True if the verifier's OWN reply reads as "not actually finished"
+    even though it didn't include the literal ESCALATION_SENTINEL/DEESCALATION_SENTINEL
+    marker it was asked to use. Confirmed live (2026-10-15, SW e2e mailbox-check test):
+    a verifier wrote "...the task is not finished: the earlier reply needs to be revised
+    to include those accounts..." in plain prose, with NEITHER marker present -- the
+    mechanical `in` checks in verify_candidate() missed it entirely, and that exact
+    prose (the verifier's own admission that it was wrong) became the final, delivered
+    user-facing answer. A cheap, separate, forced one-word classification against the
+    verifier's OWN text (not the task) catches this without relying on the SAME model
+    call to get its own formatting right and its own judgment right at the same time.
+    Never raises into the turn -- a failed re-check just keeps the original (no-sentinel)
+    reading, same as every other "never a hard dependency" check in this file."""
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(ai.resolve, _VERIFIER_INTENT_PROMPT + verified_text[:4000], model=cfg.AI_MODEL_SMALL, no_fallback=True),
+            timeout=_VERIFIER_INTENT_RECHECK_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 -- re-check must never block the turn
+        log_event("engine", "small_model_verifier_intent_recheck_failed", error=str(exc), error_type=type(exc).__name__)
+        return False
+    return str(raw or "").strip().upper().startswith("UNFINISHED")
 
 
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
@@ -1535,6 +1633,16 @@ async def run_small_model_turn(
         if can_deescalate and DEESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_deescalating", tab_id=tab_id, note=verified.replace(DEESCALATION_SENTINEL, "").strip()[:200])
             return verified, "down"
+        if can_escalate or can_deescalate:
+            # Neither literal marker is present -- but the verifier may still have
+            # judged the task unfinished in plain prose (see _recheck_verifier_intent's
+            # own doc comment for the real incident this closes). Prefer escalating up
+            # when a stronger tier remains; "down" is only the fallback direction when
+            # it's the sole continuation left (already at the last tier).
+            if await _recheck_verifier_intent(ai, cfg, verified):
+                action = "up" if can_escalate else "down"
+                log_event("engine", "small_model_verifier_intent_recheck_overrode", tab_id=tab_id, action=action, text=verified[:300])
+                return verified, action
         log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
         return verified, "done"
 
