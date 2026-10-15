@@ -701,7 +701,7 @@ def _outcomes(text: str) -> set[str]:
     return {(m.group(1) or m.group(2)).lower() for m in _OUTCOME_WORDS.finditer(text.lower().replace("ё", "е"))}
 
 
-def _is_repeat(text: str, previous: str) -> bool:
+def _is_repeat(text: str, previous: str, ignore_stems: frozenset[str] = frozenset()) -> bool:
     """Same remark in other words. _normalized_overlap only catches near-
     verbatim containment; "я всё ещё проверяю прогноз..." vs "я все еще ищу
     прогноз..." differ in one verb and a letter. Word-set overlap catches
@@ -717,12 +717,26 @@ def _is_repeat(text: str, previous: str) -> bool:
 
     def words(s: str) -> set[str]:
         s = s.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
-        return {w for w in re.findall(r"\w+", s) if len(w) > 2}
+        return {w for w in re.findall(r"\w+", s) if len(w) > 2 and w[:_STEM_LEN] not in ignore_stems}
 
     a, b = words(text), words(previous)
     if len(a) < 3 or len(b) < 3:
         return False
     return len(a & b) / len(a | b) >= 0.6
+
+
+# A crude stem: enough to match "Киеве" in a request with "Киева" in a remark.
+_STEM_LEN = 5
+
+
+def _request_stems(task: str) -> frozenset[str]:
+    """The request's own words, as stems (see _is_repeat's ignore_stems). Live 2026-10-15:
+    "Какая погода будет завтра в Киеве, Львове и Одессе?" -- every remark about it is
+    mostly those words, so every new draft looked like a repeat of the last one by word
+    overlap, and the user heard nothing for 75s in the middle of the turn. What the
+    request is about is not news either way; what is said about it is."""
+    s = task.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
+    return frozenset(w[:_STEM_LEN] for w in re.findall(r"\w+", s) if len(w) > 2)
 
 
 def _already_said_block(already_said: list[str] | None) -> str:
@@ -982,11 +996,23 @@ _FOUND_OR_CHECKING = re.compile(
 )
 
 
+# A number in words counts as a figure out of a result only next to what it measures.
+# Live 2026-10-15: "Продолжаю обрабатывать прогнозы для трёх городов." was dropped by this
+# check ("трёх" -- the three cities of the request), the second model's draft was the only
+# usable one, and the user heard nothing for over a minute.
+_MEASURE_SAID = re.compile(
+    r"\b(?:градус\w*|процент\w*|гривн\w*|доллар\w*|евро|рубл\w*|курс\w*|цел(?:ых|ая)|тысячн\w*|сотых|десятых|"
+    r"метр\w*|километр\w*|миль|милях|degrees?|percent|dollars?|euros?|hryvni?as?|rate|miles?)\b",
+    re.IGNORECASE,
+)
+
+
 def _states_figure_as_settled(text: str, activity: str) -> bool:
     if not _RESULT_WITH_FIGURE.search(activity):
         return False
     said = text.lower().replace("ё", "е")
-    return bool(_FIGURE_SAID.search(said)) and not _FOUND_OR_CHECKING.search(said)
+    figure = bool(re.search(r"\d", said)) or (bool(_FIGURE_SAID.search(said)) and bool(_MEASURE_SAID.search(said)))
+    return figure and not _FOUND_OR_CHECKING.search(said)
 
 
 def _progress_comment_prompt(
@@ -1370,7 +1396,10 @@ async def generate_progress_comment_direct(
     # repeat_window: how many of the latest remarks a new one may not repeat; None, all of
     # them. See chat_session.py's _step_voice_narration for when it is narrowed.
     recent = already_said[-repeat_window:] if repeat_window else already_said
-    if recent and any(_is_repeat(text, prev) for prev in recent):
+    # After a silence (repeat_window set) the request's own words are left out of the
+    # comparison too: near-verbatim repeats are still caught by _normalized_overlap.
+    ignore = _request_stems(task) if repeat_window else frozenset()
+    if recent and any(_is_repeat(text, prev, ignore) for prev in recent):
         log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300], direct=True)
         return ""
     if _FINISH_CLAIM.search(text):

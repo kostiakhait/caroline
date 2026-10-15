@@ -76,6 +76,15 @@ CASES = [
                "Работа над курсом ещё идёт.", "Пока всё ещё уточняю курс.", "Ищу данные о курсе на другом сайте.",
                "Всё ещё работаю над вашим вопросом про курс."],
          repeat_window=2, expect="say", need=[]),
+    # 2026-10-15, live: three cities in one request. Two remarks said; every new draft was
+    # mostly the request's own words and was rejected as a repeat -- 75s of silence.
+    dict(name="three cities, silent again", task="Какая погода будет завтра в Киеве, Львове и Одессе? Сравни.",
+         status=[ACTIVITY_START, TIER_1,
+                 'Tool call web_search (arguments: {"question": "weather Kyiv Lviv Odesa tomorrow"}); result: Web search results: 3 pages.',
+                 "Time spent on the request so far: 61 s.",
+                 "Nothing new has happened since the last remark, and the user has heard nothing for about 10 s."],
+         said=["Ищу прогноз погоды на завтра для Киева, Львова и Одессы.", "Нашла прогнозы для Киева, Львова и Одессы, сейчас их сравниваю."],
+         repeat_window=2, expect="say", need=[]),
     dict(name="answer unchecked", task="Сколько дней осталось до Нового года?",
          status=[ACTIVITY_START, TIER_1,
                  "Tool call get_current_time (arguments: {}); result: 2026-10-11 15:27",
@@ -136,11 +145,12 @@ def _outcomes(s):
     return {m.group(1) or m.group(2) for m in _OUTCOME.finditer(s.lower().replace("ё", "е"))}
 
 
-def is_repeat(a, b):
+def is_repeat(a, b, ignore=frozenset()):
     if _outcomes(a) != _outcomes(b):  # as voice_api._is_repeat: a different outcome word is news by itself
         return False
     wa, wb = set(norm(a)), set(norm(b))
-    wa, wb = {w for w in wa if len(w) > 2}, {w for w in wb if len(w) > 2}  # as voice_api._is_repeat
+    # as voice_api._is_repeat (with ignore_stems: the request's own words, after a silence)
+    wa, wb = {w for w in wa if len(w) > 2 and w[:5] not in ignore}, {w for w in wb if len(w) > 2 and w[:5] not in ignore}
     return len(wa) >= 3 and len(wb) >= 3 and len(wa & wb) / len(wa | wb) >= 0.6
 
 
@@ -162,8 +172,9 @@ def check(case, text):
     if any(w in low for w in case.get("hedge_if", ())) and not any(h in low for h in HEDGES):
         return False, "a figure stated as settled"
     # As voice_api.generate_progress_comment_direct with repeat_window (the stale case).
+    ignore = frozenset(w[:5] for w in norm(case["task"]) if len(w) > 2) if case.get("repeat_window") else frozenset()
     for prev in case["said"][-case["repeat_window"]:] if case.get("repeat_window") else case["said"]:
-        if is_repeat(text, prev):
+        if is_repeat(text, prev, ignore):
             return False, "repeat"
     if case["need"] and not any(n in text.lower().replace("ё", "е") for n in case["need"]):
         return False, "missed the fact"
