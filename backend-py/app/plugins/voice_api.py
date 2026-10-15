@@ -1001,16 +1001,21 @@ _FOUND_OR_CHECKING = re.compile(
 # check ("трёх" -- the three cities of the request), the second model's draft was the only
 # usable one, and the user heard nothing for over a minute.
 _MEASURE_SAID = re.compile(
-    r"\b(?:градус\w*|процент\w*|гривн\w*|доллар\w*|евро|рубл\w*|курс\w*|цел(?:ых|ая)|тысячн\w*|сотых|десятых|"
+    r"\b(?:градус\w*|процент\w*|гривн\w*|гривен|доллар\w*|евро|рубл\w*|курс\w*|цел(?:ых|ая)|тысячн\w*|сотых|десятых|"
     r"метр\w*|километр\w*|миль|милях|degrees?|percent|dollars?|euros?|hryvni?as?|rate|miles?)\b",
     re.IGNORECASE,
 )
 
 
-def _states_figure_as_settled(text: str, activity: str) -> bool:
+def _states_figure_as_settled(text: str, activity: str, task: str = "") -> bool:
     if not _RESULT_WITH_FIGURE.search(activity):
         return False
     said = text.lower().replace("ё", "е")
+    # A number the request itself has is part of what is asked about, not a figure out of
+    # a result. Live 2026-10-15: "Я углубляю поиск цен на iPhone 17 ..." was dropped for
+    # its "17", twice, while the user had heard nothing for half a minute.
+    for number in set(re.findall(r"\d+", task)):
+        said = re.sub(rf"(?<!\d){number}(?!\d)", " ", said)
     figure = bool(re.search(r"\d", said)) or (bool(_FIGURE_SAID.search(said)) and bool(_MEASURE_SAID.search(said)))
     return figure and not _FOUND_OR_CHECKING.search(said)
 
@@ -1405,7 +1410,7 @@ async def generate_progress_comment_direct(
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300], direct=True)
         return ""
-    if _states_figure_as_settled(text, activity):
+    if _states_figure_as_settled(text, activity, task):
         log_event("plugin:voice", "generate_progress_comment_rejected_settled_figure", text=text[:300], direct=True)
         return ""
     log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True)
