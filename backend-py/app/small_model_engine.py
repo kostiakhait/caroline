@@ -1920,6 +1920,20 @@ def _fast_lane_instructions(language: str, is_voice: bool) -> str:
 CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE = True
 
 
+# What in a Russian answer is not a sign of another language: links, and Latin words that
+# are names -- any capital letter or digit in them (iPhone, Rozetka, BBC, iPhone17Pro).
+# Live 2026-10-15: "... iPhone 17 ... в Rozetka, Comfy и Foxtrot ..." failed the 85% check,
+# went through the translation pass (Russian to Russian, 7.5s), came back slightly changed,
+# and so missed the speech made for it ahead (speech_ahead.py): 11.6s from the answer
+# being ready to its first sound. A lower-case English word still counts against it.
+_LINK = re.compile(r"(?:https?://|www\.)\S+|\b[\w.-]+\.(?:com|net|org|ua|ru|io|info|biz)(?:/\S*)?", re.IGNORECASE)
+_LATIN_NAME = re.compile(r"\b(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*\b")
+
+
+def _is_cyrillic(c: str) -> bool:
+    return "Ѐ" <= c <= "ӿ"
+
+
 def answer_is_in_language(text: str, language: str) -> bool:
     """Whether the forced translation pass can be skipped for an answer:
     only for the two languages it can be told apart cheaply and safely. Russian
@@ -1928,11 +1942,14 @@ def answer_is_in_language(text: str, language: str) -> bool:
     letters = [c for c in text if c.isalpha()]
     if len(letters) < 10:
         return False
-    cyrillic = sum(1 for c in letters if "\u0400" <= c <= "\u04ff") / len(letters)
     if language == "Russian":
+        prose_letters = [c for c in _LATIN_NAME.sub(" ", _LINK.sub(" ", text)) if c.isalpha()]
+        if len(prose_letters) < 10:
+            return False
+        cyrillic = sum(1 for c in prose_letters if _is_cyrillic(c)) / len(prose_letters)
         return cyrillic >= 0.85 and not any(c in "іїєґІЇЄҐ" for c in text)
     if language == "English":
-        return cyrillic == 0 and sum(1 for c in letters if c.isascii()) / len(letters) >= 0.95
+        return not any(_is_cyrillic(c) for c in letters) and sum(1 for c in letters if c.isascii()) / len(letters) >= 0.95
     return False
 
 
