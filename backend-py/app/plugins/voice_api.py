@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
 from app.login_api import get_cached_v2_session
@@ -835,7 +835,7 @@ def _outcomes(text: str) -> set[str]:
     return {(m.group(1) or m.group(2)).lower() for m in _OUTCOME_WORDS.finditer(text.lower().replace("ё", "е"))}
 
 
-def _is_repeat(text: str, previous: str) -> bool:
+def _is_repeat(text: str, previous: str, ignore_stems: frozenset[str] = frozenset()) -> bool:
     """Same remark in other words. _normalized_overlap only catches near-
     verbatim containment; "я всё ещё проверяю прогноз..." vs "я все еще ищу
     прогноз..." differ in one verb and a letter. Word-set overlap catches
@@ -851,12 +851,26 @@ def _is_repeat(text: str, previous: str) -> bool:
 
     def words(s: str) -> set[str]:
         s = s.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
-        return {w for w in re.findall(r"\w+", s) if len(w) > 2}
+        return {w for w in re.findall(r"\w+", s) if len(w) > 2 and w[:_STEM_LEN] not in ignore_stems}
 
     a, b = words(text), words(previous)
     if len(a) < 3 or len(b) < 3:
         return False
     return len(a & b) / len(a | b) >= 0.6
+
+
+# A crude stem: enough to match "Киеве" in a request with "Киева" in a remark.
+_STEM_LEN = 5
+
+
+def _request_stems(task: str) -> frozenset[str]:
+    """The request's own words, as stems (see _is_repeat's ignore_stems). Live 2026-10-15:
+    "Какая погода будет завтра в Киеве, Львове и Одессе?" -- every remark about it is
+    mostly those words, so every new draft looked like a repeat of the last one by word
+    overlap, and the user heard nothing for 75s in the middle of the turn. What the
+    request is about is not news either way; what is said about it is."""
+    s = task.lower().replace("ё", "е").translate(_CYRILLIC_LATIN_CONFUSABLES)
+    return frozenset(w[:_STEM_LEN] for w in re.findall(r"\w+", s) if len(w) > 2)
 
 
 def _already_said_block(already_said: list[str] | None) -> str:
@@ -876,9 +890,13 @@ def _already_said_block(already_said: list[str] | None) -> str:
             "that is a fact, not a promise.\n\n"
         )
     lines = "\n".join(f"- {remark}" for remark in already_said[-6:])
+    # "...and STATUS does not say the user has heard nothing": only the voice loop's
+    # STATUS ever says that (chat_session.py's _step_voice_narration) -- there, staying
+    # silent for want of news is the one thing not to do.
     return (
         "ALREADY SAID to the user during this request (they heard these; never repeat or rephrase them -- say "
-        "only what STATUS adds beyond them, or reply with exactly <narration></narration> if it adds nothing):\n"
+        "only what STATUS adds beyond them, or reply with exactly <narration></narration> if it adds nothing "
+        "and STATUS does not say the user has heard nothing for a while):\n"
         f"---\n{lines}\n---\n\n"
     )
 
@@ -937,6 +955,19 @@ _NARRATION_EXAMPLE_THIRDPERSON_GOOD = "Regenerated it and reopened it for you to
 # longer in the prompt text itself.
 _NARRATION_COMBINED_BAD = "The user asks Caroline to check the invoice, and Caroline says she'll email accounting once she confirms the numbers."
 _NARRATION_COMBINED_GOOD = "Invoice math like this always takes longer than it looks like it should."
+# sw-mode work-log examples (2026-10-09) -- see generate_progress_comment's STATUS rules.
+_NARRATION_WORKLOG_GOOD = "I've found two emails from Anna about the invoice."
+_NARRATION_WORKLOG_BAD = "Running the mail search on the first tier now."
+_NARRATION_DEADEND_GOOD = "The web search didn't give me the timetable, and my notes have nothing on it either."
+_NARRATION_STEP_START_GOOD = "I'm checking what I already have on the Lisbon flights."
+# Main's own example pair for a figure in a result (see generate_progress_comment's prompt).
+_NARRATION_PRELIMINARY_GOOD = "I found a rate around 1.0847, confirming it now."
+_NARRATION_PRELIMINARY_BAD = "The rate is 1.0847."
+# The found thing is the awaited answer itself (the voice loop's prompt): golden set,
+# 2026-10-11 -- with the rule above alone both drafting models read a forecast out whole.
+_NARRATION_FOUND_GOOD = "I've found a forecast for Oslo and I'm checking it now."
+_NARRATION_FOUND_BAD = "Tomorrow in Oslo it will be sunny, up to seventy-five degrees."
+_NARRATION_STILL_GOING_GOOD = "Still working through the quarterly numbers."
 
 # Ported from a teammate's branch (commit 69b8d20), confirmed live there:
 # "Закончила считать дни до Нового года." was drafted from "Checking the
@@ -961,6 +992,9 @@ def _is_echo_of_prompt_example(text: str) -> bool:
             _NARRATION_EXAMPLE_BAD, _NARRATION_EXAMPLE_GOOD, _NARRATION_EXAMPLE_TAG,
             _NARRATION_EXAMPLE_THIRDPERSON_BAD, _NARRATION_EXAMPLE_THIRDPERSON_GOOD,
             _NARRATION_COMBINED_BAD, _NARRATION_COMBINED_GOOD,
+            _NARRATION_WORKLOG_GOOD, _NARRATION_WORKLOG_BAD, _NARRATION_DEADEND_GOOD,
+            _NARRATION_STEP_START_GOOD, _NARRATION_STILL_GOING_GOOD, _NARRATION_PRELIMINARY_GOOD, _NARRATION_PRELIMINARY_BAD,
+            _NARRATION_FOUND_GOOD, _NARRATION_FOUND_BAD,
         )
     )
 
@@ -1054,6 +1088,160 @@ def _extract_tagged_text(raw: str, tag: str) -> str:
     if re.search(r"</?[a-zA-Z][\w-]*>", stripped):
         return ""
     return stripped
+
+
+def _draft_language_line(draft_language: str | None) -> str:
+    if draft_language is None:
+        return "Write in English. A separate step translates it afterward."
+    # Direct drafting (2026-10-10): a strong model writes the tab's language itself --
+    # the English-draft-then-translate route left names untranslated ("встреча с
+    # Oleg") and cost a second round trip.
+    # Numbers as words (2026-10-10): the remark is read aloud, and a digit in it makes
+    # clean_text_for_speech spend a whole model call spelling it out first.
+    return (f"Write in {draft_language}, the language of the conversation. Keep people's names in the form "
+            f"{draft_language} speakers would use. Write numbers, dates and temperatures out in words, "
+            "exactly as they would be spoken.")
+
+
+# The rule for a figure out of a tool result (main's, 2026-10-11): it may be said, as
+# something found and still being confirmed, never as the settled answer. The cheap
+# drafting model does not hold that from the prompt alone: on the golden set, 3 runs of
+# 3, a forecast in STATUS came out as "Завтра в Киеве будет облачно с дождем утром,
+# температура днем около шестидесяти градусов по Фаренгейту ..." -- the raw result read
+# out as the answer, half a minute before the reply converts it. So when STATUS holds a
+# figure in a result and the remark carries one, the remark must also say that it was
+# found or is being checked; otherwise the next model drafts, or nothing is said.
+# Russian and English words only -- in another language the prompt rule stands alone.
+_RESULT_WITH_FIGURE = re.compile(r"\); result: .*\d")
+_FIGURE_SAID = re.compile(
+    r"\d|\b(?:"
+    r"дв(?:а|е|ух|ум|умя)|тр(?:и|ех|ем|емя)|четыр\w+|пят(?:ь|и|ью)|шест(?:ь|и|ью)|сем(?:ь|и|ью)|вос(?:емь|ьми|емью)"
+    r"|девят(?:ь|и|ью)|десят(?:ь|и|ью)|\w+надцат\w+|двадцат\w+|тридцат\w+|сорок\w?|\w+десят\w*|девяност\w+"
+    r"|сто|ста|двести|двухсот|триста|трехсот|четыреста|\w+ьсот|тысяч\w*|миллион\w*|миллиард\w*|полтор\w+|градус\w*|процент\w*"
+    r"|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\w+teen|twenty|thirty|forty|fifty|sixty|seventy|eighty"
+    r"|ninety|hundred|thousand|million|billion|degrees?|percent"
+    r")\b",
+    re.IGNORECASE,
+)
+_FOUND_OR_CHECKING = re.compile(
+    r"\b(?:нашл|найден|получил|узнал|выяснил|вижу|уточня|проверя|перепровер|сверя|подтвержд|убежда|предварительн"
+    r"|found|got|see|confirm|verif|check|double-check|preliminar)\w*",
+    re.IGNORECASE,
+)
+
+
+# A number in words counts as a figure out of a result only next to what it measures.
+# Live 2026-10-15: "Продолжаю обрабатывать прогнозы для трёх городов." was dropped by this
+# check ("трёх" -- the three cities of the request), the second model's draft was the only
+# usable one, and the user heard nothing for over a minute.
+_MEASURE_SAID = re.compile(
+    r"\b(?:градус\w*|процент\w*|гривн\w*|гривен|доллар\w*|евро|рубл\w*|курс\w*|цел(?:ых|ая)|тысячн\w*|сотых|десятых|"
+    r"метр\w*|километр\w*|миль|милях|degrees?|percent|dollars?|euros?|hryvni?as?|rate|miles?)\b",
+    re.IGNORECASE,
+)
+
+
+def _states_figure_as_settled(text: str, activity: str, task: str = "") -> bool:
+    if not _RESULT_WITH_FIGURE.search(activity):
+        return False
+    said = text.lower().replace("ё", "е")
+    # A number the request itself has is part of what is asked about, not a figure out of
+    # a result. Live 2026-10-15: "Я углубляю поиск цен на iPhone 17 ..." was dropped for
+    # its "17", twice, while the user had heard nothing for half a minute.
+    for number in set(re.findall(r"\d+", task)):
+        said = re.sub(rf"(?<!\d){number}(?!\d)", " ", said)
+    figure = bool(re.search(r"\d", said)) or (bool(_FIGURE_SAID.search(said)) and bool(_MEASURE_SAID.search(said)))
+    return figure and not _FOUND_OR_CHECKING.search(said)
+
+
+def _progress_comment_prompt(
+    task: str, activity: str, already_said: list[str] | None, draft_language: str | None, gender_clause: str = "",
+) -> str:
+    """The voice loop's narrator prompt (generate_progress_comment_direct): the rules of
+    generate_progress_comment's own prompt below, plus what a remark every few seconds
+    over a raw work log needs -- the work log itself, a step that has just started,
+    and the user having heard nothing for a while.
+
+    Figures in a result (2026-10-11): this branch first kept them from the narrator
+    (masked as "<number>"), after a forecast that came back in Fahrenheit was read out
+    as "шестьдесят градусов" for Kyiv in October. Main decided otherwise the same day
+    -- a figure in STATUS is real and may be said, as a preliminary finding still being
+    confirmed -- and that rule is the one here now, in main's words."""
+    return (
+        "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
+        "short sentence, no JSON, no markdown, no preamble.\n\n"
+        "You speak to the user about where their request stands right now: how far along the work is, or that "
+        "it's finished. Use first person, plain everyday words, present tense.\n"
+        "Never mention tools, functions, commands, systems, files, processes, session mechanics or any internal "
+        "machinery -- describe the progress of the task itself, in the terms the user used.\n"
+        "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
+        "guess the user's intent or mood; never promise or plan next steps.\n"
+        "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
+        "progress -- describe it that way.\n"
+        "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
+        "arguments and results. Never repeat any of that machinery. But when a result in it is a real piece of "
+        "the task -- something found, counted or done that the user asked about -- say THAT, in plain words, as "
+        "progress so far, never as the final answer.\n"
+        "If STATUS mentions a specific number or finding from a tool result, that's real data you may mention "
+        "-- but it is preliminary, from work still in progress, not yet the final confirmed answer. Say you "
+        "found it and are still confirming it, rather than stating it as settled.\n"
+        "This matters most when what was found is the very answer the user is waiting for -- a forecast, a "
+        "price, a time. Never read the result out as if it were the reply: say that you have found it, with at "
+        "most its one key figure, and that you are checking it. The reply itself comes later and may still "
+        "convert or correct the figures.\n"
+        "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
+        "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\". "
+        "Each different place that gave nothing is its own new fact: the web, the notes or memory, the mail -- "
+        "\"nothing on the web\" being already said does not cover \"nothing in the notes either\".\n"
+        "A step that has only just started is news as well: where the work is now -- your own memory, the web, "
+        "the mail, the notes -- said once, in plain words, when it is a new place.\n"
+        "STATUS may end with how long the request has been running, and with a line saying the user has heard "
+        "nothing for a while. When that line is there and nothing else is new, do not stay silent -- on a live "
+        "call silence sounds like a hang: say in one short sentence, in words different from anything already "
+        "said, that the work on their request is still going on. Never guess how long is left.\n"
+        "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
+        "nothing else.\n\n"
+        f"{_draft_language_line(draft_language)}{(' ' + gender_clause) if gender_clause else ''}\n\n"
+        "Examples of the right kind of reply (copy the style, never the words -- these are unrelated to the "
+        "real task below):\n"
+        "  TASK: plan a three-day trip to the coast. STATUS: Steps in progress right now: 2.\n"
+        "  Good: <narration>Still putting the coast trip plan together, a few more pieces to go.</narration>\n"
+        "  TASK: translate the contract summary. STATUS: Steps completed so far this turn: 4 succeeded, 0 failed.\n"
+        "  Good: <narration>The translation is still in progress, not quite finished yet.</narration>\n"
+        "  TASK: book a table for two. STATUS: Steps completed so far this turn: 2 succeeded, 0 failed. "
+        "Task finished: yes.\n"
+        "  Good: <narration>Your table for two is booked.</narration>\n"
+        "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
+        "  Good: <narration></narration>\n"
+        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n"
+        "  TASK: find Anna's email about the invoice. STATUS: Tier 1 (openai/gpt-5-nano) is working. Tool call "
+        "mail_search (arguments: {\"from\": \"Anna\"}); result: 2 messages: 'Invoice March', 'Re: invoice'\n"
+        f"  Good: <narration>{_NARRATION_WORKLOG_GOOD}</narration>\n"
+        f"  Bad (names the machinery): <narration>{_NARRATION_WORKLOG_BAD}</narration>\n"
+        "  TASK: find train times to Lviv for Friday. STATUS: Tool call web_search (arguments: "
+        "{\"question\": \"Lviv trains Friday\"}); result: I don't have access to live timetables. Tool call "
+        "request_info (arguments: {\"query\": \"Lviv trains\"}); result: Memory holds nothing relevant.\n"
+        f"  Good: <narration>{_NARRATION_DEADEND_GOOD}</narration>\n"
+        "  TASK: when do the Lisbon flights leave. STATUS: Tool call request_info started (plugin \"memory\"; "
+        "arguments: {\"query\": \"Lisbon flights\"}).\n"
+        f"  Good: <narration>{_NARRATION_STEP_START_GOOD}</narration>\n"
+        "  TASK: check today's EURUSD rate. STATUS: Tool call web_search (arguments: EURUSD rate); result: "
+        "quote 1.0847.\n"
+        f"  Good: <narration>{_NARRATION_PRELIMINARY_GOOD}</narration>\n"
+        f"  Bad (states it as settled): <narration>{_NARRATION_PRELIMINARY_BAD}</narration>\n"
+        "  TASK: what will the weather be in Oslo tomorrow. STATUS: Tool call web_search (arguments: "
+        "{\"question\": \"Oslo weather tomorrow\"}); result: Tomorrow in Oslo: sunny, high 75 F, low 61 F.\n"
+        f"  Good: <narration>{_NARRATION_FOUND_GOOD}</narration>\n"
+        f"  Bad (reads the result out as the reply): <narration>{_NARRATION_FOUND_BAD}</narration>\n"
+        "  TASK: sum up the quarterly numbers. STATUS: Tier 2 (openai/gpt-5.1-codex-mini) is working. Time spent "
+        "on the request so far: 31 s. Nothing new has happened since the last remark, and the user has heard "
+        "nothing for about 10 s.\n"
+        f"  Good: <narration>{_NARRATION_STILL_GOING_GOOD}</narration>\n\n"
+        f"TASK (the user's request):\n---\n{task}\n---\n\n"
+        f"STATUS (what is happening):\n---\n{activity}\n---\n\n"
+        f"{_already_said_block(already_said)}"
+        "Reply now, wrapped in the tag."
+    )
 
 
 async def generate_progress_comment(
@@ -1243,6 +1431,13 @@ async def generate_progress_comment(
     if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
         log_event("plugin:voice", "generate_progress_comment_bad_response", status=data.get(".status"), reason=data.get(".reason"))
         return None
+    if re.fullmatch(r"\s*<narration>\s*</narration>\s*", data["result"]):
+        # The prompt's own "nothing new to say" reply (2026-10-09): a deliberate answer,
+        # not a broken one -- "" lets the voice loop wait for new facts instead of
+        # re-asking the same question three times in a row (seen live: 9 such retries
+        # in one turn). Still falsy, so the 60s path treats it exactly as before.
+        log_event("plugin:voice", "generate_progress_comment_nothing_new")
+        return ""
     text = _extract_tagged_text(data["result"], "narration")
     if not text:
         log_event("plugin:voice", "generate_progress_comment_unextractable", raw=data["result"][:300])
@@ -1288,8 +1483,72 @@ async def generate_progress_comment(
     final_text = translated or text
     if translated is None:
         log_event("plugin:voice", "generate_progress_comment_translate_failed_using_original", text=text[:300])
+    if already_said and any(_is_repeat(final_text, prev) for prev in already_said):
+        # The ALREADY SAID block is only an ask -- seen live, the small model said
+        # "I'm still checking the forecast" five times in one turn regardless.
+        log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=final_text[:300])
+        return ""
     log_event("plugin:voice", "generate_progress_comment_ok", dialogue_chars=len(recent_dialogue), text=final_text)
     return final_text
+
+
+async def generate_progress_comment_direct(
+    task: str, activity: str, already_said: list[str], language: str,
+    resolve: Callable[[str], Awaitable[str]], gender: str | None = None, addressee_gender: str | None = None,
+    repeat_window: int | None = None,
+) -> str | None:
+    """One-call narration (2026-10-10): drafted straight in `language` by the model
+    behind `resolve` (prompt -> raw reply), checked exactly like
+    generate_progress_comment's output. Same return contract: the remark, "" for
+    nothing new to say (including a repeat of `already_said`), None on failure --
+    callers fall back to generate_progress_comment.
+
+    Measured on a narrator golden set before switching (see the commit): the
+    two-call SMALL + translate route vs this one."""
+    if not activity or not task:
+        return None
+    # The English-draft route gets grammatical gender from translate_text(gender=...);
+    # drafting directly, the clause has to be in the prompt itself -- seen live without
+    # it: "Я искал контекст..." from Caroline.
+    prompt = _progress_comment_prompt(
+        task, activity, already_said, draft_language=language,
+        gender_clause=_gender_agreement_clause(gender, addressee_gender),
+    )
+    try:
+        raw = (await resolve(prompt)) or ""
+    except Exception as exc:  # noqa: BLE001
+        log_event("plugin:voice", "generate_progress_comment_direct_failed", error=str(exc)[:300])
+        return None
+    if raw.startswith("Agent error"):
+        log_event("plugin:voice", "generate_progress_comment_direct_failed", error=raw[:300])
+        return None
+    if re.fullmatch(r"\s*<narration>\s*</narration>\s*", raw):
+        log_event("plugin:voice", "generate_progress_comment_nothing_new", direct=True)
+        return ""
+    text = _extract_tagged_text(raw, "narration")
+    if not text:
+        log_event("plugin:voice", "generate_progress_comment_unextractable", raw=raw[:300], direct=True)
+        return None
+    if _looks_like_narration_garbage(text, language) or _is_echo_of_prompt_example(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_garbage", text=text[:300], direct=True)
+        return None
+    # repeat_window: how many of the latest remarks a new one may not repeat; None, all of
+    # them. See chat_session.py's _step_voice_narration for when it is narrowed.
+    recent = already_said[-repeat_window:] if repeat_window else already_said
+    # After a silence (repeat_window set) the request's own words are left out of the
+    # comparison too: near-verbatim repeats are still caught by _normalized_overlap.
+    ignore = _request_stems(task) if repeat_window else frozenset()
+    if recent and any(_is_repeat(text, prev, ignore) for prev in recent):
+        log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300], direct=True)
+        return ""
+    if _FINISH_CLAIM.search(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300], direct=True)
+        return ""
+    if _states_figure_as_settled(text, activity, task):
+        log_event("plugin:voice", "generate_progress_comment_rejected_settled_figure", text=text[:300], direct=True)
+        return ""
+    log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True)
+    return text
 
 
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
@@ -1304,9 +1563,9 @@ async def _synthesize_speech_locally(text: str, voice: str) -> str:
     # worker thread forever (confirmed live: 0 of 14 real requests succeeded in one
     # session once that happened, every one paying Camerlengo's slow ai:tts fallback
     # instead, 20-97s even for a few words).
-    from app.local_edge_tts import EdgeTtsOptions, synthesize_to_bytes
+    from app.local_edge_tts import EdgeTtsOptions, synthesize_sentences_in_parallel
 
-    audio = await synthesize_to_bytes(text, EdgeTtsOptions(voice=voice))
+    audio = await synthesize_sentences_in_parallel(text, EdgeTtsOptions(voice=voice))
     if not audio:
         raise VoiceApiError("local edge-tts returned no audio")
     return base64.b64encode(audio).decode("ascii")
@@ -1326,12 +1585,19 @@ async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str 
     return data["result"]  # base64 MP3
 
 
-async def synthesize_speech(text: str, voice: str = "Nova", session: str | None = None) -> str:
+async def synthesize_speech(
+    text: str, voice: str = "Nova", session: str | None = None, language: str | None = None,
+    session_provider: Callable[[], Awaitable[str | None]] | None = None,
+) -> str:
     """Prefers the local edge-tts server over Camerlengo's ai:tts -- purely
     a latency optimization (no Camerlengo round trip), tried FIRST
     regardless of session, falling back to Camerlengo whenever the local
     attempt fails for any reason (never a hard new dependency)."""
-    language = await detect_language(text)
+    # `language` (ISO 639-1, 2026-10-10): a caller that already knows it skips the
+    # ai:detectLanguage round trip -- voice narration does, since every remark is
+    # already translated into the tab's own language.
+    if language is None:
+        language = await detect_language(text)
     edge_voice = _edge_tts_voice_for(voice, language)
     try:
         audio = await _synthesize_speech_locally(text, edge_voice)
@@ -1339,6 +1605,10 @@ async def synthesize_speech(text: str, voice: str = "Nova", session: str | None 
         return audio
     except Exception as exc:
         log_event("plugin:voice", "tts_local_failed_falling_back", edge_voice=edge_voice, error=str(exc))
+        # `session_provider` (2026-10-11): the session only matters here, on the fallback,
+        # so a caller can hand over how to get one instead of minting it for every request.
+        if session is None and session_provider is not None:
+            session = await session_provider()
         return await _synthesize_speech_via_camerlengo(text, voice, session)
 
 
@@ -1347,11 +1617,16 @@ async def synthesize_speech(text: str, voice: str = "Nova", session: str | None 
 _NEEDS_TTS_CLEANUP = re.compile(r"[*_`#|~]|<[a-z][^>]*>|\d", re.IGNORECASE)
 
 
+def speech_needs_cleanup(text: str) -> bool:
+    """Whether clean_text_for_speech will spend a model call on this text."""
+    return bool(_NEEDS_TTS_CLEANUP.search(text))
+
+
 async def clean_text_for_speech(text: str, session: str | None = None) -> str:
     """Strips markdown/HTML formatting and rewrites digits/numerals into
     their spoken, correctly-inflected form before text reaches TTS/Visual
     Mode."""
-    if not _NEEDS_TTS_CLEANUP.search(text):
+    if not speech_needs_cleanup(text):
         return text
     prompt = (
         "Rewrite the following text so it is ready to be read aloud by a text-to-speech engine. "

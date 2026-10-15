@@ -191,8 +191,13 @@ public static class AudioFeatures
                 {
                     var chunkEnd = Math.Min(nFrames, chunkStart + chunkFrames);
 
-                    var sStart = chunkStart * hopLength;
-                    var sEnd = Math.Min(shifted.Length, chunkEnd * hopLength + nFft);
+                    // Clamped (2026-10-10): `shifted` is the audio minus the lead, but nFrames
+                    // counts the full clip, so a chunk can start past its end -- any clip of
+                    // 5.0-5.25s (likewise 10.x, 15.x...) threw ArgumentOutOfRangeException here
+                    // and Visual Mode fell back to plain audio. Past the end is just silence:
+                    // an empty slice, padded to nFft below.
+                    var sStart = Math.Min(chunkStart * hopLength, shifted.Length);
+                    var sEnd = Math.Max(sStart, Math.Min(shifted.Length, chunkEnd * hopLength + nFft));
                     var chunkAudio = shifted[sStart..sEnd];
                     if (chunkAudio.Length < nFft)
                     {

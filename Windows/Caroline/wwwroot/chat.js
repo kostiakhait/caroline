@@ -178,6 +178,7 @@
   visualModeEnabled.addEventListener("change", () => {
     visualModeState.enabled = visualModeEnabled.checked;
     sendControl("visual_mode_set", { enabled: visualModeEnabled.checked });
+    if (!visualModeEnabled.checked) dismissVisualWindow();
   });
 
   const localSttEnabled = document.getElementById("localSttEnabled");
@@ -1077,8 +1078,17 @@
 
   voiceStopBtn?.addEventListener("click", () => {
     stopActiveSpeech();
-    speechQueue = [];
+    clearSpeechQueue();
+    dismissVisualWindow();
   });
+
+  // In a spoken dialogue the talking-head window stays up between remarks and is closed
+  // by the user alone (VisualModeManager.StayForNextClip): by its own Stop, or by a Stop
+  // here. stopActiveSpeech() closes it only while a clip of ours is playing in it; this
+  // closes it standing idle as well.
+  function dismissVisualWindow() {
+    window.chrome?.webview?.postMessage({ type: "visual_speech_dismiss" });
+  }
 
   // Click handling for a message's manual 🔊 button: clicking the button
   // that's currently blinking (mid-synthesis or mid-playback) stops it
@@ -1088,17 +1098,144 @@
   function toggleSpeak(text, btn) {
     if (activeSpeech && activeSpeech.btn === btn) {
       stopActiveSpeech();
-      speechQueue = [];
+      clearSpeechQueue();
       return;
     }
     stopActiveSpeech();
-    speechQueue = [];
+    clearSpeechQueue();
     speak(text, btn);
   }
 
-  function speak(text, btn) {
-    speechQueue.push({ text, btn });
+  // opts.narration (2026-10-09): a progress-narrator remark (the backend's isNarration).
+  // A real reply arriving while one still waits in the queue drops it -- read out after
+  // the answer it would describe a state that's already over (see dropQueuedNarration).
+  // A long reply is read out in pieces (2026-10-10): synthesizing it whole put the full
+  // synthesis time -- 9s for 121 chars live, plus a separate model call whenever the
+  // text has digits -- as silence before its first word. The first piece is a single
+  // sentence so it starts fast; the rest are synthesized while earlier ones play (see
+  // prefetchSpeech). Visual Mode too (2026-10-10): measured live, a short piece
+  // renders in 0.5-0.8s, while synthesizing a whole reply first left 18s of silence.
+  // Each piece opens its own talking-head window (VisualModeManager), so after the
+  // first piece its pieces are a bit larger -- fewer windows opening and closing.
+  const SPEECH_PIECE_MAX_CHARS = 240;
+  const VISUAL_SPEECH_PIECE_MAX_CHARS = 300;
+  // The first piece must last long enough for the second to be synthesized behind it:
+  // live, a 7-char first piece ("Конечно.") played in under a second and left a 13s
+  // gap before a 401-char second one. Sentences are joined until it reaches this.
+  const SPEECH_FIRST_PIECE_MIN_CHARS = 60;
+  function splitForSpeech(text, maxChars = SPEECH_PIECE_MAX_CHARS) {
+    const sentences = text
+      .split(/\n+/)
+      // List markers would be read out: the backend only strips markdown from a piece
+      // that also has digits (see voice_api.py's _NEEDS_TTS_CLEANUP).
+      .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, ""))
+      .flatMap((line) => line.split(/(?<=[.!?…])\s+/))
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const pieces = [];
+    for (const sentence of sentences) {
+      const last = pieces[pieces.length - 1];
+      const firstTooShort = pieces.length === 1 && last.length < SPEECH_FIRST_PIECE_MIN_CHARS;
+      if ((pieces.length > 1 || firstTooShort) && last.length + 1 + sentence.length <= maxChars) {
+        pieces[pieces.length - 1] = `${last} ${sentence}`;
+      } else {
+        pieces.push(sentence);
+      }
+    }
+    return pieces.length ? pieces : [text];
+  }
+
+  function speak(text, btn, opts) {
+    const narration = !!opts?.narration;
+    if (!narration && !btn) dropQueuedNarration();
+    if (!btn && !narration && !opts?.audioBase64 && text.length > SPEECH_PIECE_MAX_CHARS) {
+      const pieces = splitForSpeech(text, shouldUseVisualMode(btn) ? VISUAL_SPEECH_PIECE_MAX_CHARS : SPEECH_PIECE_MAX_CHARS);
+      clog(`speaking reply in ${pieces.length} piece(s), ${text.length} chars`);
+      for (const piece of pieces) speechQueue.push({ text: piece, btn: null, narration: false });
+      if (speechQueueRunning) prefetchSpeech(speechQueue[0]);
+      runSpeechQueue();
+      return;
+    }
+    // opts.audioBase64: a narration remark the backend already synthesized (2026-10-10).
+    speechQueue.push({ text, btn, narration, prefetched: opts?.audioBase64 || undefined });
+    // Arriving while something is already playing: start its synthesis now, not when
+    // its turn comes (see prefetchSpeech).
+    if (speechQueueRunning) prefetchSpeech(speechQueue[0]);
     runSpeechQueue();
+  }
+
+  // Only items still WAITING are dropped -- the one playing now finishes its sentence,
+  // so replies never overlap and never cut off mid-word.
+  function dropQueuedNarration() {
+    const before = speechQueue.length;
+    forgetPreparedVisual(speechQueue.filter((item) => item.narration));
+    speechQueue = speechQueue.filter((item) => !item.narration);
+    if (speechQueue.length !== before) clog(`dropped ${before - speechQueue.length} queued narration remark(s): a real reply arrived`);
+  }
+
+  // Tells the backend when this queue starts playing and when it runs dry (2026-10-09)
+  // -- voice narration waits for that before showing its next remark, so remarks
+  // neither pile up behind each other nor leave dead air in between. Sent on change only.
+  let reportedSpeaking = null;
+  function reportSpeechState(speaking, force) {
+    if (!force && reportedSpeaking === speaking) return;
+    reportedSpeaking = speaking;
+    sendControl("speech_state", { speaking });
+    updateStopBtnVisibility();
+  }
+
+  // Starts synthesis for a queued item early (2026-10-09), while the item ahead of it is
+  // still playing: each synthesis is a backend round trip (language detection, speech
+  // cleanup, edge-tts), and starting it only once the previous item ENDED put exactly
+  // that latency as dead air between every two spoken lines. Times out like transcribe()
+  // does, so a reply lost to a reconnect can't stall the queue forever.
+  const TTS_PREFETCH_TIMEOUT_MS = 45_000;
+  function prefetchSpeech(item) {
+    if (!item) return;
+    if (item.prefetched || item.ttsPromise) { prepareNextVisual(); return; }
+    const requestId = `tts-${++ttsRequestSeq}`;
+    item.ttsPromise = new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingTtsRequests.delete(requestId);
+        resolve({ ok: false, audioBase64: null, err: "timed out" });
+      }, TTS_PREFETCH_TIMEOUT_MS);
+      pendingTtsRequests.set(requestId, (ok, audioBase64, err) => {
+        clearTimeout(timer);
+        if (ok && audioBase64) item.readyAudio = audioBase64;
+        resolve({ ok, audioBase64, err });
+        prepareNextVisual();
+      });
+      sendControl("tts", { text: item.text, requestId });
+    });
+  }
+
+  // Visual Mode: hands the NEXT item's audio to the native side while the current clip
+  // is still on screen (2026-10-11), so its talking-head video is already rendered when
+  // its turn comes (VisualModeManager.HandlePrepareAsync) -- live, rendering it only
+  // then left 4.0s of nothing between every two pieces of a reply. Not before the
+  // current clip's own audio has gone out: the native side renders one clip at a time,
+  // and the clip about to play must not wait behind this one. A shell that doesn't know
+  // the message ignores it and renders at play time, as before.
+  function prepareNextVisual() {
+    const item = speechQueue[0];
+    if (!item || item.visualRequestId || !activeSpeech?.visual || !activeSpeech.audioSent) return;
+    const useVisual = item.forceVisual ? !!window.chrome?.webview : shouldUseVisualMode(item.btn);
+    const audioBase64 = item.prefetched || item.readyAudio;
+    if (!useVisual || !audioBase64) return;
+    item.visualRequestId = `tts-${++ttsRequestSeq}`;
+    window.chrome.webview.postMessage({ type: "visual_speech_prepare", requestId: item.visualRequestId, audioBase64 });
+  }
+
+  // Items leaving the queue unplayed: a video rendered ahead for one is thrown away.
+  function forgetPreparedVisual(items) {
+    for (const item of items) {
+      if (item.visualRequestId) window.chrome?.webview?.postMessage({ type: "visual_speech_cancel", requestId: item.visualRequestId });
+    }
+  }
+
+  function clearSpeechQueue() {
+    forgetPreparedVisual(speechQueue);
+    speechQueue = [];
   }
 
   // Backend-synthesized audio pushed by the play_speech tool (see
@@ -1126,12 +1263,17 @@
   async function runSpeechQueue() {
     if (speechQueueRunning) return;
     speechQueueRunning = true;
+    reportSpeechState(true);
     while (speechQueue.length > 0) {
       await waitForVoiceInputIdle();
       const item = speechQueue.shift();
-      await playOneSpeech(item);
+      if (!item) continue; // emptied (Stop, or a dropped remark) while waiting
+      const playing = playOneSpeech(item);
+      prefetchSpeech(speechQueue[0]);
+      await playing;
     }
     speechQueueRunning = false;
+    reportSpeechState(false);
   }
 
   // Per explicit correction (2026-09-03): Visual Mode now applies to BOTH the
@@ -1144,10 +1286,13 @@
     return visualModeState.enabled && visualModeState.available && !!window.chrome?.webview;
   }
 
-  function playOneSpeech({ text, btn, prefetched, forceVisual }) {
+  function playOneSpeech({ text, btn, prefetched, forceVisual, ttsPromise, visualRequestId }) {
     return new Promise((resolve) => {
       const useVisual = forceVisual ? !!window.chrome?.webview : shouldUseVisualMode(btn);
-      const requestId = `tts-${++ttsRequestSeq}`;
+      // Rendered ahead (prepareNextVisual): played under the id the render was made for.
+      // Visual Mode switched off in between: that render is not needed after all.
+      if (visualRequestId && !useVisual) forgetPreparedVisual([{ visualRequestId }]);
+      const requestId = (useVisual && visualRequestId) || `tts-${++ttsRequestSeq}`;
       clog(`playOneSpeech requestId=${requestId} scheme=${useVisual ? "visual" : "plain-audio"}`, {
         visualModeEnabled: visualModeState.enabled,
         visualModeAvailable: visualModeState.available,
@@ -1178,6 +1323,8 @@
       };
       if (prefetched) {
         onAudio(true, prefetched);
+      } else if (ttsPromise) {
+        ttsPromise.then(({ ok, audioBase64, err }) => onAudio(ok, audioBase64, err));
       } else {
         pendingTtsRequests.set(requestId, onAudio);
         sendControl("tts", { text, requestId });
@@ -1194,7 +1341,16 @@
   function playAudioViaVisualMode(base64, entry, onDone) {
     if (entry.aborted) { onDone?.(); return; }
     pendingVisualDone.set(entry.requestId, { base64, entry, onDone });
-    window.chrome.webview.postMessage({ type: "visual_speech_audio", requestId: entry.requestId, audioBase64: base64 });
+    // more: something is queued behind this clip -- the window then shows its Stop bar
+    // even for a short clip (the first piece of a long reply always is one).
+    // dialogue: spoken on its own (a voice reply or a narration remark), not from a click
+    // on a message's speaker button -- the talking-head window then stays up for the next
+    // thing said instead of closing after every clip.
+    window.chrome.webview.postMessage({
+      type: "visual_speech_audio", requestId: entry.requestId, audioBase64: base64, more: speechQueue.length > 0, dialogue: !entry.btn,
+    });
+    entry.audioSent = true;
+    prepareNextVisual();
   }
 
   const STT_TIMEOUT_MS = 30_000;
@@ -1354,7 +1510,10 @@
   // first one.
   function updateStopBtnVisibility() {
     const busy = carolineStatus === "working" || carolineStatus === "recovering";
-    const show = busy || !!voiceSession;
+    // Also while a reply is being read aloud (2026-10-12): the turn is over by then, so
+    // the chat had no Stop at all for the voice -- seen live, the only Stop left was the
+    // one on the talking-head window.
+    const show = busy || !!voiceSession || reportedSpeaking === true;
     stopBtn.style.display = show ? "" : "none";
     // Sending stays enabled regardless while just a turn is busy -- the
     // backend queues a follow-up and runs it right after, so there's no
@@ -1368,6 +1527,7 @@
 
     ws.addEventListener("open", () => {
       wsConnected = true;
+      reportSpeechState(speechQueueRunning, true);
       // carolineStatus itself is left as whatever it last was -- main.py
       // sends a fresh {type:"status"} the moment this connection is
       // registered (see its own initial-connect _publish_status() call),
@@ -1626,7 +1786,7 @@
           // sdk_message (backend chat_session.py), not just "result" -- same
           // authoritative, crash/restart-stable source as before.
           if (evt.isVoice) {
-            speak(block.text);
+            speak(block.text, null, { narration: !!evt.isNarration, audioBase64: evt.audioBase64 });
             if (turn) turn.spoken = true;
           }
         } else if (block.type === "tool_use") {
@@ -2277,6 +2437,11 @@
     if (e.dataTransfer?.files?.length) handleFilesSelected(e.dataTransfer.files);
   });
 
+  // What speech recognition produced for the text now in the input box (2026-10-10),
+  // sent alongside the message so the backend can learn from the user's own edits
+  // to it -- see backend-py/app/stt_adaptation.py.
+  let pendingVoiceTranscript = null;
+
   function send(voiceOrigin, overrideText) {
     const text = (overrideText !== undefined ? overrideText : inputEl.value).trim();
     if (!text && pendingAttachments.length === 0) return;
@@ -2292,7 +2457,9 @@
     // wait for the previous turn just to queue up the next one.
     turnQueue.push({ isVoice: !!voiceOrigin, assistantText: "", spoken: false });
     addBubble("user", text, pendingAttachments);
-    ws.send(JSON.stringify({ type: "user_message", text, attachments: pendingAttachments, voice: !!voiceOrigin }));
+    const voiceTranscript = voiceOrigin ? undefined : pendingVoiceTranscript || undefined;
+    pendingVoiceTranscript = null;
+    ws.send(JSON.stringify({ type: "user_message", text, attachments: pendingAttachments, voice: !!voiceOrigin, voiceTranscript }));
     inputEl.value = "";
     pendingAttachments = [];
     renderPendingAttachments();
@@ -2397,6 +2564,7 @@
           if (voiceAutoSend.checked) {
             send(true, text.trim());
           } else {
+            pendingVoiceTranscript = pendingVoiceTranscript ? `${pendingVoiceTranscript} ${text.trim()}` : text.trim();
             inputEl.value = inputEl.value ? `${inputEl.value} ${text.trim()}` : text.trim();
             autoGrow();
             inputEl.focus();
@@ -2595,8 +2763,9 @@
         // notice layered on top.
         setStatusBarText(data.text);
       } else if (data && data.type === "visual_speech_done") {
-        // VisualModeWindow finished playing (or failed to render/play) and has
-        // already closed itself -- advance playOneSpeech's queue the same way
+        // VisualModeWindow finished playing (or failed to render/play); it stays up
+        // for its 1s post-roll, where the next clip can take it over -- advance
+        // playOneSpeech's queue the same way
         // playAudioBase64 does on the <audio> element's "ended" event.
         const pending = pendingVisualDone.get(data.requestId);
         if (pending) {
@@ -2613,6 +2782,10 @@
             // same requestId for "signaling fallback" / the exact cause.
             playAudioBase64(pending.base64, pending.entry, pending.onDone);
           } else {
+            // Stop pressed on the talking-head window itself: like the chat's own voice
+            // Stop, nothing still queued is read. A reply is read in pieces, one clip
+            // each, and the window only ended its clip -- the next piece just went on.
+            if (data.stopped) clearSpeechQueue();
             if (activeSpeech === pending.entry) activeSpeech = null;
             pending.entry.btn?.classList.remove("speaking");
             pending.onDone?.();
@@ -2637,7 +2810,14 @@
       stopVoiceSession(voiceSession, true);
       return;
     }
-    stopCurrentTurn();
+    // Stop means the voice too (2026-10-11): what is being said and what is queued behind
+    // it belong to the turn being stopped, and the talking-head window goes with them.
+    stopActiveSpeech();
+    clearSpeechQueue();
+    dismissVisualWindow();
+    // With no turn running the click was for the voice alone; "interrupt" then has
+    // nothing to stop, and stopCurrentTurn would still rearrange the turn queue.
+    if (carolineStatus === "working" || carolineStatus === "recovering") stopCurrentTurn();
   });
   inputEl.addEventListener("input", autoGrow);
   inputEl.addEventListener("keydown", (e) => {

@@ -72,6 +72,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -90,7 +91,7 @@ from app.owner_profile import get_owner_profile, owner_profile_system_prompt_cla
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
-from app.plugins.sw_api import clear_funds_exhausted, mark_funds_exhausted
+from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
     continuity_pointer_instruction,
     credentials_check_notes_first_instruction,
@@ -343,6 +344,19 @@ ABSOLUTE_TURN_TIMEOUT_S = 1800
 # reconsider if this turns out to be a real latency/cost problem in
 # practice once this path is re-enabled.
 REASONING_EFFORT = {"effort": "high"}
+
+# Per tier (2026-10-10) -- live evidence for the "reconsider" note above. At "high",
+# gpt-5-nano spent 24-34s and 3.5-5.3k completion tokens on EVERY agentic step of a
+# plain "what can you do" turn: 117s of a 164s voice turn. The cheap tiers run at
+# low; a weak first attempt is still caught -- the verifier escalates an
+# unfinished answer to the next tier -- and the last tier keeps REASONING_EFFORT.
+TIER_REASONING_EFFORT = ({"effort": "low"}, {"effort": "low"}, REASONING_EFFORT)
+# The verifier only checks a finished candidate against facts it is handed; at "high"
+# it was another 7-10s on the end of every turn.
+VERIFIER_REASONING_EFFORT = {"effort": "low"}
+# One-word SIMPLE/COMPLEX call (_start_tier_index): with no reasoning parameter at
+# all it ran at the model's default and took ~10s live before any real work began.
+COMPLEXITY_REASONING_EFFORT = {"effort": "minimal"}
 
 # Per explicit instruction (2026-09-13): OpenRouter's "middle-out" transform
 # (enabled by default inside OpenRouterAdapter._resolve() for every OTHER
@@ -765,24 +779,250 @@ def _check_soft_repeat_loop(tool_name: str, history: list[str], ai: Any, cfg: An
     return None
 
 
+# web_search really searches, or says it could not (2026-10-11, per explicit instruction:
+# the main model must have real access to the web through OpenRouter's own mechanism).
+# It did go through ":online" before -- via AI.resolveOnline, which on ANY exception
+# silently asks the same model again WITHOUT the web. That model then answers "I can't
+# access live weather data", and this came back as the search result: live, the same
+# question about tomorrow's weather took 41-180s, once ended in "нет доступа к живым
+# данным", and once sent the tier to the browser and the command line. Probed with
+# Caroline's own key the same day, the search itself works: the web plugin with the Exa
+# engine returns in 3.2-3.8s for $0.007, with the pages it read.
+#
+# So the call is made here, where its outcome can be seen: Exa, because it returns its
+# sources (url, title, excerpt) and a reply without a single source is then known not to
+# be grounded; the sources themselves go to the main model, not only another model's
+# retelling of them; and a failure is reported as a failure.
+WEB_SEARCH_ENGINE = "exa"
+WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_TIMEOUT_S = 40.0
+WEB_SEARCH_EXCERPT_CHARS = 700
+WEB_SEARCH_REASONING = {"effort": "minimal"}
+_WEB_SEARCH_SYSTEM = (
+    "Today is {today}. Answer ONLY from the web search results you are given: state figures exactly as the "
+    "sources do, with their units, and say which date each one is for. If the results do not contain the "
+    "answer, say so plainly -- never fill in from general knowledge or typical values."
+)
+
+
+# Where the model is called from.
+#
+# Per explicit instruction (2026-10-11): "Кэролайн не должна НИ В КАКОМ СЛУЧАЕ напрямую
+# обращаться к OpenRouter и тем более сама получать ключ -- вызов модели должен идти через
+# SquirrelWisdom", and (2026-10-12) through ai:resolveAgenticStep specifically -- the
+# server's own tool-calling step command -- which is to be extended where it lacks
+# something, rather than a second route built beside it.
+#
+# What exists since 2026-09-12 is the opposite: ai:getModelKey hands this process the
+# provider key, and Camerlengo's loop (AI.resolve_agentic) calls the provider with it.
+# This branch added more callers of the same kind (fast lane and its gate, the narrator's
+# ladder, the web-search plugin call, the speech-recognition check). All of them now get
+# their AI object from _model_ai(), so there is one switch for the lot.
+#
+# With the switch on, the loop stays Camerlengo's and the tools still run here, but the
+# adapter under the loop is _SquirrelWisdomStepAdapter: each model call is one
+# ai:resolveAgenticStep request made with the user's own session, and no provider key is
+# fetched or held by this process at all.
+#
+# The switch is OFF until the server side is in place; turned on today, nothing answers:
+#   1. Caroline's API key is refused the command -- errcode 997, "Key scope/resource ACL
+#      does not permit this call" (probed 2026-10-11 and again 2026-10-12);
+#   2. the command forwards neither reasoning, transforms, plugins, max_tokens nor
+#      temperature, and returns neither annotations (web-search sources) nor usage. The
+#      change for it was handed over as a patch against reforce's microagents branch
+#      (resolveAgenticStep-options.patch); this adapter already speaks that form, and a
+#      server without it simply ignores the extra fields.
+# With both done: set this to True, and ai:getModelKey has no caller left.
+MODEL_CALLS_VIA_SQUIRRELWISDOM = False
+SW_STEP_TIMEOUT_S = 300.0
+# login_api.get_v2_session() logs in afresh on every call (0.5-0.8s): one session serves
+# the calls of the next minute, and a call refused for its session gets a new one.
+SW_SESSION_REUSE_S = 60.0
+_sw_session: str | None = None
+_sw_session_at = 0.0
+_SW_ERRCODE_SESSION = "202"
+_SW_ERRCODE_FUNDS = "402"
+
+
+def _step_as_response(step: dict[str, Any]) -> Any:
+    """ai:resolveAgenticStep's reply in the shape AI.resolve_agentic reads off a provider
+    response: choices[0].message (.content, .tool_calls[].id / .function.name /
+    .function.arguments, .annotations) and .usage."""
+    from types import SimpleNamespace as NS
+
+    usage = step.get("usage")
+    usage_ns = None
+    if isinstance(usage, dict):
+        usage_ns = NS(
+            prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"), cost=usage.get("cost"),
+            prompt_tokens_details=NS(cached_tokens=usage.get("cached_tokens")),
+        )
+    if step.get("type") == "tool_calls":
+        calls = [
+            NS(id=call.get("id"), type="function", function=NS(name=call.get("name"), arguments=call.get("arguments") or "{}"))
+            for call in step.get("calls") or []
+        ]
+        message = NS(content=(step.get("assistant_message") or {}).get("content") or "", tool_calls=calls, annotations=None)
+    else:
+        message = NS(content=step.get("text") or "", tool_calls=None, annotations=step.get("annotations") or None)
+    return NS(choices=[NS(message=message)], usage=usage_ns)
+
+
+class _SquirrelWisdomStepAdapter:
+    """Stands where Camerlengo's OpenRouterAdapter stands under AI.resolve_agentic():
+    the same _resolve(), answered by the server's ai:resolveAgenticStep.
+
+    _resolve is called on the worker thread resolve_agentic runs in. The request itself
+    is made on the main loop (sw_api._post_json is a coroutine), which is free at that
+    moment: whoever started the loop is awaiting that very thread."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def _on_loop(self, coro: Any, timeout: float) -> Any:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            coro.close()
+            raise RuntimeError("a model call must not be made on the event loop itself")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    def _session(self, fresh: bool = False) -> str:
+        global _sw_session, _sw_session_at
+        if fresh or _sw_session is None or time.monotonic() - _sw_session_at > SW_SESSION_REUSE_S:
+            from app.login_api import get_v2_session
+
+            _sw_session = self._on_loop(get_v2_session(), 30.0)
+            _sw_session_at = time.monotonic()
+        return _sw_session
+
+    def _resolve(
+        self, model: str, messages: list[dict[str, Any]], max_tokens: int | None = None, temperature: float = 0.2,
+        transforms: list[str] | None = None, stop: Any = None, tools: list[dict[str, Any]] | None = None,
+        reasoning: dict[str, Any] | None = None, timeout: float | None = None, plugins: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        body: dict[str, Any] = {
+            "command": "ai:resolveAgenticStep", "key": CAROLINE_SW_KEY, "messages": messages, "model": model,
+            "temperature": temperature,
+        }
+        if tools:
+            body["tools"] = tools
+        if transforms is not None:
+            body["transforms"] = transforms
+        if reasoning:
+            body["reasoning"] = reasoning
+        if plugins:
+            body["plugins"] = plugins
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        wait = float(timeout or SW_STEP_TIMEOUT_S)
+        data: Any = None
+        for attempt in (1, 2):
+            body["session"] = self._session(fresh=attempt == 2)
+            data = self._on_loop(_post_json(body, timeout=wait), wait + 10.0)
+            expired = isinstance(data, dict) and data.get(".status") == "error" and str(data.get(".errcode")) == _SW_ERRCODE_SESSION
+            if not expired:
+                break
+        if not isinstance(data, dict) or data.get(".status") != "ok":
+            code = str(data.get(".errcode")) if isinstance(data, dict) else "?"
+            reason = data.get(".reason") if isinstance(data, dict) else "no reply"
+            if code == _SW_ERRCODE_FUNDS:
+                # The words the engine's own funds handling looks for (_call_with_funds_wait).
+                raise RuntimeError(f"SquirrelWisdom returned 402 Insufficient funds: {reason}")
+            raise RuntimeError(f"SquirrelWisdom ai:resolveAgenticStep failed (errcode {code}): {reason}")
+        return _step_as_response(data)
+
+
+async def _model_ai() -> Any | None:
+    """The AI object every model call in this file is made with -- see the note above
+    MODEL_CALLS_VIA_SQUIRRELWISDOM. None when there is no way to call a model right now
+    (Camerlengo missing; or, on the old route, not logged in / no key)."""
+    if camerlengo_ai is None:
+        return None
+    if MODEL_CALLS_VIA_SQUIRRELWISDOM:
+        return camerlengo_ai.AI(adapter=_SquirrelWisdomStepAdapter(asyncio.get_running_loop()))
+    api_key = await get_model_provider_key()
+    if not api_key:
+        return None
+    return camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
+
+
+async def prewarm_model_access() -> None:
+    """What the first model call would otherwise wait for, done ahead: the login, and on
+    the old route the key (2026-10-10: the first fast-lane call after a start took 4.9s
+    instead of ~1.8s for exactly that)."""
+    if MODEL_CALLS_VIA_SQUIRRELWISDOM:
+        adapter = _SquirrelWisdomStepAdapter(asyncio.get_running_loop())
+        await asyncio.to_thread(adapter._session)
+    else:
+        await get_model_provider_key()
+
+
+def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[str, Any]]]:
+    """(the search model's answer, the pages it was given). Raises on any API failure."""
+    search_messages = [
+        {"role": "system", "content": _WEB_SEARCH_SYSTEM.format(today=time.strftime("%A, %Y-%m-%d"))},
+        {"role": "user", "content": question},
+    ]
+    search_plugins = [{"id": "web", "engine": WEB_SEARCH_ENGINE, "max_results": WEB_SEARCH_MAX_RESULTS}]
+    if isinstance(ai.adapter, _SquirrelWisdomStepAdapter):
+        via_server = ai.adapter._resolve(
+            model=cfg.AI_MODEL_SMALL, messages=search_messages, max_tokens=1200, reasoning=WEB_SEARCH_REASONING,
+            plugins=search_plugins, timeout=WEB_SEARCH_TIMEOUT_S,
+        ).choices[0].message
+        found = [a.get("url_citation") or {} for a in (via_server.annotations or []) if isinstance(a, dict) and a.get("type") == "url_citation"]
+        return str(via_server.content or "").strip(), [s for s in found if s.get("url")]
+    response = ai.adapter.client.with_options(timeout=WEB_SEARCH_TIMEOUT_S, max_retries=0).chat.completions.create(
+        model=cfg.AI_MODEL_SMALL,
+        messages=[
+            {"role": "system", "content": _WEB_SEARCH_SYSTEM.format(today=time.strftime("%A, %Y-%m-%d"))},
+            {"role": "user", "content": question},
+        ],
+        max_tokens=1200,
+        extra_body={
+            "plugins": [{"id": "web", "engine": WEB_SEARCH_ENGINE, "max_results": WEB_SEARCH_MAX_RESULTS}],
+            "reasoning": WEB_SEARCH_REASONING,
+        },
+    )
+    message = response.model_dump()["choices"][0]["message"]
+    sources = [a.get("url_citation") or {} for a in (message.get("annotations") or []) if a.get("type") == "url_citation"]
+    return str(message.get("content") or "").strip(), [s for s in sources if s.get("url")]
+
+
 def _run_web_search_tool(name: str, args: dict[str, Any], ai: Any, cfg: Any) -> str:
     question = str(args.get("question") or "").strip()
     if not question:
         return "ERROR: 'question' is required."
-    # One retry (2026-10-03, confirmed live): the FIRST resolveOnline call sometimes
-    # comes back empty while an identical immediate retry succeeds -- same ordinary
-    # intermittent-empty-result shape already retried everywhere else in this file
-    # (key fetch, verification, narration), not a sign anything is actually broken.
-    last_error: Exception | None = None
+    # One retry, as before (2026-10-03: the first online call sometimes comes back empty
+    # while an identical immediate retry succeeds).
+    reason = "no result"
     for attempt in (1, 2):
+        started = time.monotonic()
         try:
-            result = ai.resolveOnline(question, model=cfg.AI_MODEL_SMALL)
+            answer, sources = _web_search_once(question, ai, cfg)
         except Exception as exc:  # noqa: BLE001 -- a failed search is a tool result, not a turn-ending error
-            last_error = exc
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+            log_event("engine", "small_model_web_search_failed", attempt=attempt, error=reason,
+                      ms=int((time.monotonic() - started) * 1000))
             continue
-        if result:
-            return str(result)
-    return f"ERROR: web_search failed: {last_error}" if last_error else "ERROR: web_search returned no answer (tried twice)."
+        log_event("engine", "small_model_web_search", attempt=attempt, sources=len(sources), answer_len=len(answer),
+                  ms=int((time.monotonic() - started) * 1000), question=question[:200])
+        if not sources:
+            reason = "the search returned no pages"
+            continue
+        lines = [f"Web search results for: {question}"]
+        for index, source in enumerate(sources, 1):
+            excerpt = " ".join(str(source.get("content") or "").split())[:WEB_SEARCH_EXCERPT_CHARS]
+            lines.append(f"{index}. {source.get('title') or '(untitled)'} -- {source['url']}" + (f"\n   {excerpt}" if excerpt else ""))
+        if answer:
+            lines.append("Summary by the search model (it read the same pages; where it differs from them, trust the pages):\n" + answer)
+        return "\n".join(lines)
+    return (
+        f"ERROR: the web search did not work ({reason}); nothing was found out. Do not answer from memory as if it "
+        "were current -- say that the search failed, or get the information another way."
+    )
 
 
 @dataclass
@@ -1262,7 +1502,7 @@ def _build_verification_prompt(
     if tier_trace:
         parts.append(
             "Real tool calls made while producing that reply, with their real results (this is ground truth -- "
-            "the reply above is a separate, later summary of this, not the source of it):\n" + "\n".join(tier_trace[-40:])
+            "the reply above is a separate, later summary of this, not the source of it):\n" + _trace_text(tier_trace, 40)
         )
     if tracker.branch_trace:
         parts.append(
@@ -1287,35 +1527,51 @@ def _build_verification_prompt(
             "These tool operations were started but never confirmed as finished: "
             + ", ".join(sorted(tracker.pending_operation_ids))
         )
-    if can_escalate or can_deescalate:
-        branches = []
-        if can_escalate:
-            branches.append(
-                "The remaining work is still genuinely hard (the kind of thing the model that just tried this "
-                f'struggled with) -- reply with EXACTLY this and nothing else: "{ESCALATION_SENTINEL} <one short '
-                'sentence saying what is still missing or wrong>". A stronger model will pick it up from exactly '
-                "that point, with the full tool-call history so far."
-            )
-        if can_deescalate:
-            branches.append(
-                "The remaining work is simple and mechanical -- a clearly weaker, cheaper model could finish it "
-                f'from here -- reply with EXACTLY this and nothing else: "{DEESCALATION_SENTINEL} <one short '
-                'sentence saying what is left to do>". A less capable model will pick it up from exactly that '
-                "point, with the full tool-call history so far. Only choose this when you are confident the "
-                "SPECIFIC remaining steps are easy, not merely because the task as a whole seemed simple -- when "
-                "in doubt, do not use this."
-            )
-        parts.append(
-            "If, based on the reply and the facts above, the task is genuinely NOT finished yet -- real work "
-            "still needed, not just a wording issue -- judge which of these applies:\n- "
-            + "\n- ".join(branches)
-            + "\n\nUse exactly one of the signals above, and only for genuinely unfinished work -- if it's "
-            "actually done, write the final reply instead, as described below."
+    # The verifier's reply is a verdict a program reads, in one of up to four forms
+    # (2026-10-11, agreed: "OK / эскалация / исправленный текст в теге"; de-escalation
+    # added 2026-10-15, same shape as escalation -- see DEESCALATION_SENTINEL's own
+    # comment). Until then it was told to write the final message itself, "even if the
+    # earlier reply was already fine" -- and four times in two days what it wrote was
+    # its opinion OF the reply, shown or read out to the user as the answer (see
+    # _looks_like_verdict). A good reply now goes out as the tier wrote it; the verifier
+    # writes text only when the reply has to change, and then inside a tag, so a comment
+    # outside it is never the answer.
+    has_candidate = bool(final_text.strip())
+    forms = []
+    if has_candidate:
+        forms.append(
+            f'- "{VERIFIER_OK}" -- the reply above answers the request, claims nothing the facts above do not show, '
+            "and can go to the user exactly as it stands. It is then sent word for word. This is the normal outcome "
+            "for a good reply: never rewrite a reply that is already fine."
         )
-    parts.append(
-        "Your reply is the final message the user will read. Write it fresh, clearly and to the point, directly "
-        "answering their request, even if the earlier reply was already fine. Never describe the other assistant's "
-        "work as a report. Do not claim anything is done unless the reply and facts above show it."
+    if can_escalate:
+        forms.append(
+            f'- "{ESCALATION_SENTINEL} <one short sentence saying what is still missing or wrong>" -- the task is '
+            "genuinely NOT finished yet: real work is still needed, not just a wording issue. A stronger model will "
+            "pick it up from exactly that point, with the full tool-call history so far. Only for genuinely "
+            "unfinished work -- which includes a reply that only promises or announces an action (\"I'll send it "
+            "now\") where the facts above show no such action was taken."
+        )
+    if can_deescalate:
+        forms.append(
+            f'- "{DEESCALATION_SENTINEL} <one short sentence saying what is left to do>" -- the task is genuinely '
+            "NOT finished yet, but what remains is simple and mechanical: a clearly weaker, cheaper model could "
+            "finish it from here. A less capable model will pick it up from exactly that point, with the full "
+            "tool-call history so far. Only choose this when you are confident the SPECIFIC remaining steps are "
+            "easy, not merely because the task as a whole seemed simple -- when in doubt, escalate instead."
+        )
+    forms.append(
+        f'- "<{VERIFIER_FINAL_TAG}>the reply</{VERIFIER_FINAL_TAG}>" -- '
+        + (
+            "the reply above has to change before the user reads it: it claims something the facts above do not "
+            "show, leaves out part of what was asked, or is not written to the user."
+            if has_candidate
+            else "there is no reply to send, so you write the message the user will read."
+        )
+        + " What is inside the tag is sent to the user as the whole reply. Write the reply itself there -- to the "
+        "user, in the language of their request, clearly and to the point, directly answering it. Never describe "
+        "the other assistant's work as a report, and never put a comment on the reply or on your own check inside "
+        "the tag. Do not claim anything is done unless the reply and facts above show it."
         + (
             ""
             if (can_escalate or can_deescalate)
@@ -1331,6 +1587,11 @@ def _build_verification_prompt(
         + " You have no tools and this is the only message you get to send -- never promise to check, follow up, "
         "or give it a minute: nothing will act on that promise after this reply, so it would just be a lie."
     )
+    parts.append(
+        "CRITICAL: a program reads your reply. Reply in exactly one of these forms and with nothing else -- no "
+        "explanation, no opinion of the reply:\n" + "\n".join(forms)
+    )
+    parts.append(f"A corrected reply written without the <{VERIFIER_FINAL_TAG}> tag cannot be used and is thrown away.")
     return "\n\n".join(parts)
 
 
@@ -1339,23 +1600,205 @@ def _build_verification_prompt(
 _UNAVAILABLE_ANSWER = "I can't answer this right now -- please try again a little later."
 
 
+# The verifier is told its reply IS the final message to the user. Seen live
+# (2026-10-10, three turns in a row): the cheap verifier model instead wrote a
+# review OF the reply -- "Ответ, который вы получили, полностью покрывает запрос...",
+# "Ответ удовлетворяет всем условиям...", "Проверила, ответ подробный и
+# соответствует задаче, дополнительных действий не требуется" -- and that review is
+# what the user heard instead of a 1657-char real answer. Only replies that talk
+# ABOUT "the reply" are caught: "Задача выполнена: письмо отправлено" is a real
+# answer and must pass.
+_VERDICT_PATTERNS = (
+    re.compile(r"\b(ответ|reply|response)\w*\b.{0,80}\b(удовлетвор|соответству|покрыва|корректн|полност|"
+               r"meets|satisf|covers|is complete|fully|correct)", re.IGNORECASE | re.DOTALL),
+    # 2026-10-11, live, shown as Caroline's own greeting after a restart: "Поняла,
+    # приветствие соответствует запросу." -- no "ответ" in it for the pattern above.
+    # "The request", not "the requirements": an answer may well say a bag meets an
+    # airline's requirements.
+    re.compile(r"\b(соответству\w+|удовлетворя\w+) (запрос|задач|инструкци)\w*"
+               r"|\b(matches|meets|satisfies|fulfil+s) the (request|instructions?|task)\b", re.IGNORECASE),
+    re.compile(r"\bдополнительн\w* (работ|действи|шаг)\w* не требу", re.IGNORECASE),
+    re.compile(r"\bno (further|additional) (work|action|steps?) (is |are )?(needed|required)", re.IGNORECASE),
+)
+
+
+# A review can also be long, and say none of the above (2026-10-11, live, 573 chars
+# read out as the answer to "what will the weather be, and who wrote War and Peace"):
+# "В ответе другая помощница написала, что в Киеве ... Проверка источников показывает,
+# что ...". Whoever speaks of "the other assistant" or of what "the reply says" is
+# talking ABOUT the answer, at any length -- the user is never the one being told that.
+_REVIEW_MARKERS = re.compile(
+    r"друг(ая|ой|ого|ую) (помощни|ассистент|модел)|предыдущ\w+ (помощни|ассистент)|"
+    r"\bв ответе (выше )?(другая |другой )?(помощни\w+ |ассистент\w* )?(сказано|написано|написал|указано|указал|говорится|утверждается)|"
+    r"\bпроверка (источников|фактов|вызовов|результат\w*) (показ|подтвержда)|"
+    r"\b(the other|another|the previous|the first) (assistant|model)\b|\bthe (reply|response|answer) (above )?(says|states|claims|said)\b|"
+    r"\b(checking|a check of) the (sources|tool calls) (shows|confirms)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_verdict(text: str) -> bool:
+    return bool(_REVIEW_MARKERS.search(text)) or (len(text) < 400 and any(p.search(text) for p in _VERDICT_PATTERNS))
+
+
+# The verifier also writes the final text, and sometimes opens it with its opinion of the
+# candidate (2026-10-11, live, read aloud to someone who had only asked about the weather:
+# "Похоже, прогноз верный: завтра в Киеве ожидается ..."). Unlike a whole-text verdict
+# (_looks_like_verdict) the answer is all there after the colon, so only the opening
+# clause goes. It counts as the verifier's own addition only when the candidate did not
+# open the same way: "Решение верное: ..." in reply to "check my solution" stays.
+_VERDICT_PREFACE = re.compile(
+    r"^[^:.!?\n]{0,60}\b(?:вер(?:ен|на|но|ны|ный|ная|ное|ные)|правил(?:ен|ьна|ьно|ьны|ьный|ьная|ьное|ьные)|"
+    r"коррект(?:ен|на|но|ны|ный|ная|ное|ные)|подтвержд(?:аю|ается|ён|ен|ено|ена)|проверен[оаы]?|"
+    r"correct|accurate|verified|confirmed|checks out)\b[^:.!?\n]{0,30}:\s+(?=\S)",
+    re.IGNORECASE,
+)
+VERDICT_PREFACE_MIN_REST_CHARS = 40
+
+
+def _strip_verdict_preface(verified: str, candidate: str) -> str:
+    text = verified.lstrip()
+    match = _VERDICT_PREFACE.match(text)
+    if not match or _VERDICT_PREFACE.match(candidate.lstrip()):
+        return verified
+    rest = text[match.end():]
+    if len(rest) < VERDICT_PREFACE_MIN_REST_CHARS:
+        return verified
+    return rest[0].upper() + rest[1:]
+
+
 def _usable(text: str) -> bool:
     return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
+
+
+VERIFIER_OK = "OK"
+VERIFIER_FINAL_TAG = "final"
+# A cheaper model asked first, with the same prompt (None: off, as shipped). It can only
+# approve: its "OK" sends the answer out, anything else -- an escalation, a correction, a
+# reply in no form -- goes to the verifier proper (AI_MODEL_MINI), which rules as before.
+# Why it is here: with the answer no longer rewritten, the verifier's own wait is what
+# is left between a tier's answer and the user -- live 2026-10-12, with the app's real
+# prompt, 5.9s, 8.3s and 10.3s. On the golden set (evals/verifier_eval.py, 3 runs)
+# google/gemini-2.5-flash-lite ruled all 33 as the verifier proper does, in 0.4s against
+# 2.9s; claude-haiku-4.5 got 30 (it rewrote a correct answer three times).
+# Off because that set is 11 cases with a short system prompt, and a wrong "OK" here is
+# an unfinished answer delivered: turning it on is a decision about the quality gate.
+VERIFIER_FIRST_MODEL: str | None = None
+_VERIFIER_OK = re.compile(r"^\W*OK\W*$", re.IGNORECASE)
+# The closing tag may be missing (a reply cut short): everything after the opening one is the text.
+_VERIFIER_FINAL = re.compile(rf"<{VERIFIER_FINAL_TAG}>(.*?)(?:</{VERIFIER_FINAL_TAG}>|\Z)", re.IGNORECASE | re.DOTALL)
+_ANY_TAG = re.compile(r"</?[a-zA-Z][\w-]*>")
+
+
+def _verifier_form_reminder(can_escalate: bool, can_deescalate: bool, has_candidate: bool) -> str:
+    """Sent once when the verifier's reply was in none of the forms (verify_candidate).
+    On the golden set (evals/verifier_eval.py) the usual such reply was a correct
+    correction written without the tag -- 2 runs of 3 for a wrong figure -- and keeping
+    the candidate there sends the wrong figure out."""
+    forms = [f'"{VERIFIER_OK}"'] if has_candidate else []
+    if can_escalate:
+        forms.append(f'"{ESCALATION_SENTINEL} <what is still missing>"')
+    if can_deescalate:
+        forms.append(f'"{DEESCALATION_SENTINEL} <what is left to do>"')
+    forms.append(f'"<{VERIFIER_FINAL_TAG}>the reply the user should read</{VERIFIER_FINAL_TAG}>"')
+    return ("That reply is in none of the forms, so the program cannot use it. Reply again with exactly one of these and "
+            "nothing else: " + ", or ".join(forms) + ".")
+
+
+def _read_verifier_reply(verified: str, candidate: str) -> tuple[str, str]:
+    """What goes to the user after a verifier reply that is not an escalation, and how it
+    was decided (for the log): see _build_verification_prompt for the forms.
+
+    The candidate is the answer unless the verifier corrected it inside the tag. A reply
+    in neither form is the verifier talking about the candidate instead of ruling on it
+    -- exactly what used to reach the user -- so the candidate goes out, not that text.
+    Only when there is no candidate at all (no tier produced one) is free text used: it
+    is then the one message there is."""
+    stripped = verified.strip()
+    has_candidate = _usable(candidate)
+    if _VERIFIER_OK.match(stripped):
+        return (candidate, "ok") if has_candidate else ("", "ok_without_candidate")
+    match = _VERIFIER_FINAL.search(stripped)
+    if match and match.group(1).strip():
+        text = match.group(1).strip()
+        # The tag is where the answer goes, and still a model wrote it: the old guards stay.
+        if has_candidate and _looks_like_verdict(text):
+            return candidate, "verdict_in_tag"
+        return _strip_verdict_preface(text, candidate), "corrected"
+    if has_candidate:
+        return candidate, "unparsed_candidate_kept"
+    return _strip_verdict_preface(_ANY_TAG.sub("", stripped).strip(), candidate), "unparsed_text_used"
 
 
 def _answer(text: str) -> dict[str, Any]:
     return {"status": "answered", "text": text}
 
 
+# How much of a tool result the trace keeps -- the trace is the verifier's "ground truth"
+# and what an escalated tier continues from. It was the first 300 characters. Live
+# (2026-10-11, twice in a row, the same question): a web_search result is five sources
+# with excerpts, ~4000 characters, and its first 300 are the heading and the start of the
+# first source -- "... Morning temperature of 10 °C, af". The tier answered from the whole
+# result (night, day, rain, wind); the verifier, shown only that stub, ruled "ответ
+# содержит только данные о температуре утра" and escalated a correct answer that was ready
+# at 10s, and the next tier, with the same stub to continue from, searched again and
+# browsed for three minutes (190s and 223s to the answer). A whole web_search result fits now.
+TRACE_RESULT_CHARS = 4500
+# All trace lines shown together stay within this; beyond it older results are cut back to
+# the old stub (a page snapshot from the app browser is as long as the limit above, and a
+# browsing tier makes dozens).
+TRACE_BUDGET_CHARS = 20000
+TRACE_OLD_LINE_CHARS = 650
+
+
+def _trace_line(name: Any, args_json: str, result: Any) -> str:
+    return f"- {name}({args_json}) -> {str(result)[:TRACE_RESULT_CHARS]}"
+
+
+def _trace_text(lines: list[str], limit: int) -> str:
+    """The last `limit` trace lines: the newest whole, older ones cut once the budget is spent."""
+    kept: list[str] = []
+    spent = 0
+    for line in reversed(lines[-limit:]):
+        if spent + len(line) > TRACE_BUDGET_CHARS and len(line) > TRACE_OLD_LINE_CHARS:
+            line = line[:TRACE_OLD_LINE_CHARS] + " ..."
+        spent += len(line)
+        kept.append(line)
+    return "\n".join(reversed(kept))
+
+
 def _continuation_note(tier_trace: list[str]) -> str:
     return (
         "[Internal: a previous attempt at this same request already ran these tool calls, with their real "
         "results. Continue from exactly where it stopped -- do not repeat these calls, do not restart from scratch.]\n"
-        + "\n".join(tier_trace[-25:])
+        + _trace_text(tier_trace, 25)
     )
 
 
 COMPLEXITY_TIMEOUT_S = 12.0
+
+# Voice turns (2026-10-10): the answer is read aloud, and any digit in it makes
+# clean_text_for_speech spend a model call per spoken piece first -- live, 6s for a
+# 195-char weather answer with "13-14 °C". Part of the system message, so the
+# verifier (which writes the final text) follows it too. The trade-off: the chat
+# bubble shows the numbers in words as well.
+# Messages sent one after another within USER_MESSAGE_MERGE_WINDOW_S reach the model
+# as one, joined by blank lines (chat_session._flush_held_user_messages) -- and they
+# need not be about the same thing. Per explicit instruction (2026-10-11): the answer
+# must not run them together. Tried on five joined pairs first: the topics were kept
+# apart, each in its own paragraph, but nothing said which paragraph answered what.
+_SEVERAL_REQUESTS_INSTRUCTION = (
+    "The user's message may be several messages sent one after another, joined by blank lines. When they ask "
+    "about different things, answer every one of them, in the order asked, and open each part by naming what it "
+    "is about (\"Что касается погоды, ...\", \"As for the translation, ...\") so that the parts cannot be mixed "
+    "up. When a later message corrects, narrows or withdraws an earlier one, answer what the user ended up "
+    "asking, not both."
+)
+
+_VOICE_ANSWER_INSTRUCTION = (
+    "This conversation is spoken: your final reply will be read aloud. Write numbers, dates, temperatures, "
+    "units and formulas out in words, as they would be said, and use no markdown."
+)
 
 _COMPLEXITY_PROMPT = (
     "Classify a request for an assistant that has tools (shell commands, files, apps, windows, email, notes). "
@@ -1364,54 +1807,378 @@ _COMPLEXITY_PROMPT = (
 )
 
 
-_VERIFIER_INTENT_RECHECK_TIMEOUT_S = 12.0
+# ------------------------------------------------------------------ fast lane --
+#
+# Prototype (2026-10-10), per explicit request ("нужно очень быстро... с твоей
+# скоростью"): a question that needs no tools -- "what can you do", "explain
+# fractions" -- went through the whole cascade anyway: tier pick, a reasoning model,
+# the verifier, then a forced translation of an answer already in the right language.
+# Measured live: 50-160s for exactly such questions. One plain call to a fast model
+# answers them directly; anything needing live data, the user's own data or an action
+# is declined with FAST_LANE_DECLINE and goes through the cascade exactly as before
+# (sequentially -- never in parallel: a cascade worker can't be reliably stopped once
+# it runs, and it may act). Off by FAST_LANE_ENABLED = False.
 
-_VERIFIER_INTENT_PROMPT = (
-    "Below is a reply a VERIFIER wrote while checking whether another assistant's work on a task was actually "
-    "finished. Judge what the verifier ITSELF is saying about completeness -- not the task's own subject matter. "
-    "Does this reply say or clearly imply the task is NOT actually finished (real work is still needed), or does "
-    "it treat the task as done? Reply with exactly one word: UNFINISHED or DONE.\n\nVerifier's reply:\n"
+FAST_LANE_ENABLED = True
+# Picked by benchmark (2026-10-10, same prompt/persona/key as the app, 8 questions:
+# 3 to answer, 5 that need tools). Median latency / correct decisions:
+#   claude-haiku-4.5 1.8s 8/8 | claude-sonnet-5 2.6s 8/8 (2x the price)
+#   gemini-2.5-flash 1.5s 7/8 -- made up the time ("Сейчас 16:35")
+#   gpt-4.1-mini 1.6s 6/8 -- made up memory ("ты мне вчера ничего не говорил")
+#   gpt-5-nano/minimal 1.8s 4/8 -- asked for details instead of handing tasks on
+#   gemini-2.5-flash-lite 1.5s 2/4 -- "Я проверила вашу почту", an invented email
+# Cheaper than Haiku only meant confident wrong answers -- worse than a slow one.
+FAST_LANE_MODEL = "anthropic/claude-haiku-4.5"
+FAST_LANE_TIMEOUT_S = 15.0
+# Only for a reasoning model in the fast lane (e.g. {"effort": "minimal"} for
+# gpt-5-nano) -- left at its default such a model thinks for seconds first.
+FAST_LANE_REASONING: dict[str, str] | None = None
+FAST_LANE_DECLINE = "[[NEEDS_TOOLS]]"
+# Declining, the fast lane also does _start_tier_index's job (2026-10-10): the same
+# SIMPLE/COMPLEX call cost ~1.7s more on every tool turn, by a weaker model.
+FAST_LANE_DECLINE_COMPLEX = "[[NEEDS_TOOLS:COMPLEX]]"
+# A deterministic check after the model (2026-10-10), in the multi-stage sanitizing
+# sense of the microagents paper: told plainly to decline questions about the user's
+# own past or identity, the fast model still answered "Как меня зовут?" with "Мы ещё
+# не встречались" and "Что я тебе вчера говорил?" with "Мы ещё не общались" -- false
+# whenever memory or notes hold the answer. Such a reply is treated as a decline, so
+# the cascade, which can look, answers instead.
+_FAST_LANE_NO_HISTORY = re.compile(
+    r"не (встречал|общал|знаком|разговаривал)|"
+    r"(не знаю|не помню) (вашего|твоего|вашe|твоё|твое)? ?(имени|имя)|"
+    r"(ничего|ещё|еще) (мне )?не (говорил|рассказывал|писал)|"
+    # 2026-10-11, "Что я тебе вчера говорил про проект?" -> "Мы с вами только что начали
+    # разговор -- у меня нет записей о том, что вы говорили вчера", and on the next run
+    # "Я не помню предыдущих разговоров". "I don't remember" from a lane that has no
+    # memory to look in is never the answer -- the cascade has one.
+    r"только что (начали (разговор|общение|беседу|диалог|общаться|разговаривать)|познакомились)|"
+    r"нет (записей|сведений|данных|информации|воспоминаний|памяти) о (том|наш|ваш|тво|вчераш|предыдущ|прошл)|"
+    r"\bне (помню|запоминаю|сохраняю)\b|нет доступа к (предыдущ|прошл|истори|памят)|"
+    r"haven'?t (met|talked|spoken)|don'?t know your name|you (haven'?t|didn'?t) (tell|told|mention)|"
+    r"\bwe(('ve| have)? (only )?just (started|begun|met))|\bno (record|memory|recollection) of (what|our|your|you)|"
+    r"(don'?t|do not|can'?t|cannot) (remember|recall)|don'?t have (access to|a record of|any record of) (previous|past|earlier|our)",
+    re.IGNORECASE,
 )
+_FAST_LANE_DIALOGUE_LINES = 12
+# The sentence a voice decline comes with (see _fast_lane_instructions) is read aloud
+# as the turn's first narration remark, so it is held to the narrator's own rules by
+# code, not by the prompt alone: no question, no digits, no promise, no machinery. One
+# that fails is dropped -- the narrator then drafts the first remark itself, as before.
+_FIRST_REMARK_FORBIDDEN = re.compile(
+    r"[?\d\[\]]"
+    r"|\b(сделаю|проверю|посмотрю|найду|поищу|узнаю|уточню|гляну|отправлю|сообщу|напишу|вернусь|попробую|постараюсь)\b"
+    r"|\bскоро\b|\bI('ll| will| am going to)\b|\blet me\b"
+    r"|инструмент|модел|уровень|уровн[яе]|\btools?\b|\bmodels?\b|\btier\b",
+    re.IGNORECASE,
+)
+_FIRST_REMARK_MIN_CHARS = 8
+_FIRST_REMARK_MAX_CHARS = 140
 
 
-async def _recheck_verifier_intent(ai: Any, cfg: Any, verified_text: str) -> bool:
-    """Returns True if the verifier's OWN reply reads as "not actually finished"
-    even though it didn't include the literal ESCALATION_SENTINEL/DEESCALATION_SENTINEL
-    marker it was asked to use. Confirmed live (2026-10-15, SW e2e mailbox-check test):
-    a verifier wrote "...the task is not finished: the earlier reply needs to be revised
-    to include those accounts..." in plain prose, with NEITHER marker present -- the
-    mechanical `in` checks in verify_candidate() missed it entirely, and that exact
-    prose (the verifier's own admission that it was wrong) became the final, delivered
-    user-facing answer. A cheap, separate, forced one-word classification against the
-    verifier's OWN text (not the task) catches this without relying on the SAME model
-    call to get its own formatting right and its own judgment right at the same time.
-    Never raises into the turn -- a failed re-check just keeps the original (no-sentinel)
-    reading, same as every other "never a hard dependency" check in this file."""
+def _first_remark_from_decline(text: str) -> str | None:
+    lines = text[text.rindex("]]") + 2:].strip().splitlines()
+    remark = lines[0].strip().strip("\"«»") if lines else ""
+    if not _FIRST_REMARK_MIN_CHARS <= len(remark) <= _FIRST_REMARK_MAX_CHARS or _FIRST_REMARK_FORBIDDEN.search(remark):
+        return None
+    return remark
+
+
+def _first_remark_clause(language: str) -> str:
+    # Voice only (2026-10-11): the model that has just read the request can say in one
+    # sentence what the work is, at no extra cost -- live, the narrator's own first remark
+    # was heard 12.9s after the question. Checked by _first_remark_from_decline.
+    return (
+        "One exception to \"nothing else\": the user is listening, and hears nothing while the work goes on. "
+        f"After the marker, on the same line, add ONE short sentence in {language}, in your own voice, saying "
+        "what you are now doing for them, as work already under way -- \"Ищу прогноз погоды на завтра в "
+        "Киеве.\" It names their task in plain words. It is not a promise (\"сейчас посмотрю\", \"I'll check\"), "
+        "not a question, not a greeting; it says nothing of tools, models or steps, claims no result, and has no "
+        "digits. "
+    )
+
+
+# Per explicit instruction (2026-10-11): the fast model is not called on every message.
+# The cheapest model goes first and only decides whether the fast lane's level is
+# needed at all -- can this be answered without tools? -- and only after its yes is
+# FAST_LANE_MODEL asked for the answer. A request that needs tools never reaches the
+# fast model: the gate itself hands it to the cascade, with the starting tier and, for
+# voice, the first spoken remark. The gate errs towards yes: FAST_LANE_MODEL can still
+# decline, while a wrong no costs the user the whole cascade for a question that needed
+# two seconds. Any failure of the gate also just means the fast model is asked.
+FAST_LANE_GATE_ENABLED = True
+FAST_LANE_GATE_MODEL = "google/gemini-2.5-flash-lite"
+FAST_LANE_GATE_REASONING: dict[str, str] | None = None
+FAST_LANE_GATE_TIMEOUT_S = 6.0
+FAST_LANE_ANSWERABLE = "[[ANSWER]]"
+
+
+def _fast_lane_gate_instructions(language: str, is_voice: bool) -> str:
+    return (
+        "You are the first and cheapest step in front of the assistant. You do NOT answer the user. Decide one "
+        "thing about their last message: can it be answered fully and correctly from this conversation and "
+        "general knowledge alone?\n"
+        "Reply with exactly " + FAST_LANE_ANSWERABLE + " and nothing else if it can: explaining, defining, "
+        "calculating, translating, writing, editing or checking a text, advice, small talk -- however long or "
+        "detailed the answer has to be.\n"
+        "Reply with exactly " + FAST_LANE_DECLINE + " and nothing else if it needs ANYTHING more: current or live "
+        "information (weather, news, prices, the time or the date, schedules), the user's own data (mail, notes, "
+        "files, contacts, calendar, anything about the user themselves or about what they said before this "
+        "conversation), looking something up, or doing anything (sending, saving, opening, scheduling, reminding, "
+        "changing). Reply with exactly " + FAST_LANE_DECLINE_COMPLEX + " instead when that takes several dependent "
+        "tool steps (check, then act, then verify).\n"
+        "The message may be several messages joined by blank lines: if even one of them needs more, the whole "
+        "message does.\n"
+        + (_first_remark_clause(language) + "This applies to the two NEEDS_TOOLS replies only.\n" if is_voice else "")
+        + "When you cannot tell, reply " + FAST_LANE_ANSWERABLE + ": the next step can still decline."
+    )
+
+
+def _fast_lane_messages(
+    workspace_dir: str, persona: Persona, instructions: str, recent_dialogue_lines: list[str], user_text: str,
+) -> list[dict[str, Any]]:
+    system = "\n\n".join([
+        _persona_system_message(persona),
+        owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
+        instructions,
+    ])
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for line in recent_dialogue_lines[-_FAST_LANE_DIALOGUE_LINES:]:
+        messages.append({"role": "assistant" if line.startswith("Caroline:") else "user", "content": line.split(":", 1)[-1].strip()})
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+async def _fast_lane_gate(
+    ai: Any, workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
+) -> tuple[bool, int | None, str | None] | None:
+    """(needs tools?, start tier, first remark), or None when the gate gave no usable
+    verdict -- the caller then asks the fast model as if there were no gate."""
+    started = time.monotonic()
     try:
         raw = await asyncio.wait_for(
-            asyncio.to_thread(ai.resolve, _VERIFIER_INTENT_PROMPT + verified_text[:4000], model=cfg.AI_MODEL_SMALL, no_fallback=True),
-            timeout=_VERIFIER_INTENT_RECHECK_TIMEOUT_S,
+            asyncio.to_thread(
+                ai.resolve_agentic,
+                _fast_lane_messages(workspace_dir, persona, _fast_lane_gate_instructions(language, is_voice), recent_dialogue_lines, user_text),
+                None, None, model=FAST_LANE_GATE_MODEL, max_iterations=1, reasoning=FAST_LANE_GATE_REASONING,
+            ),
+            timeout=FAST_LANE_GATE_TIMEOUT_S,
         )
-    except Exception as exc:  # noqa: BLE001 -- re-check must never block the turn
-        log_event("engine", "small_model_verifier_intent_recheck_failed", error=str(exc), error_type=type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "fast_lane_gate_failed", error=str(exc)[:200], error_type=type(exc).__name__,
+                  ms=int((time.monotonic() - started) * 1000))
+        return None
+    text = str(raw or "").strip()
+    ms = int((time.monotonic() - started) * 1000)
+    if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
+        start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
+        first_remark = _first_remark_from_decline(text) if is_voice else None
+        log_event("engine", "fast_lane_gate", verdict="tools", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
+        return True, start_tier, first_remark
+    if FAST_LANE_ANSWERABLE in text:
+        log_event("engine", "fast_lane_gate", verdict="answer", ms=ms)
+        return False, None, None
+    log_event("engine", "fast_lane_gate_failed", error=text[:200], error_type="unparseable", ms=ms)
+    return None
+
+
+def _fast_lane_instructions(language: str, is_voice: bool) -> str:
+    style = (
+        "This is a spoken conversation: your reply will be read aloud. Plain sentences only -- no markdown, no "
+        "lists, no emoji. Keep it short and natural, like a person answering out loud (2-5 sentences); if the "
+        "user asked for detail, explain fully -- still in plain spoken sentences. Write numbers, formulas and "
+        "symbols out in words, as they would be said aloud (\"углекислый газ\", not \"CO2\")."
+        if is_voice
+        else "Keep it concise and to the point."
+    )
+    first_remark = _first_remark_clause(language) if is_voice else ""
+    return (
+        f"Reply in {language}.\n{style}\n{_SEVERAL_REQUESTS_INSTRUCTION} If even one of several requests needs "
+        "anything beyond this conversation and general knowledge, decline the whole message as described below -- "
+        "do not answer the rest of it here.\n\n"
+        "Answer the user's last message directly ONLY if you can do it fully and correctly from this conversation "
+        "and general knowledge alone. If answering needs ANYTHING else -- current or live information (weather, "
+        "news, prices, dates, schedules), the user's own data (mail, notes, files, contacts, calendar, anything "
+        "remembered about them beyond this conversation), looking something up, or doing anything (sending, "
+        "saving, opening, scheduling, changing) -- reply with exactly " + FAST_LANE_DECLINE + " and nothing else, or "
+        "with exactly " + FAST_LANE_DECLINE_COMPLEX + " if it needs several dependent tool steps (check, then act, "
+        "then verify). " + first_remark +
+        "Writing, drafting, editing, checking or translating text is yours to do here -- only SENDING, saving "
+        "or otherwise acting on it needs tools (seen live: \"help me write a polite letter to my teacher\" was "
+        "declined). Anything about the user themselves that your instructions above don't state -- their name, "
+        "history, preferences, what they said or did before this conversation -- may be in their notes or "
+        "memory: decline; never answer that you don't know them, haven't met or don't remember (seen live: "
+        "\"Как меня зовут?\" -> \"Мы ещё не встречались\"; \"Что я тебе вчера говорил?\" -> \"Я не помню "
+        "предыдущих разговоров\"). "
+        "When unsure, decline. Length or depth is never a reason to decline: a detailed explanation from general "
+        "knowledge is still yours to give (seen live: \"Объясни подробно, как растения делают фотосинтез\" was "
+        "declined, the same question without \"подробно\" answered). Never claim to have done, checked or saved "
+        "anything, and never promise to."
+    )
+
+
+# Experiment (2026-10-10): the same check for the cascade's own final answer. The
+# forced translation pass took 5-20s live on answers already in the tab's language;
+# an answer that fails the check (code, paths, English terms, another language) is
+# still translated exactly as before. False restores unconditional translation.
+CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE = True
+
+
+# What in a Russian answer is not a sign of another language: links, and Latin words that
+# are names -- any capital letter or digit in them (iPhone, Rozetka, BBC, iPhone17Pro).
+# Live 2026-10-15: "... iPhone 17 ... в Rozetka, Comfy и Foxtrot ..." failed the 85% check,
+# went through the translation pass (Russian to Russian, 7.5s), came back slightly changed,
+# and so missed the speech made for it ahead (speech_ahead.py): 11.6s from the answer
+# being ready to its first sound. A lower-case English word still counts against it.
+_LINK = re.compile(r"(?:https?://|www\.)\S+|\b[\w.-]+\.(?:com|net|org|ua|ru|io|info|biz)(?:/\S*)?", re.IGNORECASE)
+_LATIN_NAME = re.compile(r"\b(?=[A-Za-z0-9]*[A-Z0-9])[A-Za-z0-9]*[A-Za-z][A-Za-z0-9]*\b")
+
+
+def _is_cyrillic(c: str) -> bool:
+    return "Ѐ" <= c <= "ӿ"
+
+
+def answer_is_in_language(text: str, language: str) -> bool:
+    """Whether the forced translation pass can be skipped for an answer:
+    only for the two languages it can be told apart cheaply and safely. Russian
+    must not contain Ukrainian-only letters (a Russian/Ukrainian mix-up is exactly
+    what the translation pass exists to catch)."""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 10:
         return False
-    return str(raw or "").strip().upper().startswith("UNFINISHED")
+    if language == "Russian":
+        prose_letters = [c for c in _LATIN_NAME.sub(" ", _LINK.sub(" ", text)) if c.isalpha()]
+        if len(prose_letters) < 10:
+            return False
+        cyrillic = sum(1 for c in prose_letters if _is_cyrillic(c)) / len(prose_letters)
+        return cyrillic >= 0.85 and not any(c in "іїєґІЇЄҐ" for c in text)
+    if language == "English":
+        return not any(_is_cyrillic(c) for c in letters) and sum(1 for c in letters if c.isascii()) / len(letters) >= 0.95
+    return False
+
+
+async def try_fast_answer(
+    workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
+) -> tuple[str | None, int | None, str | None]:
+    """(answer, None, None) when the fast lane answered; (None, start tier, first
+    remark) when it declined -- the tier is 1 for a COMPLEX request, else 0, for
+    run_small_model_turn's start_tier; the remark, voice only and possibly None, is
+    what to say first while the cascade works. (None, None, None) when it couldn't
+    run, and the cascade picks its tier itself. Never raises."""
+    if not FAST_LANE_ENABLED or camerlengo_ai is None:
+        return None, None, None
+    started = time.monotonic()
+    try:
+        ai = await _model_ai()
+        if ai is None:
+            return None, None, None
+        if FAST_LANE_GATE_ENABLED:
+            gate = await _fast_lane_gate(ai, workspace_dir, persona, user_text, recent_dialogue_lines, language, is_voice)
+            if gate is not None and gate[0]:
+                log_event("engine", "fast_lane_declined", ms=int((time.monotonic() - started) * 1000), start_tier=gate[1],
+                          first_remark=gate[2], by="gate")
+                return None, gate[1], gate[2]
+        model = FAST_LANE_MODEL
+        messages = _fast_lane_messages(workspace_dir, persona, _fast_lane_instructions(language, is_voice), recent_dialogue_lines, user_text)
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(ai.resolve_agentic, messages, None, None, model=model, max_iterations=1, reasoning=FAST_LANE_REASONING),
+            timeout=FAST_LANE_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the cascade is always there to fall back on
+        log_event("engine", "fast_lane_failed", error=str(exc)[:300], error_type=type(exc).__name__,
+                  ms=int((time.monotonic() - started) * 1000))
+        return None, None, None
+    text = str(raw or "").strip()
+    ms = int((time.monotonic() - started) * 1000)
+    if not text or text.startswith("Agent error"):
+        log_event("engine", "fast_lane_failed", error=text[:300], error_type="agent_error", ms=ms)
+        return None, None, None
+    if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
+        start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
+        first_remark = _first_remark_from_decline(text) if is_voice else None
+        log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
+        return None, start_tier, first_remark
+    if _FAST_LANE_NO_HISTORY.search(text):
+        log_event("engine", "fast_lane_declined", ms=ms, start_tier=0, reason="claims_no_history", text=text[:200])
+        return None, 0, None
+    log_event("engine", "fast_lane_answered", ms=ms, model=model, text_len=len(text), text=text)
+    return text, None, None
+
+
+# Same model as the fast lane, for the same reason: on a narrator golden set it beat
+# the SMALL-draft-plus-translation route (see generate_progress_comment_direct).
+NARRATOR_MODEL = FAST_LANE_MODEL
+# Per explicit instruction (2026-10-11): what runs on every turn must not go straight to
+# the fast model. The narrator drafts with the cheapest model first, and NARRATOR_MODEL
+# is asked only when that one has nothing to say or its remark is rejected by the checks
+# (draft_narration_remark). On the golden set, 36 runs, the cheap model alone: 29 right
+# at 0.56s median, and all 7 misses were silences where a remark was due -- never a wrong
+# remark. Its neighbours were worse in the way that matters: gpt-4.1-nano said "Новых
+# писем от Анны не найдено" about three found letters, gpt-5-nano announced the work
+# finished and slipped into Ukrainian.
+NARRATOR_FIRST_MODEL = "google/gemini-2.5-flash-lite"
+
+
+async def resolve_narration_prompt(prompt: str, model: str | None = None, reasoning: dict[str, str] | None = None) -> str:
+    """Raw reply of NARRATOR_MODEL to one narrator prompt; raises if the engine or
+    the provider key is unavailable (the caller then falls back)."""
+    if camerlengo_ai is None:
+        raise RuntimeError("camerlengo unavailable")
+    ai = await _model_ai()
+    if ai is None:
+        raise RuntimeError("no provider key")
+    return await asyncio.wait_for(
+        asyncio.to_thread(ai.resolve_agentic, [{"role": "user", "content": prompt}], None, None,
+                          model=model or NARRATOR_MODEL, max_iterations=1, reasoning=reasoning),
+        timeout=FAST_LANE_TIMEOUT_S,
+    )
+
+
+async def draft_narration_remark(
+    task: str, facts: str, already_said: list[str], language: str, gender: str | None = None, addressee_gender: str | None = None,
+    repeat_window: int | None = None,
+) -> str | None:
+    """One narration remark by the ladder: NARRATOR_FIRST_MODEL, then NARRATOR_MODEL when
+    the first has nothing or is rejected. Same contract as
+    generate_progress_comment_direct: the remark, "" for nothing new, None on failure."""
+    from app.plugins.voice_api import generate_progress_comment_direct
+
+    async def first(prompt: str) -> str:
+        return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
+
+    remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
+                                                    repeat_window=repeat_window)
+    if remark:
+        log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
+        return remark
+    remark = await generate_progress_comment_direct(
+        task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
+        repeat_window=repeat_window,
+    )
+    log_event("engine", "narration_drafted", by="second", model=NARRATOR_MODEL, said=bool(remark))
+    return remark
 
 
 async def _start_tier_index(ai: Any, cfg: Any, user_text: str) -> int:
     """Pre-assessment: a complex multi-step tool task starts directly at the second
     tier (mini) instead of the first (nano). Per explicit instruction (2026-10-15,
     "Предварительную оценку задачи делаем gpt-5.1-mini, не nano"): this one-word
-    classification call itself now runs on AI_MODEL_MINI rather than AI_MODEL_SMALL
-    (nano) -- a sturdier judgment call for deciding whether nano is even worth
-    trying, at the cost of this one extra service call being a little more
-    expensive than before. AI_MODEL_SMALL remains tier 0 of the real cascade; it's
-    just no longer used for this pre-assessment itself."""
+    classification call runs on AI_MODEL_MINI rather than AI_MODEL_SMALL (nano) -- a
+    sturdier judgment call for deciding whether nano is even worth trying. AI_MODEL_SMALL
+    remains tier 0 of the real cascade; it's just no longer used for this pre-assessment
+    itself. Goes through resolve_agentic (not a plain resolve call) for the same reason
+    every other service call in this file does: one error-handling/Agent-error path,
+    shared with the fast lane above."""
     try:
         raw = await asyncio.wait_for(
-            asyncio.to_thread(ai.resolve, _COMPLEXITY_PROMPT + user_text[:2000], model=cfg.AI_MODEL_MINI, no_fallback=True),
+            asyncio.to_thread(
+                ai.resolve_agentic, [{"role": "user", "content": _COMPLEXITY_PROMPT + user_text[:2000]}], None, None,
+                model=cfg.AI_MODEL_MINI, max_iterations=1, reasoning=COMPLEXITY_REASONING_EFFORT,
+            ),
             timeout=COMPLEXITY_TIMEOUT_S,
         )
+        if str(raw or "").startswith("Agent error"):
+            # resolve_agentic reports a failed call as text, not an exception.
+            log_event("engine", "small_model_complexity_failed", error=str(raw)[:300], error_type="agent_error")
         verdict = str(raw or "").strip().upper()
         start = 1 if verdict.startswith("COMPLEX") else 0
     except Exception as exc:  # noqa: BLE001 -- classification must never block the turn
@@ -1432,6 +2199,9 @@ async def run_small_model_turn(
     on_live_dialogue_update: Callable[[list[str]], None] | None = None,
     get_new_user_comments: Callable[[], list[str]] | None = None,
     on_activity: Callable[[str], None] | None = None,
+    start_tier: int | None = None,
+    is_voice: bool = False,
+    on_candidate: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -1465,20 +2235,17 @@ async def run_small_model_turn(
         log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
         return _answer(_UNAVAILABLE_ANSWER)
 
-    api_key = await get_model_provider_key()
-    if not api_key:
-        log_event("engine", "small_model_no_key_available", tab_id=tab_id)
-        return _answer(_UNAVAILABLE_ANSWER)
-
-    # Explicit adapter with the freshly-fetched key -- never rely on
-    # camerlengo_ai.AI()'s own default (Config.OPENROUTER_KEY, server-only)
-    # from this process; Caroline always passes its own, per-session key.
+    # Explicit adapter -- never rely on camerlengo_ai.AI()'s own default
+    # (Config.OPENROUTER_KEY, server-only) from this process. Which adapter, and
+    # whether a provider key is involved at all: see _model_ai().
     # Built here (moved up 2026-10-03) rather than right before the tier loop
     # so executor_fn (built below) can use `ai`/`cfg` directly for the
     # web_search tool, which is a plain blocking call, not a dispatch()'d
     # plugin operation.
-    adapter = camerlengo_ai.OpenRouterAdapter(api_key=api_key)
-    ai = camerlengo_ai.AI(adapter=adapter)
+    ai = await _model_ai()
+    if ai is None:
+        log_event("engine", "small_model_no_key_available", tab_id=tab_id)
+        return _answer(_UNAVAILABLE_ANSWER)
     cfg = camerlengo_ai.Config
 
     registry = build_tool_registry()
@@ -1489,7 +2256,7 @@ async def run_small_model_turn(
         memory_topics_system_prompt_clause(workspace_dir),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
-    ])
+    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else []))
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for line in recent_dialogue_lines:
         is_caroline = line.startswith("Caroline:")
@@ -1535,7 +2302,15 @@ async def run_small_model_turn(
     # STARTS, not only once it returns -- live, the model's own thinking
     # plus a web search left the narrator nothing to say for ~16s.
     def on_tool_start(name: str, args: dict[str, Any]) -> None:
-        emit(f"Started tool call {name} (arguments: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
+        # Only calls that do the user's work -- the plan and operation bookkeeping is not
+        # news. A plugin's name ("memory", "email") tells the narrator in a plain word
+        # where the work is now, which a tool name like request_info does not: live
+        # (2026-10-11) a memory lookup started and the narrator found nothing to say.
+        plugin = registry.lookup[name][0] if name in registry.lookup else None
+        if plugin is None and name not in _WEB_SEARCH_TOOL_NAMES:
+            return
+        where = f'plugin "{plugin}"; ' if plugin else ""
+        emit(f"Tool call {name} started ({where}arguments: {json.dumps(args, ensure_ascii=False, default=str)[:120]}).")
 
     executor_fn = _make_executor_fn(
         registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage, on_tool_start=on_tool_start,
@@ -1551,7 +2326,7 @@ async def run_small_model_turn(
             log_event("engine", "small_model_tool_output", tab_id=tab_id, tool=evt.get("name"), args=evt.get("args"), result=str(evt.get("result", "")))
             args = json.dumps(evt.get("args") or {}, ensure_ascii=False, default=str)[:300]
             emit(f"Tool call {evt.get('name')} (arguments: {args[:120]}); result: {str(evt.get('result', ''))[:160]}")
-            tier_trace.append(f"- {evt.get('name')}({args}) -> {str(evt.get('result', ''))[:300]}")
+            tier_trace.append(_trace_line(evt.get("name"), args, evt.get("result", "")))
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
             if ESCALATION_SENTINEL not in text:
@@ -1586,17 +2361,23 @@ async def run_small_model_turn(
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
     # is no longer only a final polish pass tacked on after the loop.
-    async def run_verifier(candidate_text: str, can_escalate: bool, can_deescalate: bool, trace: list[str]) -> str:
+    async def run_verifier(
+        candidate_text: str, can_escalate: bool, can_deescalate: bool, trace: list[str],
+        not_a_form: str | None = None, first_model: str | None = None,
+    ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate)})
+        if not_a_form is not None:
+            verification_messages.append({"role": "assistant", "content": not_a_form})
+            verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text))})
         return await _call_with_funds_wait(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
                 messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
-                model=cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
+                model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                reasoning=REASONING_EFFORT, on_usage=on_usage,
+                reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
             ),
             tab_id, emit,
         )
@@ -1612,6 +2393,22 @@ async def run_small_model_turn(
         the same honest final answer regardless of whether funds ran out on a tier
         call or here."""
         emit("Checking the result (no tools).")
+        if VERIFIER_FIRST_MODEL and _usable(candidate_text):
+            started = time.monotonic()
+            try:
+                first = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], first_model=VERIFIER_FIRST_MODEL)
+            except _FundsExhaustedGivingUp:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the verifier proper decides
+                log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt="first model", error=str(exc), error_type=type(exc).__name__)
+                first = ""
+            approved = bool(_VERIFIER_OK.match(first.strip()))
+            log_event("engine", "small_model_verification_first", tab_id=tab_id, model=VERIFIER_FIRST_MODEL, approved=approved,
+                      ms=int((time.monotonic() - started) * 1000), reply=first[:200])
+            if approved:
+                log_event("engine", "small_model_verification_done", tab_id=tab_id, how="ok_by_first_model", text_len=len(candidate_text),
+                          text=candidate_text, verifier_reply=VERIFIER_OK)
+                return candidate_text, "done"
         verified = ""
         for attempt in (1, 2):
             log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate, can_deescalate=can_deescalate)
@@ -1633,20 +2430,40 @@ async def run_small_model_turn(
         if can_deescalate and DEESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_deescalating", tab_id=tab_id, note=verified.replace(DEESCALATION_SENTINEL, "").strip()[:200])
             return verified, "down"
-        if can_escalate or can_deescalate:
-            # Neither literal marker is present -- but the verifier may still have
-            # judged the task unfinished in plain prose (see _recheck_verifier_intent's
-            # own doc comment for the real incident this closes). Prefer escalating up
-            # when a stronger tier remains; "down" is only the fallback direction when
-            # it's the sole continuation left (already at the last tier).
-            if await _recheck_verifier_intent(ai, cfg, verified):
-                action = "up" if can_escalate else "down"
-                log_event("engine", "small_model_verifier_intent_recheck_overrode", tab_id=tab_id, action=action, text=verified[:300])
-                return verified, action
-        log_event("engine", "small_model_verification_done", tab_id=tab_id, text_len=len(verified), text=verified)
-        return verified, "done"
+        final, how = _read_verifier_reply(verified, candidate_text)
+        if how.startswith("unparsed"):
+            # In none of the forms: asked once more, with its own reply in view.
+            log_event("engine", "small_model_verification_not_a_form", tab_id=tab_id, verifier_reply=verified[:300])
+            try:
+                again = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], not_a_form=verified)
+            except _FundsExhaustedGivingUp:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the first reading stands
+                log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt="second ask", error=str(exc), error_type=type(exc).__name__)
+                again = ""
+            if can_escalate and ESCALATION_SENTINEL in again:
+                log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=again.replace(ESCALATION_SENTINEL, "").strip()[:200])
+                return again, "up"
+            if can_deescalate and DEESCALATION_SENTINEL in again:
+                log_event("engine", "small_model_verification_deescalating", tab_id=tab_id, note=again.replace(DEESCALATION_SENTINEL, "").strip()[:200])
+                return again, "down"
+            if again.strip():
+                final_again, how_again = _read_verifier_reply(again, candidate_text)
+                if not how_again.startswith("unparsed"):
+                    final, how, verified = final_again, how_again + "_on_second_ask", again
+        log_event("engine", "small_model_verification_done", tab_id=tab_id, how=how, text_len=len(final), text=final,
+                  verifier_reply=verified[:300] if how != "ok" else VERIFIER_OK)
+        return final, "done"
 
-    start_index = await _start_tier_index(ai, cfg, user_text)
+    # A real fact from the first second (2026-10-10): picking the starting tier is itself
+    # a model call (~10s live), and until a tier starts the narrator had nothing to
+    # draft from -- the first spoken remark of a voice turn came ~30s after the question.
+    emit("The request has been received and work on it has started.")
+    if start_tier is not None:
+        start_index = start_tier  # already decided by the fast lane's decline
+        log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
+    else:
+        start_index = await _start_tier_index(ai, cfg, user_text)
     final_text = ""
     index = start_index
     deescalations_used = 0
@@ -1663,7 +2480,7 @@ async def run_small_model_turn(
                     messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
                     model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                     get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                    reasoning=REASONING_EFFORT, on_usage=on_usage,
+                    reasoning=TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)], on_usage=on_usage,
                 ),
                 tab_id, emit,
             )
@@ -1684,6 +2501,13 @@ async def run_small_model_turn(
         if _usable(candidate):
             log_event("engine", "small_model_tier_answered", tab_id=tab_id, tier=index, model=model, text_len=len(candidate), text=candidate)
             emit(f"Tier {index + 1} ({model}) produced an answer; moving on to checking it.")
+            # The answer as it will most likely go out (the verifier says "OK" to most): the
+            # caller can start on what it does with a final text while the check runs.
+            if on_candidate is not None:
+                try:
+                    on_candidate(candidate)
+                except Exception:  # noqa: BLE001 -- a head start must never cost the turn
+                    pass
             can_escalate = index < len(tiers) - 1
             can_deescalate = index > 0 and deescalations_used < MAX_DEESCALATIONS
             try:

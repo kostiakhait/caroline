@@ -27,6 +27,8 @@ from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
+from app.stt_adaptation import apply_adaptation, observe_user_message
+from app.stt_sanity import STT_SANITY_MODEL, check_transcript
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
@@ -63,7 +65,7 @@ from app.plugins.memory_plugin import start_save_drain_loop, start_topic_prefetc
 from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
-from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
+from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
@@ -1043,6 +1045,12 @@ async def handle_control_request(
     if op == "client_diag":
         log_event("engine", "client_diag", **{k: v for k, v in parsed.items() if k not in ("op", "requestId")})
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "speech_state":
+        # chat.js's speech queue started an item or ran dry (2026-10-09) -- paces voice
+        # narration, see ChatSession.on_client_speech_state. No reply payload needed.
+        if session is not None:
+            session.on_client_speech_state(bool(parsed.get("speaking")))
+        return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "visible_transcript_set":
         entries = parsed.get("entries")
         if isinstance(entries, list) and session is not None:
@@ -1083,7 +1091,25 @@ async def handle_control_request(
             except Exception as exc:
                 log_event("engine", "stt_failed", request_id=request_id, error=str(exc))
                 return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
-        log_event("engine", "stt_done", request_id=request_id, text_len=len(text))
+        # Learned per-user mishearings (2026-10-10) -- see stt_adaptation.py.
+        text = apply_adaptation(WORKSPACE_DIR, text)
+        # A pass for meaning and coherence (2026-10-11) -- see stt_sanity.py. What it
+        # drops comes back as an empty transcript, which chat.js already ignores.
+        language = current_language_name(session.tab_id) if session is not None else None
+        dialogue: list[str] = []
+        if session is not None:
+            from app.chat_session import _read_recent_dialogue_lines
+
+            dialogue = _read_recent_dialogue_lines(session.last_saved_session_id, session.tab_id, WORKSPACE_DIR, 4)
+
+        async def _sanity_model(prompt: str) -> str:
+            from app.small_model_engine import resolve_narration_prompt
+
+            return await resolve_narration_prompt(prompt, model=STT_SANITY_MODEL)
+
+        checked = await check_transcript(text, dialogue, language, _sanity_model)
+        text = checked.text
+        log_event("engine", "stt_done", request_id=request_id, text_len=len(text), sanity=checked.verdict, sanity_by=checked.by)
         return {"type": "control_response", "op": op, "ok": True, "stdout": text, "requestId": request_id}
     if op == "local_stt_get":
         stdout = json.dumps({"enabled": is_local_stt_enabled(WORKSPACE_DIR), "available": is_local_stt_available()})
@@ -1099,11 +1125,39 @@ async def handle_control_request(
         if not text:
             return {"type": "control_response", "op": op, "ok": False, "stderr": "tts requires text", "requestId": request_id}
         log_event("engine", "tts_requested", request_id=request_id, text_len=len(text))
+        # Made ahead while the reply was still being checked (speech_ahead.py)? A head start
+        # must never cost the speech itself: any trouble with it and the piece is made here.
+        ahead = None
         try:
-            sw_session = await _sw_session_or_none()
+            from app import speech_ahead
+
+            ahead = speech_ahead.take(text)
+        except Exception as exc:  # noqa: BLE001
+            log_event("engine", "tts_ahead_failed", request_id=request_id, error=str(exc)[:200])
+        if ahead is not None:
+            try:
+                audio_b64 = await ahead
+                log_event("engine", "tts_ahead_used", request_id=request_id, ready=True, audio_bytes=len(audio_b64))
+                return {"type": "control_response", "op": op, "ok": True, "stdout": audio_b64, "requestId": request_id}
+            except Exception as exc:  # noqa: BLE001 -- made again below, as if never made ahead
+                log_event("engine", "tts_ahead_failed", request_id=request_id, error=str(exc)[:200])
+        try:
+            # The session bills the model call that cleans the text, and the Camerlengo
+            # fallback. Minting it is a login round trip (0.5-0.8s, measured 2026-10-11) that
+            # came before every request; most have nothing to clean (voice replies spell
+            # their numbers out), so it is minted only when one of the two needs it.
+            sw_session = await _sw_session_or_none() if speech_needs_cleanup(text) else None
             cleaned_text = await clean_text_for_speech(text, sw_session)
             gender = get_persona_gender(WORKSPACE_DIR)
-            audio_b64 = await synthesize_speech(cleaned_text, voice_for_gender(gender), sw_session)
+            # The tab's language is already known (2026-10-10): without it every request
+            # first asks ai:detectLanguage -- live, even a 7-char piece took 4.5s end to
+            # end. Only the two languages edge-tts has voices for here; else detect as before.
+            iso = None
+            if session is not None:
+                iso = {"Russian": "ru", "English": "en"}.get(current_language_name(session.tab_id))
+            audio_b64 = await synthesize_speech(
+                cleaned_text, voice_for_gender(gender), sw_session, language=iso, session_provider=_sw_session_or_none,
+            )
         except Exception as exc:
             log_event("engine", "tts_failed", request_id=request_id, error=str(exc))
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
@@ -1972,6 +2026,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             # fix for why). Cheap, always-useful visibility going forward.
             log_event("ws", "message_received", tab_id=tab_id, msg_type=msg_type, op=data.get("op") if msg_type == "control_request" else None)
             if msg_type == "user_message":
+                observe_user_message(WORKSPACE_DIR, tab_id, data.get("text", ""), bool(data.get("voice")), data.get("voiceTranscript"))
                 session.submit_or_try_small_model(data.get("text", ""), data.get("attachments") or [], bool(data.get("voice")))
             elif msg_type == "interrupt":
                 session.stop()

@@ -1,7 +1,10 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Threading;
 using Caroline.Services;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
@@ -30,6 +33,68 @@ public partial class VisualModeWindow : Window
     /// <summary>Fired when the video finishes playing on its own (not via Stop).</summary>
     public event Action? PlaybackEnded;
 
+    /// <summary>True when the clip playing now was cut short by this window's own Stop
+    /// button. The chat side reads replies in pieces, one clip each: without this it only
+    /// saw "the clip is over" and went on to the next piece of a reply the user had just
+    /// stopped (VisualModeManager passes it on in visual_speech_done).</summary>
+    public bool StoppedByUser { get; private set; }
+
+    /// <summary>Set before each clip: more speech is queued behind it. A reply is read in
+    /// pieces and its first piece is always a short one, so by ControlsMinDurationSeconds
+    /// alone a minute-long reply began with ten seconds in which there was nothing to
+    /// stop it with (2026-10-11, live: "нету кнопки отменить!!"). "Not worth showing
+    /// controls for something that short" is about a short utterance, not about the short
+    /// opening of a long one.</summary>
+    public bool MoreToCome { get; set; }
+    private bool _controlsShown;
+
+    /// <summary>Stop was pressed while no clip was playing -- the window is standing
+    /// between two remarks of a dialogue (see VisualModeManager.StayForNextClip).</summary>
+    public event Action? DismissRequested;
+    private bool _playing;
+
+    /// <summary>This window has played a clip of a spoken dialogue, so it is the user who
+    /// closes it, not a timer -- see VisualModeManager.StayForNextClip.</summary>
+    public bool StaysUp { get; set; }
+
+    /// <summary>Standing between two remarks: there is nothing to pause or to restart
+    /// (Restart would play the last remark again, out of a file already deleted), only
+    /// Stop, which sends the window away.</summary>
+    public bool Idle
+    {
+        set
+        {
+            PauseBtn.Visibility = RestartBtn.Visibility = value ? Visibility.Collapsed : Visibility.Visible;
+            if (value) ControlsBar.Visibility = Visibility.Visible;
+        }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private const uint SwpNoSize = 0x0001, SwpNoMove = 0x0002, SwpNoActivate = 0x0010;
+
+    // Bug fix (2026-10-11), confirmed live ("если на модельку случайно нажать, она
+    // пропадёт и тупо не отменишь"): this window and the main chat window are BOTH
+    // Topmost, and among topmost windows the one activated last is on top. A click on
+    // the model -- or anywhere in the chat window, which sits right behind it -- left
+    // the chat window in front: this one was still alive and still speaking, but
+    // covered, its Stop button with it. Measured after one click on the model: the chat
+    // window was the foreground window and one place above this one in the z-order.
+    // Re-asserting the topmost position (without taking the focus) puts it back on top:
+    // at once when either window is activated, and on a timer for anything else that
+    // could get in front of it.
+    private readonly DispatcherTimer _stayOnTopTimer = new() { Interval = TimeSpan.FromMilliseconds(300) };
+    private readonly System.Collections.Generic.List<Window> _otherWindows = new();
+
+    private void StayOnTop()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero) SetWindowPos(hwnd, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+    }
+
+    private void OnOtherWindowActivated(object? sender, EventArgs e) => StayOnTop();
+
     public VisualModeWindow()
     {
         InitializeComponent();
@@ -38,6 +103,23 @@ public partial class VisualModeWindow : Window
         {
             Logger.Log($"VisualModeWindow: Loaded event -- IsVisible={IsVisible} ActualWidth={ActualWidth} ActualHeight={ActualHeight}");
             PositionBottomRight();
+            _stayOnTopTimer.Start();
+        };
+        _stayOnTopTimer.Tick += (_, _) => StayOnTop();
+        Deactivated += (_, _) => StayOnTop();
+        if (System.Windows.Application.Current != null)
+        {
+            foreach (Window other in System.Windows.Application.Current.Windows)
+            {
+                if (other == this) continue;
+                other.Activated += OnOtherWindowActivated;
+                _otherWindows.Add(other);
+            }
+        }
+        Closed += (_, _) =>
+        {
+            _stayOnTopTimer.Stop();
+            foreach (var other in _otherWindows) other.Activated -= OnOtherWindowActivated;
         };
     }
 
@@ -58,8 +140,24 @@ public partial class VisualModeWindow : Window
     private void PositionBottomRight()
     {
         var wa = SystemParameters.WorkArea; // excludes the taskbar -- "above the tray" for free
-        Left = wa.Right - Width - ScreenMargin;
-        Top = wa.Bottom - Height - ScreenMargin;
+        var left = wa.Right - Width - ScreenMargin;
+        var top = wa.Bottom - Height - ScreenMargin;
+        // A window that stays for a whole dialogue must not stand on the chat (2026-10-11):
+        // docked at the right edge, the chat window has its input box, microphone and send
+        // button exactly under this corner. Then the model stands just left of the chat
+        // window instead, when there is room for it.
+        foreach (Window other in System.Windows.Application.Current.Windows)
+        {
+            if (other is not MainWindow || !other.IsVisible || other.WindowState == WindowState.Minimized) continue;
+            var overlaps = left < other.Left + other.ActualWidth && left + Width > other.Left
+                           && top < other.Top + other.ActualHeight && top + Height > other.Top;
+            var beside = other.Left - Width - ScreenMargin;
+            if (overlaps && beside >= wa.Left) left = beside;
+            break;
+        }
+        if (Math.Abs(Left - left) < 0.5 && Math.Abs(Top - top) < 0.5) return;
+        Left = left;
+        Top = top;
         Logger.Log($"VisualModeWindow: PositionBottomRight -- WorkArea={wa} -> Left={Left} Top={Top}");
     }
 
@@ -145,13 +243,17 @@ public partial class VisualModeWindow : Window
                 var type = doc.RootElement.GetProperty("type").GetString();
                 if (type == "ended")
                 {
+                    _playing = false;
                     PlaybackEnded?.Invoke();
                 }
                 else if (type == "duration")
                 {
                     var seconds = doc.RootElement.GetProperty("seconds").GetDouble();
-                    Logger.Log($"VisualModeWindow: duration={seconds:F1}s -- {(seconds < ControlsMinDurationSeconds ? "hiding" : "showing")} controls bar");
-                    ControlsBar.Visibility = seconds < ControlsMinDurationSeconds ? Visibility.Collapsed : Visibility.Visible;
+                    // Once shown, the bar stays for the clips that follow in this window: it
+                    // must not vanish under the cursor for a short last piece.
+                    _controlsShown = _controlsShown || MoreToCome || seconds >= ControlsMinDurationSeconds;
+                    Logger.Log($"VisualModeWindow: duration={seconds:F1}s moreToCome={MoreToCome} -- {(_controlsShown ? "showing" : "hiding")} controls bar");
+                    ControlsBar.Visibility = _controlsShown ? Visibility.Visible : Visibility.Collapsed;
                 }
             }
             catch (Exception ex)
@@ -186,6 +288,10 @@ public partial class VisualModeWindow : Window
             Logger.Log("VisualModeWindow: PlayVideoAsync -- not ready, skipping");
             return;
         }
+        StoppedByUser = false; // a window can play several clips in a row, see VisualModeManager.StartPostRoll
+        _playing = true;
+        Idle = false;
+        PositionBottomRight(); // the chat window may have been moved since the last clip
         var fileUri = new Uri(webmPath).AbsoluteUri;
         var result = await _webView.CoreWebView2.ExecuteScriptAsync($"window.playVideo({JsonSerializer.Serialize(fileUri)})");
         Logger.Log($"VisualModeWindow: PlayVideoAsync ExecuteScriptAsync result={result}, IsVisible={IsVisible}");
@@ -218,7 +324,11 @@ public partial class VisualModeWindow : Window
         // keeps decoding/outputting audio in the background at all.
         _webView?.CoreWebView2?.ExecuteScriptAsync(
             "(function(){var v=document.getElementById('vid'); v.pause(); v.removeAttribute('src'); v.load();})()");
+        var wasPlaying = _playing;
+        _playing = false;
+        StoppedByUser = true;
         TriggerStop();
+        if (!wasPlaying) DismissRequested?.Invoke();
     }
 
     /// <summary>
@@ -229,4 +339,28 @@ public partial class VisualModeWindow : Window
     /// just mean "done, unblock whatever's awaiting playbackEnded".
     /// </summary>
     public void TriggerStop() => PlaybackEnded?.Invoke();
+
+    /// <summary>
+    /// Silences the clip at once. The audio is muxed into the video playing inside the
+    /// WebView2, and Close() alone leaves it playing until the WebView2 is torn down --
+    /// live (2026-10-14), Stop pressed in the chat closed this window 2ms later and the
+    /// user still heard the rest of the phrase. This window's own Stop button always
+    /// paused the video first (OnStopClick); every other way of closing it now does the
+    /// same, and mutes the WebView2 too, which takes effect without waiting for script.
+    /// </summary>
+    public void SilenceNow()
+    {
+        try
+        {
+            var core = _webView?.CoreWebView2;
+            if (core == null) return;
+            core.IsMuted = true;
+            _ = core.ExecuteScriptAsync(
+                "(function(){var v=document.getElementById('vid'); v.pause(); v.removeAttribute('src'); v.load();})()");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"VisualModeWindow: SilenceNow failed: {ex.Message}");
+        }
+    }
 }

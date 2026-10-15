@@ -70,9 +70,82 @@ async def synthesize_to_bytes(text: str, options: EdgeTtsOptions | None = None) 
     return b"".join(parts)
 
 
+# One request takes about as long as its text is: measured 2026-10-11 on text the service
+# had not seen before (a repeated text comes back from its cache in 0.5s and says
+# nothing), 89 chars took 1.2s, 162 chars 2.2s, 285 chars 4.3s -- and live, a 218-char
+# reply waited 7.4s for its audio. The four sentences of a 285-char piece sent at once
+# were all back in 1.3-1.7s, the joined audio within 2% of the whole text's length, so
+# no pauses are added between them.
+PARALLEL_PART_MIN_CHARS = 40
+# Across every text being synthesized at the moment: empty audio is Microsoft's soft
+# rate limit (see _NoAudioError), and each hit costs a retry delay.
+_PARALLEL_REQUESTS = asyncio.Semaphore(6)
+
+
+def _parallel_parts(text: str) -> list[str]:
+    """Whole sentences; a short one stays with its neighbour -- a request of its own
+    for "Да." buys nothing."""
+    parts: list[str] = []
+    for sentence in (p.strip() for p in _SENT_SPLIT_RE.split(text)):
+        if not sentence:
+            continue
+        if parts and (len(parts[-1]) < PARALLEL_PART_MIN_CHARS or len(sentence) < PARALLEL_PART_MIN_CHARS):
+            parts[-1] = f"{parts[-1]} {sentence}"
+        else:
+            parts.append(sentence)
+    return parts
+
+
+async def synthesize_sentences_in_parallel(text: str, options: EdgeTtsOptions | None = None) -> bytes:
+    """synthesize_to_bytes for speech someone is waiting to hear: the text's sentences
+    are synthesized side by side and joined in order. Any part failing fails the whole
+    call, like synthesize_to_bytes itself."""
+    opts = options or EdgeTtsOptions()
+    parts = _parallel_parts(_sanitize_text(text))
+    if len(parts) < 2:
+        return await synthesize_to_bytes(text, opts)
+
+    async def one(part: str) -> bytes:
+        async with _PARALLEL_REQUESTS:
+            return await synthesize_to_bytes(part, opts)
+
+    return b"".join(await asyncio.gather(*(one(part) for part in parts)))
+
+
+class EdgeTtsRefused(RuntimeError):
+    """The service refused the connection itself (HTTP 403 on the handshake)."""
+
+
+# Live, 2026-10-12: after an evening of 60 syntheses that all worked, every request from
+# this machine was answered 403 -- the read-aloud endpoint is free and unofficial, and it
+# limits by address. Each remark then spent ~5s on three retries that could not succeed
+# before the server-side fallback was even tried: the first spoken word of a turn came at
+# 18s instead of 6s. A refusal is not a glitch to retry through, and more requests are the
+# one thing that does not help with a limiter. So: no retry on a 403, and for the next
+# while every call fails at once, which sends the caller (voice_api.synthesize_speech)
+# straight to its fallback. After that one request tries again.
+REFUSED_COOLDOWN_S = 600.0
+_refused_until = 0.0
+
+
+def _refused_now() -> bool:
+    import time
+
+    return time.monotonic() < _refused_until
+
+
+def _note_refused() -> None:
+    import time
+
+    global _refused_until
+    _refused_until = time.monotonic() + REFUSED_COOLDOWN_S
+
+
 async def _synth_chunk(text: str, opts: EdgeTtsOptions) -> bytes:
     if not text or len(text.strip()) < 2:
         return b""
+    if _refused_now():
+        raise EdgeTtsRefused("local edge-tts was refused by the service (403) a short while ago; not asking again yet")
 
     import edge_tts
 
@@ -104,6 +177,9 @@ async def _synth_chunk(text: str, opts: EdgeTtsOptions) -> bytes:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 -- classified into a retry/give-up decision below
+            if getattr(exc, "status", None) == 403:
+                _note_refused()
+                raise EdgeTtsRefused(f"local edge-tts was refused by the service: {exc}") from exc
             last_exc = exc
             attempt += 1
             if attempt > opts.max_retries:
