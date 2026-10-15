@@ -200,6 +200,26 @@ def _gender_agreement_clause(speaker_gender: str | None, addressee_gender: str |
             f"matching THEIR gender, e.g. {addressee_examples} -- never bleed the speaker's own gender into "
             "how they're addressed."
         )
+    # Bug fix (2026-10-15), confirmed live, repeatedly, same real incident:
+    # Caroline drafted a letter for the owner (male) to send to Oksana in
+    # HIS OWN first-person voice ("28 и 29 октября я заберу его сам") --
+    # the speaker-gender rule above has no way to tell that this quoted
+    # draft's "I" is the addressee speaking, not Caroline, and kept forcing
+    # it to her own (female) gender ("я заберу его сама"), surviving three
+    # direct corrections in the same conversation because every retranslate
+    # pass re-applied the same blanket rule. Only fires when BOTH genders
+    # are known -- needs the addressee's own first-person forms, not just
+    # their second-person ones above.
+    quoted_speaker_examples = _first_person_examples(addressee_gender.lower()) if addressee_gender else None
+    if speaker_examples and quoted_speaker_examples:
+        parts.append(
+            "If part of the text is a DRAFTED OR QUOTED message meant to be sent in someone else's own voice "
+            "(e.g. a letter or reply Caroline composed for the user to send as themselves -- often introduced "
+            "by something like \"Here's the text for...\" or set off with a quote/dash/colon), the first-person "
+            f"forms INSIDE that quoted message belong to THAT person ({addressee_gender}), not to Caroline -- "
+            f"use their gender there instead, e.g. {quoted_speaker_examples}. Only Caroline's own surrounding "
+            "commentary, outside the quoted message, uses her own gender from the rule above."
+        )
     if parts:
         # Bug fix (2026-10-05), confirmed live: this instruction, meant to fix
         # ONLY grammatical gender, once caused ai:translate to also flip an
