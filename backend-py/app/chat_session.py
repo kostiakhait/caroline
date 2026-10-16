@@ -6716,9 +6716,9 @@ class ChatSession:
                         raw_error_text = " ".join(b.text for b in message.content if isinstance(b, TextBlock))
                         log_event("engine", "engine_error_suppressed", tab_id=self.tab_id, error_kind=message.error, text=raw_error_text[:500])
                         if message.error == "authentication_failed":
-                            self._set_conn_state("auth_failed", "The AI provider rejected the credentials -- check the login/API key in Settings.")
+                            self._set_conn_state("auth_failed", "The AI provider rejected the credentials -- check the login/API key in Settings.", arm_ignore_next_result=True)
                         else:
-                            self._set_conn_state("engine_error", "The AI provider returned an error. Try again in a moment.")
+                            self._set_conn_state("engine_error", "The AI provider returned an error. Try again in a moment.", arm_ignore_next_result=True)
                         # The trailing ResultMessage is a REAL completion (clears turn_pending) but must
                         # not flip this status straight back to "connected" -- same flag the usage-cap
                         # branch below uses. The flat retry stays ON for every kind, auth included,
@@ -6726,6 +6726,17 @@ class ChatSession:
                         # refreshed login, a new key) and the session must pick that up by itself.
                         # What changed is only that the failure is silent in the chat, and that the
                         # retry is cancelled on an engine/mode switch (switch_engine_if_needed).
+                        #
+                        # Bug fix (2026-10-16), confirmed live (tab stuck ~8 hours on "The AI provider
+                        # returned an error" with no retry ever firing again): suppress_next_conn_state_
+                        # reset above only protects conn_state itself from being reset by this same
+                        # turn's own trailing ResultMessage -- it does NOT protect the retry timer
+                        # _schedule_api_retry is about to arm below. That ResultMessage still hit the
+                        # "else: self._clear_api_retry_timer()" branch further down (gated on the
+                        # SEPARATE ignore_next_result_recovery flag, which this call site never set),
+                        # silently cancelling the just-scheduled retry in the same breath it was
+                        # created -- exactly the 2026-09-22 cc_cli_limit_message bug, just never fixed
+                        # here. arm_ignore_next_result=True closes it the same way.
                         self.suppress_next_conn_state_reset = True
                         self._schedule_api_retry(f"engine_error:{message.error}", self.turn_is_voice)
                         continue
