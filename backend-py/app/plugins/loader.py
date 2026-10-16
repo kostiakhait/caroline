@@ -166,8 +166,25 @@ def discover_plugins() -> list[Plugin]:
     for module_info in pkgutil.iter_modules([str(package_dir)]):
         if module_info.name in ("loader",) or module_info.name.startswith("_"):
             continue
-        module = importlib.import_module(f"app.plugins.{module_info.name}")
-        importlib.reload(module)  # pick up on-disk edits without a process restart
+        # Bug fix (2026-10-16), confirmed live on a real Linux test box: a
+        # plugin module that fails to import (e.g. app_browser_cdp.py's
+        # unconditional `from playwright.async_api import ...` -- playwright
+        # is a Windows-only extra per requirements-linux.txt's own docstring,
+        # deliberately absent on Linux) used to propagate straight out of
+        # this function, since import_module() here had no try/except at
+        # all. discover_plugins() runs fresh on EVERY query() build (see
+        # this module's own docstring), so that ModuleNotFoundError crashed
+        # every single turn -- not just disabled one plugin -- putting every
+        # tab into a permanent restart_backoff loop ("Trouble reconnecting").
+        # requirements-linux.txt's own claim that Windows-only plugins "fail
+        # to import on Linux and are skipped" was never actually true at
+        # this choke point; this is what makes it true.
+        try:
+            module = importlib.import_module(f"app.plugins.{module_info.name}")
+            importlib.reload(module)  # pick up on-disk edits without a process restart
+        except Exception as exc:  # noqa: BLE001 -- one broken/platform-unavailable plugin must never cost every other plugin, or the whole turn
+            log_event("engine", "plugin_import_failed", module=module_info.name, error=str(exc), error_type=type(exc).__name__)
+            continue
         plugin = getattr(module, "PLUGIN", None)
         if plugin is None:
             log_event("engine", "plugin_skipped", module=module_info.name, reason="no PLUGIN object")
