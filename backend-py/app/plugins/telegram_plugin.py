@@ -28,6 +28,15 @@ resolves a phone-number-looking `chat` the same way on its own, so the
 common case is one call, not two. telegram_delete_contact,
 telegram_block_user and telegram_unblock_user round out ordinary contact
 management.
+
+Usernames (2026-10-16, after a real incident: told to message six people by
+username, Caroline reported no way to do that directly and asked for phone
+numbers to add them as contacts first -- a real gap in the code, not an
+actual Telegram restriction). `chat`/`user` accepts a Telegram @username
+directly, resolved with no contact-adding step at all: unlike a phone
+number, username lookup is NOT subject to the "must already be known"
+rule -- the same way opening someone's profile by @handle needs no prior
+contact in any Telegram client.
 """
 
 from __future__ import annotations
@@ -74,6 +83,10 @@ NOT_AVAILABLE = (
 )
 
 _PHONE = re.compile(r"^\+?[\d][\d \-()]{5,}$")
+# Telegram's own username rules: 5-32 chars, starts with a letter, letters/
+# digits/underscores after that. The leading "@" people naturally type is
+# optional here and stripped before the actual resolve call.
+_USERNAME = re.compile(r"^@?[a-zA-Z][a-zA-Z0-9_]{4,31}$")
 
 
 def _looks_like_phone(raw: str) -> bool:
@@ -82,6 +95,10 @@ def _looks_like_phone(raw: str) -> bool:
     # parses fine in Python, so a leading "+" or any phone-style separator
     # is what actually distinguishes "+420 792 429649" from a real chat id.
     return raw.startswith("+") or any(c in raw for c in " -()")
+
+
+def _looks_like_username(raw: str) -> bool:
+    return bool(_USERNAME.match(raw))
 
 
 def _not_connected(account: str) -> str:
@@ -104,18 +121,39 @@ def _not_ready(account: str) -> dict[str, Any] | None:
 
 
 async def _resolve_chat(client: Any, raw: str) -> tuple[int | None, dict[str, Any] | None]:
-    """A numeric chat id as given, or -- when `raw` looks like a phone
-    number instead -- resolved (adding the contact if needed, the same way
-    telegram_add_contact does). (chat_id, None) on success, or
-    (None, error envelope)."""
+    """A numeric chat id as given; a Telegram @username resolved directly
+    (no contact-adding needed -- unlike a phone number, Telegram's username
+    lookup (contacts.ResolveUsername) has no "must already know this person"
+    restriction, the same way opening someone's profile by @handle in the
+    app itself needs no prior contact); or -- when `raw` looks like a phone
+    number instead -- resolved by adding the contact first, the same way
+    telegram_add_contact does (phone-number lookup IS subject to Telegram's
+    "may only message someone already known" rule and to the owner's privacy
+    settings). (chat_id, None) on success, or (None, error envelope).
+
+    Per explicit instruction (2026-10-16), after a real incident: told to
+    message six people by username, Caroline reported she had "no tool to
+    write directly by username" and needed phone numbers to add them as
+    contacts first -- true of the code as it stood (only numeric id and
+    phone number were ever resolved here), but not a real Telegram
+    limitation; this adds the missing, always-available username path."""
     raw = raw.strip()
     if not _looks_like_phone(raw):
         try:
             return int(raw), None
         except ValueError:
             pass
+    if _looks_like_username(raw):
+        try:
+            entity = await client.get_entity(raw.lstrip("@"))
+        except Exception as exc:
+            return None, {
+                "text": f'Telegram found no account at username "{raw}" (or it could not be resolved right now): {exc}',
+                "is_error": True,
+            }
+        return entity.id, None
     if not _PHONE.match(raw):
-        return None, {"text": "chat must be the numeric chat id from telegram_list_chats/telegram_add_contact or a proactive notification, or a phone number to message cold.", "is_error": True}
+        return None, {"text": "chat must be the numeric chat id from telegram_list_chats/telegram_add_contact or a proactive notification, a Telegram @username, or a phone number to message cold.", "is_error": True}
     user_id, result = await resolve_or_add_contact(client, raw)
     if user_id is None:
         return None, {"text": result, "is_error": True}
@@ -544,9 +582,9 @@ PLUGIN = Plugin(
             "sends AS THE OWNER, from their own personal account -- use this ONLY when the owner has explicitly "
             "asked you, for this specific message, to send it from their account; never on your own initiative, "
             "never because a past approval or a similar earlier message makes it seem fine. If in doubt, ask "
-            "them first rather than send as them. `chat` is the exact numeric chat id, OR a phone number for a "
-            "first message to someone this account has never talked to -- resolved (and added to contacts) "
-            "automatically.",
+            "them first rather than send as them. `chat` is the exact numeric chat id, a Telegram @username "
+            "(resolved directly, no contact-adding needed), OR a phone number for a first message to someone "
+            "this account has never talked to -- resolved (and added to contacts) automatically.",
             {"chat": str, "text": str, "account": str | None}, telegram_send_message,
         ),
         PluginTool(
