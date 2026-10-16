@@ -21,6 +21,7 @@ SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 InjectProactiveFn = Callable[[str], bool]
 CliPidSinkFn = Callable[[int], None]
 PermissionBlockerFn = Callable[[], "str | None"]
+SendActionGuardFn = Callable[[str, "dict[str, Any]"], Awaitable["str | None"]]
 ReplyWatchFn = Callable[[str, dict, Any], None]
 RecentDirectivesFn = Callable[[], str]
 
@@ -126,6 +127,38 @@ def get_permission_block(tab_id: str | None) -> str | None:
     mutates anything, it just forwards to whatever the tab registered."""
     fn = _permission_blocker_by_tab.get(tab_id) if tab_id else None
     return fn() if fn else None
+
+
+# Every live ChatSession's send-action guard by tab id (see register_send_action_guard).
+_send_action_guard_by_tab: dict[str, SendActionGuardFn] = {}
+
+
+def register_send_action_guard(tab_id: str, fn: SendActionGuardFn) -> None:
+    """Per explicit instruction (2026-10-15), after a real incident:
+    app/operations.py's dispatch() calls this, awaited, for a send-type tool
+    call BEFORE running its real handler -- a synchronous, blocking
+    pre-flight check distinct from register_permission_blocker's cheap
+    synchronous flag-read above. That existing check only catches an
+    already-known pending block; it has no way to catch a NEW, un-narrated
+    send decided silently inside this exact tool call's own arguments (e.g.
+    "account": "owner" chosen without ever saying so in visible text) --
+    which is exactly what let a real unauthorized send through. The
+    registered function summarizes this specific call (ActionSummary.py)
+    and feeds that into the SAME turn.permission.guard check
+    _check_permission_guard already runs, via its own extra_context
+    parameter, returning a block reason if one comes back. Mirrors
+    register_permission_blocker's per-tab shape exactly, just async. A later
+    session of the same tab replaces it."""
+    _send_action_guard_by_tab[tab_id] = fn
+
+
+async def check_send_action(tab_id: str | None, tool_name: str, args: "dict[str, Any]") -> str | None:
+    """The reason this specific send-type call must not run right now, or
+    None when it may proceed. A missing tab (no live session registered)
+    means no guard to ask -- never blocks on that account alone, same
+    non-fatal shape as get_permission_block."""
+    fn = _send_action_guard_by_tab.get(tab_id) if tab_id else None
+    return await fn(tool_name, args) if fn else None
 
 
 def register_send_for_tab(tab_id: str, fn: SendFn) -> None:

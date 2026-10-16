@@ -63,7 +63,7 @@ from app.http_tls import ssl_context
 from app import memory_save_queue
 from app import memory_turns
 from app.logging_setup import log_event
-from app.memory_topics import cached_topic_detail, is_stale, recent_topics, replace_topics, topic_description, update_topic
+from app.memory_topics import cached_topic_detail, is_stale, recent_topics, replace_topics, set_current_topic, topic_description, update_topic
 from app.operations import REGISTRY as OPERATIONS
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager
@@ -410,6 +410,14 @@ async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     params: dict[str, Any] = {"text": text, "traceId": uuid.uuid4().hex, "language": _language()}
     if materials:
         params["materials"] = materials
+    # Per explicit instruction (2026-10-15): carried through the durable
+    # queue only to let _drain_one mark the topic this save lands in as this
+    # TAB's current track (memory_topics.set_current_topic) once the save
+    # finishes -- popped back out before the params are ever sent to the
+    # server (see _drain_one), so this never reaches memory:saveStart itself.
+    tab_id = get_tab_id()
+    if tab_id:
+        params["_tab_id"] = tab_id
     # Per explicit instruction (2026-10-13): durably enqueued BEFORE
     # anything else -- see memory_save_queue.py's own module docstring for
     # the restart-survival this fixes. Then an eager _drain_one fires right
@@ -452,7 +460,8 @@ async def _drain_one(entry_id: str, inject: Any = None) -> None:
         entry = memory_save_queue.get(WORKSPACE_DIR, entry_id)
         if entry is None:
             return
-        params = entry["params"]
+        params = dict(entry["params"])
+        tab_id = params.pop("_tab_id", None)
         started = time.monotonic()
         job_id = entry.get("job_id")
         try:
@@ -476,7 +485,10 @@ async def _drain_one(entry_id: str, inject: Any = None) -> None:
             reaction = await _react_to_status(reply) if reply.get("status") in (STATUS_OK, STATUS_EMPTY, STATUS_NO_FUNDS_USER) else None
             for result in (reply.get("output") or {}).get("results") or []:
                 if result.get("source") == SOURCE_TOPICS and result.get("status") == STATUS_OK:
-                    update_topic(WORKSPACE_DIR, (result.get("output") or {}).get("topic") or {})
+                    saved_topic = (result.get("output") or {}).get("topic") or {}
+                    update_topic(WORKSPACE_DIR, saved_topic)
+                    if tab_id and saved_topic.get("id"):
+                        set_current_topic(WORKSPACE_DIR, tab_id, saved_topic["id"])
             await _refresh_topics_if_stale()
         except Exception as exc:  # noqa: BLE001
             reaction = None
@@ -533,6 +545,28 @@ def start_save_drain_loop(interval_s: float = SAVE_DRAIN_INTERVAL_S) -> "asyncio
 
     log_event("plugin:memory", "save_drain_loop_starting", interval_s=interval_s)
     return supervise("memory_save_drain", _loop)
+
+
+async def close_track(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """memory:topicClose -- see TopicMemory.py's own docstring, section
+    "Status". Per explicit instruction (2026-10-15): the only way a track is
+    marked done; saving a new episode into it (save_info) reopens it on its
+    own, so there is no separate "reopen" tool."""
+    refused = await _gate()
+    if refused:
+        return refused
+    topic_id = (args.get("topic") or "").strip()
+    if not topic_id:
+        return {"text": 'close_track needs "topic": the id of the track to close, from your own topic list.', "is_error": True}
+    reply = await _memory("memory:topicClose", topic=topic_id, traceId=uuid.uuid4().hex)
+    reaction = await _react_to_status(reply)
+    failure = _failure_text(reply, "Closing that track")
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    topic = (reply.get("output") or {}).get("topic") or {}
+    if topic.get("id"):
+        update_topic(WORKSPACE_DIR, topic)
+    return {"text": f"Closed: {topic.get('description') or topic_id}."}
 
 
 async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -1006,7 +1040,14 @@ _USAGE_INSTRUCTIONS = (
     "the place it was read from; open it the same way when the exact wording matters.\n"
     "The older memory tools -- recall_memory, working_memory_*, topic_upsert/topics_list/topic_close -- are "
     "deprecated and read-only: what they hold can still be read, nothing new is written "
-    "through them. notes_* tools work as before for notes the user asks about by name."
+    "through them. notes_* tools work as before for notes the user asks about by name.\n"
+    "TRACK STATUS. Each track in your system prompt's topic list may be marked [CURRENT TRACK of this tab] "
+    "(the one save_info last wrote to, from this tab) and/or [closed] (nothing open on it right now -- "
+    "close_track marks this; saving into it again reopens it on its own). Before ever telling the user you "
+    "have no record of something, or that context was lost and you need them to repeat it: check this tab's "
+    "current track if one is marked, check every track NOT marked [closed] (with request_info(topic=<id>) for "
+    "its real content), and check your recent dialogue history -- in that order. Only say you have nothing "
+    "once all three have genuinely come up empty."
 )
 
 
@@ -1051,6 +1092,15 @@ PLUGIN = Plugin(
             "request_info; a part is read in full with request_info(document, section).",
             {"path": str, "note": str | None},
             save_document,
+        ),
+        PluginTool(
+            "close_track",
+            "Marks a track (topic) closed: it is done, nothing is currently open on it. \"topic\" is its id, "
+            "from your own topic list or an earlier request_info/save_info reply. Saving a new episode into a "
+            "closed track (save_info) reopens it on its own -- there is no separate reopen tool. Closing is "
+            "informational only: a closed track is still found and read exactly like an open one.",
+            {"topic": str},
+            close_track,
         ),
     ],
 )

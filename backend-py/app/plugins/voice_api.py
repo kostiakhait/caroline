@@ -319,11 +319,26 @@ async def translate_text(
     actually was. Passed as preceeding_context: the real task this reply is
     answering (the same string review_reply already receives as `task` at
     every call site that has one), so the model translating has the same
-    grounding the review step already does, not a blind substring."""
+    grounding the review step already does, not a blind substring.
+
+    Rewritten (2026-10-15), per explicit instruction, after a real incident:
+    ai:translate (AI.translateText, reforce's shared general-purpose
+    translation command) forces the WHOLE text into `language`
+    unconditionally -- confirmed live, asked to translate "Это кот" into
+    English, the reply "Вот перевод на английский: This is a cat" came back
+    with "This is a cat" retranslated back into Russian, destroying the
+    actual deliverable. Caroline's own server-side agent, reply.translate
+    (apps/microagents/ReplyTranslate.py in reforce-microagents, "reply:
+    translate" here), replaces ai:translate for this wrapper only -- every
+    other ai:translate caller in reforce is untouched. It takes the SAME
+    `context` as `task` (what this exception needs to judge against) instead
+    of preceeding_context/following_context, and -- like every other reply:
+    command -- answers {"status", "output": {"text"}}, not ai:translate's
+    bare {"result"}."""
     body: dict[str, Any] = {
-        "command": "ai:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
+        "command": "reply:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
         "instructions": _gender_agreement_clause(gender, addressee_gender) or None,
-        "preceeding_context": context or None,
+        "task": context or None,
     }
     if not session:
         session = await get_cached_v2_session()
@@ -334,10 +349,11 @@ async def translate_text(
     except Exception as exc:
         log_event("plugin:voice", "translate_text_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
+    output = data.get("output")
+    if data.get(".status") != "ok" or data.get("status") != "ok" or not isinstance(output, dict) or not isinstance(output.get("text"), str):
         log_event("plugin:voice", "translate_text_failed", reason="bad_response", status=data.get(".status"), api_reason=data.get(".reason"))
         return None
-    translated = data["result"]
+    translated = output["text"]
     if not translated.strip():
         log_event("plugin:voice", "translate_text_failed", reason="empty")
         return None
@@ -442,6 +458,57 @@ async def check_permission_guard(
         "needs_approval": output["needs_approval"], "reason": str(output.get("reason") or ""),
         "same_action_as_before": bool(output.get("same_action_as_before")),
     }
+
+
+async def summarize_action(
+    tool_name: str, args: dict[str, Any], session: str | None = None, timeout: float = 10.0,
+) -> str | None:
+    """Per explicit instruction (2026-10-15), after a real incident: Caroline
+    sent a Telegram message AS the user (account="owner") to a business
+    contact with no approval for that specific identity choice --
+    check_permission_guard's own instructions already covered this exactly,
+    but that agent reads only the recent dialogue TEXT, never a tool call's
+    actual arguments, and nothing in the visible dialogue before the three
+    sends said which account each one would use. The guard had nothing to
+    see.
+
+    Backed by the server-side turn.action.summary microagent
+    (ActionSummary.py) -- deliberately cheap and NOT a judgment call: it
+    only describes what a tool call will do in one plain sentence (naming
+    the account/identity and recipient when present in the arguments), never
+    decides whether that needs approval. The caller (chat_session.py) splices
+    the sentence into the SAME dialogue check_permission_guard already reads
+    (via its own extra_context parameter), so permissionGuard's own prompt
+    and judgment stay completely unchanged -- it just stops being blind to
+    this one fact.
+
+    Returns the one-sentence summary, or None on any error/timeout/malformed
+    response (fail-open: the caller must decide what "no summary available"
+    means for whether a send may proceed -- see its own call site)."""
+    try:
+        args_json = json.dumps(args, ensure_ascii=False, default=str)
+    except Exception:
+        args_json = str(args)
+    body: dict[str, Any] = {
+        "command": "reply:actionSummary", "key": CAROLINE_SW_KEY, "toolName": tool_name, "argsJson": args_json,
+    }
+    if not session:
+        session = await get_cached_v2_session()
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "summarize_action_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or data.get("status") != "ok":
+        log_event("plugin:voice", "summarize_action_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+        return None
+    output = data.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("summary"), str) or not output["summary"].strip():
+        log_event("plugin:voice", "summarize_action_failed", reason="empty")
+        return None
+    return output["summary"]
 
 
 async def fuzzy_match(query: str, candidates: list[dict[str, str]], session: str | None = None, timeout: float = 15.0) -> list[str] | None:

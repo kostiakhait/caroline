@@ -140,7 +140,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import get_recent_real_user_directives, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import get_recent_real_user_directives, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_send_action_guard, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -4416,6 +4416,43 @@ class ChatSession:
             self.permission_guard_consecutive_blocks = 0
             self.permission_guard_last_reason = None
 
+    async def _check_action_before_send(self, tool_name: str, args: dict[str, Any]) -> str | None:
+        """Registered with session_context's register_send_action_guard;
+        awaited by app/operations.py's dispatch() right before a send-type
+        tool call's real handler runs -- see that registration's own
+        docstring, and ActionSummary.py (reforce-microagents) for the real
+        incident this closes: a send choosing which account/identity to go
+        out under is a decision made silently inside THIS call's own
+        arguments, with nothing said about it in the visible dialogue
+        beforehand, so the regular _check_permission_guard (text-only) has
+        no way to ever see it in time.
+
+        Summarizes this exact call into one plain sentence (turn.action.
+        summary, cheap and judgment-free), then runs the SAME turn.
+        permission.guard check _check_permission_guard already does
+        elsewhere, with that sentence spliced in as extra_context -- so
+        permissionGuard's own prompt/judgment is untouched, it just stops
+        being blind to this one fact. Returns the block reason if one comes
+        back, else None.
+
+        Fail-open on a failed summary (never a hard dependency, same
+        philosophy as every other microagent check here): proceeding
+        without this extra visibility layer still leaves the regular,
+        text-only guard check in place exactly as before this existed --
+        strictly additive, never a new way to get stuck."""
+        from app.plugins.voice_api import summarize_action
+
+        try:
+            summary = await summarize_action(tool_name, args)
+        except Exception as exc:
+            log_event("engine", "summarize_action_failed", tab_id=self.tab_id, tool=tool_name, error=str(exc))
+            summary = None
+        if not summary:
+            return None
+        log_event("engine", "action_summarized", tab_id=self.tab_id, tool=tool_name, summary=summary)
+        await self._check_permission_guard(extra_context=f"About to happen, not yet done: {summary}")
+        return self.pending_unapproved_action
+
     def _on_outbound_message_sent(self, channel: str, args: dict[str, Any], result: Any) -> None:
         """Per explicit instruction (2026-10-12): registered with
         session_context's register_reply_watch, called synchronously by
@@ -6282,10 +6319,34 @@ class ChatSession:
         set_inject_proactive(lambda text: self.inject_proactive(text))
         register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
         register_permission_blocker(self.tab_id, self._on_permission_block_checked)
+        register_send_action_guard(self.tab_id, self._check_action_before_send)
         register_send_for_tab(self.tab_id, self.send)
         register_reply_watch(self.tab_id, self._on_outbound_message_sent)
         register_recent_real_user_directives(self.tab_id, self.recent_real_user_directives_text)
         set_cli_pid_sink(self._on_cli_process_spawned)
+        # Per explicit instruction (2026-10-15), after a real incident: a tab
+        # that spends its WHOLE lifetime in sw mode never reaches the claude/
+        # openai-specific branch below (see the sw-mode early-continue right
+        # after this), which is the ONLY place self.last_saved_session_id
+        # used to get populated (from _resolve_resume_session_id, deep inside
+        # that branch). Confirmed live: "Tunnel Cat" (tab 5) ran several real
+        # sw-mode turns across a whole evening session with a valid, already-
+        # saved session id sitting on disk the entire time (tab-session-5.json)
+        # -- _append_small_model_turn_to_session hit its own no-session guard
+        # on every single one (small_model_turn_not_persisted_no_session), so
+        # none of that conversation ever reached the CLI-resumable transcript.
+        # Switching the SAME tab to claude mode afterward resumed that real,
+        # valid session -- but from its own last REAL checkpoint, a day and a
+        # half earlier, with zero knowledge of anything since: the model had
+        # no way to know the conversation it could see on screen had ever
+        # happened at all. Loaded here, once, unconditionally, before either
+        # branch below runs -- cheap (one file read), and harmless to a tab
+        # that goes on to run claude/openai turns normally: that branch's own
+        # _resolve_resume_session_id() (which also handles the pre-multi-tab
+        # migration fallback, not needed here) still re-sets it the same way
+        # moments later, this is strictly an earlier, narrower first read.
+        if self.last_saved_session_id is None:
+            self.last_saved_session_id = load_tab_session_id(self.workspace_dir, self.tab_id, self.engine_kind)
         while not self.ended:
             try:
                 if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
@@ -6441,7 +6502,7 @@ class ChatSession:
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
                     working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
-                    memory_topics_system_prompt_clause(self.workspace_dir),
+                    memory_topics_system_prompt_clause(self.workspace_dir, self.tab_id),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),

@@ -33,7 +33,7 @@ from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server,
 from app import memory_nudge
 from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
-from app.session_context import get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
+from app.session_context import check_send_action, get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
 from app.workspace_dir import WORKSPACE_DIR
 
 # How long dispatch() waits before giving up on returning a "done" result
@@ -47,6 +47,17 @@ from app.workspace_dir import WORKSPACE_DIR
 # setup cost are added in -- widened to keep native-exe tools (the majority
 # of Phase 2's ported plugins) landing on the fast path consistently rather
 # than flapping between "done" and "running" run to run.
+# Per explicit instruction (2026-10-15), after a real incident (Caroline sent
+# a Telegram message AS the user, account="owner", with no approval for that
+# specific identity choice -- see session_context.py's own
+# register_send_action_guard docstring for the full mechanism this triggers):
+# a structural fact, not a judgment call -- reliable to hardcode, unlike
+# PermissionGuard's own "is this communication on the user's behalf" question,
+# which stays the model's call. Broad on purpose (a false positive here just
+# costs one extra cheap summarize+guard round-trip on something harmless;
+# under-triggering is the dangerous direction).
+_SEND_TOOL_NAME_MARKER = "send"
+
 FAST_PATH_TIMEOUT_S = 0.5
 # A completion notice for an operation the caller walked away from waits
 # this long first; if the model has meanwhile collected the result itself
@@ -237,6 +248,19 @@ async def dispatch(
     if blocked_reason:
         log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved", tool=tool_name, reason=blocked_reason)
         return {"operation_id": "", "status": "error", "error": f"Blocked: {blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}
+    # Per explicit instruction (2026-10-15): a SEPARATE, synchronous pre-flight
+    # check for send-type calls specifically -- see _SEND_TOOL_NAME_MARKER's own
+    # comment and session_context.py's register_send_action_guard docstring for
+    # the real incident this closes. The check above only catches an ALREADY-
+    # known pending block; this one asks fresh, right now, about THIS exact call,
+    # since a risky identity/recipient choice can be made silently inside a
+    # single tool call's own arguments with nothing said about it in the visible
+    # dialogue beforehand.
+    if _SEND_TOOL_NAME_MARKER in tool_name.lower():
+        send_blocked_reason = await check_send_action(tab_id, tool_name, args)
+        if send_blocked_reason:
+            log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved_send", tool=tool_name, reason=send_blocked_reason)
+            return {"operation_id": "", "status": "error", "error": f"Blocked: {send_blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}
     op = REGISTRY.create(tool_name, tab_id=tab_id)
     memory_note = memory_nudge.note_tool_call(op.tab_id, tool_name)
 

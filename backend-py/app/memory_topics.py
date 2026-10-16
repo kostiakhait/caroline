@@ -70,11 +70,13 @@ def _load(workspace_dir: str) -> dict[str, Any]:
     try:
         stored = json.loads(_path(workspace_dir).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"fetched_at": 0.0, "topics": {}, "details": {}}
+        return {"fetched_at": 0.0, "topics": {}, "details": {}, "current_by_tab": {}}
     if not isinstance(stored, dict) or not isinstance(stored.get("topics"), dict):
-        return {"fetched_at": 0.0, "topics": {}, "details": {}}
+        return {"fetched_at": 0.0, "topics": {}, "details": {}, "current_by_tab": {}}
     if not isinstance(stored.get("details"), dict):
         stored["details"] = {}
+    if not isinstance(stored.get("current_by_tab"), dict):
+        stored["current_by_tab"] = {}
     return stored
 
 
@@ -88,7 +90,7 @@ def _save(workspace_dir: str, data: dict[str, Any]) -> None:
 
 
 def _entry(topic: dict[str, Any]) -> dict[str, Any]:
-    return {key: topic.get(key) for key in ("id", "parent", "description", "last_episode_at")}
+    return {key: topic.get(key) for key in ("id", "parent", "description", "status", "last_episode_at")}
 
 
 def _epoch(iso: str | None) -> float:
@@ -139,6 +141,30 @@ def replace_topics(workspace_dir: str, tiers: dict[str, Any], now: float | None 
     _save(workspace_dir, {"fetched_at": now if now is not None else time.time(), "topics": topics, "details": details})
 
 
+def set_current_topic(workspace_dir: str, tab_id: str, topic_id: str) -> None:
+    """Per explicit instruction (2026-10-15), after a real incident (the
+    "Tunnel Cat" tab lost context mid-conversation and, instead of checking
+    its own track memory, told the user it had no record at all): the track
+    a save_info call just wrote to becomes this TAB's "current" track --
+    tracks themselves are a per-USER concept server-side (shared across
+    every tab), but which one a given tab is actively working on right now
+    is purely a client-side notion, so it is kept here, not on the server.
+    Only save_info (an active write) sets this -- a read (request_info)
+    might just be looking something up, not "now working on this" -- see
+    memory_topics_system_prompt_clause's own use of it below."""
+    if not tab_id or not topic_id:
+        return
+    data = _load(workspace_dir)
+    data["current_by_tab"][tab_id] = topic_id
+    _save(workspace_dir, data)
+
+
+def get_current_topic(workspace_dir: str, tab_id: str | None) -> str | None:
+    if not tab_id:
+        return None
+    return (_load(workspace_dir).get("current_by_tab") or {}).get(tab_id)
+
+
 def cached_topic_detail(workspace_dir: str, topic_id: str) -> dict[str, Any] | None:
     """{"topic": <the server's full object, opaque>, "cached_at": epoch_s},
     or None if this topic has never been cached. See update_topic/
@@ -178,19 +204,38 @@ def recent_topics(workspace_dir: str, now: float | None = None) -> tuple[list[di
     return newest_first(today), newest_first(week)
 
 
-def memory_topics_system_prompt_clause(workspace_dir: str, now: float | None = None) -> str:
-    """Empty when nothing was discussed in the last week."""
+def memory_topics_system_prompt_clause(workspace_dir: str, tab_id: str | None = None, now: float | None = None) -> str:
+    """Empty when nothing was discussed in the last week and this tab has no
+    current track. Per explicit instruction (2026-10-15): marks each closed
+    topic and names this tab's current one (see set_current_topic), and
+    tells the model explicitly to check both -- plus dialogue history --
+    before ever claiming it has no record of something, instead of just
+    listing topics and leaving that judgment call to chance."""
     today, week = recent_topics(workspace_dir, now)
-    if not today and not week:
+    current_id = get_current_topic(workspace_dir, tab_id)
+    if not today and not week and not current_id:
         return ""
-    line = lambda topic: f"- {(topic.get('description') or '').strip()[:MAX_DESCRIPTION_CHARS]}"
+    def line(topic: dict[str, Any]) -> str:
+        text = f"- {(topic.get('description') or '').strip()[:MAX_DESCRIPTION_CHARS]}"
+        if topic.get("id") == current_id:
+            text += "  [CURRENT TRACK of this tab]"
+        if topic.get("status") == "closed":
+            text += "  [closed]"
+        return text
     parts = [
         "Topics you and the user have been discussing lately, from your topic memory (short descriptions only -- "
         "call request_info for where a topic stands, what was decided, what is still open, and its letters and "
-        "documents; topics older than a week are not listed here but are still found by request_info):"
+        "documents; topics older than a week are not listed here but are still found by request_info). Before ever "
+        "telling the user you have no record of something, or that context was lost, check: this tab's current "
+        "track if one is marked below, any track here not marked [closed], and your recent dialogue history -- in "
+        "that order -- not just your own immediate memory of the conversation."
     ]
     if today:
         parts.append("In the last 24 hours:\n" + "\n".join(line(topic) for topic in today))
     if week:
         parts.append("Earlier this week:\n" + "\n".join(line(topic) for topic in week))
+    if current_id and not any(topic.get("id") == current_id for topic in today + week):
+        detail = cached_topic_detail(workspace_dir, current_id)
+        description = ((detail or {}).get("topic") or {}).get("description") or topic_description(workspace_dir, current_id) or current_id
+        parts.append(f"This tab's current track (older than a week, so not listed above):\n- {description}  [CURRENT TRACK of this tab]")
     return "\n".join(parts)

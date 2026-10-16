@@ -93,6 +93,7 @@ from app.memory_topics import memory_topics_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
 from app.policies import (
+    complex_task_execution_instruction_for_sw,
     continuity_pointer_instruction,
     credentials_check_notes_first_instruction,
     event_memory_check_first_instruction,
@@ -132,6 +133,15 @@ _SHARED_ALWAYS_ON_INSTRUCTIONS = (
     credentials_check_notes_first_instruction,
     memory_check_first_instruction,
     event_memory_check_first_instruction,
+    # Per explicit instruction (2026-10-15), after a real incident (a sw-mode
+    # turn asked to check every mailbox called request_info once and
+    # answered as if done, no escalation): complex_task_execution_
+    # instruction itself is excluded above (its CLI-only bullets reference
+    # TodoWrite/Task/run_in_background), so sw never saw ANY decompose-
+    # first framing until this sw-specific variant was written -- see its
+    # own docstring in policies.py. Written but never actually added here
+    # until now; without this line the fix did not exist in practice.
+    complex_task_execution_instruction_for_sw,
 )
 
 # Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__
@@ -2253,7 +2263,7 @@ async def run_small_model_turn(
         _persona_system_message(persona),
         owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
         working_memory_system_prompt_clause(load_working_memory(workspace_dir)),
-        memory_topics_system_prompt_clause(workspace_dir),
+        memory_topics_system_prompt_clause(workspace_dir, tab_id),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
     ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else []))

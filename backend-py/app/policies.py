@@ -131,6 +131,24 @@ def timestamp_awareness_instruction() -> str:
     )
 
 
+def _complex_task_execution_core() -> tuple[str, str]:
+    """The engine-agnostic half of complex_task_execution_instruction --
+    factored out (2026-10-15) so small_model_engine.py's sw-specific
+    variant (complex_task_execution_instruction_for_sw, just below) can
+    share the opening/closing framing verbatim instead of drifting from it
+    independently. Returns (opening, closing); the CLI-specific middle
+    (TodoWrite/Task-subagent/run_in_background/schedule_reminder) and sw's
+    own middle (declare_plan/run_parallel_stage) each go between these."""
+    return (
+        "For a genuinely composite or multi-step deliverable (an article needing research first, several "
+        "documents to work through, a long chain of dependent operations) -- don't try to do it all in one pass "
+        "or one uninterrupted turn. Break it into concrete steps first, then pick the right vehicle for each:\n",
+        "Either way, the final response must read as one coherent whole, not disconnected fragments -- you're "
+        "responsible for tying it together, checking it's internally consistent, and cutting anything that "
+        "doesn't actually fit once everything's combined.",
+    )
+
+
 def complex_task_execution_instruction() -> str:
     """Merged (2026-09-23) from three separate, meaningfully overlapping
     instructions (task_decomposition_instruction, plan_then_stepwise_
@@ -143,11 +161,15 @@ def complex_task_execution_instruction() -> str:
     and a shared, repeated Task-tool/backgrounding/check-back thread
     running through each. One instruction, organized as: decompose, pick
     a vehicle per piece, pace long-running work across turns, never
-    fire-and-forget anything backgrounded."""
+    fire-and-forget anything backgrounded.
+
+    Unchanged text (2026-10-15): now built from _complex_task_execution_
+    core()'s opening/closing plus this function's own CLI-specific middle,
+    purely a refactor for complex_task_execution_instruction_for_sw() to
+    share the core without duplicating it -- not a wording change here."""
+    opening, closing = _complex_task_execution_core()
     return (
-        "For a genuinely composite or multi-step deliverable (an article needing research first, several "
-        "documents to work through, a long chain of dependent operations) -- don't try to do it all in one pass "
-        "or one uninterrupted turn. Break it into concrete steps first, then pick the right vehicle for each:\n"
+        opening +
         "- Same mechanical operation repeated over many similar targets, no real judgment needed per item "
         "(checking several mailboxes, the same check across a list of files) -- write and run a script (Python/"
         "Bash) rather than looping tool calls yourself; faster, more reliable, and only its own summary lands "
@@ -169,9 +191,53 @@ def complex_task_execution_instruction() -> str:
         "between steps is the only point the system can safely do its own housekeeping on a long-running "
         "session, which a single giant unbroken turn never gives it the chance to do -- exactly what makes very "
         "long turns slow down and grow unreliable the longer they run. A short, simple task needs none of this.\n"
-        "Either way, the final response must read as one coherent whole, not disconnected fragments -- you're "
-        "responsible for tying it together, checking it's internally consistent, and cutting anything that "
-        "doesn't actually fit once everything's combined."
+        + closing
+    )
+
+
+def complex_task_execution_instruction_for_sw() -> str:
+    """The sw engine's own variant of complex_task_execution_instruction,
+    added 2026-10-15 per explicit instruction after a real incident: a
+    sw-mode turn asked to check every mailbox (log in, read, download
+    attachments, report per mailbox) called request_info once and answered
+    as if done -- no escalation, no further tool calls, task silently
+    abandoned. complex_task_execution_instruction's own worked example is
+    almost verbatim this exact task ("checking several mailboxes"), but it
+    was withheld from sw entirely (small_model_engine.py's _SHARED_ALWAYS_
+    ON_INSTRUCTIONS excluded the whole function, since its other bullets
+    reference TodoWrite/Task-subagent/run_in_background, which sw has none
+    of) -- so sw never saw the decompose-first framing at all, in any form.
+
+    Per explicit instruction, the fix here is NOT "push the same small
+    model to try harder/do more sequential work itself" -- that is
+    squeezing out of it what it genuinely cannot reliably do. It already
+    HAS the right mechanism for this shape of task: declare_plan's
+    "parallel" stage + run_parallel_stage (small_model_engine.py) runs
+    each step as its own small, narrowly-scoped model call (one mailbox,
+    not the whole list), up to 4 at once -- turning one task that overwhelms
+    a single reasoning pass into several small ones that don't. This
+    variant names that mechanism explicitly and concretely, the same way
+    the CLI version names Task/TodoWrite/run_in_background concretely
+    rather than leaving "decompose" abstract."""
+    opening, closing = _complex_task_execution_core()
+    return (
+        opening +
+        "- Same mechanical operation repeated over several independent targets, no real judgment needed per "
+        "item (checking several mailboxes, the same check across a list of files or addresses) -- that is a "
+        "direct signal to call declare_plan with a \"parallel\" stage (stages=[{\"mode\": \"parallel\", "
+        "\"steps\": [...]}]), one step per target, then run_parallel_stage. Do not try to work through every "
+        "target yourself in one sequential reasoning pass -- that is exactly how targets get silently skipped "
+        "while the reply still sounds like the whole thing was done. Each step of a parallel stage runs as its "
+        "own small, narrowly-scoped call on just that one target -- you don't have to hold the whole list in "
+        "mind at once, run_parallel_stage does.\n"
+        "- A substantial, self-contained piece needing real judgment or its own research, isolatable from the "
+        "rest -- declare_plan a \"sequential\" step for it like any other step; you have no subagent delegation "
+        "of your own, so do it yourself as one declared, trackable step rather than skipping declare_plan "
+        "because the work doesn't look mechanical.\n"
+        "- Smaller or sequential steps -- declare_plan with a \"sequential\" stage and call mark_step_done right "
+        "after each one actually finishes; this is what tracks real progress for you, the same role TodoWrite "
+        "plays for the CLI engine.\n"
+        + closing
     )
 
 
