@@ -7,6 +7,30 @@
 # out of scope for this port (pywin32, playwright, edge-tts/edge-playback)
 # are intentionally absent; those plugins fail to import on Linux and are
 # skipped, same as already verified in earlier Linux-port phases.
+#
+# Regenerated 2026-10-16, same incident: re-ran the iterative resolution for
+# the first time since the Slack/Telegram/Discord messenger integrations
+# landed (2026-10-06 onward) -- aiohttp, slack_sdk, telethon and discord.py
+# (plus their own transitive deps) had never been added here, so a fresh
+# Linux provision failed on `from app.main import PORT, app` the moment it
+# reached app/slack_channel.py's own import. Regenerating this file isn't a
+# one-off fix: provision_runtime.sh's own verify step is the thing that
+# would have caught this immediately -- it just hadn't been run live since.
+#
+# Also gained python-xlib (2026-10-16, same pass): linux-shell/caroline_
+# shell.py (the Linux launcher, a separate entry point from app.main, but
+# installed into this SAME shared runtime/python by provision_runtime.sh)
+# imports it via hotkeys.py for its global-hotkey X11 grab -- there is no
+# separate requirements file for linux-shell/, so this file now covers
+# both entry points that share this one runtime, not just backend-py's own
+# `from app.main import PORT, app` check. Found the same way: a real
+# AppImage built from provision_runtime.sh's own output failed at startup
+# with ModuleNotFoundError: No module named 'Xlib', confirmed live on a
+# fresh xopek-desktop test container (2026-10-16) -- this verify step had
+# apparently never been run end-to-end since the hotkey feature was added.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -17,7 +41,10 @@ charset-normalizer==3.5.2
 claude-agent-sdk==0.2.163
 click==8.5.0
 cryptography==50.0.2
+discord==2.3.2
+discord.py==2.7.1
 fastapi==0.142.2
+frozenlist==1.8.0
 h11==0.16.0
 httpcore==1.0.9
 httpcore2==2.13.1
@@ -30,24 +57,33 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 mcp==2.3.0
 mcp-types==2.3.0
+multidict==7.1.0
 openai==3.24.0
 opentelemetry-api==1.45.0
+propcache==0.5.4
 psutil==7.2.2
+pyaes==1.6.1
+pyasn1==0.6.4
 pycparser==3.0
 pydantic==2.13.5
 pydantic_core==2.46.5
 PyJWT==2.15.1
 pymupdf==1.28.2
 python-multipart==0.0.32
+python-xlib==0.33
 referencing==0.37.0
 requests==2.34.2
 rpds-py==2026.9.1
+rsa==4.9.1
+slack_sdk==3.45.0
 sniffio==1.3.1
 sse-starlette==3.5.0
 starlette==1.7.0
+Telethon==1.45.0
 truststore==0.10.4
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 urllib3==2.8.0
 uvicorn==0.54.0
 websockets==17.1
+yarl==1.25.1

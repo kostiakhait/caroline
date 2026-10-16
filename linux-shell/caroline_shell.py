@@ -1167,7 +1167,21 @@ def _build_tray_icon(shell: Shell) -> Any:
     try:
         import pystray
         from PIL import Image
-    except ImportError as exc:
+    except Exception as exc:
+        # Bug fix (2026-10-16), confirmed live on a real xopek-desktop test
+        # container: `except ImportError` was too narrow -- pystray's own
+        # backend-selection code (vendor/pystray/__init__.py's backend())
+        # runs AT IMPORT TIME and, on a host with no AppIndicator3/
+        # AyatanaAppIndicator3 GI namespace (exactly this container, and
+        # plausibly many minimal Linux desktops), raises ValueError from
+        # deep inside `import pystray` itself -- not ImportError. That
+        # propagated straight through `main()` (no try/except there),
+        # crashing the whole process before splash.show() ever ran: no
+        # window, no visible error, only a trace in shell.log nobody would
+        # think to check. This function's own docstring already promised
+        # "best-effort... if construction fails for any other reason" --
+        # broadened to match what it actually said, same as the two other
+        # try/excepts a few lines below in this same function.
         log(f"tray: pystray/Pillow not importable, tray disabled: {exc}")
         return None
     try:

@@ -258,6 +258,7 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT_LINUX)/backend-py/app"
 	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT_LINUX)/backend-py/run_server.py"
 	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT_LINUX)/backend-py/supervisor.py"
+	cp "$(BACKEND_PY_DIR)/requirements-linux.txt" "$(OUT_LINUX)/backend-py/requirements-linux.txt"
 	find "$(OUT_LINUX)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find "$(OUT_LINUX)/linux-shell" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@echo "--- camerlengo (small-model primary path, same conditional vendoring as the Windows build) ---"
