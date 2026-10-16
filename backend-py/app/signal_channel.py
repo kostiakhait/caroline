@@ -55,6 +55,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass
@@ -283,18 +284,39 @@ async def _rpc_call(account: str, method: str, params: dict[str, Any]) -> Any:
     return result
 
 
+# A Signal username: 3-32 chars, letters/digits/underscore, a literal "."
+# then a numeric discriminator (e.g. "alice.01") -- added by Signal
+# specifically so people can be reached with no phone number shared at all.
+# The leading "u:" people sometimes already type is optional and stripped
+# before matching, matching signal-cli's own recipient-argument convention
+# (any RECIPIENT place accepts phone / ACI / "PNI:..." / "u:username").
+_USERNAME = re.compile(r"^(?:u:)?[A-Za-z_][A-Za-z0-9_]{2,31}\.\d{1,9}$")
+
+
 def _is_group_id(target: str) -> bool:
     """signal-cli recipients are always E.164 phone numbers (a leading
-    '+'); group ids are opaque base64 strings with no such prefix -- the
-    same shape-based distinction telegram_channel.py and whatsapp_channel.
-    py each already use for their own id-vs-phone split, so every
-    to/target param here can take either without a separate flag."""
-    return not target.startswith("+")
+    '+') or a "u:username" (see _USERNAME above); group ids are opaque
+    base64 strings with neither shape -- the same shape-based distinction
+    telegram_channel.py and whatsapp_channel.py each already use for their
+    own id-vs-phone split, so every to/target param here can take any of
+    the three without a separate flag."""
+    return not target.startswith("+") and not _USERNAME.match(target)
+
+
+def _recipient_value(target: str) -> str:
+    """signal-cli's own recipient syntax requires the "u:" prefix on a bare
+    username (confirmed against its own RECIPIENT-argument docs: phone /
+    ACI / "PNI:..." / "u:username" are the only forms it accepts there) --
+    add it if the caller didn't already."""
+    if _USERNAME.match(target) and not target.startswith("u:"):
+        return f"u:{target}"
+    return target
 
 
 async def send_message(account: str, recipient: str, text: str) -> None:
     key = "groupId" if _is_group_id(recipient) else "recipient"
-    await _rpc_call(account, "send", {key: [recipient], "message": text})
+    value = recipient if key == "groupId" else _recipient_value(recipient)
+    await _rpc_call(account, "send", {key: [value], "message": text})
 
 
 async def list_contacts(account: str) -> list[dict[str, Any]]:
@@ -316,7 +338,8 @@ async def send_file(account: str, to: str, path: str, caption: str | None = None
     if not Path(path).is_file():
         raise SignalError(f"No such local file: {path}")
     key = "groupId" if _is_group_id(to) else "recipient"
-    params: dict[str, Any] = {key: [to], "attachment": [path]}
+    value = to if key == "groupId" else _recipient_value(to)
+    params: dict[str, Any] = {key: [value], "attachment": [path]}
     if caption:
         params["message"] = caption
     await _rpc_call(account, "send", params)
@@ -350,7 +373,7 @@ async def download_attachment(account: str, ref: str, save_path: str | None = No
 # closest Signal equivalent to Telegram's telegram_add_contact); block/
 # unblock work on both individual recipients and groups.
 async def update_contact_name(account: str, recipient: str, name: str | None = None, given_name: str | None = None, family_name: str | None = None) -> None:
-    params: dict[str, Any] = {"recipient": recipient}
+    params: dict[str, Any] = {"recipient": _recipient_value(recipient)}
     if name:
         params["name"] = name
     if given_name:
@@ -362,7 +385,8 @@ async def update_contact_name(account: str, recipient: str, name: str | None = N
 
 async def set_block(account: str, target: str, block: bool) -> None:
     key = "groupId" if _is_group_id(target) else "recipient"
-    await _rpc_call(account, "block" if block else "unblock", {key: [target]})
+    value = target if key == "groupId" else _recipient_value(target)
+    await _rpc_call(account, "block" if block else "unblock", {key: [value]})
 
 
 # Groups (2026-10-11). Signal groups are fully decentralized -- every

@@ -20,6 +20,13 @@ separate add/delete. Signal groups are also fully decentralized -- there
 is no call that deletes a group "for everyone", not even for its creator
 (every member keeps an independent copy) -- signal_delete_group
 approximates one the same way whatsapp_delete_group does, and says so.
+
+Usernames (2026-10-16): a Signal username (e.g. "alice.01", Signal's own
+feature for being reachable with no phone number shared at all) needs no
+prior contact either -- every `to`/`target`/`recipient` param here accepts
+one directly, alongside a phone number or a group id (see
+app/signal_channel.py's own _recipient_value/_USERNAME for the exact shape
+signal-cli expects).
 """
 
 from __future__ import annotations
@@ -272,16 +279,18 @@ def _usage_instructions() -> str:
         "`account=\"owner\"` is the human owner's own personal Signal account -- read freely, but only send AS "
         "the owner when they have explicitly asked you to send that specific message. Signal has no bot/app "
         "API at all -- signal-cli (the standard tool for this) is how either account is reached. `to`/"
-        "`target`/`recipient` accept either the exact phone number (E.164, e.g. +15551234567) or a group id -- "
-        "distinguished automatically (a group id never starts with \"+\"). signal_login(account=...) is "
+        "`target`/`recipient` accept the exact phone number (E.164, e.g. +15551234567), a Signal USERNAME "
+        "(e.g. \"alice.01\", with or without a leading \"u:\" -- Signal's own feature for being reached with "
+        "no phone number shared at all), or a group id -- distinguished automatically (a group id never "
+        "starts with \"+\" and never has username's required \".NNN\" suffix). signal_login(account=...) is "
         "one-time setup per account (a QR code image opens automatically to scan in the Signal app's Linked "
         "Devices screen) -- call it only when the user has explicitly asked to connect that account, never on "
         "your own initiative. There's no model-facing message search here -- only contacts, groups, and "
         "sending.\n"
-        "Like WhatsApp, Signal needs no prior contact to message a number cold -- any phone number can be "
-        "messaged directly. signal_update_contact just sets a local display name (the closest Signal "
-        "equivalent to telegram_add_contact); signal_block_user/signal_unblock_user work on either a "
-        "recipient or a group.\n"
+        "Like WhatsApp, Signal needs no prior contact to message a number OR a username cold -- either can be "
+        "messaged directly, no add-contact step. signal_update_contact just sets a local display name (the "
+        "closest Signal equivalent to telegram_add_contact); signal_block_user/signal_unblock_user work on "
+        "either a recipient or a group.\n"
         "Attachments: a proactive notification for an incoming photo/video/document/voice message says so "
         "(\"Attached: ...\") and gives a \"ref\" -- download it with signal_download_attachment(ref) before "
         "using it (omit savePath for a default location). signal_send_file(to, path, caption) sends a local "
@@ -313,14 +322,16 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "signal_send_message",
-            "Sends a Signal message. `to` is a phone number (E.164) or a group id -- no add-contact step "
-            "needed first. `account`: \"self\" (default) or \"owner\" -- only send as \"owner\" when the user "
+            "Sends a Signal message. `to` is a phone number (E.164), a Signal username (e.g. \"alice.01\"), or "
+            "a group id -- no add-contact step needed first, for a number or a username either. `account`: "
+            "\"self\" (default) or \"owner\" -- only send as \"owner\" when the user "
             "has explicitly asked for this specific message.",
             {"to": str, "text": str, "account": str | None}, signal_send_message,
         ),
         PluginTool(
             "signal_send_file",
-            "Sends a local file as a Signal attachment. `to` is a phone number or group id. Optional "
+            "Sends a local file as a Signal attachment. `to` is a phone number, a Signal username, or a group "
+            "id. Optional "
             "`caption` (sent as the message text alongside the attachment). `account`: \"self\" (default) or "
             "\"owner\" -- same owner-impersonation rule as signal_send_message.",
             {"to": str, "path": str, "caption": str | None, "account": str | None}, signal_send_file,
@@ -336,20 +347,22 @@ PLUGIN = Plugin(
         PluginTool(
             "signal_update_contact",
             "Sets a local display name for a Signal contact (creating a local contact entry if one didn't "
-            "exist). `recipient` is their phone number. At least one of `name`, `givenName`, `familyName`. "
+            "exist). `recipient` is their phone number or Signal username. At least one of `name`, "
+            "`givenName`, `familyName`. "
             "`account`: \"self\" (default) or \"owner\".",
             {"recipient": str, "name": str | None, "givenName": str | None, "familyName": str | None, "account": str | None}, signal_update_contact,
         ),
         PluginTool(
             "signal_block_user",
-            "Blocks a Signal contact or group. `target` is a phone number or group id. `account`: \"self\" "
+            "Blocks a Signal contact or group. `target` is a phone number, Signal username, or group id. "
+            "`account`: \"self\" "
             "(default) or \"owner\" -- blocking on the owner's own account is a real decision about who can "
             "reach them; only do it when they have asked for it.",
             {"target": str, "account": str | None}, signal_block_user,
         ),
         PluginTool(
             "signal_unblock_user",
-            "Reverses signal_block_user. `target` is a phone number or group id. `account`: \"self\" "
+            "Reverses signal_block_user. `target` is a phone number, Signal username, or group id. `account`: \"self\" "
             "(default) or \"owner\".",
             {"target": str, "account": str | None}, signal_unblock_user,
         ),
