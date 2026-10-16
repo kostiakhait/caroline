@@ -73,6 +73,7 @@ def mark_funds_exhausted(reason: str) -> None:
     comment above for why this is tracked account-wide, not per-caller."""
     global _funds_exhausted_reason
     _funds_exhausted_reason = reason
+    _ensure_funds_probe_running()
 
 
 def clear_funds_exhausted() -> None:
@@ -90,6 +91,56 @@ def _check_funds_exhaustion(envelope: Any) -> None:
     reason = envelope.get(".reason")
     if isinstance(reason, str) and ("insufficient funds" in reason.lower() or " 402" in reason):
         _funds_exhausted_reason = reason
+        _ensure_funds_probe_running()
+
+
+# Per explicit instruction (2026-10-15), a real incident: chat_session.py's
+# submit() now refuses to start ANY new turn while _funds_exhausted_reason is
+# set (see its own funds-gate comment) -- "absolutely all" of Caroline's
+# activity pauses until the balance is back. But the flag is only ever
+# CLEARED as a side effect of some real call happening to succeed (see
+# _check_funds_exhaustion above) -- if nothing is allowed to run, nothing
+# would ever notice recovery, and the app would stay blocked forever even
+# after the provider's balance was topped up. This is the one thing still
+# allowed to run while blocked: a minimal, cheap ai:resolve/SMALL probe,
+# repeated on a flat interval, whose own success (through this module's
+# shared _post_json/_check_funds_exhaustion chokepoint, same as every real
+# call) is what actually clears the flag and lets chat_session.py's queued
+# turns drain. Self-starting (from mark_funds_exhausted/_check_funds_
+# exhaustion, not a loop main.py has to remember to launch) and self-
+# stopping (its own while condition exits once the flag clears).
+FUNDS_PROBE_INTERVAL_S = 30.0
+_funds_probe_task: Any = None
+
+
+def _ensure_funds_probe_running() -> None:
+    global _funds_probe_task
+    if _funds_probe_task is not None and not _funds_probe_task.done():
+        return
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return  # called from sync/startup context with no loop yet -- nothing to probe for right now
+    from app.task_supervisor import supervise
+    from app.logging_setup import log_event
+    log_event("plugin:sw_api", "funds_probe_starting", reason=_funds_exhausted_reason)
+    _funds_probe_task = supervise("sw_funds_probe", _funds_probe_loop)
+
+
+async def _funds_probe_loop() -> None:
+    import asyncio
+    from app.logging_setup import log_event
+    while _funds_exhausted_reason is not None:
+        await asyncio.sleep(FUNDS_PROBE_INTERVAL_S)
+        if _funds_exhausted_reason is None:
+            break  # cleared by some other real call in the meantime
+        try:
+            await _post_json({"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": "ok", "model": "SMALL"}, timeout=15.0)
+        except Exception as exc:  # noqa: BLE001 -- still exhausted or a transient hiccup either way, keep probing
+            log_event("plugin:sw_api", "funds_probe_attempt_failed", error=str(exc))
+            continue
+    log_event("plugin:sw_api", "funds_probe_stopped", recovered=_funds_exhausted_reason is None)
 
 
 async def _post_json(body: dict[str, Any], timeout: float = 30.0) -> Any:

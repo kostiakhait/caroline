@@ -1795,6 +1795,23 @@ class ChatSession:
         # finishes.
         self.compaction_queued_turns: list[dict[str, Any]] = []
 
+        # Per explicit instruction (2026-10-15), a real incident: a
+        # background pseudo-session relayed raw, untranslated, internal-
+        # mechanics chatter straight into the user's visible chat because
+        # the SAME upstream OpenRouter balance exhaustion broke BOTH the
+        # relay-worth check AND the translate step that would otherwise
+        # have caught it -- two independent fail-open safety nets, same
+        # root cause, both down at once. Direct instruction afterward: "При
+        # недостатке баланса у провайдера ВСЯ деятельность Кэролайн должна
+        # ПОЛНОСТЬЮ блокироваться до пополнения баланса" -- every new turn
+        # queues here instead of starting, exact same shape as
+        # compaction_queued_turns/forced_compaction_result_pending above,
+        # while sw_api.get_funds_exhausted_reason() is set. Drained by
+        # _drain_funds_blocked_queue() the moment _check_funds_exhaustion_
+        # status notices the reason clear (sw_api.py's own probe loop is
+        # what makes that happen at all while everything else is paused).
+        self.funds_blocked_queued_turns: list[dict[str, Any]] = []
+
         # activity / hang tracking
         self.last_activity = time.monotonic()
         self.last_user_activity = time.monotonic()
@@ -2333,8 +2350,16 @@ class ChatSession:
         the next time something else happens to trigger a republish."""
         current = get_funds_exhausted_reason()
         if current != self._last_known_funds_exhausted_reason:
+            was_blocked = bool(self._last_known_funds_exhausted_reason)
             self._last_known_funds_exhausted_reason = current
             asyncio.create_task(self._publish_status())
+            # Per explicit instruction (2026-10-15): the transition TO None
+            # is what unblocks submit() again -- see funds_blocked_queued_
+            # turns' own __init__ comment. sw_api.py's own probe loop (not
+            # this tick) is what actually makes that transition happen
+            # while everything is paused; this just has to notice it.
+            if was_blocked and not current:
+                self._drain_funds_blocked_queue()
 
     def _compute_public_status(self) -> tuple[str, str]:
         kind = self.conn_state.get("kind")
@@ -2343,16 +2368,28 @@ class ChatSession:
             return "error", reason
         if kind in ("restarting", "restart_backoff", "limited", "engine_error"):
             return "recovering", reason
-        # Bug fix (2026-09-16), per explicit instruction: "при исчерпании
-        # баланса на клоде или опенроутере эта информация явно
-        # прокидывалась в кэролайн и высвечивалась на статус-баре" -- see
+        # Bug fix (2026-09-16), originally: "при исчерпании баланса на
+        # клоде или опенроутере эта информация явно прокидывалась в
+        # кэролайн и высвечивалась на статус-баре" -- see
         # sw_api.get_funds_exhausted_reason's own comment for how this is
-        # detected. Deliberately NOT surfaced as "error" here (unlike
-        # Claude's own billing_blocked above) -- an exhausted SquirrelWisdom/
-        # OpenRouter balance doesn't block a tab using its own Claude
-        # subscription at all, only narration/translation/consult/SW-mode
-        # chat, which is why this rides along as extra reason text on
-        # ready/working instead of overriding the actual state.
+        # detected. Used to ride along as extra reason text on ready/
+        # working, deliberately not blocking (an exhausted balance didn't
+        # stop a tab using its own Claude subscription, only narration/
+        # translation/SW-mode chat).
+        # Superseded (2026-10-15), per explicit instruction, a real
+        # incident: "При недостатке баланса у провайдера ВСЯ деятельность
+        # Кэролайн должна ПОЛНОСТЬЮ блокироваться до пополнения баланса" --
+        # submit() now queues every new turn instead of starting it while
+        # this is set (see funds_blocked_queued_turns' own __init__
+        # comment), so this has to be a real blocking state now, same
+        # "recovering" yellow lamp as restarting/limited/compacting above,
+        # not just a note riding along on ready/working -- the old
+        # ready/working return below would otherwise claim the tab is fine
+        # while it's actually refusing every new turn.
+        funds_reason = get_funds_exhausted_reason()
+        if funds_reason:
+            queued_note = f" ({len(self.funds_blocked_queued_turns)} message(s) queued)" if self.funds_blocked_queued_turns else ""
+            return "recovering", f"Paused -- the AI provider's balance is exhausted, waiting for it to be topped up ({funds_reason}){queued_note}"
         # Per explicit instruction (2026-09-18): compaction must be visible
         # on the status bar (the yellow "recovering" lamp, same as
         # restarting/restart_backoff/limited above) -- previously silent,
@@ -2366,13 +2403,9 @@ class ChatSession:
         if self.forced_compaction_result_pending:
             queued_note = f" ({len(self.compaction_queued_turns)} message(s) queued)" if self.compaction_queued_turns else ""
             return "recovering", f"Compacting conversation, one moment…{queued_note}"
-        funds_note = ""
-        funds_reason = get_funds_exhausted_reason()
-        if funds_reason:
-            funds_note = f"SquirrelWisdom/OpenRouter balance exhausted -- narration/translation/SW features are down until it's topped up ({funds_reason})"
         if self.turn_pending:
-            return "working", funds_note
-        return "ready", funds_note
+            return "working", ""
+        return "ready", ""
 
     async def _publish_status(self) -> None:
         state, reason = self._compute_public_status()
@@ -2400,6 +2433,25 @@ class ChatSession:
         # every replay -- confirmed live tonight this had NO logging of
         # its own at all, unlike inject_proactive.
         attachments = attachments or []
+        # Per explicit instruction (2026-10-15): queue BEFORE anything else
+        # below (the stop-note handling, memory_turns.start_turn, chat-mode
+        # routing) -- see funds_blocked_queued_turns' own __init__ comment
+        # for the real incident this closes off. Same early-return shape as
+        # the forced-compaction queue just below, deliberately checked
+        # first: if BOTH conditions somehow held at once, this still queues
+        # correctly and compaction's own check simply never gets reached
+        # for this call -- _drain_funds_blocked_queue() replays through this
+        # exact same submit(), so compaction (if still pending by then)
+        # queues it again normally, nothing is skipped or double-handled.
+        funds_reason = get_funds_exhausted_reason()
+        if funds_reason:
+            log_event(
+                "engine", "submit_queued_funds_exhausted", tab_id=self.tab_id, is_real_user=is_real_user,
+                is_voice=is_voice, text_len=len(text), attachment_count=len(attachments), reason=funds_reason,
+            )
+            self.funds_blocked_queued_turns.append({"text": text, "attachments": attachments, "is_real_user": is_real_user, "is_voice": is_voice, "pending_text": pending_text})
+            asyncio.create_task(self._publish_status())
+            return
         if is_real_user and self._stop_note_pending:
             # Delivered by _push_message as its own, machine-marked block --
             # not glued into the user's words, so language detection and the
@@ -5757,6 +5809,26 @@ class ChatSession:
             "engine", "forced_compaction_hit_limit", tab_id=self.tab_id,
             pause_s=FORCED_COMPACTION_LIMIT_PAUSE_MS // 1000, message=limit_text[:200],
         )
+
+    def _drain_funds_blocked_queue(self) -> None:
+        """Called right after _check_funds_exhaustion_status notices
+        sw_api.get_funds_exhausted_reason() has gone back to None --
+        replays every submit() call that arrived while the upstream
+        balance was exhausted, in the order they originally arrived,
+        through the exact same submit() they'd have gone through
+        immediately if nothing had been blocked at all. See submit()'s own
+        funds-gate and funds_blocked_queued_turns' own __init__ comment for
+        the incident this fixes. Same shape as _drain_compaction_queue just
+        below, minus that one's compaction-specific reminder -- nothing
+        here was mid-compaction, there is no "got cut off" risk to warn
+        about."""
+        if not self.funds_blocked_queued_turns:
+            return
+        queued = self.funds_blocked_queued_turns
+        self.funds_blocked_queued_turns = []
+        log_event("engine", "funds_blocked_queue_drained", tab_id=self.tab_id, count=len(queued))
+        for item in queued:
+            self.submit(item["text"], item["attachments"], item["is_real_user"], item["is_voice"], pending_text=item.get("pending_text"))
 
     def _drain_compaction_queue(self) -> None:
         """Called right after forced_compaction_result_pending flips back
