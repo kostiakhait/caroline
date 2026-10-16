@@ -997,7 +997,12 @@ async def _model_ai() -> Any | None:
     api_key = await get_model_provider_key()
     if not api_key:
         return None
-    return camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(api_key=api_key))
+    # base_url points this at Camerlengo's own /v1/chat/completions proxy
+    # (not openrouter.ai directly) -- see model_key_provisioning.py's own
+    # docstring: api_key here is the composite "<CAROLINE_SW_KEY>.<session>"
+    # token that proxy expects, not a real OpenRouter key.
+    return camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(
+        api_key=api_key, base_url="https://www.squirrelwisdom.com/v1"))
 
 
 async def prewarm_model_access() -> None:
@@ -1224,6 +1229,7 @@ async def _run_parallel_stage(
                             messages=branch_messages, tool_defs=branch_tools, executor_fn=traced_executor,
                             model=model, max_iterations=MAX_ITERATIONS,
                             transforms=DISABLE_MIDDLE_OUT, reasoning=REASONING_EFFORT,
+                            app="caroline",
                         ),
                         tab_id, lambda _line: None,
                     )
@@ -2503,6 +2509,7 @@ async def run_small_model_turn(
                 model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                 reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
+                app="caroline",
             ),
             tab_id, emit,
         )
@@ -2628,6 +2635,7 @@ async def run_small_model_turn(
                     model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                     get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                     reasoning=TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)], on_usage=on_usage,
+                    app="caroline",
                 ),
                 tab_id, emit,
             )
