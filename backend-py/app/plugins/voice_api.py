@@ -1473,7 +1473,23 @@ async def generate_progress_comment(
         "-- but it is preliminary, from work still in progress, not yet the final confirmed answer. Say you "
         "found it and are still confirming it, rather than stating it as settled.\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
-        "nothing else.\n\n"
+        "nothing else.\n"
+        # Bug fix (2026-10-16), confirmed live: TASK was an already-answered
+        # question ("Did Oksana reply?" -- she had, Caroline had already told
+        # the user so), but STATUS by then was about a completely different,
+        # later piece of work (identifying an unrelated incoming message) and
+        # said nothing about Oksana either way. Told to describe "where TASK
+        # stands" from STATUS, the model invented a plausible-sounding update
+        # for TASK anyway ("she still hasn't replied, still working on it") --
+        # flatly contradicting what had already been said. STATUS not
+        # mentioning TASK at all is exactly the "nothing concrete to say about
+        # the task" case above, not license to guess -- added as its own
+        # explicit rule plus a matching example, since the existing wording
+        # evidently wasn't enough on its own for this one.
+        "STATUS describing work that has nothing to do with TASK is ALSO \"nothing concrete to say about the "
+        "task\" -- reply empty rather than guessing where TASK stands from it. Never state or imply TASK is "
+        "still open, unresolved, or being worked on unless STATUS is actually about TASK; STATUS being about "
+        "something else entirely is not evidence either way about TASK.\n\n"
         "Write in English. A separate step translates it afterward.\n\n"
         "Examples of the right kind of reply (copy the style, never the words -- these are unrelated to the "
         "real task below):\n"
@@ -1481,6 +1497,11 @@ async def generate_progress_comment(
         "  Good: <narration>Still putting the coast trip plan together, a few more pieces to go.</narration>\n"
         "  TASK: translate the contract summary. STATUS: Steps completed so far this turn: 4 succeeded, 0 failed.\n"
         "  Good: <narration>The translation is still in progress, not quite finished yet.</narration>\n"
+        "  TASK: did Oksana reply to my email. STATUS: Steps in progress right now: 1 (identifying the sender "
+        "of an unrelated WhatsApp message).\n"
+        "  Good: <narration></narration>\n"
+        "  Bad (STATUS is unrelated to TASK, not evidence TASK is still open): <narration>She still hasn't "
+        "replied, still working on it.</narration>\n"
         "  TASK: book a table for two. STATUS: Steps completed so far this turn: 2 succeeded, 0 failed. "
         "Task finished: yes.\n"
         "  Good: <narration>Your table for two is booked.</narration>\n"

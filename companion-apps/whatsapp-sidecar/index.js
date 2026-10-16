@@ -175,12 +175,23 @@ async function start() {
         mediaRef = `${jid}:${msg.key.id}`;
         rememberMedia(mediaRef, msg);
       }
+      // knownChats only fills via contacts.upsert, which some senders never
+      // trigger at all (seen live: an @lid-addressed jid -- WhatsApp's
+      // newer privacy-preserving contact id -- left the chat name unknown
+      // even though this was an ongoing conversation). Baileys puts the
+      // sender's own self-set WhatsApp display name on msg.pushName
+      // directly, no separate sync event needed -- use it whenever
+      // knownChats doesn't already have a name, and remember it so the
+      // NEXT message from this same jid has it too without needing
+      // contacts.upsert to ever fire.
+      const pushName = msg.pushName || undefined;
+      if (pushName && !knownChats.has(jid)) knownChats.set(jid, pushName);
       emit({
         type: 'message',
         from: jid,
         fromMe: !!msg.key.fromMe,
         text,
-        chatName: knownChats.get(jid) || jid,
+        chatName: knownChats.get(jid) || pushName || jid,
         media: media || undefined,
         mediaRef,
       });
