@@ -89,16 +89,27 @@ SLACK_CLIENT_ID = ""
 # conversations.list/history, chat.postMessage, search.messages.
 SLACK_USER_SCOPES = (
     "channels:history,channels:read,chat:write,groups:history,groups:read,"
-    "im:history,im:read,mpim:history,mpim:read,search:read,users:read"
+    "im:history,im:read,im:write,mpim:history,mpim:read,search:read,users:read,"
+    "users:read.email"
 )
 # Bot Token Scopes -- Caroline's own separate "self" identity (2026-10-11).
 # Deliberately the same capability set as the user scopes above, minus
 # search:read (Slack has no bot-token search.messages equivalent at all) --
 # a bot only ever sees channels/DMs it was itself invited to, same
 # limitation already documented for the user-token path's own comments.
+#
+# im:write/users:read.email added (2026-10-16), after a real incident:
+# resolution only ever covered conversations already surfaced by
+# conversations.list -- there was no way to reach a workspace member Caroline
+# had never DMed before, forcing an unnecessary "wait for them to message
+# first" workaround even though Slack's own conversations.open (im:write)
+# opens a DM cold with anyone in the workspace, and users.lookupByEmail
+# (users:read.email) finds a member by email with no prior contact needed --
+# see slack_plugin.py's _resolve_slack_target.
 SLACK_BOT_SCOPES = (
     "channels:history,channels:read,chat:write,groups:history,groups:read,"
-    "im:history,im:read,mpim:history,mpim:read,users:read"
+    "im:history,im:read,im:write,mpim:history,mpim:read,users:read,"
+    "users:read.email"
 )
 
 # Fixed local port for the OAuth redirect -- must match exactly what's

@@ -105,6 +105,70 @@ async def slack_find_channel(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": str(matches)}
 
 
+async def _resolve_slack_target(client: AsyncWebClient, raw: str) -> tuple[str | None, dict[str, Any] | None]:
+    """A conversation id as given (channel/DM/group-DM -- C.../D.../G...,
+    Slack's own id prefixes), OR -- when `raw` is a user id or an email
+    instead -- the DM channel with that person, opened cold if there isn't
+    one yet. (channel_id, None) on success, or (None, error envelope).
+
+    Per explicit instruction (2026-10-16), after a real incident parallel to
+    the Telegram one (telegram_plugin.py's _resolve_chat): resolution used
+    to cover only conversations already surfaced by conversations.list --
+    someone Caroline had never DMed before had no path at all, even though
+    Slack's own conversations.open (scope im:write) opens a DM with anyone
+    in the workspace with no prior message, and users.lookupByEmail (scope
+    users:read.email) finds a member by email with no prior contact needed
+    either -- the same "reachable cold" guarantee Telegram's get_entity and
+    WhatsApp's bare-phone-number send already had."""
+    raw = raw.strip()
+    if raw[:1] in ("C", "D", "G") and raw[1:].isalnum():
+        return raw, None
+    try:
+        if raw[:1] == "U" and raw[1:].isalnum():
+            user_id = raw
+        elif "@" in raw:
+            looked_up = await client.users_lookupByEmail(email=raw)
+            user_id = looked_up["user"]["id"]
+        else:
+            return None, {
+                "text": f'"{raw}" isn\'t a conversation id, a Slack user id, or an email -- use slack_find_person '
+                "to look someone up by name first, or pass their email/user id directly.",
+                "is_error": True,
+            }
+        opened = await client.conversations_open(users=[user_id])
+        return opened["channel"]["id"], None
+    except SlackApiError as exc:
+        return None, {"text": f"Slack API error resolving \"{raw}\": {exc.response.get('error', str(exc))}", "is_error": True}
+
+
+async def slack_find_person(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'slack_find_person needs "query".', "is_error": True}
+    try:
+        result = await client.users_list(limit=1000)
+    except SlackApiError as exc:
+        return {"text": f"Slack API error: {exc.response.get('error', str(exc))}", "is_error": True}
+    rows = []
+    for u in result.get("members", []):
+        if u.get("deleted") or u.get("is_bot") or u.get("id") == "USLACKBOT":
+            continue
+        profile = u.get("profile") or {}
+        rows.append({
+            "id": u["id"],
+            "name": profile.get("real_name") or profile.get("display_name") or u.get("name") or u["id"],
+            "email": profile.get("email"),
+        })
+    matches = await find_by_name(query, rows)
+    return {"text": str(matches)}
+
+
 async def slack_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     account, error = _account_or_error(args)
     if error:
@@ -112,7 +176,9 @@ async def slack_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     client, error = _client_or_error(account)
     if error:
         return error
-    channel = str(args["channel"]).strip()
+    channel, error = await _resolve_slack_target(client, str(args["channel"]).strip())
+    if error:
+        return error
     text = str(args["text"])
     try:
         await client.chat_postMessage(channel=channel, text=text)
@@ -166,7 +232,9 @@ def _usage_instructions() -> str:
         "ID (e.g. \"C0123ABCD\" for a channel, \"D0123ABCD\" for a DM) -- always use the EXACT id from "
         "slack_list_channels or from a proactive new-message notification, never a guessed #name or @user, "
         "same reasoning as every other messenger/channel integration in this codebase: a bare name is "
-        "ambiguous and a wrong guess sends to the wrong place silently. slack_login opens the user's own "
+        "ambiguous and a wrong guess sends to the wrong place silently. The one exception is "
+        "slack_send_message, whose `channel` also accepts a Slack USER id or email straight from "
+        "slack_find_person -- that opens a DM cold, with nobody needing to have messaged first. slack_login opens the user's own "
         "browser to Slack's real login/consent screen (a normal OAuth flow, requesting both identities at "
         "once) -- call it only when the user has actually asked to connect Slack, never on your own "
         "initiative, and tell them to watch for the browser window that opens. Workspace-wide search "
@@ -204,10 +272,20 @@ PLUGIN = Plugin(
             {"query": str, "account": str | None}, slack_find_channel,
         ),
         PluginTool(
+            "slack_find_person",
+            "Finds workspace member(s) matching a name/description, by MEANING (transliteration, diminutives, "
+            "typos) -- never exact text. Returns each match's Slack user id and email, either of which "
+            "slack_send_message accepts directly to message them, even if you've never DMed them before. "
+            "`account`: \"self\" (default) or \"owner\".",
+            {"query": str, "account": str | None}, slack_find_person,
+        ),
+        PluginTool(
             "slack_send_message",
-            "Sends a message to a Slack channel or DM. `channel` must be the exact conversation id (see this "
-            "plugin's own usage_instructions). `account`: \"self\" (default) or \"owner\" -- only send as "
-            "\"owner\" when the user has explicitly asked for this specific message.",
+            "Sends a message to a Slack channel or DM. `channel` is the exact conversation id (see "
+            "slack_list_channels/slack_find_channel), OR a Slack user id or email from slack_find_person -- "
+            "either opens a DM with that person on the spot, no prior conversation needed. `account`: "
+            "\"self\" (default) or \"owner\" -- only send as \"owner\" when the user has explicitly asked for "
+            "this specific message.",
             {"channel": str, "text": str, "account": str | None}, slack_send_message,
         ),
         PluginTool(
