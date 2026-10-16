@@ -92,22 +92,10 @@ from app.working_memory import load_working_memory, working_memory_system_prompt
 from app.memory_topics import memory_topics_system_prompt_clause
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
+from app import policies
 from app.policies import (
-    complex_task_execution_instruction_for_sw,
     continuity_pointer_instruction,
-    credentials_check_notes_first_instruction,
-    event_memory_check_first_instruction,
-    learn_from_mistakes_instruction,
-    memory_check_first_instruction,
-    no_internal_mechanics_to_user_instruction,
-    no_unauthorized_secret_changes_instruction,
-    no_unbounded_filesystem_scans_instruction,
-    prefer_own_backend_tools_instruction,
-    proactive_context_recovery_instruction,
     recent_dialogue_history_instruction,
-    self_sufficiency_instruction,
-    system_temp_dir_instruction,
-    timestamp_awareness_instruction,
 )
 
 # Per explicit instruction (2026-09-13), after a real capability audit
@@ -116,33 +104,60 @@ from app.policies import (
 # Code-CLI-native affordance this engine structurally lacks (Bash's own
 # run_in_background/BashOutput, the Task subagent tool, TodoWrite, or the
 # multi-bubble live narration the SDK path's own streaming turn produces).
-# Deliberately NOT a curated subset for any other reason -- this list is
-# ALWAYS_ON_INSTRUCTIONS minus exactly the entries that reference a tool
-# this engine doesn't have, so a future addition to that list is included
-# here automatically unless it hits the same structural limit.
-_SHARED_ALWAYS_ON_INSTRUCTIONS = (
-    no_unbounded_filesystem_scans_instruction,
-    timestamp_awareness_instruction,
-    no_internal_mechanics_to_user_instruction,
-    proactive_context_recovery_instruction,
-    no_unauthorized_secret_changes_instruction,
-    prefer_own_backend_tools_instruction,
-    learn_from_mistakes_instruction,
-    self_sufficiency_instruction,
-    system_temp_dir_instruction,
-    credentials_check_notes_first_instruction,
-    memory_check_first_instruction,
-    event_memory_check_first_instruction,
-    # Per explicit instruction (2026-10-15), after a real incident (a sw-mode
-    # turn asked to check every mailbox called request_info once and
-    # answered as if done, no escalation): complex_task_execution_
-    # instruction itself is excluded above (its CLI-only bullets reference
-    # TodoWrite/Task/run_in_background), so sw never saw ANY decompose-
-    # first framing until this sw-specific variant was written -- see its
-    # own docstring in policies.py. Written but never actually added here
-    # until now; without this line the fix did not exist in practice.
-    complex_task_execution_instruction_for_sw,
-)
+#
+# Rewritten (2026-10-15), per explicit instruction, after a real incident
+# traced to this list's OWN lie: this comment has always claimed the list
+# below is "ALWAYS_ON_INSTRUCTIONS minus exactly the entries that reference
+# a tool this engine doesn't have, so a future addition is included here
+# automatically" -- but the list used to be a plain hand-written tuple that
+# never actually read ALWAYS_ON_INSTRUCTIONS at all, so that claim was false.
+# Four entries had silently drifted out and were simply never noticed:
+# no_update_sentinel_instruction (sw's own output IS checked for the
+# [[NO_UPDATE]] sentinel -- chat_session.py's _finish_small_model_turn_
+# answered -- so sw genuinely needs to know the convention, unlike the other
+# CLI-only exclusions below), prefer_command_line_and_scripting_instruction
+# (almost entirely generic -- only references bash_background_instruction
+# in passing), document_opening_preference_instruction (open_in_viewer vs
+# open_file, both ordinary plugin tools, no CLI dependency at all), and
+# no_unrequested_send_confirmation_instruction (a general conversational
+# rule, added 2026-10-13, postdating this list's last manual curation).
+# Rewritten as an actual derivation so that gap can't recur silently --
+# the direction of error changes from "silently missing" (unsafe) to
+# "silently included" (safe default; a genuinely CLI-only future addition
+# needs a human to notice and add it to the maps below, same effort as
+# before, but now an OMISSION is the thing that requires a conscious
+# decision, not an inclusion).
+_SW_VEHICLE_SUBSTITUTIONS: dict[Callable[[], str], Callable[[], str]] = {
+    # complex_task_execution_instruction's non-core bullets reference Task/
+    # TodoWrite/run_in_background by name -- not just "a CLI affordance sw
+    # lacks" the way the four entries below are, but a genuinely different
+    # VEHICLE for the same underlying advice (decompose, don't do a big task
+    # as one undifferentiated blob). sw has its own real vehicle for exactly
+    # this (declare_plan's "parallel" stage + run_parallel_stage -- see this
+    # real incident: a sw-mode turn asked to check every mailbox called
+    # request_info once and answered as if done, no escalation, because it
+    # never saw ANY decompose-first framing in any form), so it gets a
+    # substituted variant instead of a plain exclusion. See
+    # complex_task_execution_instruction_for_sw's own docstring.
+    policies.complex_task_execution_instruction: policies.complex_task_execution_instruction_for_sw,
+}
+_CLI_NATIVE_ONLY_EXCLUSIONS: dict[Callable[[], str], str] = {
+    policies.bash_background_instruction: "no backgrounding primitive of its own (no run_in_background/BashOutput)",
+    policies.compact_continuation_is_genuine_instruction: "refers to Claude Code's own auto-compaction, which this single resolve_agentic() call never goes through",
+    policies.usage_cap_self_awareness_instruction: "refers to the Claude subscription usage cap; this engine has its own OpenRouter funds-exhausted handling (mark_funds_exhausted/get_funds_exhausted_reason)",
+    policies.progress_narration_instruction: "covered at the engine level already (emit()/on_activity-driven progress narration), not something the model's own text needs to produce",
+}
+
+
+def _derive_shared_always_on_instructions() -> tuple[Callable[[], str], ...]:
+    return tuple(
+        _SW_VEHICLE_SUBSTITUTIONS.get(fn, fn)
+        for fn in policies.ALWAYS_ON_INSTRUCTIONS
+        if fn not in _CLI_NATIVE_ONLY_EXCLUSIONS
+    )
+
+
+_SHARED_ALWAYS_ON_INSTRUCTIONS = _derive_shared_always_on_instructions()
 
 # Mirrors chat_session.py's own "disallowed_tools": ["mcp__caroline-notes__
 # notes_login"] on the full SDK path's ClaudeAgentOptions -- notes_login is
@@ -202,6 +217,32 @@ DEESCALATION_SENTINEL = "[[CAN_DEESCALATE]]"
 # B) cannot loop indefinitely -- same spirit as REPEATED_CALL_LIMIT below, just
 # for cross-tier bouncing instead of same-tier tool-call repetition.
 MAX_DEESCALATIONS = 2
+
+# Per explicit instruction (2026-10-15), a real incident: a sw-mode turn asked
+# to check every mailbox called request_info once and answered as if done --
+# no escalation, no further tool calls, task silently abandoned. The gap:
+# ESCALATION_SENTINEL/DEESCALATION_SENTINEL both hand the SAME unfinished work
+# to a DIFFERENT model tier; neither covers the verifier judging that the SAME
+# tier just stopped short (used tools fine, then quit before covering what was
+# asked) rather than being genuinely incapable -- the correct response there is
+# a same-tier retry with a concrete correction, not a model swap. Per explicit
+# instruction on the fix's OWN philosophy ("не выжимать из маленьких моделей
+# то, что они не могут... параллелить работу, если ее можно параллелить"):
+# this sentinel's real job is NOT "try harder, do more sequential work" --
+# it's specifically for the case where the missing work should have been
+# split into a declare_plan "parallel" stage + run_parallel_stage and wasn't,
+# which makes the retry genuinely EASIER for the same tier, not harder. See
+# _looks_multi_target/_build_verification_prompt's own red-flag fact, which is
+# what actually points the verifier at this diagnosis.
+RETRY_SENTINEL = "[[RETRY_SAME_TIER]]"
+
+# Scoped per TURN, not per tier (so it can't be bypassed by escalating once
+# and retrying again at the next tier) -- same anti-bounce shape as
+# MAX_DEESCALATIONS, deliberately small: a retry that still doesn't cover
+# what's missing is far more likely a genuine capability gap than a model
+# that just needs one more nudge, so the verifier is told explicitly once
+# this is exhausted and naturally pushed to escalate instead.
+MAX_SAME_TIER_RETRY = 1
 
 # Per explicit instruction (2026-09-12): NOT a task-complexity budget --
 # resolve_agentic()'s own doc comment documents this same thing. Set high
@@ -1043,6 +1084,11 @@ class _TurnTracker:
     verification pass (see _build_verification_prompt)."""
 
     tool_call_count: int = 0
+    # Computed once at the start of run_small_model_turn() from the user's own
+    # request text (_looks_multi_target) -- a mechanical fact for the verifier
+    # (_build_verification_prompt), not something a tool call sets. See that
+    # function's own comment for the real incident this closes off.
+    looks_multi_target: bool = False
     plan_steps: list[str] | None = None
     # (mode, step indices) per stage, in order; indices refer to plan_steps.
     plan_stages: list[tuple[str, list[int]]] = field(default_factory=list)
@@ -1472,7 +1518,7 @@ def _make_executor_fn(
 
 def _build_verification_prompt(
     tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
-    can_deescalate: bool = False,
+    can_deescalate: bool = False, can_retry: bool = False,
 ) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
     any work. It checks the candidate against the mechanical facts below.
@@ -1502,9 +1548,20 @@ def _build_verification_prompt(
     True for every tier except the first one actually tried this turn. The mirror
     image of `can_escalate` -- unfinished work isn't automatically harder than
     what was just tried; sometimes a stronger tier already did the hard part and
-    what's left is mechanical. Mutually exclusive with escalating up for any given
-    verifier reply: the verifier picks exactly one of "still hard, escalate up",
-    "what's left is simple, step down", or "it's actually done"."""
+    what's left is mechanical.
+
+    `can_retry` (2026-10-15, RETRY_SENTINEL's own real incident): True while
+    MAX_SAME_TIER_RETRY hasn't been used yet THIS TURN. Distinct from escalating
+    up: the verifier picks this when the gap looks like the SAME tier simply
+    stopped short (it used tools fine for part of the work, then quit before
+    covering the rest of what was named) rather than being unable to reason
+    through it -- most often because repeated work across independent targets
+    should have been split into a declare_plan "parallel" stage + run_
+    parallel_stage and wasn't (see tracker.looks_multi_target's own red flag,
+    added unconditionally below). Mutually exclusive with the other three
+    outcomes for any given verifier reply: the verifier picks exactly one of
+    "still hard, escalate up", "what's left is simple, step down", "this tier
+    stopped short, retry it with what's missing", or "it's actually done"."""
     parts = [
         "The reply above is from another assistant that worked on the user's request. You are a verifier only: "
         "you have no tools and must not try to do or finish any work. Check the reply against the facts below."
@@ -1537,6 +1594,24 @@ def _build_verification_prompt(
             "These tool operations were started but never confirmed as finished: "
             + ", ".join(sorted(tracker.pending_operation_ids))
         )
+    # Per explicit instruction (2026-10-15), a real incident: unconditional (not
+    # gated on can_escalate/can_retry, not dependent on a plan ever having been
+    # declared) -- the absence of a parallel stage on an apparently multi-target
+    # request has to be a mechanical fact the verifier is TOLD, same as undone
+    # plan steps or unconfirmed operations above, not something it has to notice
+    # by its own reading comprehension alone (which is exactly what missed the
+    # real incident this closes off).
+    if tracker.looks_multi_target and not tracker.parallel_stages_run and len(tier_trace or []) <= 2:
+        parts.append(
+            "This request appears to name multiple independent targets or items to go through one by one "
+            "(e.g. several accounts, mailboxes, files, or addresses), but no parallel plan stage was ever run "
+            "(declare_plan with a \"parallel\" stage, then run_parallel_stage), and only "
+            f"{len(tier_trace or [])} real tool call(s) were made. Do not take a plausible-sounding reply as "
+            "proof the task is finished -- check specifically whether it accounts for EVERY target the request "
+            "named, with real results for each, not just one. The most likely explanation for a trace this "
+            "shallow is that the task needed to be split into a parallel stage (one step per target) and "
+            "wasn't -- not that it is impossible."
+        )
     # The verifier's reply is a verdict a program reads, in one of up to four forms
     # (2026-10-11, agreed: "OK / эскалация / исправленный текст в теге"; de-escalation
     # added 2026-10-15, same shape as escalation -- see DEESCALATION_SENTINEL's own
@@ -1561,6 +1636,17 @@ def _build_verification_prompt(
             "pick it up from exactly that point, with the full tool-call history so far. Only for genuinely "
             "unfinished work -- which includes a reply that only promises or announces an action (\"I'll send it "
             "now\") where the facts above show no such action was taken."
+        )
+    if can_retry:
+        forms.append(
+            f'- "{RETRY_SENTINEL} <one short sentence saying exactly what is still missing>" -- the task is '
+            "genuinely NOT finished, but the gap looks like this SAME model simply stopped short -- it used tools "
+            "fine for part of the work, then quit before covering the rest of what was named -- not that the task "
+            "is beyond what this tier can reason through. Prefer this over escalating up when the same model, told "
+            "specifically what's missing, is likely to finish it; this is very often the case when a request named "
+            "several independent targets (several mailboxes, files, addresses) and the work was never split into a "
+            "declare_plan \"parallel\" stage + run_parallel_stage. Escalate instead only when the gap looks like it "
+            "is genuinely beyond this tier's reasoning, not a matter of doing the rest of the same operation."
         )
     if can_deescalate:
         forms.append(
@@ -1700,7 +1786,7 @@ _VERIFIER_FINAL = re.compile(rf"<{VERIFIER_FINAL_TAG}>(.*?)(?:</{VERIFIER_FINAL_
 _ANY_TAG = re.compile(r"</?[a-zA-Z][\w-]*>")
 
 
-def _verifier_form_reminder(can_escalate: bool, can_deescalate: bool, has_candidate: bool) -> str:
+def _verifier_form_reminder(can_escalate: bool, can_deescalate: bool, has_candidate: bool, can_retry: bool = False) -> str:
     """Sent once when the verifier's reply was in none of the forms (verify_candidate).
     On the golden set (evals/verifier_eval.py) the usual such reply was a correct
     correction written without the tag -- 2 runs of 3 for a wrong figure -- and keeping
@@ -1708,6 +1794,8 @@ def _verifier_form_reminder(can_escalate: bool, can_deescalate: bool, has_candid
     forms = [f'"{VERIFIER_OK}"'] if has_candidate else []
     if can_escalate:
         forms.append(f'"{ESCALATION_SENTINEL} <what is still missing>"')
+    if can_retry:
+        forms.append(f'"{RETRY_SENTINEL} <what is still missing>"')
     if can_deescalate:
         forms.append(f'"{DEESCALATION_SENTINEL} <what is left to do>"')
     forms.append(f'"<{VERIFIER_FINAL_TAG}>the reply the user should read</{VERIFIER_FINAL_TAG}>"')
@@ -1815,6 +1903,33 @@ _COMPLEXITY_PROMPT = (
     "Reply with exactly one word: COMPLEX if it needs several dependent tool steps (check, then act, then verify), "
     "otherwise SIMPLE.\n\nRequest:\n"
 )
+
+# Per explicit instruction (2026-10-15), a real incident: "check every mailbox"
+# is a FAN-OUT task (the same mechanical check repeated over independent
+# targets), not necessarily a "complex dependent chain" in _COMPLEXITY_PROMPT's
+# own sense ("check, then act, then verify") -- the two are genuinely
+# different shapes, and a fan-out task can plausibly score SIMPLE even though
+# it's exactly the shape most likely to get silently abandoned after one
+# shallow pass. A cheap, free, bilingual regex (no extra model call) rather
+# than extending the classifier call -- deliberately recall-favoring: a false
+# positive only costs one extra sentence in the verifier prompt or starting
+# one tier higher, a false negative just leaves today's behavior unchanged.
+_MULTI_TARGET_PATTERN = re.compile(
+    r"\b(every|each|all (my|the)|one by one|across (my|the|all))\b.{0,40}\b"
+    r"(mailbox(?:es)?|account(?:s)?|inbox(?:es)?|file(?:s)?|folder(?:s)?|document(?:s)?|item(?:s)?|"
+    r"site(?:s)?|server(?:s)?|machine(?:s)?|address(?:es)?)\b"
+    r"|\bкажд\w+\b|\bвсе (мои|почтов\w+|учётн\w+|аккаунт\w+)\b|по очеред\w+|по кажд\w+",
+    re.IGNORECASE,
+)
+
+
+def _looks_multi_target(user_text: str) -> bool:
+    """True when the request names multiple independent targets/items to go
+    through one by one -- the signal _build_verification_prompt's own red
+    flag and _start_tier_index use to catch the "checked one, declared the
+    whole thing done" failure mode. See this pattern's own comment for why
+    it's a free regex, not a model call."""
+    return bool(_MULTI_TARGET_PATTERN.search(user_text))
 
 
 # ------------------------------------------------------------------ fast lane --
@@ -2373,14 +2488,14 @@ async def run_small_model_turn(
     # is no longer only a final polish pass tacked on after the loop.
     async def run_verifier(
         candidate_text: str, can_escalate: bool, can_deescalate: bool, trace: list[str],
-        not_a_form: str | None = None, first_model: str | None = None,
+        not_a_form: str | None = None, first_model: str | None = None, can_retry: bool = False,
     ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
-        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate)})
+        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate, can_retry)})
         if not_a_form is not None:
             verification_messages.append({"role": "assistant", "content": not_a_form})
-            verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text))})
+            verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text), can_retry)})
         return await _call_with_funds_wait(
             lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
@@ -2394,19 +2509,20 @@ async def run_small_model_turn(
 
     async def verify_candidate(
         candidate_text: str, can_escalate: bool, can_deescalate: bool = False, trace: list[str] | None = None,
+        can_retry: bool = False,
     ) -> tuple[str, str]:
-        """Returns (text, action), action one of "done"/"up"/"down". A technical
-        verifier failure (empty reply/exception on both attempts) is never treated
-        as an escalation or de-escalation signal -- it just falls back to the
-        candidate as-is, same as before this change. _FundsExhaustedGivingUp is NOT
-        a technical failure -- let it propagate to the caller, which turns it into
-        the same honest final answer regardless of whether funds ran out on a tier
-        call or here."""
+        """Returns (text, action), action one of "done"/"up"/"down"/"retry". A
+        technical verifier failure (empty reply/exception on both attempts) is
+        never treated as an escalation/de-escalation/retry signal -- it just
+        falls back to the candidate as-is, same as before this change.
+        _FundsExhaustedGivingUp is NOT a technical failure -- let it propagate
+        to the caller, which turns it into the same honest final answer
+        regardless of whether funds ran out on a tier call or here."""
         emit("Checking the result (no tools).")
         if VERIFIER_FIRST_MODEL and _usable(candidate_text):
             started = time.monotonic()
             try:
-                first = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], first_model=VERIFIER_FIRST_MODEL)
+                first = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], first_model=VERIFIER_FIRST_MODEL, can_retry=can_retry)
             except _FundsExhaustedGivingUp:
                 raise
             except Exception as exc:  # noqa: BLE001 -- the verifier proper decides
@@ -2421,9 +2537,9 @@ async def run_small_model_turn(
                 return candidate_text, "done"
         verified = ""
         for attempt in (1, 2):
-            log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate, can_deescalate=can_deescalate)
+            log_event("engine", "small_model_verification_started", tab_id=tab_id, attempt=attempt, has_candidate=bool(candidate_text), can_escalate=can_escalate, can_deescalate=can_deescalate, can_retry=can_retry)
             try:
-                verified = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [])
+                verified = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], can_retry=can_retry)
             except _FundsExhaustedGivingUp:
                 raise
             except Exception as exc:  # noqa: BLE001 -- verifier failure is a retry, never silence
@@ -2437,6 +2553,9 @@ async def run_small_model_turn(
         if can_escalate and ESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=verified.replace(ESCALATION_SENTINEL, "").strip()[:200])
             return verified, "up"
+        if can_retry and RETRY_SENTINEL in verified:
+            log_event("engine", "small_model_verification_retrying_same_tier", tab_id=tab_id, note=verified.replace(RETRY_SENTINEL, "").strip()[:200])
+            return verified, "retry"
         if can_deescalate and DEESCALATION_SENTINEL in verified:
             log_event("engine", "small_model_verification_deescalating", tab_id=tab_id, note=verified.replace(DEESCALATION_SENTINEL, "").strip()[:200])
             return verified, "down"
@@ -2445,7 +2564,7 @@ async def run_small_model_turn(
             # In none of the forms: asked once more, with its own reply in view.
             log_event("engine", "small_model_verification_not_a_form", tab_id=tab_id, verifier_reply=verified[:300])
             try:
-                again = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], not_a_form=verified)
+                again = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], not_a_form=verified, can_retry=can_retry)
             except _FundsExhaustedGivingUp:
                 raise
             except Exception as exc:  # noqa: BLE001 -- the first reading stands
@@ -2454,6 +2573,9 @@ async def run_small_model_turn(
             if can_escalate and ESCALATION_SENTINEL in again:
                 log_event("engine", "small_model_verification_escalating", tab_id=tab_id, note=again.replace(ESCALATION_SENTINEL, "").strip()[:200])
                 return again, "up"
+            if can_retry and RETRY_SENTINEL in again:
+                log_event("engine", "small_model_verification_retrying_same_tier", tab_id=tab_id, note=again.replace(RETRY_SENTINEL, "").strip()[:200])
+                return again, "retry"
             if can_deescalate and DEESCALATION_SENTINEL in again:
                 log_event("engine", "small_model_verification_deescalating", tab_id=tab_id, note=again.replace(DEESCALATION_SENTINEL, "").strip()[:200])
                 return again, "down"
@@ -2465,6 +2587,13 @@ async def run_small_model_turn(
                   verifier_reply=verified[:300] if how != "ok" else VERIFIER_OK)
         return final, "done"
 
+    # Per explicit instruction (2026-10-15): computed once, up front, from the
+    # user's own request text -- feeds both _start_tier_index just below (start
+    # no lower than tier 1 for an apparent fan-out task) and the verifier's own
+    # unconditional red flag (_build_verification_prompt). See _looks_multi_
+    # target's own comment for the real incident this closes off.
+    tracker.looks_multi_target = _looks_multi_target(user_text)
+
     # A real fact from the first second (2026-10-10): picking the starting tier is itself
     # a model call (~10s live), and until a tier starts the narrator had nothing to
     # draft from -- the first spoken remark of a voice turn came ~30s after the question.
@@ -2474,9 +2603,17 @@ async def run_small_model_turn(
         log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
     else:
         start_index = await _start_tier_index(ai, cfg, user_text)
+        if tracker.looks_multi_target:
+            # "check every mailbox" is a fan-out task, not necessarily a
+            # COMPLEX dependent chain in _COMPLEXITY_PROMPT's own sense -- see
+            # _MULTI_TARGET_PATTERN's own comment for why it can plausibly
+            # score SIMPLE even though it's exactly the shape most likely to
+            # get silently abandoned after one shallow pass.
+            start_index = max(start_index, 1)
     final_text = ""
     index = start_index
     deescalations_used = 0
+    same_tier_retries_used = 0
     while index < len(tiers):
         model = tiers[index]
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
@@ -2520,8 +2657,9 @@ async def run_small_model_turn(
                     pass
             can_escalate = index < len(tiers) - 1
             can_deescalate = index > 0 and deescalations_used < MAX_DEESCALATIONS
+            can_retry = same_tier_retries_used < MAX_SAME_TIER_RETRY
             try:
-                verified_text, action = await verify_candidate(candidate, can_escalate, can_deescalate, tier_trace)
+                verified_text, action = await verify_candidate(candidate, can_escalate, can_deescalate, tier_trace, can_retry)
             except _FundsExhaustedGivingUp as exc:
                 log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
                 return _answer(_funds_exhausted_final_answer(exc.reason))
@@ -2531,6 +2669,22 @@ async def run_small_model_turn(
             if tier_trace:
                 messages.append({"role": "user", "content": _continuation_note(tier_trace)})
                 tier_trace.clear()
+            if action == "retry":
+                # Per explicit instruction, the fix's own philosophy: this is NOT
+                # "try harder, do more sequential work yourself" -- the nudge below
+                # specifically redirects to decomposition+parallelization (declare_
+                # plan's "parallel" stage + run_parallel_stage), which makes the
+                # retried attempt genuinely EASIER for the same tier, not harder.
+                # Same index (not +1): same model, same tier, continuing.
+                same_tier_retries_used += 1
+                emit(f"The check found this tier's work incomplete but likely fixable by splitting it up; retrying tier {index + 1} with what's missing.")
+                messages.append({"role": "user", "content": (
+                    "[Verifier checked the previous attempt and found it incomplete: "
+                    f"{verified_text.replace(RETRY_SENTINEL, '').strip()} Split this into "
+                    "declare_plan(stages=[{\"mode\": \"parallel\", \"steps\": [...]}]) with one step per target, "
+                    "then call run_parallel_stage -- do not try to handle every target yourself in one sequential pass.]"
+                )})
+                continue
             if action == "down":
                 deescalations_used += 1
                 emit(f"The check found the remaining work simple enough for a weaker tier; stepping down to tier {index}.")

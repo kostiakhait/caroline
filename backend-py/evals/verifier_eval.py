@@ -74,7 +74,24 @@ LONG_SEARCH_RESULT = (
 LONG_TRACE = [e._trace_line("web_search", '{"question": "Kyiv weather tomorrow October 12, 2026 forecast"}', LONG_SEARCH_RESULT)]
 MAIL_TRACE = ['Tool call mail_search (arguments: {"from": "Anna"}); result: 2 messages: "Invoice March" (2026-10-09), "Re: invoice" (2026-10-10)']
 
-# (name, user text, candidate, trace, can_escalate, want): want is "ok" | "escalate" | "changed" | "not_ok"
+# Per explicit instruction (2026-10-15), a real incident: a sw-mode turn asked
+# to check every mailbox (log in, read important messages, download
+# attachments, report per mailbox) called request_info (memory) once and
+# answered as if done -- no escalation, no further tool calls, task silently
+# abandoned. Golden case for RETRY_SENTINEL, shaped exactly like it: a
+# multi-target request, a one-call trace, no parallel stage ever run, a
+# candidate that claims completion. See MEMORY_TRACE/MAILBOX_TASK below.
+MEMORY_TRACE = [
+    'Tool call request_info (arguments: {"query": "unread mail across accounts"}); result: '
+    "Memory holds nothing relevant to this query."
+]
+MAILBOX_TASK = (
+    "Проверь все мои почтовые ящики на новые письма: зайди в каждый, прочитай важное, скачай вложения, "
+    "отчитайся по каждому ящику отдельно."
+)
+
+# (name, user text, candidate, trace, can_escalate, want): want is "ok" | "escalate" | "changed" | "not_ok" |
+# "retry" (want="retry" implies can_retry=True is also passed -- see case[6] handling in main()).
 MODEL_CASES = [
     ("good: weather with a source", "Какая погода будет завтра в Киеве?",
      "Завтра в Киеве небольшой дождь, днём около тринадцати градусов, ночью около девяти. Это по данным BBC Weather.",
@@ -100,6 +117,8 @@ MODEL_CASES = [
     ("wrong figure against the tool result", "Какая погода будет завтра в Киеве?",
      "Завтра в Киеве солнечно, днём около двадцати пяти градусов. Это по данным BBC Weather.", WEATHER_TRACE, True, "not_ok"),
     ("last tier, nothing was done", "Отправь Анне письмо, что я опоздаю на десять минут.", "", [], False, "changed"),
+    ("multi-target abandoned after one shallow call (real incident, 2026-10-15)", MAILBOX_TASK,
+     "Проверила — новых писем не найдено, все ящики в порядке.", MEMORY_TRACE, True, "retry", True),
 ]
 
 
@@ -107,13 +126,17 @@ def looks_like_comment(text):
     return e._looks_like_verdict(text)
 
 
-async def run_model_case(ai, cfg, user_text, candidate, trace, can_escalate):
+async def run_model_case(ai, cfg, user_text, candidate, trace, can_escalate, can_retry=False):
     """The verifier asked the way verify_candidate asks it, the second ask included.
     Returns (raw reply that was used, ms, asked twice)."""
     tracker = e._TurnTracker()
+    # Mirrors run_small_model_turn()'s own computation -- see _looks_multi_target's
+    # own comment; without this, _build_verification_prompt's multi-target red flag
+    # never fires here even for a case deliberately shaped to trigger it.
+    tracker.looks_multi_target = e._looks_multi_target(user_text)
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user_text},
                 {"role": "assistant", "content": candidate or "(no answer was produced)"},
-                {"role": "user", "content": e._build_verification_prompt(tracker, candidate, can_escalate, trace)}]
+                {"role": "user", "content": e._build_verification_prompt(tracker, candidate, can_escalate, trace, can_retry=can_retry)}]
 
     async def ask(msgs):
         return (await asyncio.to_thread(ai.resolve_agentic, msgs, None, None, model=cfg.AI_MODEL_MINI, max_iterations=1,
@@ -122,11 +145,13 @@ async def run_model_case(ai, cfg, user_text, candidate, trace, can_escalate):
     t0 = time.monotonic()
     raw = await ask(messages)
     twice = False
-    if not (can_escalate and e.ESCALATION_SENTINEL in raw) and e._read_verifier_reply(raw, candidate)[1].startswith("unparsed"):
+    already_a_form = (can_escalate and e.ESCALATION_SENTINEL in raw) or (can_retry and e.RETRY_SENTINEL in raw)
+    if not already_a_form and e._read_verifier_reply(raw, candidate)[1].startswith("unparsed"):
         twice = True
         again = await ask(messages + [{"role": "assistant", "content": raw},
-                                      {"role": "user", "content": e._verifier_form_reminder(can_escalate, e._usable(candidate))}])
-        if (can_escalate and e.ESCALATION_SENTINEL in again) or not e._read_verifier_reply(again, candidate)[1].startswith("unparsed"):
+                                      {"role": "user", "content": e._verifier_form_reminder(can_escalate, False, e._usable(candidate), can_retry)}])
+        already_a_form_again = (can_escalate and e.ESCALATION_SENTINEL in again) or (can_retry and e.RETRY_SENTINEL in again)
+        if already_a_form_again or not e._read_verifier_reply(again, candidate)[1].startswith("unparsed"):
             raw = again
     return raw, int((time.monotonic() - t0) * 1000), twice
 
@@ -150,15 +175,19 @@ async def main():
             AI_MODEL_MINI = os.environ["VERIFIER_MODEL"]
         e.VERIFIER_REASONING_EFFORT = None
     rows = []
-    for name, user_text, candidate, trace, can_escalate, want in MODEL_CASES * RUNS:
-        raw, ms, twice = await run_model_case(ai, cfg, user_text, candidate, trace, can_escalate)
+    for case in MODEL_CASES * RUNS:
+        name, user_text, candidate, trace, can_escalate, want = case[:6]
+        can_retry = case[6] if len(case) > 6 else False
+        raw, ms, twice = await run_model_case(ai, cfg, user_text, candidate, trace, can_escalate, can_retry)
         if can_escalate and e.ESCALATION_SENTINEL in raw:
             got, sent = "escalate", ""
+        elif can_retry and e.RETRY_SENTINEL in raw:
+            got, sent = "retry", ""
         else:
             sent, how = e._read_verifier_reply(raw, candidate)
             got = "ok" if how == "ok" else "changed" if sent != candidate else "kept"
         if want == "not_ok":
-            ok = got in ("escalate", "changed")
+            ok = got in ("escalate", "changed", "retry")
         else:
             ok = got == want
         if sent and looks_like_comment(sent):
@@ -166,7 +195,7 @@ async def main():
         rows.append((want, ok, ms, len(raw), twice))
         if not ok or twice or os.environ.get("VERBOSE"):
             print(f"{'PASS' if ok else 'FAIL'} {ms:>6} ms | {name:38} want {want:8} got {got:8}{' (asked twice)' if twice else ''} | {raw[:150]!r}")
-    for want in ("ok", "escalate", "not_ok", "changed"):
+    for want in ("ok", "escalate", "retry", "not_ok", "changed"):
         mine = [r for r in rows if r[0] == want]
         if mine:
             print(f"{want:8} {sum(r[1] for r in mine)}/{len(mine)}   median {int(statistics.median(r[2] for r in mine))} ms, "
