@@ -143,26 +143,40 @@ async def _funds_probe_loop() -> None:
     log_event("plugin:sw_api", "funds_probe_stopped", recovered=_funds_exhausted_reason is None)
 
 
-async def _post_json(body: dict[str, Any], timeout: float = 30.0) -> Any:
-    """`timeout` is per-attempt (up to 3 attempts on a transport-level
-    failure, see below -- httpx.TimeoutException is itself a
+async def _post_json(body: dict[str, Any], timeout: float = 30.0, retries: int = 3) -> Any:
+    """`timeout` is per-attempt (up to `retries` attempts on a transport-
+    level failure, see below -- httpx.TimeoutException is itself a
     TransportError, so a short timeout here also bounds how long a single
     attempt can hang on a slow-but-not-actually-dead response). Defaults
-    to 30.0 (unchanged behavior for every existing caller); progress
+    to 30.0/3 (unchanged behavior for every existing caller); progress
     narration (chat_session.py's _check_progress_narration, via voice_api.
     py's generate_progress_comment/translate_text) passes a much shorter
-    value -- per explicit instruction (2026-09-22), narration is cosmetic
-    filler under a 60s promise, not worth the same patience a real
-    user-facing call deserves."""
+    `timeout` -- per explicit instruction (2026-09-22), narration is
+    cosmetic filler under a 60s promise, not worth the same patience a
+    real user-facing call deserves.
+
+    `retries` (2026-10-15), per explicit instruction, a real incident: this
+    function's OWN 3x internal retry-on-timeout was never accounted for by
+    narration's "short per-attempt timeout" design above -- confirmed live,
+    a stuck/overloaded endpoint made ONE call here (3 attempts x the given
+    timeout each) take up to 3x as long as that timeout implied, which
+    _check_progress_narration's OWN outer retry loop then multiplied
+    AGAIN (its own several attempts, each secretly 3x longer than it
+    thought) -- up to several hundred seconds of total silence for what
+    was meant to be a handful of ~45s attempts. Narration passes retries=1
+    here specifically so its short timeout means what it says: one real
+    network attempt, no hidden multiplication -- the OUTER loop (chat_
+    session.py) is where narration's own retrying already happens, on
+    purpose, one layer up. Every other caller keeps the default 3."""
     async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout) as client:
         last_err: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
                 res = await client.post(API_URL, json=body)
                 break
             except httpx.TransportError as exc:
                 last_err = exc
-                if attempt < 2:
+                if attempt < retries - 1:
                     import asyncio
                     await asyncio.sleep(0.5 * (attempt + 1))
         else:

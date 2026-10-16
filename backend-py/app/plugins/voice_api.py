@@ -250,6 +250,7 @@ def _gender_agreement_clause(speaker_gender: str | None, addressee_gender: str |
 async def translate_text(
     text: str, language: str, session: str | None = None, timeout: float = 30.0,
     gender: str | None = None, addressee_gender: str | None = None, context: str | None = None,
+    retries: int = 3,
 ) -> str | None:
     """Per explicit instruction (2026-09-13): the target language for a
     generated piece of text (progress narration, today) must come from
@@ -277,6 +278,11 @@ async def translate_text(
     budget, default unchanged (30s) for the two real-visible-reply call
     sites (chat_session.py) -- narration passes a much shorter value, see
     generate_progress_comment's own doc comment for why.
+
+    `retries` (2026-10-15): forwarded to _post_json's own `retries` --
+    narration passes 1 (no internal multiplication of its already-short
+    timeout); see _post_json's own doc comment for the real incident this
+    fixes.
 
     Rewritten (2026-09-28), per explicit instruction ("Используй ai:translate
     вместо ai:resolve"), after a real incident traced to its actual root
@@ -324,7 +330,7 @@ async def translate_text(
     if session:
         body["session"] = session
     try:
-        data = await _post_json(body, timeout=timeout)
+        data = await _post_json(body, timeout=timeout, retries=retries)
     except Exception as exc:
         log_event("plugin:voice", "translate_text_failed", reason="request_failed", error=str(exc))
         return None
@@ -1247,9 +1253,14 @@ def _progress_comment_prompt(
 async def generate_progress_comment(
     recent_dialogue: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None,
     activity: str | None = None, addressee_gender: str | None = None, task: str | None = None,
-    already_said: list[str] | None = None,
+    already_said: list[str] | None = None, retries: int = 3,
 ) -> str | None:
-    """Per explicit instruction (2026-09-10): Caroline has no way to
+    """`retries` (2026-10-15): forwarded to _post_json's own `retries` --
+    narration passes 1; see _post_json's own doc comment for the real
+    incident (hidden 3x multiplication of an already-short timeout) this
+    fixes.
+
+    Per explicit instruction (2026-09-10): Caroline has no way to
     interrupt her own main session mid-turn just to narrate progress
     without genuinely disrupting whatever she's doing (the SDK only
     delivers a new injected message once the CURRENT turn -- the whole
@@ -1424,7 +1435,7 @@ async def generate_progress_comment(
     if session:
         body["session"] = session
     try:
-        data = await _post_json(body, timeout=timeout)
+        data = await _post_json(body, timeout=timeout, retries=retries)
     except Exception as exc:
         log_event("plugin:voice", "generate_progress_comment_request_failed", error=str(exc), error_type=type(exc).__name__, timeout_s=timeout)
         return None

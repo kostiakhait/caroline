@@ -4998,7 +4998,7 @@ class ChatSession:
                     dialogue, current_language_name(self.tab_id), timeout=NARRATION_NETWORK_TIMEOUT_S,
                     gender=get_persona_gender(self.workspace_dir), activity=activity_for_model, task=task,
                     addressee_gender=get_owner_profile(self.workspace_dir).gender,
-                    already_said=list(self.turn_narration_remarks),
+                    already_said=list(self.turn_narration_remarks), retries=1,
                 )
             except Exception as exc:
                 log_event("engine", "progress_narration_failed", tab_id=self.tab_id, attempt=attempt, error=str(exc))
@@ -5041,9 +5041,17 @@ class ChatSession:
             # comment would just be wasted cost.
             try:
                 from app.plugins.voice_api import translate_text
+                # Per explicit instruction (2026-10-15): same narration-is-
+                # cosmetic-filler reasoning as generate_progress_comment's own
+                # NARRATION_NETWORK_TIMEOUT_S/retries=1 just above -- this runs
+                # right after it, still under the same 60s promise, and used to
+                # default to a 30s timeout with 3 INTERNAL retries (up to ~91s
+                # on its own, on top of everything else this tick already
+                # spent) with nothing accounting for that hidden cost.
                 translated = await translate_text(
                     comment, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
                     addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
+                    timeout=NARRATION_NETWORK_TIMEOUT_S, retries=1,
                 )
             except Exception as exc:
                 log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
@@ -5396,6 +5404,7 @@ class ChatSession:
                         "", language, timeout=NARRATION_NETWORK_TIMEOUT_S,
                         gender=get_persona_gender(self.workspace_dir), activity=facts, task=task,
                         addressee_gender=get_owner_profile(self.workspace_dir).gender, already_said=already_said,
+                        retries=1,
                     )
             except asyncio.CancelledError:
                 raise
