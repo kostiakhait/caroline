@@ -30,15 +30,18 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from app.logging_setup import log_event
+
 _open_windows: dict[str, dict[str, Any]] = {}
 
 
-def register_window(key: str, *, kind: str, label: str, purpose: str, tab_id: str | None) -> None:
+def register_window(key: str, *, kind: str, label: str, purpose: str, tab_id: str | None, topic_id: str | None = None) -> None:
     _open_windows[key] = {
         "kind": kind,
         "label": label,
         "purpose": purpose,
         "tab_id": tab_id,
+        "topic_id": topic_id,
         "opened_at": time.time(),
     }
 
@@ -52,3 +55,32 @@ def list_windows(tab_id: str | None = None) -> list[dict[str, Any]]:
     if tab_id is not None:
         entries = [e for e in entries if e.get("tab_id") == tab_id]
     return sorted(entries, key=lambda e: e["opened_at"])
+
+
+async def close_windows_for_topic(topic_id: str) -> list[str]:
+    """Per explicit instruction (2026-10-16): closing a track should close
+    the windows that belong to it, not just forget about them -- "belongs
+    to" means the tab's CURRENT track (memory_topics.get_current_topic) at
+    the moment the window was opened (register_window's own topic_id,
+    threaded through from viewer_plugin.py/app_browser_plugin.py). Returns
+    the labels actually closed, for the caller (close_track) to report back
+    to the model. Deferred imports: viewer_plugin.py and
+    app_browser_plugin.py both import register_window/unregister_window
+    from this module, so importing their close functions back at module
+    level here would be circular."""
+    from app.plugins.app_browser_plugin import close_app_browser
+    from app.plugins.viewer_plugin import close_viewer
+
+    matches = [(key, entry) for key, entry in _open_windows.items() if entry.get("topic_id") == topic_id]
+    closed: list[str] = []
+    for key, entry in matches:
+        try:
+            if entry.get("kind") == "browser":
+                await close_app_browser({"label": entry["label"]}, None)
+            else:
+                await close_viewer({"path": entry["label"]}, None)
+            closed.append(entry["label"])
+        except Exception as exc:  # noqa: BLE001 -- one window's close failing must not stop the rest
+            log_event("window_registry", "close_windows_for_topic_failed", key=key, error=str(exc))
+            unregister_window(key)  # best-effort: forget it even if the real close failed
+    return closed

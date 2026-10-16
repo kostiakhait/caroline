@@ -1121,8 +1121,8 @@ public partial class MainWindow : Window
             // 20-60s while unscanned) piling up duplicate windows: every open_editor
             // for the same path used to just overwrite _viewerWindows[viewerKey]
             // with a brand new window, silently leaking the old one on screen.
-            // Scoped to kind=="image" only -- document/office/code/slideshow have
-            // their own reopen semantics, untouched here.
+            // Scoped to kind=="image" only -- the other kinds get their own,
+            // close-and-reopen version of the same fix just below.
             if (type == "open_editor" && root.TryGetProperty("kind", out var earlyKindEl) && earlyKindEl.GetString() == "image"
                 && _viewerWindows.TryGetValue(viewerKey, out var existingImageViewer))
             {
@@ -1130,6 +1130,27 @@ public partial class MainWindow : Window
                 existingImageViewer.UpdateImage(path);
                 existingImageViewer.Activate();
                 return;
+            }
+
+            // Per explicit instruction (2026-10-16): the same "no duplicate
+            // windows for the same path" fix as the image case just above,
+            // generalized to every other kind (document/office/code/
+            // slideshow) -- these never got it, so reopening the SAME path
+            // (a newer version/draft of a document Caroline already has
+            // open, or the office editor re-opened after re-saving) used to
+            // just overwrite _viewerWindows[viewerKey] with a brand new
+            // window below, leaking the old one on screen exactly like
+            // images once did. Unlike the image fast path, these kinds
+            // don't support an in-place content swap (a fresh
+            // OfficeEditorConfig, a new code/slideshow payload) -- so the
+            // old window is closed outright (its own onDone below fires for
+            // ITS OWN requestId, reporting "closed") and a fresh one opens
+            // normally, same as if the user had closed it and Caroline
+            // reopened it.
+            if (_viewerWindows.TryGetValue(viewerKey, out var existingOtherViewer))
+            {
+                Logger.Log($"MainWindow: {type} replacing existing window for path={path}");
+                existingOtherViewer.Close();
             }
 
             Action<ViewerOutcome, string?, string?> onDone = (outcome, resultPath, message) =>

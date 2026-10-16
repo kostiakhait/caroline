@@ -71,6 +71,7 @@ from app.plugins.sw_api import API_URL, CAROLINE_SW_KEY, SessionExpiredError, Sw
 from app.session_context import get_inject_proactive, get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.task_supervisor import supervise
+from app.window_registry import close_windows_for_topic
 from app.workspace_dir import WORKSPACE_DIR
 
 _sessions = SessionManager()
@@ -566,7 +567,20 @@ async def close_track(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     topic = (reply.get("output") or {}).get("topic") or {}
     if topic.get("id"):
         update_topic(WORKSPACE_DIR, topic)
-    return {"text": f"Closed: {topic.get('description') or topic_id}."}
+    # Per explicit instruction (2026-10-16): closing a track closes the
+    # windows that belong to it (viewer/browser windows opened while this
+    # was the tab's current track) -- see window_registry.close_windows_
+    # for_topic's own docstring. Best-effort: a window that fails to close
+    # doesn't stop the track itself from being reported closed.
+    try:
+        closed_windows = await close_windows_for_topic(topic_id)
+    except Exception as exc:  # noqa: BLE001
+        log_event("plugin:memory", "close_windows_for_topic_failed", topic=topic_id, error=str(exc))
+        closed_windows = []
+    text = f"Closed: {topic.get('description') or topic_id}."
+    if closed_windows:
+        text += f" Also closed {len(closed_windows)} window(s) open for it: {', '.join(closed_windows)}."
+    return {"text": text}
 
 
 async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -1098,7 +1112,8 @@ PLUGIN = Plugin(
             "Marks a track (topic) closed: it is done, nothing is currently open on it. \"topic\" is its id, "
             "from your own topic list or an earlier request_info/save_info reply. Saving a new episode into a "
             "closed track (save_info) reopens it on its own -- there is no separate reopen tool. Closing is "
-            "informational only: a closed track is still found and read exactly like an open one.",
+            "informational only: a closed track is still found and read exactly like an open one. Also closes "
+            "any viewer/browser windows that were opened while this was the tab's current track.",
             {"topic": str},
             close_track,
         ),

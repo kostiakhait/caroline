@@ -19,11 +19,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from app.memory_topics import get_current_topic
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.office_editor import OfficeEditorError, prepare_office_edit_session
 from app.policies import close_windows_after_task_instruction, read_content_not_headers_instruction
 from app.session_context import get_send, get_tab_id
 from app.window_registry import register_window, unregister_window
+from app.workspace_dir import WORKSPACE_DIR
 
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _VIDEO_EXT = {".mp4", ".webm", ".mov", ".avi", ".mkv"}
@@ -82,7 +84,9 @@ async def open_in_viewer(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         _open_requests[request_id] = {"path": path}
         await send({"type": "open_editor", "requestId": request_id, "path": path, "kind": kind})
 
-    register_window(f"viewer:{path}", kind=f"viewer_{kind}", label=path, purpose=purpose, tab_id=get_tab_id())
+    tab_id = get_tab_id()
+    register_window(f"viewer:{path}", kind=f"viewer_{kind}", label=path, purpose=purpose, tab_id=tab_id,
+                     topic_id=get_current_topic(WORKSPACE_DIR, tab_id))
     return {"text": f"Opened {path} in the viewer window."}
 
 

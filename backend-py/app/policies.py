@@ -394,6 +394,38 @@ def document_opening_preference_instruction() -> str:
     )
 
 
+def reuse_window_for_same_document_or_site_instruction() -> str:
+    """Per explicit instruction (2026-10-16): for sequential versions of the
+    same document, or repeated visits to the same site, Caroline should
+    reuse the window already open for it rather than opening a new one each
+    time -- a genuinely new file path (or a different site) still gets its
+    own window as normal; this is specifically about not piling up
+    duplicate windows for what is really the same ongoing thing.
+
+    Deliberately an instruction (judgment call), not automatic dedup inside
+    open_in_viewer/open_app_browser themselves: the exact-path case (the
+    same file opened again) is unambiguous and could in principle be
+    handled in code, but "a new version of the same article/report" is
+    often a DIFFERENT file (a new draft, a new export) that the model has
+    to recognize as a continuation of the same thing -- a judgment no fixed
+    rule in the tools can make for it. Same shape as
+    document_opening_preference_instruction just above: promoted to
+    ALWAYS_ON rather than left as a per-plugin usage_instructions entry,
+    since this is exactly the kind of granular operational preference that
+    does not reliably survive compaction otherwise."""
+    return (
+        "Before opening a document in the viewer (open_in_viewer) or a site in the embedded browser "
+        "(open_app_browser), check list_my_windows first. If a window already open there is really the SAME "
+        "ongoing thing -- the same document, even a newer version/draft/export of it, or the same site/page you "
+        "already have open -- reuse or update that existing window instead of opening a new one: call "
+        "open_in_viewer/open_app_browser again with the SAME path/label you used before (the editor refreshes "
+        "its own content) rather than inventing a new one, and never leave several windows open for what is "
+        "really one evolving document or one site. A genuinely different document or a different site still "
+        "gets its own new window as usual -- this is about not duplicating windows for the same thing, not about "
+        "limiting how many windows you may have open."
+    )
+
+
 def no_internal_mechanics_to_user_instruction() -> str:
     """Per explicit instruction (2026-09-10): confirmed live -- Caroline
     kept narrating her own plumbing to the user ("let me look at what
@@ -1023,6 +1055,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     learn_from_mistakes_instruction,
     compact_continuation_is_genuine_instruction,
     document_opening_preference_instruction,
+    reuse_window_for_same_document_or_site_instruction,
     usage_cap_self_awareness_instruction,
     proactive_context_recovery_instruction,
     no_internal_mechanics_to_user_instruction,

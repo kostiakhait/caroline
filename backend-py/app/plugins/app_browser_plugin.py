@@ -33,12 +33,14 @@ import httpx
 
 from app.http_tls import ssl_context
 from app.logging_setup import log_event
+from app.memory_topics import get_current_topic
 from app.plugins import app_browser_cdp as cdp
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.voice_api import describe_image_cheap
 from app.policies import close_windows_after_task_instruction, prefer_cropped_screenshots_instruction, prefer_window_targeted_input_instruction
 from app.session_context import get_tab_id
 from app.window_registry import register_window, unregister_window
+from app.workspace_dir import WORKSPACE_DIR
 
 if sys.platform != "win32":
     from app.plugins import _linux_app_browser as linux_browser
@@ -180,7 +182,9 @@ async def open_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         if args.get("url"):
             body["url"] = args["url"]
         result = await _call("/open", body, OPEN_TIMEOUT_S)
-    register_window(f"browser:{args['label']}", kind="browser", label=args["label"], purpose=args["purpose"], tab_id=get_tab_id())
+    tab_id = get_tab_id()
+    register_window(f"browser:{args['label']}", kind="browser", label=args["label"], purpose=args["purpose"], tab_id=tab_id,
+                     topic_id=get_current_topic(WORKSPACE_DIR, tab_id))
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
