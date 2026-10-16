@@ -404,7 +404,7 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
 
 async def check_permission_guard(
     task: str, recent_dialogue: str, previous_block_reason: str | None = None,
-    session: str | None = None, timeout: float = 15.0,
+    session: str | None = None, timeout: float = 190.0,
 ) -> dict[str, Any] | None:
     """Per explicit instruction (2026-10-11): Caroline often asks a yes/no
     permission question and then, a turn or two later, does the thing
@@ -433,7 +433,29 @@ async def check_permission_guard(
     infrastructure hiccup must not paralyze Caroline -- this is
     defense-in-depth on top of the system prompt, not the only line of
     defense). The caller (chat_session.py) decides what to do with None --
-    typically, leave whatever gate state it already had untouched."""
+    typically, leave whatever gate state it already had untouched.
+
+    Bug fix (2026-10-16), confirmed live, a real incident: the user approved
+    a pending send THREE times in a row ("Подтверждаю") and Caroline kept
+    re-asking anyway. Root cause traced through Caroline's own log: this
+    call was failing very often (390 check_permission_guard_failed events
+    over 2 days, many "HTTP 504", many a bare transport timeout) against the
+    OLD 15.0s default -- nowhere near enough for turn.permission.guard's own
+    2-rung ladder (apps/microagents/PermissionGuard.py's GUARD_LADDER,
+    server-side MICROAGENT_CALL_TIMEOUT_S=60s per rung, hard-capped overall
+    by MICROAGENT_AGENT_DEADLINE_S=180s). Because fail-open means a failed
+    recheck leaves the gate state UNCHANGED (see above), a failed recheck
+    right after the user's own approval silently swallowed that approval --
+    the user had actually answered, the server probably even judged it
+    correctly, but the client never got to see the answer because it gave up
+    first. Fixed two ways: (a) timeout raised to 190.0, just past the
+    server's own 180s hard ceiling, so the client no longer gives up before
+    the server could possibly have finished either way; (b) retries=1 below
+    (same fix already established for narration's own short-timeout calls,
+    2026-10-15, see _post_json's own docstring) -- _post_json's default
+    retries=3 would otherwise have silently multiplied the new, much longer
+    timeout into an 9-plus-minute worst case, one real attempt is what a
+    190s budget is supposed to mean."""
     body: dict[str, Any] = {
         "command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue,
         "previousBlockReason": previous_block_reason or "",
@@ -443,7 +465,7 @@ async def check_permission_guard(
     if session:
         body["session"] = session
     try:
-        data = await _post_json(body, timeout=timeout)
+        data = await _post_json(body, timeout=timeout, retries=1)
     except Exception as exc:
         log_event("plugin:voice", "check_permission_guard_failed", reason="request_failed", error=str(exc))
         return None
