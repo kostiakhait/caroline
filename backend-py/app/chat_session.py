@@ -1970,6 +1970,15 @@ class ChatSession:
         # the turn it was started for, so a draft finishing after its turn ended is dropped.
         self._voice_narration_task: asyncio.Task[None] | None = None
         self._voice_narration_wake = asyncio.Event()
+        # Bumped by stop() (user Stop and permission-guard stop both go through
+        # it -- see its own comment) so _check_progress_narration's staleness
+        # check can drop a comment that was already mid-generation when the
+        # stop landed, even if pending_user_text/turn_pending end up looking
+        # unchanged by the time it would otherwise send (2026-10-16 incident:
+        # a narration generated for a turn killed by the permission guard was
+        # sent a second AFTER the guard's own direct question, flatly
+        # contradicting it).
+        self._narration_stop_epoch = 0
         self._narration_turn_seq = 0
         self._narration_turn_started_at: float | None = None
         self._narration_draft_task: asyncio.Task[None] | None = None
@@ -3193,6 +3202,11 @@ class ChatSession:
         self.submit(replay["text"], replay["attachments"], is_real_user=True, is_voice=replay["is_voice"])
 
     def stop(self) -> None:
+        # Invalidates any narration comment already mid-generation for the
+        # turn being stopped -- see _narration_stop_epoch's own comment.
+        # Unconditional and first: both the early-return (between turns) and
+        # the main path below must invalidate it the same way.
+        self._narration_stop_epoch += 1
         # An explicit Stop also drops a turn waiting to be replayed.
         self._cancel_memory_replay()
         # Latched before the turn_pending check below: between turns nothing is
@@ -5014,10 +5028,19 @@ class ChatSession:
         # only sent if, once it is ready, this is still the same silent turn.
         silence_marker = self.last_visible_output_at
         turn_marker = self._narration_turn_marker()
+        stop_epoch = self._narration_stop_epoch
 
         def _stale() -> str | None:
             if self.ended or not self.turn_pending:
                 return "turn_ended"
+            # A stop (user Stop or permission-guard stop, both go through
+            # stop()) can land, kill the engine and start a fresh turn whose
+            # pending_user_text/turn_pending end up looking just like the one
+            # being narrated here -- the epoch check catches that case even
+            # when the marker/silence checks above don't. See
+            # _narration_stop_epoch's own __init__ comment.
+            if self._narration_stop_epoch != stop_epoch:
+                return "stopped"
             if self._narration_turn_marker() != turn_marker:
                 return "another_turn"
             if self.last_visible_output_at != silence_marker:
