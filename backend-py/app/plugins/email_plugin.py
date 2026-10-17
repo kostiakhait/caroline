@@ -147,6 +147,43 @@ async def email_latest_uid(address: str, password: str, imap_host: str, folder: 
     return await _sessions.with_session(do)
 
 
+# Bug fix (2026-10-16), confirmed live: email_read_range's own batch fetch (which calls this
+# function as its worker, see email_batch_plugin.py) returned a handful of messages' FULL,
+# untruncated bodies in one tool response -- one long thread was enough to overflow the
+# conversation's context even after auto-compaction, archiving the session as unrecoverable.
+# Same failure shape as the 41-image/~48.5MB incident files_plugin.py/pdf_pages.py already
+# document and fixed for images/PDFs -- this plugin never got that same treatment. Fixed the
+# same way: truncate with a continuation offset instead of returning the whole body.
+# EMAIL_BODY_MAX_CHARS reuses the number already established for the same "a long text is cut
+# with a note" pattern elsewhere in this codebase (apps/microagents/settings.py's
+# MEMORY_NOTES_MAX_TEXT_CHARS), not a new, separately-chosen constant.
+EMAIL_BODY_MAX_CHARS = 20_000
+
+
+def _truncate_body(data: dict[str, Any], body_offset: int) -> None:
+    """Mutates data in place: each of "text"/"html", if present and longer than
+    EMAIL_BODY_MAX_CHARS from body_offset, is cut to that window and a
+    continuation note is appended to "text" (the one field the model actually
+    reads as prose) -- same shape as files_plugin.py's read_document_pages
+    "N more pages beyond this range -- call again with page_start=N"."""
+    for field in ("text", "html"):
+        value = data.get(field)
+        if not isinstance(value, str):
+            continue
+        total = len(value)
+        window = value[body_offset:body_offset + EMAIL_BODY_MAX_CHARS]
+        if body_offset + len(window) < total:
+            data[field] = window
+            if field == "text":
+                shown_end = body_offset + len(window)
+                data["text"] += (
+                    f"\n\n[... body truncated: showing characters {body_offset}-{shown_end} of {total} total -- "
+                    f"call email_get_message again with bodyOffset={shown_end} to continue reading ...]"
+                )
+        elif body_offset:
+            data[field] = window
+
+
 async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         result = await call_v2("email:getMessage", session=session, folder=args["folder"], uid=args["uid"], **_creds_kwargs(args))
@@ -161,6 +198,7 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     # worth delaying the read over this.
     pairs = getaddresses([data.get("from") or "", data.get("to") or ""])
     asyncio.ensure_future(upsert_contacts_from_emails(pairs, exclude={args.get("address") or ""}))
+    _truncate_body(data, int(args.get("bodyOffset") or 0))
     return {"text": json.dumps(data, indent=2, ensure_ascii=False)}
 
 
@@ -352,9 +390,11 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "email_get_message",
-            "Fetches a single message's full content (subject, from, to, cc, date, text/html body, "
-            "attachment list) by folder + uid." + _ACCOUNT_PARAM_NOTE,
-            {**_CREDENTIAL_PARAMS, "folder": str, "uid": int}, email_get_message,
+            "Fetches a single message's content (subject, from, to, cc, date, text/html body, "
+            f"attachment list) by folder + uid. A body longer than {EMAIL_BODY_MAX_CHARS} characters "
+            "comes back truncated with a note telling you how long it really is and what bodyOffset to "
+            "call again with to keep reading -- never assume a truncated body IS the whole message." + _ACCOUNT_PARAM_NOTE,
+            {**_CREDENTIAL_PARAMS, "folder": str, "uid": int, "bodyOffset": int | None}, email_get_message,
         ),
         PluginTool(
             "email_mark",

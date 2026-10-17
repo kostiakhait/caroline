@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 from app.plugins.email_plugin import (
     _ACCOUNT_PARAM_NOTE,
     _CREDENTIAL_PARAMS,
+    EMAIL_BODY_MAX_CHARS,
     email_delete,
     email_get_message,
     email_list_messages,
@@ -115,6 +116,16 @@ def _message_label(item: dict[str, Any]) -> str:
 # megabytes of attachment content nobody asked for.
 BULK_READ_MAX_MESSAGES = 200
 
+# Bug fix (2026-10-16), confirmed live: email_read_range's only size guard was a message-COUNT
+# cap (BULK_READ_MAX_MESSAGES) -- nothing bounded the total TEXT returned in one response. Even
+# with each individual body now truncated (email_get_message's own EMAIL_BODY_MAX_CHARS, 2026-
+# 10-16 fix), a range with many not-tiny messages could still return hundreds of KB in one tool
+# result, which is exactly what overflowed a conversation's context past what auto-compaction
+# could recover from. Same number as files_plugin.py's own MAX_READ_BYTES -- one already-vetted
+# "how much text is reasonable to hand the model in one call" budget, reused rather than picked
+# fresh here.
+EMAIL_RANGE_TOTAL_BODY_CHARS = 200_000
+
 
 async def email_read_range(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     folder = args.get("folder") or "INBOX"
@@ -136,13 +147,29 @@ async def email_read_range(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return {"text": f'No messages found in "{folder}" for that date range/filter.'}
 
     items = [{**creds, "folder": folder, "uid": int(h["uid"])} for h in headers]
-    # _run_batch's own BATCH_MAX_ITEMS (50) is tuned for the lighter write-batch tools
-    # below -- chunked here (each chunk still concurrent within itself) so a busy
-    # folder/range up to BULK_READ_MAX_MESSAGES doesn't just hit that cap's ValueError.
+    # _run_batch's own BATCH_MAX_ITEMS (50) is tuned for the lighter write-batch tools below,
+    # where a chunk's worst case is trivially small -- too big a chunk here (bug fix, 2026-10-16,
+    # confirmed live: a single 50-message chunk, each body already capped at EMAIL_BODY_MAX_CHARS
+    # by email_get_message, can still total up to 50*20_000 = 1,000,000 characters, five times
+    # EMAIL_RANGE_TOTAL_BODY_CHARS, before the between-chunk check below ever gets a chance to
+    # fire). Chunk size here is instead budget-aware: never more than the whole total budget
+    # could plausibly need in one chunk, so the between-chunk check actually gets to fire well
+    # before the budget is blown, not after.
+    chunk_size = max(1, min(BATCH_MAX_ITEMS, EMAIL_RANGE_TOTAL_BODY_CHARS // EMAIL_BODY_MAX_CHARS))
     outcomes: list[dict[str, Any]] = []
-    for start in range(0, len(items), BATCH_MAX_ITEMS):
-        chunk = items[start:start + BATCH_MAX_ITEMS]
-        outcomes.extend(await _run_batch(chunk, _message_label, lambda item: email_get_message(item, None)))
+    skipped_items: list[dict[str, Any]] = []
+    body_chars_so_far = 0
+    for start in range(0, len(items), chunk_size):
+        if body_chars_so_far > EMAIL_RANGE_TOTAL_BODY_CHARS:
+            skipped_items.extend(items[start:])
+            break
+        chunk = items[start:start + chunk_size]
+        chunk_outcomes = await _run_batch(chunk, _message_label, lambda item: email_get_message(item, None))
+        outcomes.extend(chunk_outcomes)
+        for outcome in chunk_outcomes:
+            if outcome["ok"]:
+                body = json.loads(outcome["result"]["text"])
+                body_chars_so_far += len(body.get("text") or "") + len(body.get("html") or "")
 
     messages: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -158,6 +185,14 @@ async def email_read_range(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         lines.append(
             f"NOTE: the folder/range may hold MORE than the {limit} messages returned here (the list was "
             "capped at `limit`) -- narrow sinceIso/untilIso or raise `limit` to be sure nothing was skipped."
+        )
+    if skipped_items:
+        skipped_uids = ", ".join(str(item["uid"]) for item in skipped_items)
+        lines.append(
+            f"STOPPED EARLY: total body text passed {EMAIL_RANGE_TOTAL_BODY_CHARS} characters, so "
+            f"{len(skipped_items)} more message(s) in this range were NOT fetched: uid {skipped_uids}. "
+            "Fetch these individually with email_get_message (one at a time, or in a few small groups) if "
+            "you actually need them -- do not assume they're unimportant just because this call stopped."
         )
     if errors:
         lines.append(f"{len(errors)} message(s) failed to fetch in full (shown as missing below):")
@@ -217,10 +252,13 @@ def _usage_instructions() -> str:
         "Need the actual CONTENT (to/from/cc/subject/body), not just headers, for every message in one "
         "folder over a date range -- \"read everything in Inbox since Monday\", a digest, a sweep for "
         "something specific? Use email_read_range instead of email_list_messages followed by one "
-        "email_get_message per uid: it does both steps itself, concurrently, so nothing gets missed and "
-        "nothing needs fetching one at a time. Attachments come back as a list (filename/type) only, never "
-        "their bytes -- call email_download_attachment yourself for a specific one only if its content is "
-        "actually needed, not for every attachment by default.",
+        "email_get_message per uid: it does both steps itself, concurrently. Each body is truncated the "
+        "same way email_get_message truncates one (long messages come back cut with a note), AND the whole "
+        "call stops early once the combined total gets large, reporting which uids were skipped -- fetch "
+        "those specific ones individually with email_get_message (one at a time, or a few at once) rather "
+        "than assuming a shorter-than-expected result means the range was actually empty. Attachments come "
+        "back as a list (filename/type) only, never their bytes -- call email_download_attachment yourself "
+        "for a specific one only if its content is actually needed, not for every attachment by default.",
         follow_explicit_parameters_instruction(),
     ))
 
@@ -245,14 +283,16 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "email_read_range",
-            "Reads every message's FULL content (to, from, cc, subject, body, attachment list) in one "
-            "folder over a date range, in one call -- no need to list headers then fetch each uid "
-            "separately, and nothing gets skipped. Use sinceIso/untilIso (ISO dates, e.g. \"2026-10-01\") "
-            "for a [since, until) interval, unseenOnly/query to narrow further, and limit to raise the "
-            f"cap above the default ({BULK_READ_MAX_MESSAGES}) if the reply says the range may hold more. "
-            "Attachments come back as {index, filename, contentType} only -- never their bytes; call "
-            "email_download_attachment yourself for one specific attachment only when its actual content "
-            "is needed." + _ACCOUNT_PARAM_NOTE,
+            "Reads every message's content (to, from, cc, subject, body, attachment list) in one folder "
+            "over a date range, in one call -- no need to list headers then fetch each uid separately. Use "
+            "sinceIso/untilIso (ISO dates, e.g. \"2026-10-01\") for a [since, until) interval, unseenOnly/"
+            "query to narrow further, and limit to raise the cap above the default "
+            f"({BULK_READ_MAX_MESSAGES}) if the reply says the range may hold more. Each body is truncated "
+            f"past {EMAIL_BODY_MAX_CHARS} characters (same as email_get_message), and the whole call stops "
+            f"early past {EMAIL_RANGE_TOTAL_BODY_CHARS} combined characters, naming the uids it skipped -- "
+            "fetch those with email_get_message individually if you actually need them. Attachments come "
+            "back as {index, filename, contentType} only -- never their bytes; call email_download_attachment "
+            "yourself for one specific attachment only when its actual content is needed." + _ACCOUNT_PARAM_NOTE,
             {
                 **_CREDENTIAL_PARAMS, "folder": str | None, "sinceIso": str | None, "untilIso": str | None,
                 "unseenOnly": bool | None, "query": str | None, "limit": int | None,
