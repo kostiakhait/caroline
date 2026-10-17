@@ -52,6 +52,7 @@ from app.signal_channel import (
     update_group_members,
 )
 from app.workspace_dir import WORKSPACE_DIR
+from app.context_cap import cap_count
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -82,6 +83,7 @@ async def signal_list_contacts(args: dict[str, Any], _rp: Any) -> dict[str, Any]
         contacts = await list_contacts(account)
     except SignalError as exc:
         return {"text": str(exc), "is_error": True}
+    contacts, _cut = cap_count(contacts)
     return {"text": str(contacts)}
 
 
@@ -178,6 +180,7 @@ async def signal_list_groups(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         groups = await list_groups(account)
     except SignalError as exc:
         return {"text": str(exc), "is_error": True}
+    groups, _cut = cap_count(groups)
     return {"text": str(groups)}
 
 
@@ -193,6 +196,7 @@ async def signal_find_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     except SignalError as exc:
         return {"text": str(exc), "is_error": True}
     matches = await find_by_name(query, groups)
+    matches, _cut = cap_count(matches)
     return {"text": str(matches)}
 
 

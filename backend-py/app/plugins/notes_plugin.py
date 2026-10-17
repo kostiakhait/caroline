@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from app.context_cap import cap_count, truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.policies import (
     notes_folder_fallback_instruction,
@@ -322,17 +323,33 @@ async def notes_whoami(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 async def notes_list(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     entries = await _sessions.with_session(lambda session: list_notes(session, folder=args.get("folder"), include_deleted=bool(args.get("includeDeleted"))))
-    return {"text": json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)}
+    entries, cut = cap_count(entries)
+    text = json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)
+    if cut:
+        text += f"\n\n[... {cut} more note(s) not shown; narrow with a folder or notes_search ...]"
+    return {"text": text}
 
 
 async def notes_search(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     entries = await _sessions.with_session(lambda session: search_notes(session, args["query"], folder=args.get("folder"), include_deleted=bool(args.get("includeDeleted"))))
-    return {"text": json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)}
+    entries, cut = cap_count(entries)
+    text = json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)
+    if cut:
+        text += f"\n\n[... {cut} more match(es) not shown; narrow the query ...]"
+    return {"text": text}
 
 
 async def notes_get(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit): a note's
+    # text could be any length, no cap at all -- same shape as the email body fix
+    # (email_plugin.EMAIL_BODY_MAX_CHARS/bodyOffset), reusing the same context_cap.truncate.
     note = await _sessions.with_session(lambda session: get_note(session, args["id"]))
-    return {"text": json.dumps({"id": note["id"], "text": note.get("text", ""), "folder": note.get("folder") or "", "updatedAt": note.get("updatedAt"), "deleted": bool(note.get("deleted"))}, indent=2, ensure_ascii=False)}
+    body, trunc_note = truncate(note.get("text", ""), offset=int(args.get("offset") or 0))
+    payload = {"id": note["id"], "text": body, "folder": note.get("folder") or "", "updatedAt": note.get("updatedAt"), "deleted": bool(note.get("deleted"))}
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    if trunc_note:
+        text += "\n\n" + trunc_note
+    return {"text": text}
 
 
 async def notes_create(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -444,8 +461,10 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "notes_get",
-            "Fetches a single note's full text and metadata by id.",
-            {"id": str}, notes_get,
+            "Fetches a single note's text and metadata by id. A note longer than "
+            "20000 characters comes back truncated with a note telling you how long it really "
+            "is and what `offset` to call again with to keep reading.",
+            {"id": str, "offset": int | None}, notes_get,
         ),
         PluginTool(
             "notes_create",

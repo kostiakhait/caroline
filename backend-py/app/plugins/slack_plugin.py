@@ -29,6 +29,7 @@ from app.slack_channel import (
     run_oauth_login,
 )
 from app.workspace_dir import WORKSPACE_DIR
+from app.context_cap import truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -196,7 +197,7 @@ async def slack_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any
         return error
     query = str(args["query"]).strip()
     channel = args.get("channel")
-    count = int(args.get("limit") or 20)
+    count = min(int(args.get("limit") or 20), 200)
     try:
         if channel:
             # A specific channel's own recent history, filtered client-side --
@@ -219,6 +220,11 @@ async def slack_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any
             ]
     except SlackApiError as exc:
         return {"text": f"Slack API error: {exc.response.get('error', str(exc))}", "is_error": True}
+    # Defensive cap (2026-10-16, full-plugin context-overflow audit): count is bounded but
+    # each message's own text was untruncated.
+    for r in rows:
+        if isinstance(r.get("text"), str):
+            r["text"], _note = truncate(r["text"])
     return {"text": str(rows)}
 
 

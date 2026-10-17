@@ -67,6 +67,7 @@ from app.telegram_channel import (
     unblock_user,
 )
 from app.workspace_dir import WORKSPACE_DIR
+from app.context_cap import cap_batch, cap_count, skipped_note, truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -219,7 +220,7 @@ async def telegram_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if not_ready:
         return not_ready
     client = get_live_client(account)
-    limit = int(args.get("limit") or 50)
+    limit = min(int(args.get("limit") or 50), 500)
     dialogs = await client.get_dialogs(limit=limit)
     rows = [
         {"id": d.id, "name": d.name, "isGroup": d.is_group, "isChannel": d.is_channel, "unread": d.unread_count}
@@ -242,13 +243,14 @@ async def telegram_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     # A much higher cap than telegram_list_chats' own default (50) -- this
     # tool exists specifically so a chat far down the dialog list is still
     # found, not just whatever happens to be most recently active.
-    limit = int(args.get("limit") or 500)
+    limit = min(int(args.get("limit") or 500), 2000)
     dialogs = await client.get_dialogs(limit=limit)
     rows = [
         {"id": d.id, "name": d.name, "isGroup": d.is_group, "isChannel": d.is_channel, "unread": d.unread_count}
         for d in dialogs
     ]
     matches = await find_by_name(query, rows)
+    matches, _cut = cap_count(matches)
     return {"text": str(matches)}
 
 
@@ -298,11 +300,20 @@ async def telegram_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, 
     except (TypeError, ValueError):
         return {"text": "chat must be the numeric chat id from telegram_list_chats -- Telethon has no single-call global search across every chat (unlike Slack), only per-chat.", "is_error": True}
     query = str(args["query"]).strip()
-    limit = int(args.get("limit") or 20)
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit, same incident
+    # as email_batch_plugin.py's own fix): `limit` had no hard ceiling, and every matched
+    # message's FULL raw_text went back with no truncation and no total-char budget -- the
+    # same "many full bodies, one call" shape as the email-batch incident.
+    limit = min(int(args.get("limit") or 20), 200)
     rows = []
     async for m in client.iter_messages(chat_id, search=query, limit=limit):
-        rows.append({"id": m.id, "date": m.date.isoformat() if m.date else None, "text": m.raw_text})
-    return {"text": str(rows)}
+        text, _note = truncate(m.raw_text or "")
+        rows.append({"id": m.id, "date": m.date.isoformat() if m.date else None, "text": text})
+    included, skipped = cap_batch(rows, lambda r: r["text"], lambda r: str(r["id"]))
+    lines = [str(included)]
+    if skipped:
+        lines.append(skipped_note(skipped, 200_000, "Narrow the query or search a smaller limit to see the rest in full."))
+    return {"text": "\n\n".join(lines)}
 
 
 async def telegram_delete_contact(args: dict[str, Any], _rp: Any) -> dict[str, Any]:

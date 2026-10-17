@@ -45,6 +45,7 @@ from app.whatsapp_channel import (
     update_group_participants,
 )
 from app.workspace_dir import WORKSPACE_DIR
+from app.context_cap import cap_count
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -88,6 +89,7 @@ async def whatsapp_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         chats = await list_chats(account)
     except WhatsAppError as exc:
         return {"text": str(exc), "is_error": True}
+    chats, _cut = cap_count(chats)
     return {"text": str(chats)}
 
 
@@ -103,6 +105,7 @@ async def whatsapp_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     except WhatsAppError as exc:
         return {"text": str(exc), "is_error": True}
     matches = await find_by_name(query, chats)
+    matches, _cut = cap_count(matches)
     return {"text": str(matches)}
 
 

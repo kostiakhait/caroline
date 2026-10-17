@@ -14,20 +14,29 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.context_cap import cap_count, truncate
 from app.event_memory import forget_event, remember_event, search_events
 from app.plugins.loader import Plugin, PluginTool
 from app.workspace_dir import WORKSPACE_DIR
 
 
 def _event_dict(event: Any) -> dict[str, Any]:
-    return {"id": event.id, "text": event.text, "dueAtIso": event.due_at_iso, "source": event.source}
+    text, _note = truncate(event.text or "")
+    return {"id": event.id, "text": text, "dueAtIso": event.due_at_iso, "source": event.source}
 
 
 async def event_memory_recall(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    # Bug fix (2026-10-16, full-plugin context-overflow audit): an empty query returns
+    # EVERY stored event, with no count cap and no per-item text cap (retention was
+    # time-based only).
     events = search_events(WORKSPACE_DIR, args.get("query") or "")
     if not events:
         return {"text": "No matching events in event memory."}
-    return {"text": json.dumps([_event_dict(e) for e in events], ensure_ascii=False)}
+    events, cut = cap_count(events)
+    text = json.dumps([_event_dict(e) for e in events], ensure_ascii=False)
+    if cut:
+        text += f"\n\n[... {cut} more event(s) not shown; narrow with a query ...]"
+    return {"text": text}
 
 
 async def event_memory_remember(args: dict[str, Any], _rp: Any) -> dict[str, Any]:

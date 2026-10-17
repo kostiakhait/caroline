@@ -60,6 +60,7 @@ from typing import Any
 import httpx
 
 from app.http_tls import ssl_context
+from app.context_cap import truncate
 from app import memory_save_queue
 from app import memory_turns
 from app.logging_setup import log_event
@@ -632,7 +633,7 @@ async def _run_memory_query(query: str, history: int | None = None) -> dict[str,
     except Exception as exc:  # noqa: BLE001 -- what was already found is still worth giving
         log_event("plugin:memory", "request_poll_failed", error=str(exc))
         found = _merge_parts(read.parts)
-        return {"text": f"The memory request failed while reading: {exc}" + (f"\nFound before that: {json.dumps({'results': found}, ensure_ascii=False)}" if found else ""),
+        return {"text": _capped_text(f"The memory request failed while reading: {exc}" + (f"\nFound before that: {json.dumps({'results': found}, ensure_ascii=False)}" if found else "")),
                 "is_error": True}
     await _refresh_topics_if_stale()
     _cache_topics_from_parts(read.parts)
@@ -645,18 +646,28 @@ async def _run_memory_query(query: str, history: int | None = None) -> dict[str,
                  "with what you have.")
         if not results:
             return {"text": f'Nothing found yet for "{query}" within {int(SOFT_READ_TIMEOUT_S)} s. {later}'}
-        return {"text": json.dumps({"status": "partial", "results": results}, ensure_ascii=False) + "\n" + later}
+        return {"text": _capped_text(json.dumps({"status": "partial", "results": results}, ensure_ascii=False)) + "\n" + later}
     final = read.final
     log_event("plugin:memory", "request_finished", trace_id=params["traceId"], status=final.get("status"), error=final.get("error"))
     reaction = await _react_to_status(final)
     failure = _failure_text(final, "The memory request")
     if failure:
-        return {"text": " ".join(filter(None, [failure, reaction])) + ("\n" + json.dumps({"results": results}, ensure_ascii=False) if results else ""),
+        return {"text": _capped_text(" ".join(filter(None, [failure, reaction])) + ("\n" + json.dumps({"results": results}, ensure_ascii=False) if results else "")),
                 "is_error": True}
     if not results:
         return {"text": f'Memory holds nothing relevant to "{query}".'}
     await _expand_notes_candidates(results)
-    return {"text": json.dumps({"status": final.get("status"), "results": results}, ensure_ascii=False)}
+    # Bug fix (2026-10-16, full-plugin context-overflow audit): merges every "facts"/
+    # "documents" part across possibly many sources/pages with no total-char budget --
+    # same shape as the email-batch incident (many full results, one call).
+    return {"text": _capped_text(json.dumps({"status": final.get("status"), "results": results}, ensure_ascii=False))}
+
+
+def _capped_text(text: str) -> str:
+    window, note = truncate(text)
+    if note is None:
+        return text
+    return window + "\n\n[... truncated: unusually large reply; narrow the query ...]"
 
 
 def _cache_topics_from_parts(parts: list[dict[str, Any]]) -> None:
@@ -966,7 +977,20 @@ async def _read_document(document: str, section: Any, offset: Any, save_file_to:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(base64.b64decode(content or ""))
         output["file"] = f"saved to {target}"
-    return {"text": json.dumps(output, ensure_ascii=False)}
+    return {"text": _capped_output_json(output)}
+
+
+def _capped_output_json(output: dict[str, Any]) -> str:
+    # Defensive cap (2026-10-16, full-plugin context-overflow audit): memory:document/
+    # memory:material already page server-side (section/offset, reforce's own
+    # MEMORY_DOCUMENTS_SECTION_PAGE_CHARS) -- this is a client-side backstop in case that
+    # server-side cap is ever misconfigured or a different server is pointed at, same
+    # "never trust the server alone" reasoning as every other fix in this pass.
+    text = json.dumps(output, ensure_ascii=False)
+    window, note = truncate(text)
+    if note is None:
+        return text
+    return window + "\n\n[... truncated: unusually large reply; pass a smaller `offset`/narrower `section` ...]"
 
 
 async def _read_material(topic: str, material: str, offset: Any, save_file_to: Any) -> dict[str, Any]:
@@ -990,7 +1014,7 @@ async def _read_material(topic: str, material: str, offset: Any, save_file_to: A
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(base64.b64decode(content))
             output["file"] = f"saved to {target}"
-    return {"text": json.dumps(output, ensure_ascii=False)}
+    return {"text": _capped_output_json(output)}
 
 
 _USAGE_INSTRUCTIONS = (

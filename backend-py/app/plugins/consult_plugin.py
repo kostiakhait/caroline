@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.context_cap import truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import load_credentials, verify_password
 from app.plugins.sw_api import CAROLINE_SW_KEY, call_v2
@@ -33,7 +34,11 @@ async def consult_large_model(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     advice = result.get("result")
     if not isinstance(advice, str):
         raise RuntimeError("consult_large_model (ai:resolve) failed: no result text returned")
-    return {"text": advice}
+    # Defensive cap (2026-10-16, full-plugin context-overflow audit): the model's own reply
+    # is ordinarily nowhere near this size, but nothing upstream guarantees that -- a no-op
+    # in the normal case.
+    window, note = truncate(advice)
+    return {"text": window if note is None else window + "\n\n[... advice truncated: unusually long reply ...]"}
 
 
 def _usage_instructions() -> str:

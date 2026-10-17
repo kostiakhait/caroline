@@ -85,6 +85,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.context_cap import cap_batch, cap_count, skipped_note, truncate
 from app.logging_setup import log_event
 from app.plugins.companion_api import (
     AmbiguousDeviceError,
@@ -244,7 +245,17 @@ async def companion_read_sms_thread(args: dict[str, Any], report_progress: Any) 
     messages = list_messages(store, thread_id)
     if messages is None:
         return {"text": f"No SMS thread found for '{thread_id}' -- get a thread_id from companion_list_sms_threads first.", "is_error": True}
-    return {"text": _json({"lastSyncedAt": last_synced_at(store), "messages": messages})}
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit, same
+    # incident as email_batch_plugin.py's own fix): returned EVERY message in a thread,
+    # no count limit, no truncation -- the same "many full bodies, one call" shape.
+    for m in messages:
+        if isinstance(m.get("body"), str):
+            m["body"], _note = truncate(m["body"])
+    included, skipped = cap_batch(messages, lambda m: str(m.get("body") or ""), lambda m: str(m.get("date")))
+    result_text = _json({"lastSyncedAt": last_synced_at(store), "messages": included})
+    if skipped:
+        result_text += "\n\n" + skipped_note(skipped, 200_000, "This thread has more messages than fit in one call; ask for a narrower range if you need them.")
+    return {"text": result_text}
 
 
 async def companion_search_sms_local(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -255,12 +266,15 @@ async def companion_search_sms_local(args: dict[str, Any], report_progress: Any)
     address = args.get("address")
     if not query and not address:
         return {"text": "Give at least one of 'query' (text to search for) or 'address' (a number to filter to).", "is_error": True}
-    limit = int(args.get("limit") or 50)
+    limit = min(int(args.get("limit") or 50), 200)
     # Local copy (companion_sms_store.py) -- instant, no phone round trip.
     # See this module's own header comment for why this is tried BEFORE
     # companion_search_sms, not the other way round.
     store = load_store(WORKSPACE_DIR)
     results = search_messages(store, query=str(query) if query else None, address=str(address) if address else None, limit=limit)
+    for m in results:
+        if isinstance(m.get("body"), str):
+            m["body"], _note = truncate(m["body"])
     return {"text": _json({"lastSyncedAt": last_synced_at(store), "messages": results})}
 
 
@@ -272,7 +286,15 @@ async def companion_list_contacts(args: dict[str, Any], report_progress: Any) ->
         contacts = await _contacts_request(args.get("fromNumber"), {"op": "list"}, report_progress)
     except (PhoneUnreachableError, AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
         return {"text": _device_error_text(exc) if not isinstance(exc, PhoneUnreachableError) else str(exc), "is_error": True}
-    return {"text": _json(contacts)}
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit): no limit
+    # parameter exists at all here, and companion_api.py's own multi-device fan-out
+    # concatenates every paired phone's contacts with no merge-size cap either -- capped
+    # here instead, after the fan-out, so it applies regardless of device count.
+    contacts, cut = cap_count(contacts)
+    text = _json(contacts)
+    if cut:
+        text += f"\n\n[... {cut} more contact(s) not shown; use companion_search_contacts to narrow ...]"
+    return {"text": text}
 
 
 async def companion_search_contacts(args: dict[str, Any], report_progress: Any) -> dict[str, Any]:
@@ -286,6 +308,7 @@ async def companion_search_contacts(args: dict[str, Any], report_progress: Any) 
         contacts = await _contacts_request(args.get("fromNumber"), {"op": "search", "query": query}, report_progress)
     except (PhoneUnreachableError, AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
         return {"text": _device_error_text(exc) if not isinstance(exc, PhoneUnreachableError) else str(exc), "is_error": True}
+    contacts, _cut = cap_count(contacts)
     return {"text": _json(contacts)}
 
 
@@ -327,6 +350,7 @@ async def companion_search_contacts_local(args: dict[str, Any], report_progress:
             matched_labels = await fuzzy_match(query, candidates)
             if matched_labels:
                 results = [pool[int(label)] for label in matched_labels if label.isdigit() and int(label) < len(pool)]
+    results, _cut = cap_count(results)
     return {"text": _json({"lastSyncedAt": contacts_last_synced_at(store), "contacts": results})}
 
 
@@ -411,12 +435,26 @@ async def companion_search_sms(args: dict[str, Any], report_progress: Any) -> di
     address = args.get("address")
     if not query and not address:
         return {"text": "Give at least one of 'query' (text to search for) or 'address' (a number to filter to).", "is_error": True}
-    limit = args.get("limit")
+    raw_limit = args.get("limit")
+    limit = min(int(raw_limit), 200) if raw_limit else 50
     payload = {"op": "search", "query": query, "address": address, "limit": limit}
     try:
         result = await _device_request("sms_query", args.get("fromNumber"), payload, report_progress)
     except (PhoneUnreachableError, AmbiguousDeviceError, UnknownDeviceError, NoPairedDeviceError) as exc:
         return {"text": _device_error_text(exc) if not isinstance(exc, PhoneUnreachableError) else str(exc), "is_error": True}
+    # Bug fix (2026-10-16): `limit` was forwarded to the phone but never enforced here,
+    # and multi-device fan-out (companion_api.py) can multiply it again -- capped
+    # defensively on whatever shape comes back, same as companion_search_sms_local.
+    messages = result.get("messages") if isinstance(result, dict) else result if isinstance(result, list) else None
+    if isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, dict) and isinstance(m.get("body"), str):
+                m["body"], _note = truncate(m["body"])
+        capped, _cut = cap_count(messages)
+        if isinstance(result, dict):
+            result["messages"] = capped
+        else:
+            result = capped
     return {"text": _json(result)}
 
 

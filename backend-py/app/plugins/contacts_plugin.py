@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.context_cap import cap_count, truncate
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, SwApiError, call_v2
@@ -192,7 +193,11 @@ _ADDRESS_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
 
 async def contact_list(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     entries = await _sessions.with_session(lambda s: list_contacts(s, tag=args.get("tag"), include_deleted=bool(args.get("includeDeleted"))))
-    return {"text": json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)}
+    entries, cut = cap_count(entries)
+    text = json.dumps([_summarize(e) for e in entries], indent=2, ensure_ascii=False)
+    if cut:
+        text += f"\n\n[... {cut} more contact(s) not shown; narrow with a tag or contact_search ...]"
+    return {"text": text}
 
 
 async def _address_book(command: str, doing: str, **params: Any) -> dict[str, Any]:
@@ -266,7 +271,12 @@ async def contact_search(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 async def contact_get(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    # Bug fix (2026-10-16, full-plugin context-overflow audit): the freeform "notes" field
+    # has no cap -- lower risk than a note/email body (contact notes are usually short) but
+    # still unbounded by design.
     contact = await _sessions.with_session(lambda s: get_contact(s, args["id"]))
+    if isinstance(contact.get("notes"), str):
+        contact["notes"], _note = truncate(contact["notes"])
     return {"text": json.dumps(contact, indent=2, ensure_ascii=False)}
 
 

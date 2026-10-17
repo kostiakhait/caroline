@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.context_cap import truncate
 from app.login_api import get_cached_v2_session
 from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
@@ -63,7 +64,15 @@ async def _anvar(query: str, timeout: float = 30.0) -> tuple[Any, str | None]:
 
 
 def _ok(result: Any) -> dict[str, Any]:
-    return {"text": json.dumps(result, ensure_ascii=False)}
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit):
+    # anvar_list_agents/operations/threads/recipients can grow unboundedly over an
+    # agent's lifetime with no cap anywhere -- truncated here, the one chokepoint
+    # every anvar_* tool's result passes through, a no-op for every small result.
+    text = json.dumps(result, ensure_ascii=False)
+    window, note = truncate(text)
+    if note is None:
+        return {"text": text}
+    return {"text": window + "\n\n[... result truncated: too large to return in full; narrow with a more specific filter/id ...]"}
 
 
 def _err(message: str) -> dict[str, Any]:

@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.context_cap import cap_batch, skipped_note, truncate
 from app.deprecated_memory import READ_PREFIX
 from app.durability import load_chat_mode
 from app.plugins.loader import Plugin, PluginTool
@@ -138,12 +139,22 @@ async def recall_memory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if not ids:
         return {"text": f'Nothing relevant found for "{query}" across {len(candidates)} stored note(s).'}
 
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit, same
+    # incident as email_batch_plugin.py's own fix): joined every selected note's FULL
+    # body with no per-note truncation and no total budget -- the same "many full
+    # bodies, one call" shape as the email-batch incident.
     by_id = {c["id"]: c for c in candidates}
-    bodies = []
+    entries = []
     for note_id in ids:
         note = await _sessions.with_session(lambda session, nid=note_id: get_note(session, nid))
-        bodies.append(f'"{by_id[note_id]["title"]}" (folder: {by_id[note_id]["folder"] or "(none)"}):\n{note.get("text", "")}')
-    return {"text": "\n\n---\n\n".join(bodies)}
+        body, _note_hint = truncate(note.get("text", ""))
+        entries.append({"id": note_id, "title": by_id[note_id]["title"], "folder": by_id[note_id]["folder"] or "(none)", "body": body})
+    included, skipped = cap_batch(entries, lambda e: e["body"], lambda e: e["title"])
+    bodies = [f'"{e["title"]}" (folder: {e["folder"]}):\n{e["body"]}' for e in included]
+    text = "\n\n---\n\n".join(bodies)
+    if skipped:
+        text += "\n\n" + skipped_note(skipped, 200_000, "Fetch these individually with notes_get if you actually need them.")
+    return {"text": text}
 
 
 PLUGIN = Plugin(

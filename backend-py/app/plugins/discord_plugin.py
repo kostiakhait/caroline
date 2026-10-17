@@ -16,6 +16,7 @@ import discord
 
 from app.discord_channel import get_live_client, has_discord_token, set_discord_token
 from app.workspace_dir import WORKSPACE_DIR
+from app.context_cap import truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -146,11 +147,12 @@ async def discord_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, A
         return {"text": "channel must be the numeric channel/DM id -- Discord has no bot-accessible cross-channel search.", "is_error": True}
     channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
     query = str(args["query"]).strip().lower()
-    limit = int(args.get("limit") or 20)
+    limit = min(int(args.get("limit") or 20), 200)
     rows = []
     async for m in channel.history(limit=200):
         if query in (m.content or "").lower():
-            rows.append({"id": m.id, "author": str(m.author), "createdAt": m.created_at.isoformat(), "text": m.content})
+            text, _note = truncate(m.content or "")
+            rows.append({"id": m.id, "author": str(m.author), "createdAt": m.created_at.isoformat(), "text": text})
             if len(rows) >= limit:
                 break
     return {"text": str(rows)}

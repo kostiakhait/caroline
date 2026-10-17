@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.context_cap import cap_batch, cap_count, skipped_note, truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 from app.plugins.notes_api import load_credentials
@@ -87,7 +88,11 @@ async def ensure_ratatosk_own_account(_args: dict[str, Any], _rp: Any) -> dict[s
 async def ratatosk_list_conversations(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     session, sender_email = await resolve_ratatosk_session(args.get("account") or DEFAULT_ACCOUNT)
     conversations = await list_conversations(session, sender_email)
-    return {"text": json.dumps(conversations, ensure_ascii=False)}
+    conversations, cut = cap_count(conversations)
+    text = json.dumps(conversations, ensure_ascii=False)
+    if cut:
+        text += f"\n\n[... {cut} more conversation(s) not shown; narrow with ratatosk_find_conversation ...]"
+    return {"text": text}
 
 
 async def ratatosk_find_conversation(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -97,13 +102,25 @@ async def ratatosk_find_conversation(args: dict[str, Any], _rp: Any) -> dict[str
     session, sender_email = await resolve_ratatosk_session(args.get("account") or DEFAULT_ACCOUNT)
     conversations = await list_conversations(session, sender_email)
     matches = await find_by_name(query, conversations)
+    matches, _cut = cap_count(matches)
     return {"text": json.dumps(matches, ensure_ascii=False)}
 
 
 async def ratatosk_get_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    # Bug fix (2026-10-16), confirmed live: this used to return every message of
+    # `days` days concatenated with NO cap at all -- not even a message-count limit,
+    # the single most exposed tool found in the full-plugin context-overflow audit
+    # (see email_batch_plugin.py's own 2026-10-16 fix for the original incident).
     session, _sender_email = await resolve_ratatosk_session(args.get("account") or DEFAULT_ACCOUNT)
     messages = await get_recent_messages(session, args["groupId"], args.get("days") or 2)
-    return {"text": json.dumps(messages, ensure_ascii=False)}
+    for m in messages:
+        if isinstance(m.get("text"), str):
+            m["text"], _note = truncate(m["text"])
+    included, skipped = cap_batch(messages, lambda m: str(m.get("text") or ""), lambda m: str(m.get("id") or m.get("ts")))
+    lines = [json.dumps(included, ensure_ascii=False)]
+    if skipped:
+        lines.append(skipped_note(skipped, 200_000, "Call again with a smaller `days` to see the rest in full."))
+    return {"text": "\n\n".join(lines)}
 
 
 async def ratatosk_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:

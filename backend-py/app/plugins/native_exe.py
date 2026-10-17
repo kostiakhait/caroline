@@ -20,6 +20,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from app.context_cap import truncate
+
 NATIVE_TOOLS_DIR = Path(
     os.environ.get("CAROLINE_NATIVE_TOOLS_DIR", r"D:\REPO\caroline\backend\mcp-servers-src")
 )
@@ -49,7 +51,19 @@ async def run_exe(exe: Path, args: list[str]) -> str:
         raise
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode(errors="replace").strip() or f"{exe.name} exited with code {proc.returncode}")
-    return stdout.decode(errors="replace").strip()
+    # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit): this is
+    # the one chokepoint every native-exe-backed plugin's output passes through (inspect.exe's
+    # full UI-Automation dump of a busy desktop/deep control tree, in particular, has no
+    # natural size ceiling) -- truncating HERE covers inspect_plugin.py, chain_plugin.py, and
+    # window_screenshot_plugin.py's own output in one place, same reasoning as email_
+    # get_message being email_read_range's shared worker. A no-op for every tiny-output
+    # caller (mouse/keyboard/position ack strings never come close to the cap). No
+    # continuation offset here (unlike truncate()'s usual note) -- re-invoking the exe can't
+    # resume mid-output the way a paginated read can, so the note just says what happened.
+    text, note = truncate(stdout.decode(errors="replace").strip())
+    if note is None:
+        return text
+    return text + "\n\n[... output truncated: too large to return in full; narrow what you're asking for (a specific window/control instead of the whole desktop) ...]"
 
 
 def parse_position(output: str) -> dict[str, int]:
