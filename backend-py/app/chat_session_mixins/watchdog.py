@@ -138,12 +138,13 @@ class WatchdogMixin:
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
-                    self._pending_tool_calls[block.id] = block.name
+                    args_preview = json.dumps(block.input, ensure_ascii=False, default=str)[:120] if isinstance(block.input, dict) else str(block.input)[:120]
+                    self._pending_tool_calls[block.id] = (block.name, args_preview)
             return
         if isinstance(message, UserMessage) and isinstance(message.content, list):
             for block in message.content:
                 if isinstance(block, ToolResultBlock):
-                    tool_name = self._pending_tool_calls.pop(block.tool_use_id, None) or "unknown_tool"
+                    tool_name, args_preview = self._pending_tool_calls.pop(block.tool_use_id, None) or ("unknown_tool", "")
                     content = block.content
                     if isinstance(content, list):
                         # SDK's own shape here is raw dicts (e.g.
@@ -161,6 +162,7 @@ class WatchdogMixin:
                     preview = preview.strip()[:300]
                     self.turn_tool_outcomes[tool_name] = ToolOutcome(
                         name=tool_name, is_error=bool(block.is_error), result_preview=preview,
+                        arguments_preview=args_preview,
                     )
     def _turn_outcomes_summary(self) -> str:
         """Ground-truth text for the current real-user episode's tool calls

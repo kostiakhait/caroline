@@ -400,12 +400,14 @@ class ChatSession(
         # view, and the whole point is remembering a tool failure ACROSS
         # those follow-ups until it's genuinely resolved (a later call to the
         # SAME tool succeeding overwrites/clears the earlier failure -- see
-        # turn_tool_outcomes' own key). _pending_tool_calls is the id->name
-        # scratch space bridging a ToolUseBlock to its eventual
+        # turn_tool_outcomes' own key). _pending_tool_calls is the id->(name,
+        # arguments_preview) scratch space bridging a ToolUseBlock to its eventual
         # ToolResultBlock; population happens once, at the top of _run_loop's
         # per-message handling, off the raw SDK objects both engines produce
-        # identically -- see ToolOutcome's own docstring.
-        self._pending_tool_calls: dict[str, str] = {}
+        # identically -- see ToolOutcome's own docstring. arguments_preview added
+        # 2026-10-17 so the progress narrator can see what a running call is
+        # actually doing (see _narration_action_facts), not just its name.
+        self._pending_tool_calls: dict[str, tuple[str, str]] = {}
         self.turn_tool_outcomes: dict[str, ToolOutcome] = {}
         # Every narration remark actually SENT this real-user episode (2026-10-11,
         # ported from a teammate's branch) -- lets the drafting prompt see its own

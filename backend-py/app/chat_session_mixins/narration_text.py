@@ -11,8 +11,16 @@ class TextNarrationMixin:
         stays silent rather than invent anything from the conversation."""
         if self.small_model_active:
             return "\n".join(self.small_model_activity[-8:]) or None
-        # Counts only, never tool names: the narrator reports task status to the
-        # user in plain words and must not surface internal machinery.
+        # Per-call lines, same "Tool call X (arguments: ...); result: ..." shape
+        # small_model_engine.py's own emit() already produces for the small-model
+        # path above -- the narrator prompt's few-shot examples (_progress_comment_
+        # prompt) are tuned against exactly this shape and already instruct the
+        # model to turn it into plain words without ever naming the machinery, so
+        # reusing it here (2026-10-17) needed no prompt change. Before this, this
+        # branch reduced everything to bare counts ("Steps in progress: 2") --
+        # the narrator then had nothing concrete to vary between remarks and just
+        # paraphrased the same vague sentence (confirmed live, see the screenshot
+        # this fixes: 6 near-identical "proverila Upwork" remarks in a row).
         #
         # Bug fix (2026-10-11), confirmed live: every plugin tool call goes
         # through dispatch() (app/operations.py), which answers the SDK
@@ -24,16 +32,19 @@ class TextNarrationMixin:
         # running" to the narrator for its entire actual duration. REGISTRY
         # is the same per-tab ground truth ChatSession.stop()'s own
         # cancel_for_tab already relies on for "what's really running".
-        running = len(self._pending_tool_calls) + len(REGISTRY.running_for_tab(self.tab_id))
+        running_calls = list(self._pending_tool_calls.values())
+        running_agents = REGISTRY.running_for_tab(self.tab_id)
         finished = list(self.turn_tool_outcomes.values())
-        if not running and not finished:
+        if not running_calls and not running_agents and not finished:
             return None
         lines: list[str] = []
-        if running:
-            lines.append(f"Steps in progress right now: {running}")
-        if finished:
-            failed = sum(1 for o in finished if o.is_error)
-            lines.append(f"Steps completed so far this turn: {len(finished) - failed} succeeded, {failed} failed")
+        for name, args_preview in running_calls:
+            lines.append(f"Tool call {name} started (arguments: {args_preview}).")
+        for op in running_agents:
+            lines.append(f"Tool call {op.tool_name} is still running in the background.")
+        for outcome in finished:
+            result = "ERROR: " + outcome.result_preview if outcome.is_error else outcome.result_preview
+            lines.append(f"Tool call {outcome.name} (arguments: {outcome.arguments_preview}); result: {result}")
         return "\n".join(lines)
     def _narration_task(self) -> str:
         """The user's request for the current task -- the one thing the narrator

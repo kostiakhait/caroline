@@ -1528,6 +1528,14 @@ class ToolOutcome:
     name: str
     is_error: bool
     result_preview: str
+    # Added 2026-10-17 for the progress narrator (see _narration_action_facts'
+    # own comment) -- same json.dumps(input)[:120] preview small_model_engine.py's
+    # emit() already uses for its own "Tool call X (arguments: ...)" activity
+    # lines, so both paths feed the narrator prompt the exact shape its few-shot
+    # examples were tuned against. Optional/defaulted: every OTHER reader of
+    # ToolOutcome (the recovery-nudge summary) only ever needed name/is_error/
+    # result_preview, so this stays additive rather than touching their call sites.
+    arguments_preview: str = ""
 
 
 def _format_exception_chain(exc: BaseException) -> str:
