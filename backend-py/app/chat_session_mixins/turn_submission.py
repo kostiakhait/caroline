@@ -75,7 +75,21 @@ class TurnSubmissionMixin:
             self._post_turn_check_rounds = 0
             self._post_turn_checks_halted = False
         self.classifier_refusal_retry_count = 0
-        self.pending_user_text = text
+        # Bug fix (2026-10-17), confirmed live -- tab 1, a real incident: this
+        # used to be unconditional, same root cause as pending_is_real_user's
+        # own 2026-09-15 fix just below, but for the text itself. A real user
+        # question set this; while that same turn was still pending (stuck on
+        # a broken OpenAI token, then a Claude rate limit), a proactive
+        # silent_user_wait_nudge fired submit(is_real_user=False) and
+        # overwrote this back to the nudge's own text. When the turn was then
+        # hard-killed and _handle_failure replayed self.pending_user_text
+        # (handle_failure_replay_pending), it replayed the NUDGE, not the
+        # user's real question -- which was gone, silently, with no error and
+        # no indication to the user. Same guard as pending_is_real_user: a
+        # proactive/internal nudge injected INTO an already-pending turn must
+        # never clobber the text of a turn a real user already started.
+        if is_real_user or not self.turn_pending:
+            self.pending_user_text = text
         # Reset for THIS turn -- see this flag's own __init__ comment for
         # why it exists (post-turn-completion sanity check for proactive
         # turns that silently produce no content at all).
@@ -113,7 +127,12 @@ class TurnSubmissionMixin:
         # on a turn that was already in flight.
         if not self.turn_pending:
             self.current_turn_suppress_narration = suppress_narration
-        self.pending_attachments = attachments
+        # Same guard as pending_user_text just above, same incident: a real
+        # user message's attachments must not be wiped out by a later
+        # proactive nudge (normally attachment-less) arriving mid-turn --
+        # _handle_failure's replay needs the real ones still there.
+        if is_real_user or not self.turn_pending:
+            self.pending_attachments = attachments
         self.turn_pending = True
         self.last_activity = time.monotonic()
         if is_real_user:
