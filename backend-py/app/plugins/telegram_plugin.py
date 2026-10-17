@@ -112,6 +112,15 @@ def _account_or_error(args: dict[str, Any]) -> tuple[str, dict[str, Any] | None]
     return account, None
 
 
+def _display_id(resolved: Any) -> Any:
+    """_resolve_chat may now return a full Telethon entity (the username
+    path, see its own docstring) instead of a bare int -- this is what
+    every f-string below shows the model, so a resolved entity's own
+    .id prints the same plain number a numeric chat id always did,
+    instead of the entity object's verbose repr."""
+    return getattr(resolved, "id", resolved)
+
+
 def _not_ready(account: str) -> dict[str, Any] | None:
     if not app_configured():
         return {"text": NOT_AVAILABLE, "is_error": True}
@@ -120,7 +129,7 @@ def _not_ready(account: str) -> dict[str, Any] | None:
     return None
 
 
-async def _resolve_chat(client: Any, raw: str) -> tuple[int | None, dict[str, Any] | None]:
+async def _resolve_chat(client: Any, raw: str) -> tuple[int | Any | None, dict[str, Any] | None]:
     """A numeric chat id as given; a Telegram @username resolved directly
     (no contact-adding needed -- unlike a phone number, Telegram's username
     lookup (contacts.ResolveUsername) has no "must already know this person"
@@ -151,7 +160,20 @@ async def _resolve_chat(client: Any, raw: str) -> tuple[int | None, dict[str, An
                 "text": f'Telegram found no account at username "{raw}" (or it could not be resolved right now): {exc}',
                 "is_error": True,
             }
-        return entity.id, None
+        # Per explicit instruction (2026-10-16), a real incident just after
+        # the fix above shipped: returning only entity.id (a bare int) and
+        # letting callers pass that back into send_message/send_file/etc.
+        # made the FIRST send to a just-resolved username fail with a raw
+        # OSError (Errno 22, "Invalid argument") -- a bare id forces
+        # Telethon to re-resolve it from its own entity cache a second
+        # time, a round trip the id-only numeric-chat-id path never needed
+        # (that id always came from an existing dialog, already fully
+        # cached with its access hash). Returning the entity object
+        # get_entity already fully resolved removes that whole second
+        # lookup -- every Telethon call this feeds into (send_message,
+        # send_file, block/unblock, ...) accepts a resolved entity directly,
+        # same as it accepts a bare int.
+        return entity, None
     if not _PHONE.match(raw):
         return None, {"text": "chat must be the numeric chat id from telegram_list_chats/telegram_add_contact or a proactive notification, a Telegram @username, or a phone number to message cold.", "is_error": True}
     user_id, result = await resolve_or_add_contact(client, raw)
@@ -260,7 +282,7 @@ async def telegram_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any
         return error
     text = str(args["text"])
     await client.send_message(chat_id, text)
-    return {"text": f'Sent to {chat_id} (account="{account}").'}
+    return {"text": f'Sent to {_display_id(chat_id)} (account="{account}").'}
 
 
 async def telegram_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -370,7 +392,7 @@ async def telegram_send_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         await send_file(client, chat_id, path, args.get("caption"))
     except TelegramLoginError as exc:
         return {"text": str(exc), "is_error": True}
-    return {"text": f'Sent {path} to {chat_id} (account="{account}").'}
+    return {"text": f'Sent {path} to {_display_id(chat_id)} (account="{account}").'}
 
 
 async def telegram_create_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -434,7 +456,7 @@ async def telegram_set_admin(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         await set_admin(client, chat_id, user_id, is_admin, args.get("title"))
     except TelegramLoginError as exc:
         return {"text": str(exc), "is_error": True}
-    return {"text": f'{"Promoted" if is_admin else "Demoted"} {user_id} in {chat_id} (account="{account}").'}
+    return {"text": f'{"Promoted" if is_admin else "Demoted"} {_display_id(user_id)} in {chat_id} (account="{account}").'}
 
 
 async def telegram_remove_member(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -453,7 +475,7 @@ async def telegram_remove_member(args: dict[str, Any], _rp: Any) -> dict[str, An
     if error:
         return error
     await remove_member(client, chat_id, user_id)
-    return {"text": f'Removed {user_id} from {chat_id} (account="{account}").'}
+    return {"text": f'Removed {_display_id(user_id)} from {chat_id} (account="{account}").'}
 
 
 async def telegram_delete_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
