@@ -6,12 +6,24 @@ scaled down (SCALE) so a multi-minute turn runs in seconds; all checks are in th
 scaled units converted back to real seconds."""
 import ast, asyncio, os, sys, time, types
 
-SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app", "chat_session.py")
+# Split 2026-10-17: the voice-narration methods/constants this sim extracts
+# verbatim used to all live in chat_session.py itself. They now live in
+# chat_session_shared.py (module-level constants/helpers, imported by every
+# mixin) and app/chat_session_mixins/{narration_text,narration_voice}.py
+# (the methods, split by subsystem -- see those mixins' own ChatSession.__mro__
+# for how they recombine at runtime). Read from all three.
+APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app")
+SHARED_SRC = os.path.join(APP_DIR, "chat_session_shared.py")
+MIXIN_SRCS = [
+    os.path.join(APP_DIR, "chat_session_mixins", "narration_text.py"),
+    os.path.join(APP_DIR, "chat_session_mixins", "narration_voice.py"),
+]
+SRC = SHARED_SRC  # used below only as the `filename` compile() reports on error
 SCALE = 0.05  # 1 real second -> 0.05 s of simulation
 
-tree = ast.parse(open(SRC, encoding="utf-8").read())
+shared_tree = ast.parse(open(SHARED_SRC, encoding="utf-8").read())
 consts = {}
-for node in tree.body:
+for node in shared_tree.body:
     if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
         name = node.targets[0].id
         if name.startswith(("VOICE_NARRATION_", "NARRATION_")) or name == "_INTERIM_NOTES_HEADER":
@@ -21,12 +33,15 @@ WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speec
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
           "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval"}
-# Module-level helpers of chat_session.py the copied methods call.
+# Module-level helpers (now in chat_session_shared.py) the copied methods call.
 HELPERS = {"_spoken_duration"}
-helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in HELPERS]
+helpers = [n for n in shared_tree.body if isinstance(n, ast.FunctionDef) and n.name in HELPERS]
 assert {h.name for h in helpers} == HELPERS, HELPERS
-cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChatSession")
-funcs = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in WANTED]
+funcs = []
+for mixin_src in MIXIN_SRCS:
+    mixin_tree = ast.parse(open(mixin_src, encoding="utf-8").read())
+    cls = next(n for n in mixin_tree.body if isinstance(n, ast.ClassDef) and n.name.endswith("Mixin"))
+    funcs.extend(n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in WANTED)
 missing = WANTED - {f.name for f in funcs}
 assert not missing, missing
 
