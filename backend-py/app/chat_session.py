@@ -76,6 +76,7 @@ from app import win_subprocess_patch
 # open a visible console window without this).
 win_subprocess_patch.apply()
 
+from app.archive_chunks import chunk_archive
 from app.durability import (
     _sanitize_tab_id,
     claude_project_dir,
@@ -3960,6 +3961,26 @@ class ChatSession:
                     )
                     save_tab_continuity_archive(self.workspace_dir, self.tab_id, archive_path)
                     log_event("engine", "archived_unrecoverable_session", tab_id=self.tab_id, old_session_id=old_session_id, archive_path=archive_path)
+                    # Bug fix (2026-10-16), confirmed live: archive_path above is the SAME
+                    # oversized transcript that just overflowed this session -- a model that
+                    # actually followed the note and Read it back in whole would overflow
+                    # again immediately. Additional, purely additive: chunk it into an
+                    # addressable index on the side (never touches archive_path itself, so
+                    # main.py's expand_dehydrated_ref/the human "view archived conversation"
+                    # UI keeps working against the original file unchanged). None when the
+                    # transcript was small enough that reading it directly is already safe.
+                    try:
+                        chunk_dir = directory / f"{old_session_id}-chunks"
+                        index_path = chunk_archive(Path(old_path), chunk_dir)
+                        if index_path is not None:
+                            archive_note += (
+                                f"[System note: that archive is also split into smaller chunks, indexed at "
+                                f"{index_path} -- read THAT index first (it's small), then only the specific "
+                                f"chunk(s) it points to; never read {archive_path} directly, it's the full "
+                                "oversized original and will overflow you again.]\n\n"
+                            )
+                    except Exception as exc:
+                        log_event("engine", "archive_chunking_failed", tab_id=self.tab_id, error=str(exc))
             except Exception as exc:
                 log_event("engine", "archive_unrecoverable_session_failed", tab_id=self.tab_id, error=str(exc))
         clear_tab_session_id(self.workspace_dir, self.tab_id)
