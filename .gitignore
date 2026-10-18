@@ -39,11 +39,12 @@ art/__pycache__/
 **/__pycache__/
 
 # --- Deploy tooling / secrets (maintainer-only, never public) --------------
-# See deploy.mk's own header comment: split out of the public Makefile,
-# gitignored the same as these two scripts always were.
+# deploy.mk committed 2026-10-18 (contains no secret -- the bearer token
+# lives in deploy_token.txt, outside this repo entirely, never committed
+# here). deploy.bat/deploy_models.bat are the superseded pre-deploy.mk
+# scripts (see deploy.mk's own header) and stay ignored as dead local files.
 deploy.bat
 deploy_models.bat
-deploy.mk
 install-local.ps1
 
 # --- Ad-hoc test/diagnostic scripts (backend/) ------------------------------
