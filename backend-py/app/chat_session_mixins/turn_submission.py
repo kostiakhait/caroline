@@ -391,7 +391,7 @@ class TurnSubmissionMixin:
             self.small_model_pending_comments.append(text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}")
             return
         self._start_small_model_turn(text, attachments, is_real_user, is_voice)
-    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False) -> bool:
+    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = True) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
         showing is now decided ENTIRELY by the model's own reply content
@@ -403,7 +403,29 @@ class TurnSubmissionMixin:
         (b) got its own state corrupted by an unrelated bug (a rejected
         turn's own trailing ResultMessage wrongly flipping it back to
         True mid-conversation, silently swallowing a whole later real
-        reply). Removed entirely rather than patched again."""
+        reply). Removed entirely rather than patched again.
+
+        `suppress_narration` default flipped to True (2026-10-18), per
+        explicit instruction ("Нарратора у фоновых активностей быть не
+        должно вообще" -- confirmed live, screenshots): every inject_
+        proactive() caller is, by construction, a background/proactive
+        event (a messenger notification, a reminder, a watchdog nudge --
+        never a real user message, which always goes through submit()
+        directly with is_real_user=True instead). The progress narrator's
+        own job is to keep a REAL user company while Caroline is visibly
+        mid-task on something THEY asked for; confirmed live it has no
+        reliable way to tell a genuine in-flight user task apart from
+        stale/unrelated internal chatter once a proactive note is in the
+        dialogue (it kept narrating a 'still backing up your notes/updating
+        storage' status for 40+ minutes with no real backup operation
+        actually running). Previously only reminder-driven turns
+        (main.py's _on_reminder_due) and a handful of other call sites
+        opted into this explicitly; messenger-channel notifications
+        (_inject_messenger_proactive) and others relied on the old
+        default (False) and got narration they were never supposed to.
+        A caller that genuinely wants narration during a proactive turn
+        must now opt in explicitly with suppress_narration=False -- none
+        currently do, and none are expected to."""
         if self.ended:
             return False
         attachments = attachments or []
