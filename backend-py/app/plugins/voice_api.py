@@ -336,23 +336,22 @@ async def translate_text(
     of preceeding_context/following_context, and -- like every other reply:
     command -- answers {"status", "output": {"text"}}, not ai:translate's
     bare {"result"}."""
-    body: dict[str, Any] = {
-        "command": "reply:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
+    from app.evolution_client import run_reply_agent
+    from app.microagents.reply_translate import TRANSLATE
+
+    agent_input: dict[str, Any] = {
+        "text": text, "language": language,
         "instructions": _gender_agreement_clause(gender, addressee_gender) or None,
         "task": context or None,
     }
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
     try:
-        data = await _post_json(body, timeout=timeout, retries=retries)
+        result = await run_reply_agent(TRANSLATE, agent_input)
     except Exception as exc:
         log_event("plugin:voice", "translate_text_failed", reason="request_failed", error=str(exc))
         return None
-    output = data.get("output")
-    if data.get(".status") != "ok" or data.get("status") != "ok" or not isinstance(output, dict) or not isinstance(output.get("text"), str):
-        log_event("plugin:voice", "translate_text_failed", reason="bad_response", status=data.get(".status"), api_reason=data.get(".reason"))
+    output = result.get("output") if result.get("status") == "ok" else None
+    if not isinstance(output, dict) or not isinstance(output.get("text"), str):
+        log_event("plugin:voice", "translate_text_failed", reason="bad_response", error=result.get("error"))
         return None
     translated = output["text"]
     if not translated.strip():
@@ -383,20 +382,18 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     malformed/empty response returns None, and the caller is expected to
     fall back to the text it already had rather than block or drop a reply
     over this."""
-    body: dict[str, Any] = {"command": "reply:review", "key": CAROLINE_SW_KEY, "text": text, "task": task}
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
+    from app.evolution_client import run_reply_agent
+    from app.microagents.reply_review import REVIEW
+
     try:
-        data = await _post_json(body, timeout=timeout)
+        result = await run_reply_agent(REVIEW, {"text": text, "task": task})
     except Exception as exc:
         log_event("plugin:voice", "review_reply_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("plugin:voice", "review_reply_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "review_reply_failed", reason="bad_response", error=result.get("error"))
         return None
-    output = data.get("output")
+    output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("text"), str) or not output["text"].strip():
         log_event("plugin:voice", "review_reply_failed", reason="empty")
         return None
@@ -405,7 +402,7 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
 
 async def check_permission_guard(
     task: str, recent_dialogue: str, previous_block_reason: str | None = None,
-    session: str | None = None, timeout: float = 190.0,
+    session: str | None = None, timeout: float = 190.0, facts: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Per explicit instruction (2026-10-11): Caroline often asks a yes/no
     permission question and then, a turn or two later, does the thing
@@ -468,37 +465,43 @@ async def check_permission_guard(
     identify) is skipped there too -- only step 2 (turn.permission.guard,
     the approval-policy judgment, still the evolution engine's pilot role)
     still runs server-side. Falls back to today's fully-remote behavior
-    whenever the local step can't run (see that function's own docstring)."""
-    facts = await _identify_pending_action_locally(task, recent_dialogue)
+    whenever the local step can't run (see that function's own docstring).
+
+    `facts` (2026-10-18, the action-boundary tracking system): when the
+    caller already ran _identify_pending_action_locally itself (see
+    permission_guard.py's own _check_action_before_send, which needs the
+    identify step's own matched_action_id BEFORE deciding whether this
+    guard call is even needed at all), it passes the already-fetched facts
+    straight through instead of this function repeating the same local
+    model call a second time. None (the common case: every other call site)
+    means run identify locally here, same as always."""
+    if facts is None:
+        facts = await _identify_pending_action_locally(task, recent_dialogue)
     if facts is not None and facts.get("action_type", "none") == "none":
         # Same short-circuit Camerlengo's own cmdV2ReplyPermissionGuard
         # applies server-side when step 1 finds nothing pending -- doing it
         # here too (step 1 already ran, locally) saves the round-trip
         # entirely for what is, in practice, most turns.
         return {"needs_approval": False, "reason": "", "same_action_as_before": False}
-    body: dict[str, Any] = {
-        "command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue,
-        "previousBlockReason": previous_block_reason or "",
-    }
+    from app.evolution_client import run_reply_agent
+    from app.microagents.permission_guard import GUARD
+
+    agent_input: dict[str, Any] = {"task": task, "recent_dialogue": recent_dialogue, "previous_block_reason": previous_block_reason or ""}
     if facts is not None:
-        body.update({
-            "actionType": facts.get("action_type"), "actionSummary": facts.get("action_summary"),
-            "recipient": facts.get("recipient"), "senderIdentity": facts.get("sender_identity"),
-            "wordingShownAndAccepted": bool(facts.get("wording_shown_and_accepted")),
+        agent_input.update({
+            "action_type": facts.get("action_type"), "action_summary": facts.get("action_summary"),
+            "recipient": facts.get("recipient"), "sender_identity": facts.get("sender_identity"),
+            "wording_shown_and_accepted": bool(facts.get("wording_shown_and_accepted")),
         })
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
     try:
-        data = await _post_json(body, timeout=timeout, retries=1)
+        result = await run_reply_agent(GUARD, agent_input)
     except Exception as exc:
         log_event("plugin:voice", "check_permission_guard_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("plugin:voice", "check_permission_guard_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "check_permission_guard_failed", reason="bad_response", error=result.get("error"))
         return None
-    output = data.get("output")
+    output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("needs_approval"), bool):
         log_event("plugin:voice", "check_permission_guard_failed", reason="malformed")
         return None
@@ -508,19 +511,29 @@ async def check_permission_guard(
     }
 
 
-async def _identify_pending_action_locally(task: str, recent_dialogue: str) -> dict[str, Any] | None:
+async def _identify_pending_action_locally(
+    task: str, recent_dialogue: str, open_actions: list[dict[str, str]] | None = None,
+) -> dict[str, Any] | None:
     """turn.permission.identify, step 1 of check_permission_guard's gate,
     run LOCALLY in this process (2026-10-17 pilot -- see
     app/microagent_client.py's own module docstring for why) instead of
     remotely on Camerlengo. Returns the step-1 facts dict (action_type/
-    action_summary/recipient/sender_identity/wording_shown_and_accepted),
-    or None when the local runtime isn't available (Microagent.py couldn't
-    be resolved -- see that module's own fallback) or the local call itself
-    failed -- the caller then falls back to the old fully-remote path
-    (Camerlengo runs step 1 itself), never a hard dependency, same
-    fail-open philosophy as every other microagent check in this file.
-    Runtime.run() is synchronous (see Microagent.py's own module
-    docstring); offloaded to a thread so it never blocks the event loop."""
+    action_summary/recipient/sender_identity/wording_shown_and_accepted/
+    matched_action_id), or None when the local runtime isn't available
+    (Microagent.py couldn't be resolved -- see that module's own fallback)
+    or the local call itself failed -- the caller then falls back to the
+    old fully-remote path (Camerlengo runs step 1 itself), never a hard
+    dependency, same fail-open philosophy as every other microagent check
+    in this file. Runtime.run() is synchronous (see Microagent.py's own
+    module docstring); offloaded to a thread so it never blocks the event
+    loop.
+
+    `open_actions` (2026-10-18, the action-boundary tracking system): the
+    calling tab's own currently-open actions ({"id", "summary"} each, see
+    app/action_registry.py) -- lets this same call also resolve
+    matched_action_id (permission_guard.py's own _check_action_before_send
+    is the only caller that passes this; every other call site omits it,
+    and the agent just reports matched_action_id=null)."""
     from app.microagent_client import build_local_runtime, new_budget
     from app.microagents.permission_identify import IDENTIFY, llm_agents as identify_agents
 
@@ -534,7 +547,8 @@ async def _identify_pending_action_locally(task: str, recent_dialogue: str) -> d
             pass  # already registered -- build_local_runtime() is called fresh per request, but be defensive
     try:
         context = runtime.new_context(budget=new_budget())
-        result = await asyncio.to_thread(runtime.run, IDENTIFY, {"task": task, "recent_dialogue": recent_dialogue}, context)
+        agent_input = {"task": task, "recent_dialogue": recent_dialogue, "open_actions": open_actions or []}
+        result = await asyncio.to_thread(runtime.run, IDENTIFY, agent_input, context)
     except Exception as exc:
         log_event("plugin:voice", "permission_identify_local_failed", error=str(exc))
         return None
@@ -573,26 +587,22 @@ async def summarize_action(
     Returns the one-sentence summary, or None on any error/timeout/malformed
     response (fail-open: the caller must decide what "no summary available"
     means for whether a send may proceed -- see its own call site)."""
+    from app.evolution_client import run_reply_agent
+    from app.microagents.action_summary import SUMMARY
+
     try:
         args_json = json.dumps(args, ensure_ascii=False, default=str)
     except Exception:
         args_json = str(args)
-    body: dict[str, Any] = {
-        "command": "reply:actionSummary", "key": CAROLINE_SW_KEY, "toolName": tool_name, "argsJson": args_json,
-    }
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
     try:
-        data = await _post_json(body, timeout=timeout)
+        result = await run_reply_agent(SUMMARY, {"tool_name": tool_name, "args_json": args_json})
     except Exception as exc:
         log_event("plugin:voice", "summarize_action_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("plugin:voice", "summarize_action_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "summarize_action_failed", reason="bad_response", error=result.get("error"))
         return None
-    output = data.get("output")
+    output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("summary"), str) or not output["summary"].strip():
         log_event("plugin:voice", "summarize_action_failed", reason="empty")
         return None
@@ -657,20 +667,18 @@ async def check_refusal_guard(task: str, assistant_reply: str, session: str | No
     not be mistaken for a decline, nor paralyze Caroline). The caller
     (chat_session.py) decides what to do with None -- typically, do nothing
     further, same as if the reply were not a decline."""
-    body: dict[str, Any] = {"command": "reply:refusalGuard", "key": CAROLINE_SW_KEY, "task": task, "assistantReply": assistant_reply}
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
+    from app.evolution_client import run_reply_agent
+    from app.microagents.refusal_guard import GUARD as REFUSAL_GUARD
+
     try:
-        data = await _post_json(body, timeout=timeout)
+        result = await run_reply_agent(REFUSAL_GUARD, {"task": task, "assistant_reply": assistant_reply})
     except Exception as exc:
         log_event("plugin:voice", "check_refusal_guard_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("plugin:voice", "check_refusal_guard_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "check_refusal_guard_failed", reason="bad_response", error=result.get("error"))
         return None
-    output = data.get("output")
+    output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("declined"), bool):
         log_event("plugin:voice", "check_refusal_guard_failed", reason="malformed")
         return None
@@ -705,20 +713,18 @@ async def check_background_relay_worth(text: str, task: str | None = None, sessi
     must default to SHOWING the message, never to silently swallowing one
     that might have mattered). The caller (ChatSession.deliver_relayed_reply)
     treats None the same as worth_relaying=True."""
-    body: dict[str, Any] = {"command": "reply:backgroundRelayWorth", "key": CAROLINE_SW_KEY, "task": task or "", "text": text}
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
+    from app.evolution_client import run_reply_agent
+    from app.microagents.background_relay_worth import WORTH
+
     try:
-        data = await _post_json(body, timeout=timeout)
+        result = await run_reply_agent(WORTH, {"task": task or "", "text": text})
     except Exception as exc:
         log_event("plugin:voice", "check_background_relay_worth_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("plugin:voice", "check_background_relay_worth_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "check_background_relay_worth_failed", reason="bad_response", error=result.get("error"))
         return None
-    output = data.get("output")
+    output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("worth_relaying"), bool):
         log_event("plugin:voice", "check_background_relay_worth_failed", reason="malformed")
         return None
@@ -741,24 +747,109 @@ async def check_reply_expected(task: str, channel: str, sent_message: str, sessi
     check_permission_guard/check_refusal_guard -- an infrastructure hiccup
     must not be mistaken for "no reply needed", it just means the caller
     skips watching this once)."""
-    body: dict[str, Any] = {"command": "reply:replyExpected", "key": CAROLINE_SW_KEY, "task": task, "channel": channel, "sentMessage": sent_message}
-    if not session:
-        session = await get_cached_v2_session()
-    if session:
-        body["session"] = session
+    from app.evolution_client import run_reply_agent
+    from app.microagents.reply_expected import EXPECTED
+
     try:
-        data = await _post_json(body, timeout=timeout)
+        result = await run_reply_agent(EXPECTED, {"task": task, "channel": channel, "sent_message": sent_message})
     except Exception as exc:
         log_event("plugin:voice", "check_reply_expected_failed", reason="request_failed", error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("plugin:voice", "check_reply_expected_failed", reason="bad_response", status=data.get("status"), api_reason=data.get(".reason"))
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "check_reply_expected_failed", reason="bad_response", error=result.get("error"))
         return None
-    output = data.get("output")
+    output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("needs_reply"), bool):
         log_event("plugin:voice", "check_reply_expected_failed", reason="malformed")
         return None
     return {"needs_reply": output["needs_reply"], "reason": str(output.get("reason") or "")}
+
+
+async def _run_local_microagent(agent_name: str, agent_module: str, agent_input: dict[str, Any]) -> dict[str, Any] | None:
+    """Shared body for the two action-boundary/delivery-completeness agents
+    below -- both are new, Caroline-specific, non-evolvable client agents
+    (never deployed to Camerlengo, see each module's own docstring), run
+    the exact same way _identify_pending_action_locally already runs
+    turn.permission.identify: a fresh local Microagent.Runtime, one
+    registration, one call, offloaded to a thread since Runtime.run() is
+    synchronous. Returns the raw {"status", "output", "error"} dict, or
+    None when the local runtime itself isn't available (Microagent.py
+    couldn't be resolved) -- fail-open, same philosophy as every other
+    microagent check in this file."""
+    from app.microagent_client import build_local_runtime, new_budget
+    import importlib
+
+    runtime = build_local_runtime()
+    if runtime is None:
+        return None
+    module = importlib.import_module(agent_module)
+    for agent in module.llm_agents():
+        try:
+            runtime.register(agent)
+        except ValueError:
+            pass
+    context = runtime.new_context(budget=new_budget())
+    return await asyncio.to_thread(runtime.run, agent_name, agent_input, context)
+
+
+async def check_action_sanction(message: str, open_actions: list[dict[str, str]]) -> list[dict[str, Any]] | None:
+    """Step 3 of the action-boundary tracking system (2026-10-18): after one
+    real user message, decide whether it grants/revokes sanction for any of
+    the tab's currently open actions. The caller (chat_session_mixins/
+    permission_guard.py's _check_action_sanction) already skips calling
+    this at all when open_actions is empty -- no cost when nothing is
+    pending.
+
+    Returns a list of {"action_id", "decision"} dicts (decision in
+    {"approved", "revoked", "unchanged"}), or None on any error/malformed
+    response -- fail-open: the caller leaves every action's flag exactly as
+    it was."""
+    from app.microagents.action_sanction import SANCTION
+
+    try:
+        result = await _run_local_microagent(SANCTION, "app.microagents.action_sanction", {"message": message, "open_actions": open_actions})
+    except Exception as exc:
+        log_event("plugin:voice", "check_action_sanction_failed", reason="request_failed", error=str(exc))
+        return None
+    if result is None or result.get("status") != "ok":
+        log_event("plugin:voice", "check_action_sanction_failed", reason="bad_response", error=(result or {}).get("error"))
+        return None
+    output = result.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("decisions"), list):
+        log_event("plugin:voice", "check_action_sanction_failed", reason="malformed")
+        return None
+    return output["decisions"]
+
+
+async def check_delivery_completeness(final_text: str, recent_dialogue: str) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-18), after a real incident:
+    checks whether `final_text` (the exact text about to reach the user,
+    post-review/post-translate) actually contains everything it claims or
+    implies it is delivering right now. Called from
+    chat_session_mixins/dialogue_transcript.py on EVERY outbound text
+    block.
+
+    Returns {"complete": bool, "missing": str}, or None on any error/
+    malformed response -- fail-open: the caller treats None as complete
+    (an infrastructure hiccup must never itself trigger a corrective
+    note)."""
+    from app.microagents.delivery_completeness import COMPLETENESS
+
+    try:
+        result = await _run_local_microagent(
+            COMPLETENESS, "app.microagents.delivery_completeness", {"final_text": final_text, "recent_dialogue": recent_dialogue},
+        )
+    except Exception as exc:
+        log_event("plugin:voice", "check_delivery_completeness_failed", reason="request_failed", error=str(exc))
+        return None
+    if result is None or result.get("status") != "ok":
+        log_event("plugin:voice", "check_delivery_completeness_failed", reason="bad_response", error=(result or {}).get("error"))
+        return None
+    output = result.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("complete"), bool):
+        log_event("plugin:voice", "check_delivery_completeness_failed", reason="malformed")
+        return None
+    return {"complete": output["complete"], "missing": str(output.get("missing") or "")}
 
 
 # Guards against the failure modes seen live rather than trusting any

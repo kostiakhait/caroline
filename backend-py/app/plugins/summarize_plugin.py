@@ -24,10 +24,11 @@ from pathlib import Path
 from typing import Any
 
 from app.context_cap import truncate
+from app.evolution_client import run_reply_agent
+from app.microagents.content_summary import SUMMARIZE
 from app.plugins.files_plugin import MAX_READ_BYTES
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import load_credentials, verify_password
-from app.plugins.sw_api import CAROLINE_SW_KEY, call_v2
 from app.session_context import get_send
 from app.sw_gate import require_sw_or_prompt
 
@@ -51,15 +52,15 @@ async def summarize_content(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return {"text": gate.message, "is_error": True}
     creds = load_credentials()
     assert creds is not None  # gate.ok guarantees this
-    session = await verify_password(creds["email"], creds["password"])
+    await verify_password(creds["email"], creds["password"])
 
-    call_args: dict[str, Any] = {"key": CAROLINE_SW_KEY, "text": text, "session": session}
+    agent_input: dict[str, Any] = {"text": text}
     if args.get("target_chars"):
-        call_args["targetChars"] = int(args["target_chars"])
-    result = await call_v2("reply:summarize", **call_args)
-    summary = (result.get("output") or {}).get("summary")
+        agent_input["target_chars"] = int(args["target_chars"])
+    result = await run_reply_agent(SUMMARIZE, agent_input)
+    summary = (result.get("output") or {}).get("summary") if result.get("status") == "ok" else None
     if not isinstance(summary, str):
-        raise RuntimeError("summarize_content (reply:summarize) failed: no summary returned")
+        raise RuntimeError("summarize_content (content.summarize) failed: no summary returned")
     # Defensive cap, same reasoning as consult_large_model's own: nothing upstream guarantees
     # the summary actually stayed short, even though the microagent's own verify_summarize
     # rejects a reply that's barely shorter than the original.

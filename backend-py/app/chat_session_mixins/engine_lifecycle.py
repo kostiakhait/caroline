@@ -384,6 +384,7 @@ class EngineLifecycleMixin:
         register_inject_proactive(self.tab_id, lambda text: self.inject_proactive(text))
         register_permission_blocker(self.tab_id, self._on_permission_block_checked)
         register_send_action_guard(self.tab_id, self._check_action_before_send)
+        register_action_closer(self.tab_id, self._on_action_send_completed)
         register_send_for_tab(self.tab_id, self.send)
         register_reply_watch(self.tab_id, self._on_outbound_message_sent)
         register_recent_real_user_directives(self.tab_id, self.recent_real_user_directives_text)

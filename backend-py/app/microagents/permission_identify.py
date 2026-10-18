@@ -101,14 +101,31 @@ _PROMPT = (
     "RECENT/most pressing one -- the one a reader would need a policy decision about right now -- as a "
     "single, specific action; never merge two different actions or two different identities into one "
     "vague summary.\n\n"
+    "Per explicit instruction (2026-10-18, the action-boundary tracking system): when action_type is not "
+    "\"none\", also decide whether the pending action you just identified is the SAME bounded operation as "
+    "one already listed under OPEN ACTIONS below (e.g. \"send the Four Faith renewal email to Jessica Zhou\" "
+    "stays the same operation across several turns even if its wording drifts -- drafting it, then revising "
+    "it, then actually sending it, are all the SAME operation, not a new one each time) -- if so, set "
+    "matched_action_id to that action's own id, copied EXACTLY. If it is a genuinely different operation "
+    "(or OPEN ACTIONS is empty), set matched_action_id to null. Never invent an id that isn't listed.\n\n"
     f"TASK (the user's request):\n---\n{{task}}\n---\n\n"
     f"RECENT DIALOGUE (oldest first, last line is the newest):\n{{recent_dialogue}}\n\n"
+    f"OPEN ACTIONS (operations already tracked, each with its own id -- empty means none are open):\n{{open_actions_block}}\n\n"
     "Reply now."
 )
 
 
+def _open_actions_block(open_actions: Any) -> str:
+    if not open_actions:
+        return "(none)"
+    return "\n".join(f"- id: {a['id']} -- summary: {a['summary']}" for a in open_actions)
+
+
 def prompt_identify(input: Any, context: Any) -> str:
-    return _PROMPT.format(task=input["task"] or "(not given)", recent_dialogue=input["recent_dialogue"] or "(empty)")
+    return _PROMPT.format(
+        task=input["task"] or "(not given)", recent_dialogue=input["recent_dialogue"] or "(empty)",
+        open_actions_block=_open_actions_block(input.get("open_actions")),
+    )
 
 
 def verify_identify(input: Any, output: Any) -> Optional[str]:
@@ -124,6 +141,11 @@ def verify_identify(input: Any, output: Any) -> Optional[str]:
         return '"wording_shown_and_accepted" must be a boolean'
     if action_type != "none" and not (output.get("action_summary") or "").strip():
         return '"action_summary" must be a non-empty string when action_type is not "none"'
+    matched_action_id = output.get("matched_action_id")
+    if matched_action_id is not None:
+        known_ids = {a["id"] for a in (input.get("open_actions") or [])}
+        if matched_action_id not in known_ids:
+            return f'"matched_action_id" must be null or one of the given open_actions ids, got {matched_action_id!r}'
     return None
 
 
@@ -132,9 +154,13 @@ def llm_agents() -> List["M.Agent"]:
         M.Agent(
             IDENTIFY, "1",
             "Pure fact-finding step for turn.permission.guard: from the recent dialogue, is there a "
-            "pending communication-on-the-user's-behalf or money action, what is it, and whose identity "
-            "does it go out under -- no approval judgment.",
-            input_schema=_object({"task": _STRING, "recent_dialogue": _STRING}, required=["task", "recent_dialogue"]),
+            "pending communication-on-the-user's-behalf or money action, what is it, whose identity "
+            "does it go out under, and (per the action-boundary system) which already-open action -- "
+            "if any -- it is the same operation as. No approval judgment.",
+            input_schema=_object(
+                {"task": _STRING, "recent_dialogue": _STRING, "open_actions": {"type": "array", "items": {"type": "object"}}},
+                required=["task", "recent_dialogue"],
+            ),
             output_schema=_object(
                 {
                     "has_pending_action": {"type": "boolean"},
@@ -143,8 +169,12 @@ def llm_agents() -> List["M.Agent"]:
                     "recipient": _STRING,
                     "sender_identity": {"type": "string", "enum": list(_SENDER_IDENTITIES)},
                     "wording_shown_and_accepted": {"type": "boolean"},
+                    "matched_action_id": {"type": ["string", "null"]},
                 },
-                required=["has_pending_action", "action_type", "action_summary", "recipient", "sender_identity", "wording_shown_and_accepted"],
+                required=[
+                    "has_pending_action", "action_type", "action_summary", "recipient", "sender_identity",
+                    "wording_shown_and_accepted", "matched_action_id",
+                ],
             ),
             build_prompt=prompt_identify, verify=verify_identify,
         ),

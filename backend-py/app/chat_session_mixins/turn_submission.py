@@ -186,6 +186,14 @@ class TurnSubmissionMixin:
             # only the next time an outbound message triggers a re-check -- fire-
             # and-forget, same mechanism as refresh_language_in_background below.
             asyncio.ensure_future(self._check_permission_guard())
+            # Per explicit instruction (2026-10-18), the action-boundary
+            # tracking system's point 3: every real user message is also
+            # checked for whether it grants/revokes sanction on any of this
+            # tab's currently open actions -- same fire-and-forget shape as
+            # the permission-guard recheck just above, and a no-op (see
+            # _check_action_sanction's own early return) whenever nothing is
+            # open.
+            asyncio.ensure_future(self._check_action_sanction(text))
             # Bug fix (2026-09-11), per explicit instruction: language must
             # be tracked CONTINUOUSLY, not resolved once and left alone --
             # confirmed live a tab can legitimately switch languages

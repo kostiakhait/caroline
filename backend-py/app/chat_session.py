@@ -461,6 +461,20 @@ class ChatSession(
         # judges whether a newly-flagged action is the same one still pending or a
         # genuinely different one; see _check_permission_guard's own update.
         self.permission_guard_last_reason: str | None = None
+        # Per explicit instruction (2026-10-18), the action-boundary tracking
+        # system: the open-operations registry _check_action_before_send
+        # resolves/matches against (point 1), flags approved/revoked after
+        # every real user message (point 3), and PermissionGuard is skipped
+        # entirely for (point 4). Persisted to disk per tab (the user's
+        # explicit choice) -- loaded once here, written on every mutation.
+        self.action_registry: ActionRegistry = ActionRegistry.from_wire(load_action_state(workspace_dir, tab_id))
+        # The action id _check_action_before_send resolved for the send-type
+        # call currently in flight, if any -- read (and cleared) by
+        # _on_action_send_completed once that call's own handler succeeds.
+        # None whenever no send-type call is in flight, or none had an
+        # action tied to it (point 6: an action needing no separate
+        # sanction never sets this, same as today).
+        self._action_id_for_pending_send: str | None = None
         # Bug fix (2026-09-14), per explicit instruction, root-caused via a
         # real live incident ("Кэролайн ведет беседу сама с собой"):
         # last_visible_output_at gets bumped by narration's OWN firing too

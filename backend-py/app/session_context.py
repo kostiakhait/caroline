@@ -195,6 +195,28 @@ def get_reply_watch(tab_id: str | None) -> ReplyWatchFn | None:
     return _reply_watch_by_tab.get(tab_id) if tab_id else None
 
 
+# Every live ChatSession's action-closer by tab id (see register_action_closer).
+_action_closer_by_tab: dict[str, Callable[[], None]] = {}
+
+
+def register_action_closer(tab_id: str, fn: Callable[[], None]) -> None:
+    """Per explicit instruction (2026-10-18, the action-boundary tracking
+    system, point 2 -- "when the operation completes, it closes"): lets
+    app/operations.py's dispatch() tell the calling ChatSession, right after
+    a send-type tool call it had stashed an action id for (see
+    chat_session_mixins/permission_guard.py's own _check_action_before_send)
+    completes successfully, so the action can be removed from the
+    registry/freed for LRU reuse. Mirrors register_reply_watch exactly: same
+    per-tab dict, same non-fatal shape, a later session of the same tab
+    replaces it. `fn` must return immediately (no await) -- dispatch() calls
+    it synchronously from inside the tool call's own success path."""
+    _action_closer_by_tab[tab_id] = fn
+
+
+def get_action_closer(tab_id: str | None) -> Callable[[], None] | None:
+    return _action_closer_by_tab.get(tab_id) if tab_id else None
+
+
 def register_recent_real_user_directives(tab_id: str, fn: RecentDirectivesFn) -> None:
     """Per explicit instruction (2026-10-13): lets a headless background
     session's own permission-guard check reach a DIFFERENT tab's (the

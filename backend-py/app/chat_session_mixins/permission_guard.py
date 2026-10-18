@@ -113,7 +113,19 @@ class PermissionGuardMixin:
             "session_id": None, "parent_tool_use_id": None,
         }
         await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
-    async def _check_permission_guard(self, extra_context: str | None = None) -> None:
+    def _dialogue_with_note(self, extra_context: str | None) -> str:
+        """Factored out (2026-10-18) so _check_action_before_send can build
+        the exact same dialogue-plus-note text _check_permission_guard
+        feeds turn.permission.guard, for its OWN direct identify call (see
+        that method's own docstring for why it needs to run identify
+        itself, before deciding whether to call the guard at all)."""
+        dialogue = self._gather_recent_dialogue_for_permission_guard()
+        if not extra_context:
+            return dialogue
+        note = " ".join(extra_context.split())
+        return f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
+
+    async def _check_permission_guard(self, extra_context: str | None = None, facts: dict[str, Any] | None = None) -> None:
         """Per explicit instruction (2026-10-11): re-evaluates
         self.pending_unapproved_action from the recent dialogue, via the
         server-side turn.permission.guard microagent (reforce-microagents,
@@ -171,16 +183,22 @@ class PermissionGuardMixin:
         wording drift (the SAME action described two different ways across
         two consecutive real calls) would have broken anyway. The counter
         only resets when the agent says this is a genuinely different
-        action (or there is nothing pending at all)."""
+        action (or there is nothing pending at all).
+
+        `facts` (2026-10-18, the action-boundary tracking system):
+        _check_action_before_send already ran turn.permission.identify
+        itself (it needs matched_action_id before deciding whether this
+        call is even worth a guard call at all) and passes its own result
+        straight through, so this method's own call to voice_api.
+        check_permission_guard never repeats that same local model call a
+        second time. None (every other call site) means check_
+        permission_guard runs identify itself, same as always."""
         from app.plugins.voice_api import check_permission_guard
 
-        dialogue = self._gather_recent_dialogue_for_permission_guard()
-        if extra_context:
-            note = " ".join(extra_context.split())
-            dialogue = f"{dialogue}\n[Event just received, not yet acted on: {note}]" if dialogue else f"[Event just received, not yet acted on: {note}]"
+        dialogue = self._dialogue_with_note(extra_context)
         try:
             result = await check_permission_guard(
-                self._narration_task(), dialogue, previous_block_reason=self.permission_guard_last_reason,
+                self._narration_task(), dialogue, previous_block_reason=self.permission_guard_last_reason, facts=facts,
             )
         except Exception as exc:
             log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
@@ -245,19 +263,31 @@ class PermissionGuardMixin:
         no way to ever see it in time.
 
         Summarizes this exact call into one plain sentence (turn.action.
-        summary, cheap and judgment-free), then runs the SAME turn.
-        permission.guard check _check_permission_guard already does
-        elsewhere, with that sentence spliced in as extra_context -- so
-        permissionGuard's own prompt/judgment is untouched, it just stops
-        being blind to this one fact. Returns the block reason if one comes
-        back, else None.
+        summary, cheap and judgment-free).
 
-        Fail-open on a failed summary (never a hard dependency, same
-        philosophy as every other microagent check here): proceeding
-        without this extra visibility layer still leaves the regular,
-        text-only guard check in place exactly as before this existed --
-        strictly additive, never a new way to get stuck."""
-        from app.plugins.voice_api import summarize_action
+        Action-boundary tracking system (2026-10-18, per the user's own
+        6-point spec): runs turn.permission.identify ITSELF (not via
+        _check_permission_guard) so it has matched_action_id in hand before
+        deciding whether a guard call is even needed at all --
+        1. identify+match against this tab's own open actions
+           (self.action_registry).
+        4. an action whose `approved` flag is already true is NEVER sent to
+           the guard -- returns None immediately, no model call at all for
+           this one. An action with no flag ever set (or not yet approved)
+           falls straight through to today's unchanged guard check (point
+           6), with the already-fetched facts passed through via
+           _check_permission_guard's own `facts` parameter so identify
+           never runs twice for the same call.
+        The resolved action's id is stashed on self._action_id_for_pending_
+        send regardless of outcome, so _on_action_send_completed (point 2 --
+        the operation closes once actually sent) can find it once this
+        call's real handler succeeds.
+
+        Fail-open throughout, same philosophy as every other microagent
+        check here: a failed summary or failed identify call just falls
+        back to today's pre-existing behavior (the plain text-only guard
+        check, or no check at all), never a new way to get stuck."""
+        from app.plugins.voice_api import _identify_pending_action_locally, summarize_action
 
         try:
             summary = await summarize_action(tool_name, args)
@@ -267,5 +297,83 @@ class PermissionGuardMixin:
         if not summary:
             return None
         log_event("engine", "action_summarized", tab_id=self.tab_id, tool=tool_name, summary=summary)
-        await self._check_permission_guard(extra_context=f"About to happen, not yet done: {summary}")
+
+        extra_context = f"About to happen, not yet done: {summary}"
+        open_actions_wire = [{"id": a.id, "summary": a.summary} for a in self.action_registry.open_actions()]
+        try:
+            facts = await _identify_pending_action_locally(
+                self._narration_task(), self._dialogue_with_note(extra_context), open_actions=open_actions_wire,
+            )
+        except Exception as exc:
+            log_event("engine", "action_identify_failed", tab_id=self.tab_id, error=str(exc))
+            facts = None
+
+        self._action_id_for_pending_send = None
+        if facts is not None and facts.get("action_type", "none") != "none":
+            matched_id = facts.get("matched_action_id")
+            if matched_id and self.action_registry.get(matched_id):
+                action = self.action_registry.get(matched_id)
+                self.action_registry.touch(matched_id)
+            else:
+                from app.memory_topics import get_current_topic
+                track_hint = get_current_topic(self.workspace_dir, self.tab_id)
+                action = self.action_registry.open_new(facts.get("action_summary") or summary, track_hint=track_hint)
+            self._action_id_for_pending_send = action.id
+            self._persist_action_state()
+            if action.approved:
+                log_event("engine", "action_approved_short_circuit", tab_id=self.tab_id, action_id=action.id, summary=action.summary)
+                return None
+
+        await self._check_permission_guard(extra_context=extra_context, facts=facts)
         return self.pending_unapproved_action
+
+    def _persist_action_state(self) -> None:
+        save_action_state(self.workspace_dir, self.tab_id, self.action_registry.to_wire())
+
+    async def _check_action_sanction(self, message: str) -> None:
+        """Step 3 of the action-boundary tracking system (2026-10-18): after
+        every REAL user message, decide whether it grants or revokes
+        sanction for any of this tab's currently open actions. Called from
+        submit()'s own real-user-message path, same site _check_
+        permission_guard() already runs from. Skipped entirely when
+        self.action_registry is empty -- no cost when nothing is pending
+        (point 6, "an action needing no separate sanction behaves exactly
+        as today")."""
+        if self.action_registry.is_empty():
+            return
+        from app.plugins.voice_api import check_action_sanction
+
+        open_actions_wire = [{"id": a.id, "summary": a.summary} for a in self.action_registry.open_actions()]
+        try:
+            decisions = await check_action_sanction(message, open_actions_wire)
+        except Exception as exc:
+            log_event("engine", "check_action_sanction_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        if not decisions:
+            return
+        changed = False
+        for entry in decisions:
+            decision = entry.get("decision")
+            if decision == "unchanged":
+                continue
+            action_id = entry.get("action_id")
+            if not self.action_registry.get(action_id):
+                continue
+            self.action_registry.set_approved(action_id, decision == "approved")
+            log_event("engine", "action_sanction_changed", tab_id=self.tab_id, action_id=action_id, decision=decision)
+            changed = True
+        if changed:
+            self._persist_action_state()
+
+    def _on_action_send_completed(self) -> None:
+        """Registered with session_context's register_action_closer; called
+        by app/operations.py's dispatch() right after a send-type tool
+        call's real handler succeeds -- point 2 of the action-boundary spec
+        ("when the operation is done, it closes"). A no-op whenever this
+        call had no action tied to it (point 6)."""
+        action_id, self._action_id_for_pending_send = self._action_id_for_pending_send, None
+        if not action_id:
+            return
+        self.action_registry.close(action_id)
+        self._persist_action_state()
+        log_event("engine", "action_closed", tab_id=self.tab_id, action_id=action_id)

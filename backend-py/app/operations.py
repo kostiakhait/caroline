@@ -33,7 +33,7 @@ from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server,
 from app import memory_nudge
 from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
-from app.session_context import check_send_action, get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
+from app.session_context import check_send_action, get_action_closer, get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
 from app.workspace_dir import WORKSPACE_DIR
 
 # How long dispatch() waits before giving up on returning a "done" result
@@ -277,6 +277,18 @@ async def dispatch(
                 watch = get_reply_watch(tab_id)
                 if watch:
                     watch(channel, args, result)
+            # Per explicit instruction (2026-10-18), the action-boundary
+            # tracking system's point 2: the operation an earlier
+            # register_send_action_guard call (_check_action_before_send)
+            # stashed closes the moment its own real handler succeeds --
+            # same success path REPLY_WATCH_CHANNEL_BY_TOOL fires from just
+            # above. A no-op whenever this call had no action tied to it
+            # (get_action_closer's own callee reads and clears its own
+            # stashed state, so this is safe to call unconditionally after
+            # every successful tool call, not just send-type ones).
+            closer = get_action_closer(tab_id)
+            if closer:
+                closer()
             return result
         except asyncio.CancelledError:
             op.status = "cancelled"

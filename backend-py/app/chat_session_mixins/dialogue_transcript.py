@@ -255,6 +255,13 @@ class DialogueTranscriptMixin:
             # guard on every outbound message -- see _check_permission_guard's
             # own docstring for why this runs here too, not just in submit().
             await self._check_permission_guard()
+            # Per explicit instruction (2026-10-18), after a real incident:
+            # also check that THIS message actually delivers everything it
+            # claims to -- see _check_delivery_completeness's own docstring.
+            # Skipped for a silent/dropped block -- nothing is actually
+            # reaching the user, so there is nothing to check.
+            if not is_silent:
+                await self._check_delivery_completeness(text)
             if is_silent:
                 log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
                 dropped.append(block)
@@ -269,6 +276,43 @@ class DialogueTranscriptMixin:
                 return None
             wire["message"]["content"] = kept
         return wire
+    async def _check_delivery_completeness(self, final_text: str) -> None:
+        """Per explicit instruction (2026-10-18), after a real incident:
+        Caroline narrated having shown the user a Chinese email draft for
+        approval, when the actual outbound message never contained it --
+        her own belief about what she delivered diverged from what was
+        actually sent. Backed by a new, client-only microagent (turn.
+        delivery.completeness, app/microagents/delivery_completeness.py --
+        see that module's own docstring; never deployed to Camerlengo, same
+        as every other new agent this task added).
+
+        `final_text` is the REAL final text, after review_reply/
+        translate_text have already run -- what the user is actually about
+        to see, not what the model originally drafted.
+
+        Never blocks the send itself (confirmed scope: every outbound
+        message, not just action-tied ones) -- on an incomplete delivery,
+        inject_proactive()s a corrective note describing what's missing,
+        same non-blocking pattern _on_permission_block_checked already uses
+        for a permission block. Fail-open on any error: None (or a failed
+        call) is treated as complete, never itself a reason to interrupt
+        the user with a false alarm."""
+        from app.plugins.voice_api import check_delivery_completeness
+
+        dialogue = self._gather_recent_dialogue_for_permission_guard()
+        try:
+            result = await check_delivery_completeness(final_text, dialogue)
+        except Exception as exc:
+            log_event("engine", "check_delivery_completeness_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        if result is None or result["complete"]:
+            return
+        missing = result["missing"]
+        log_event("engine", "delivery_incomplete", tab_id=self.tab_id, missing=missing)
+        self.inject_proactive(
+            f"[Internal: the last message you sent did not actually deliver everything it claimed to -- "
+            f"{missing} Please actually include it now.]"
+        )
     async def _patch_cli_transcript_text(self, replacements: list[tuple[str, str]]) -> None:
         """Rewrites the CLI engine's own just-written transcript entry so its
         text matches what the user actually saw, not what the model originally

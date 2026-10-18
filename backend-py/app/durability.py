@@ -212,6 +212,51 @@ def clear_pending_operation(workspace_dir: str, tab_id: str, operation_id: str) 
         log_event("engine", "clear_pending_operation_failed", tab_id=tab_id, operation_id=operation_id, error=str(exc))
 
 
+# --- action-boundary tracking state (2026-10-18) --------------------------
+# Per explicit instruction (the action-boundary spec's own point 5, "at most
+# 5 operations, LRU eviction") and the user's explicit choice that this
+# state survive a full backend restart (unlike pending_unapproved_action's
+# own in-memory-only durability class): one small file per tab, same shape
+# as pending-operations-<id>.json. Written on every ActionRegistry mutation
+# (open/approve/revoke/close/evict) by whoever made it; loaded once, in
+# ChatSession.__init__, into a fresh ActionRegistry via
+# ActionRegistry.from_wire.
+
+def _action_state_path(workspace_dir: str, tab_id: str) -> Path:
+    return Path(workspace_dir) / f"actions-{_sanitize_tab_id(tab_id)}.json"
+
+
+def save_action_state(workspace_dir: str, tab_id: str, rows: list[dict]) -> None:
+    try:
+        path = _action_state_path(workspace_dir, tab_id)
+        if not rows:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log_event("engine", "save_action_state_failed", tab_id=tab_id, error=str(exc))
+
+
+def load_action_state(workspace_dir: str, tab_id: str) -> list[dict]:
+    path = _action_state_path(workspace_dir, tab_id)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        log_event("engine", "load_action_state_failed", tab_id=tab_id, error=str(exc))
+        return []
+
+
+def clear_action_state(workspace_dir: str, tab_id: str) -> None:
+    try:
+        _action_state_path(workspace_dir, tab_id).unlink(missing_ok=True)
+    except Exception as exc:
+        log_event("engine", "clear_action_state_failed", tab_id=tab_id, error=str(exc))
+
+
 # --- pending API retry / one-shot followup check, for restart recovery ----
 # Per explicit instruction (2026-10-12, "Почему вкладка 4 не продолжила
 # задачу?" -- a real live incident): chat_session.py's _schedule_api_retry
