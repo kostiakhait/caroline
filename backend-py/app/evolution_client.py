@@ -67,8 +67,16 @@ async def _evolution_post(command: str, **fields: Any) -> dict[str, Any] | None:
     except Exception as exc:
         log_event("engine", "evolution_client_request_failed", command=command, error=str(exc))
         return None
-    if data.get(".status") != "ok" or data.get("status") != "ok":
-        log_event("engine", "evolution_client_bad_response", command=command, status=data.get("status"), api_reason=data.get(".reason"))
+    if data.get(".status") != "ok":
+        # Unlike the reply:*/microagent:call envelopes (which also carry
+        # their own inner "status"/"output"/"error"), these three commands'
+        # payloads are plain data merged straight into the envelope by
+        # makeResponse -- the ONLY status that exists here is the envelope's
+        # own ".status". Confirmed live (2026-10-18): checking for a second,
+        # non-existent inner "status" field made every resolveCalls/
+        # mintClone/recordOutcome call look like a failure even once the ACL
+        # was granted and the server answered "ok".
+        log_event("engine", "evolution_client_bad_response", command=command, dot_status=data.get(".status"), api_reason=data.get(".reason"))
         return None
     return data
 
