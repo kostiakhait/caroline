@@ -2006,10 +2006,17 @@ _FIRST_REMARK_MIN_CHARS = 8
 _FIRST_REMARK_MAX_CHARS = 140
 
 
-def _first_remark_from_decline(text: str) -> str | None:
+def _first_remark_from_decline(text: str, user_text: str = "") -> str | None:
     lines = text[text.rindex("]]") + 2:].strip().splitlines()
     remark = lines[0].strip().strip("\"«»") if lines else ""
-    if not _FIRST_REMARK_MIN_CHARS <= len(remark) <= _FIRST_REMARK_MAX_CHARS or _FIRST_REMARK_FORBIDDEN.search(remark):
+    # A number the request itself has is a name, not a figure ("iPhone 17"), as in
+    # voice_api._states_figure_as_settled. Live 2026-10-17: "Ищу цены на iPhone 17 в
+    # украинских магазинах." was dropped for its "17", and the first remark was heard 11s
+    # after the question instead of about 6.
+    checked = remark
+    for number in set(re.findall(r"\d+", user_text)):
+        checked = re.sub(rf"(?<!\d){number}(?!\d)", " ", checked)
+    if not _FIRST_REMARK_MIN_CHARS <= len(remark) <= _FIRST_REMARK_MAX_CHARS or _FIRST_REMARK_FORBIDDEN.search(checked):
         return None
     return remark
 
@@ -2102,7 +2109,7 @@ async def _fast_lane_gate(
     ms = int((time.monotonic() - started) * 1000)
     if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
         start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
-        first_remark = _first_remark_from_decline(text) if is_voice else None
+        first_remark = _first_remark_from_decline(text, user_text) if is_voice else None
         log_event("engine", "fast_lane_gate", verdict="tools", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
         return True, start_tier, first_remark
     if FAST_LANE_ANSWERABLE in text:
@@ -2225,7 +2232,7 @@ async def try_fast_answer(
         return None, None, None
     if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
         start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
-        first_remark = _first_remark_from_decline(text) if is_voice else None
+        first_remark = _first_remark_from_decline(text, user_text) if is_voice else None
         log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
         return None, start_tier, first_remark
     if _FAST_LANE_NO_HISTORY.search(text):
