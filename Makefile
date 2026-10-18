@@ -173,6 +173,7 @@ camerlengo-vendor: $(CAMERLENGO_VENDOR_STUBS)/Config.py
 		for f in AI.py Cache.py EmailBasics.py Logger.py JSONStorage.py; do \
 			git -C "$(CAMERLENGO_REPO)" show caroline:$$f > "$(OUT)/backend-py/camerlengo/$$f"; \
 		done; \
+		git -C "$(CAMERLENGO_REPO)" show caroline:apps/microagents/Microagent.py > "$(OUT)/backend-py/camerlengo/Microagent.py"; \
 		cp "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT)/backend-py/camerlengo/Config.py"; \
 		echo "vendored from $(CAMERLENGO_REPO)@caroline"; \
 	else \

@@ -6,6 +6,7 @@ ops and by app_browser_plugin.py's app_browser_describe.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -455,11 +456,36 @@ async def check_permission_guard(
     2026-10-15, see _post_json's own docstring) -- _post_json's default
     retries=3 would otherwise have silently multiplied the new, much longer
     timeout into an 9-plus-minute worst case, one real attempt is what a
-    190s budget is supposed to mean."""
+    190s budget is supposed to mean.
+
+    Pilot (2026-10-17): step 1 of the gate (turn.permission.identify --
+    what the pending action is, whose identity it's under) now runs
+    LOCALLY via _identify_pending_action_locally, not on Camerlengo -- see
+    app/microagent_client.py's own module docstring for why. When it finds
+    nothing pending, this function returns straight away without even
+    contacting Camerlengo. When it finds something, its facts are sent
+    ALONGSIDE this call so Camerlengo's own step 1 (turn.permission.
+    identify) is skipped there too -- only step 2 (turn.permission.guard,
+    the approval-policy judgment, still the evolution engine's pilot role)
+    still runs server-side. Falls back to today's fully-remote behavior
+    whenever the local step can't run (see that function's own docstring)."""
+    facts = await _identify_pending_action_locally(task, recent_dialogue)
+    if facts is not None and facts.get("action_type", "none") == "none":
+        # Same short-circuit Camerlengo's own cmdV2ReplyPermissionGuard
+        # applies server-side when step 1 finds nothing pending -- doing it
+        # here too (step 1 already ran, locally) saves the round-trip
+        # entirely for what is, in practice, most turns.
+        return {"needs_approval": False, "reason": "", "same_action_as_before": False}
     body: dict[str, Any] = {
         "command": "reply:permissionGuard", "key": CAROLINE_SW_KEY, "task": task, "recentDialogue": recent_dialogue,
         "previousBlockReason": previous_block_reason or "",
     }
+    if facts is not None:
+        body.update({
+            "actionType": facts.get("action_type"), "actionSummary": facts.get("action_summary"),
+            "recipient": facts.get("recipient"), "senderIdentity": facts.get("sender_identity"),
+            "wordingShownAndAccepted": bool(facts.get("wording_shown_and_accepted")),
+        })
     if not session:
         session = await get_cached_v2_session()
     if session:
@@ -480,6 +506,46 @@ async def check_permission_guard(
         "needs_approval": output["needs_approval"], "reason": str(output.get("reason") or ""),
         "same_action_as_before": bool(output.get("same_action_as_before")),
     }
+
+
+async def _identify_pending_action_locally(task: str, recent_dialogue: str) -> dict[str, Any] | None:
+    """turn.permission.identify, step 1 of check_permission_guard's gate,
+    run LOCALLY in this process (2026-10-17 pilot -- see
+    app/microagent_client.py's own module docstring for why) instead of
+    remotely on Camerlengo. Returns the step-1 facts dict (action_type/
+    action_summary/recipient/sender_identity/wording_shown_and_accepted),
+    or None when the local runtime isn't available (Microagent.py couldn't
+    be resolved -- see that module's own fallback) or the local call itself
+    failed -- the caller then falls back to the old fully-remote path
+    (Camerlengo runs step 1 itself), never a hard dependency, same
+    fail-open philosophy as every other microagent check in this file.
+    Runtime.run() is synchronous (see Microagent.py's own module
+    docstring); offloaded to a thread so it never blocks the event loop."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents.permission_identify import IDENTIFY, llm_agents as identify_agents
+
+    runtime = build_local_runtime()
+    if runtime is None:
+        return None
+    for agent in identify_agents():
+        try:
+            runtime.register(agent)
+        except ValueError:
+            pass  # already registered -- build_local_runtime() is called fresh per request, but be defensive
+    try:
+        context = runtime.new_context(budget=new_budget())
+        result = await asyncio.to_thread(runtime.run, IDENTIFY, {"task": task, "recent_dialogue": recent_dialogue}, context)
+    except Exception as exc:
+        log_event("plugin:voice", "permission_identify_local_failed", error=str(exc))
+        return None
+    if result.get("status") != "ok":
+        log_event("plugin:voice", "permission_identify_local_failed", reason="bad_status", status=result.get("status"))
+        return None
+    output = result.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("action_type"), str):
+        log_event("plugin:voice", "permission_identify_local_failed", reason="malformed")
+        return None
+    return output
 
 
 async def summarize_action(
