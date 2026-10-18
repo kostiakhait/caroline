@@ -45,6 +45,7 @@ import base64
 from email.utils import getaddresses
 from pathlib import Path
 import json
+import re
 from typing import Any
 
 from app.plugins.contacts_plugin import upsert_contacts_from_emails
@@ -251,7 +252,55 @@ async def email_download_attachment(args: dict[str, Any], _rp: Any) -> dict[str,
     return {"text": f'Downloaded {len(data)} byte(s) ("{result.get("filename")}") to "{args["savePath"]}".'}
 
 
+_HEADER_INJECTION_RE = re.compile(r"[\r\n\x00]")
+_HTML_ENTITY_RE = re.compile(r"&(?:lt|gt|amp|quot|#39|nbsp);", re.IGNORECASE)
+
+
+def _validate_header_value(value: Any, field_name: str) -> None:
+    """Raises ValueError before email_send does anything else if `value` (a
+    from/to/cc/bcc address or display name) can't safely become a raw
+    RFC 5322 header value.
+
+    Per explicit instruction (2026-10-17), after a real mistake: this same
+    check was first added to Camerlengo's own shared EmailBasics.py::send()
+    -- wrong, since Camerlengo is universal across every product on that
+    backend, and this need is Caroline's alone (see
+    feedback_never_change_camerlengo_without_extreme_necessity in memory).
+    Reverted there, added here instead, client-side, before the call ever
+    reaches Camerlengo. Two checks, both at preparation time:
+      - CRLF/NUL: the classic header-injection vector -- a newline inside a
+        header value lets its content start new, attacker-controlled
+        headers (or an extra recipient) that were never part of the real
+        address.
+      - A literal HTML entity (&lt;, &gt;, &amp;, ...): a from/to/cc/bcc
+        header is never HTML-escaped content -- seeing one here means an
+        upstream HTML-escaping step (e.g. the model composing the "html"
+        body) also touched a field it was never meant to, silently
+        corrupting the address the header actually carries."""
+    if not isinstance(value, str):
+        return
+    if _HEADER_INJECTION_RE.search(value):
+        raise ValueError(f'"{field_name}" contains a newline or NUL character, which is not a valid email header value: {value!r}')
+    entity = _HTML_ENTITY_RE.search(value)
+    if entity:
+        raise ValueError(f'"{field_name}" contains an HTML entity ({entity.group(0)!r}) -- an email header is not HTML-escaped content: {value!r}')
+
+
+def _validate_addresses(value: Any, field_name: str) -> None:
+    """`value` is either one address/display-name string or a list of them
+    -- validates every string it actually contains."""
+    if value is None:
+        return
+    for one in (value if isinstance(value, list) else [value]):
+        _validate_header_value(one, field_name)
+
+
 async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    _validate_addresses(args.get("from"), "from")
+    _validate_addresses(args.get("to"), "to")
+    _validate_addresses(args.get("cc"), "cc")
+    _validate_addresses(args.get("bcc"), "bcc")
+
     async def do(session: str) -> Any:
         extra: dict[str, Any] = {
             "key": EMAIL_SERVICE_KEY, "session": session, "to": args["to"], "subject": args["subject"],

@@ -1535,11 +1535,27 @@ async def generate_progress_comment(
         "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
         "short sentence, no JSON, no markdown, no preamble.\n\n"
         "You speak to the user about where their request stands right now: how far along the work is, or that "
-        "it's finished. Use first person, plain everyday words, present tense.\n"
+        "it's finished. Use first person, plain everyday words.\n"
         "Never mention tools, functions, commands, systems, files, processes, session mechanics or any internal "
         "machinery -- describe the progress of the task itself, in the terms the user used.\n"
         "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
-        "guess the user's intent or mood; never promise or plan next steps.\n"
+        "guess the user's intent or mood; never invent a step STATUS doesn't actually show.\n"
+        # Bug fix (2026-10-17), confirmed live: two consecutive remarks about
+        # the same already-sent email, 82 seconds apart, read as contradictory
+        # ("I sent a message asking..." then "I'm writing to whoever
+        # suggested this..."). The old blanket "present tense" instruction
+        # gave the model no way to distinguish a step STATUS already marks
+        # done from one still running or not yet started, so a later remark
+        # about the same already-finished step could drift into present
+        # tense as if it were still in progress. Per explicit instruction:
+        # match tense/mood to what STATUS actually shows instead of forcing
+        # one tense for everything.
+        "Match your tense/mood to what STATUS actually shows: a step STATUS marks done is described as done "
+        "(past tense is fine -- \"I sent it\", \"I found it\"); a step STATUS shows is still running is "
+        "described as ongoing (\"I'm still working on X\"); a step that hasn't started yet but STATUS shows is "
+        "coming next is described as a plan, explicitly (\"I'm about to...\", \"I'm going to...\", \"I still "
+        "need to...\"). Never phrase a not-yet-done step as if it already happened, and never describe an "
+        "already-done step as if it were still in progress or merely planned.\n"
         # Ported from a teammate's branch (commits 96de9fd/44a6036), confirmed
         # against their golden set (16/16): a step that found nothing is
         # still worth saying once, and each different place checked is its
@@ -1599,7 +1615,19 @@ async def generate_progress_comment(
         "  Bad (states it as settled): <narration>The rate is 1.0847.</narration>\n"
         "  TASK: review my budget spreadsheet. STATUS: nothing concrete beyond the request itself.\n"
         "  Good: <narration></narration>\n"
-        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n\n"
+        "  Bad (names a machine step): <narration>Running the spreadsheet reader now.</narration>\n"
+        "  TASK: ask the vendor whether they can update the firmware. STATUS: Tool call email_send (arguments: "
+        "to vendor); result: sent.\n"
+        "  Good (STATUS marks this step done -- past tense, not a plan): <narration>I sent them a message "
+        "asking whether they can update the firmware.</narration>\n"
+        "  Bad (STATUS says it's sent, not still being written): <narration>I'm writing to them about the "
+        "firmware now.</narration>\n"
+        "  TASK: ask the vendor whether they can update the firmware. STATUS: Steps in progress right now: 1 "
+        "(drafting the message, not yet sent).\n"
+        "  Good (STATUS marks this step not-yet-done -- an explicit plan, not stated as already happened): "
+        "<narration>I'm about to send them a message asking whether they can update the firmware.</narration>\n"
+        "  Bad (claims a not-yet-sent message as already sent): <narration>I sent them a message about the "
+        "firmware.</narration>\n\n"
         f"{_already_said_block(already_said)}"
         f"TASK (the user's request):\n---\n{task}\n---\n\n"
         f"STATUS (what is happening right now):\n---\n{activity}\n---\n\n"
