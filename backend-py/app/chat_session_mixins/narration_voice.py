@@ -71,10 +71,21 @@ class VoiceNarrationMixin:
         self._prepared_narration_is_first = False
         self._prepared_narration_stale = False
         self._stale_remarks_in_row = 0
+        self._lines_since_answer_candidate = None
+        self._held_for_answer = None
         self._narration_facts_at_last_draft = None
         self._narration_last_draft_at = None
         self._voice_narration_failed_at = None
         self.turn_narration_remarks = []
+    def _note_answer_candidate(self) -> None:
+        """A tier has an answer and it goes to the verifier now (run_small_model_turn's
+        on_candidate). Counted from here by on_activity."""
+        self._lines_since_answer_candidate = 0
+    def _answer_being_checked(self) -> bool:
+        """The verifier has the answer and nothing else has happened since: the reply is
+        most likely seconds away. The check's own "Checking the result" is the one line it
+        adds; anything more -- an escalation, a retry, a step down -- means the work goes on."""
+        return self._lines_since_answer_candidate is not None and self._lines_since_answer_candidate <= 1
     def on_client_speech_state(self, speaking: bool) -> None:
         """chat.js's speech queue started an item (True) or ran dry (False) -- see its
         reportSpeechState. Wakes the loop so the next remark follows the last spoken
@@ -138,6 +149,11 @@ class VoiceNarrationMixin:
                 log_event("engine", "voice_narration_draft_expired", tab_id=self.tab_id, age_s=round(now - drafted_at, 1))
                 self._prepared_narration = None
                 self._prepared_narration_is_first = False
+            elif self._answer_being_checked() and self._client_quiet_for(now) < VOICE_NARRATION_ANSWER_HOLD_S:
+                if self._held_for_answer != comment:
+                    self._held_for_answer = comment
+                    log_event("engine", "voice_narration_held_for_answer", tab_id=self.tab_id, comment=comment)
+                return
             elif (
                 (self._prepared_narration_is_first or now - started >= VOICE_NARRATION_FIRST_S)
                 and self._client_quiet_for(now) >= VOICE_NARRATION_AFTER_SPEECH_GAP_S

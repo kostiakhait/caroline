@@ -117,6 +117,19 @@ CASES = [
                  "2026-10-11T20:25:10Z -- https://exa.ai/library/markets/forex/USDUAH # USDUAH The latest quote"],
          said=["Ищу курс доллара к гривне."], expect="say", need=["наш", "курс", "есть"],
          forbid=["не загруз", "неполн", "не полност", "частичн", "ошибк", "не удалось"], hedge_if=["сорок"]),
+    # Live 2026-10-17, these facts: "Я нашла цены на iPhone 17 256GB Black в магазинах iSpot за сорок одну
+    # тысячу ... гривен и iStore.ua за сорок три тысячи ... гривен, и продолжаю проверять." -- 197 chars,
+    # 13.6s aloud, and the answer, ready meanwhile, waited for it (see NARRATOR_MAX_CHARS).
+    dict(name="price list", task="Найди в интернете цены на iPhone 17 в трёх разных украинских магазинах и скажи, где дешевле всего.",
+         status=[ACTIVITY_START, TIER_1,
+                 'Tool call request_info (arguments: {"query": "Поиск цен на iPhone 17 в трёх украинских магазинах и где дешевле всего", '
+                 '"history": 1, "topic": ""); result: {"status": "ok", "results": [{"source": "topics", "output": {"topics": '
+                 '[{"description": "Сравнение цен на iPhone 17 256GB Black в укр',
+                 'Tool call save_info (arguments: {"text": "Найдено цены на iPhone 17 256GB Black в украинских магазинах:\\n- iSpot: '
+                 '41 999 грн\\n- iStore.ua: 43 299 грн\\n- estore.ua: 44 999); result: Saving to memory in the background; you do '
+                 'not need to wait for it. You will be told only if it fails.'],
+         said=["Я ищу цены на iPhone 17 в украинских магазинах.", "Я продолжаю искать цены на iPhone 17 в украинских магазинах."],
+         expect="say", need=["нашл", "цен", "магазин"], hedge_if=["тысяч", "гривен", "гривн"], max_chars=120),
 ]
 
 # A figure from a result is said as found and still being confirmed: one of these with it
@@ -161,11 +174,20 @@ def check(case, text):
     text = (text or "").strip()
     if not text:
         return (case["expect"] != "say", "empty" if case["expect"] == "say" else "ok (empty)")
+    if case.get("max_chars") and len(text) > case["max_chars"]:
+        return False, "too long to say"
     letters = [c for c in text if c.isalpha()]
     if letters and sum("Ѐ" <= c <= "ӿ" for c in letters) / len(letters) < 0.8:
         return False, "not Russian"
+    # A number the request itself has is a name ("iPhone 17"), not a figure to read out in words
+    # (as voice_api._states_figure_as_settled).
+    request_numbers = set(re.findall(r"\d+", case["task"]))
     for label, rx in FORBIDDEN:
-        if rx.search(text):
+        said = text
+        if label == "digits":
+            for number in request_numbers:
+                said = re.sub(rf"(?<!\d){number}(?!\d)", " ", said)
+        if rx.search(said):
             return False, label
     for word in case.get("forbid", ()):
         if word in text.lower().replace("ё", "е"):

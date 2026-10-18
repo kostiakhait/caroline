@@ -2247,6 +2247,12 @@ NARRATOR_MODEL = FAST_LANE_MODEL
 # писем от Анны не найдено" about three found letters, gpt-5-nano announced the work
 # finished and slipped into Ukrainian.
 NARRATOR_FIRST_MODEL = "google/gemini-2.5-flash-lite"
+# The longest remark said aloud, as drafted (numbers already in words): about 8s of speech.
+# The prompt asks for one short sentence with at most one figure; both models broke it on
+# lists of prices or cities. 354 remarks heard live up to 2026-10-17: median 59 chars, 90%
+# within 103, 19 over 120 (6 by the first model, 13 by the second). One of them, 197 chars,
+# took 13.6s to say, and the answer that was ready meanwhile waited for it.
+NARRATOR_MAX_CHARS = 120
 
 
 async def resolve_narration_prompt(prompt: str, model: str | None = None, reasoning: dict[str, str] | None = None) -> str:
@@ -2277,13 +2283,13 @@ async def draft_narration_remark(
         return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
 
     remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
-                                                    repeat_window=repeat_window)
+                                                    repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS)
     if remark:
         log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
         return remark
     remark = await generate_progress_comment_direct(
         task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
-        repeat_window=repeat_window,
+        repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS,
     )
     log_event("engine", "narration_drafted", by="second", model=NARRATOR_MODEL, said=bool(remark))
     return remark
