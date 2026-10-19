@@ -1884,19 +1884,26 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             resume_lang = current_language_name(tab_id)
             session.inject_proactive(
                 "[Caroline was restarted (app closed or crashed) while still working on this, and it was never "
-                f'finished or answered:\n\n"{original_text}"\n\nResume it now and answer the user -- but '
-                "this is internal machinery (the same as any other restart/recovery), so it falls under your "
-                "standing instruction to never expose it: do NOT mention that you were restarted, interrupted, "
-                "or that anything technical happened behind the scenes, and do not apologize for a delay -- "
-                "just answer normally, as if you had simply been quietly working on it the whole time. "
-                "Don't just re-run everything from scratch if you're not sure what already completed -- check "
-                "first where that makes sense (e.g. was an email already sent, a file already written). "
-                "IMPORTANT: any background operation you'd started before the restart (check_operation_status, "
-                "an operation_id from before now) is GONE -- the restart wiped it completely, with no trace and "
-                "no way to check on it anymore. Do not wait for one to report back, and do not assume it finished, "
-                "partially finished, or is still running -- treat it as if it never happened, and if it still "
-                "needs doing, start it again from scratch (checking first, per above, whether it actually needs "
-                f"redoing). Reply in {resume_lang}.]",
+                f'finished or answered:\n\n"{original_text}"\n\nResume it now, exactly as originally instructed '
+                "above -- including replying with exactly [[NO_UPDATE]] or otherwise staying silent, if that is "
+                "what the text above itself called for (e.g. routine background/internal maintenance that was "
+                "never meant to produce a visible reply in the first place). Being resumed after a restart is "
+                "never, on its own, a reason to answer visibly when the original task wouldn't have warranted "
+                "one -- per your standing instruction, background activity is reported to the user only when "
+                "the user actually asked for that report. When the original DOES call for a real visible reply "
+                "(a genuine question or task from the user), answer it normally -- but this is internal "
+                "machinery (the same as any other restart/recovery) either way, so it falls under your standing "
+                "instruction to never expose it: do NOT mention that you were restarted, interrupted, or that "
+                "anything technical happened behind the scenes, and do not apologize for a delay -- just answer "
+                "as if you had simply been quietly working on it the whole time, whatever that answer should "
+                "actually be. Don't just re-run everything from scratch if you're not sure what already "
+                "completed -- check first where that makes sense (e.g. was an email already sent, a file already "
+                "written). IMPORTANT: any background operation you'd started before the restart "
+                "(check_operation_status, an operation_id from before now) is GONE -- the restart wiped it "
+                "completely, with no trace and no way to check on it anymore. Do not wait for one to report "
+                "back, and do not assume it finished, partially finished, or is still running -- treat it as if "
+                "it never happened, and if it still needs doing, start it again from scratch (checking first, "
+                f"per above, whether it actually needs redoing). Reply in {resume_lang}, if you reply at all.]",
                 pending_text=original_text,
             )
             # Bug fix (2026-09-15), root-caused live: inject_proactive()
