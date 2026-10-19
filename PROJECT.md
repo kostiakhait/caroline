@@ -50,7 +50,10 @@ workspace (`%LOCALAPPDATA%\Caroline\workspace\`).
 the original Node backend's `runLoop` resilience layer — hang detection, a bounded restart
 budget, dehydration/compaction, a failure-classification gauntlet, a continuity-archive pointer,
 and durability across a full app restart, ported "near-verbatim" per its own module docstring,
-which calls it out as the riskiest single piece of that whole migration. `submit()` is the single
+which calls it out as the riskiest single piece of that whole migration. As of a 2026-10-17 split,
+`chat_session.py` itself only holds `__init__` and composes the class from
+`app/chat_session_mixins/*` (shared imports/helpers factored into `app/chat_session_shared.py`) —
+`submit()` specifically lives in `chat_session_mixins/turn_submission.py`. It's still the single
 choke point every turn goes through — a real user message, an internal/proactive nudge, or a
 replay after a restart all funnel through it, and it logs every call.
 
@@ -126,27 +129,35 @@ Rough roster by category:
   `topics_plugin.py`, and `working_memory_plugin.py` are deprecated, superseded by `memory_plugin.py`
   (`app/deprecated_memory.py`), kept read-only for continuity.
 - **Automation** — `mouse_plugin.py`, `keyboard_plugin.py`, `inspect_plugin.py`, `chain_plugin.py`
-  (a linear GUI-automation step interpreter), `screenshot_plugin.py` and their window-targeted
-  twins, plus Linux ports (`_x11_input.py`, `_x11_window.py`, excluded from discovery by their
-  leading underscore).
+  (a linear GUI-automation step interpreter), `screenshot_plugin.py`, `windows_plugin.py` (a
+  cross-plugin registry of Caroline's own open windows/tabs) and their window-targeted twins, plus
+  Linux ports (`_x11_input.py`, `_x11_window.py`, excluded from discovery by their leading
+  underscore).
 - **Browser** — `app_browser_plugin.py` + `app_browser_cdp.py`: one persistent, labeled WebView2
   window per site, driven over a real CDP connection, not simulated input.
 - **Voice** — `voice_api.py` (TTS/STT/translation/reply-review/permission-guard calls — see below),
-  `speech_plugin.py`, `voice_playback_plugin.py` (including Visual Mode talking-head playback).
+  `speech_plugin.py`, `voice_playback_plugin.py` (including Visual Mode talking-head playback),
+  `visual_models_plugin.py` (buying/activating extra Visual Mode talking-head models through the
+  piaster wallet).
 - **Misc** — `login_plugin.py`/`sw_api.py` (SquirrelWisdom login + shared v2 client),
-  `consult_plugin.py` (a GPT-5-class second opinion for high-stakes wording), `files_plugin.py`,
+  `consult_plugin.py` (a GPT-5-class second opinion for high-stakes wording), `summarize_plugin.py`
+  (one tool, `summarize_content`, over the `content.summarize` microagent), `files_plugin.py`,
   `shell_plugin.py`, `scheduler_plugin.py`, `viewer_plugin.py`/`office_editor.py` (embedded
   OnlyOffice docx/xlsx/pptx/pdf editing), `reforce_plugin.py` (Wikipedia search/fact extraction),
-  `image_gen_plugin.py`.
+  `image_gen_plugin.py`, `anvar_plugin.py` (Caroline's own access to Anvar, Camerlengo's
+  email-agent manager), `owner_profile_plugin.py` (tools over `app/owner_profile.py`'s cache —
+  see "Identity, voice, and persona" above), `time_plugin.py` (a trivial Phase-1 proof-of-life
+  plugin, kept as-is).
 
 ## Messenger channels vs. plugins
 
-For every messenger (Telegram/WhatsApp/Signal/Discord/Slack), an `app/*_channel.py` module owns
-the always-running connection/session — login, reconnects, the two-account model where relevant
-(Caroline's own "self" account and the human owner's "owner" account), and encrypts session state
-at rest via `app/secret_store.py`. The matching `app/plugins/*_plugin.py` is a thin, per-turn tool
-layer that imports functions directly from its channel module and exposes them to the model —
-consistently the same split across all five integrations.
+For every messenger (Telegram/WhatsApp/Signal/Discord/Slack, plus Ratatosk — SquirrelWisdom's own
+messenger, the sixth in the identical pattern), an `app/*_channel.py` module owns the always-running
+connection/session — login, reconnects, the two-account model where relevant (Caroline's own "self"
+account and the human owner's "owner" account), and encrypts session state at rest via
+`app/secret_store.py`. The matching `app/plugins/*_plugin.py` is a thin, per-turn tool layer that
+imports functions directly from its channel module and exposes them to the model — consistently the
+same split across all six integrations.
 
 ## SquirrelWisdom-gated features and login
 
@@ -291,11 +302,14 @@ else breaks.
 
 ## Settings screen (`chat.html`/`chat.js`)
 
-Personality (persona editor), Window (always-on-top), Voice (auto-send toggle), Visual mode,
-Claude account (OAuth login/logout/status), Account & Billing (resolved chat source, own-API-key,
-SquirrelWisdom login/balance/top-up), OpenAI account, Ratatosk messenger (owner status + register
-Caroline's own account), phone companion pairing, MCP servers (list/add/remove — the standard
-Claude Code mechanism, not a custom config format).
+Personality (persona editor), Window (always-on-top), Voice (auto-send toggle), Speech recognition
+(local STT on/off), Visual mode, Models (Claude/OpenAI model picker), Claude account (OAuth
+login/logout/status), Account & Billing (resolved chat source, own-API-key, SquirrelWisdom
+login/balance/top-up), OpenAI account, Ratatosk messenger (owner status + register Caroline's own
+account), MCP servers (list/add/remove — the standard Claude Code mechanism, not a custom config
+format). Phone-companion pairing is no longer a Caroline-side settings flow — the Android companion
+app registers itself against the SquirrelWisdom account server-side instead
+(`app/plugins/companion_api.py`), with no pairing UI in `chat.html`.
 
 ## Build & deploy
 
