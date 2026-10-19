@@ -125,7 +125,25 @@ class TurnSubmissionMixin:
         # just above -- see current_turn_suppress_narration's own __init__
         # comment for why this must never retroactively silence narration
         # on a turn that was already in flight.
-        if not self.turn_pending:
+        #
+        # Bug fix (2026-10-19), confirmed live: this used to be gated on
+        # `not self.turn_pending` alone, unlike every sibling flag in this
+        # function (pending_user_text/pending_is_real_user/pending_
+        # attachments), which all give is_real_user the same override. A
+        # suppress_narration=True proactive nudge (e.g. _check_forced_
+        # compaction's memory-flush-before-compaction inject) that landed
+        # while turn_pending never cleanly dropped back to False left this
+        # flag stuck True for the rest of the tab's life -- a real user's
+        # own brand new message had no way to reclaim narration for itself,
+        # unlike it could for the other flags. Confirmed live: a tab's
+        # narrator went completely silent (not even a skip/retry log line)
+        # for 41+ hours after exactly one such flush, across many real
+        # user turns in between. is_real_user now wins here too, same as
+        # its neighbors -- the protection the comment above describes (a
+        # proactive nudge must never retroactively silence an ALREADY
+        # narrating turn) is unaffected, since that case never has
+        # is_real_user=True in the first place.
+        if is_real_user or not self.turn_pending:
             self.current_turn_suppress_narration = suppress_narration
         # Same guard as pending_user_text just above, same incident: a real
         # user message's attachments must not be wiped out by a later
