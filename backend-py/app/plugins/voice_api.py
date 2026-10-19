@@ -21,6 +21,13 @@ class VoiceApiError(Exception):
     pass
 
 
+# check_background_relay_worth's own retry budget (2026-10-19) -- see that
+# function's own docstring for why this gate specifically gets several flat
+# (never exponential) attempts instead of the usual single try.
+_RELAY_WORTH_ATTEMPTS = 4
+_RELAY_WORTH_RETRY_DELAY_S = 1.0
+
+
 async def transcribe_audio(audio_base64: str, fmt: str, session: str | None = None) -> str:
     body: dict[str, Any] = {"command": "ai:stt", "key": CAROLINE_SW_KEY, "audio": audio_base64, "format": fmt}
     if not session:
@@ -718,27 +725,49 @@ async def check_background_relay_worth(text: str, task: str | None = None, sessi
     on its own, even though it was a plan, not a result.
 
     Returns {"worth_relaying": bool, "reason": str} on a clean result, or
-    None on any error/timeout/malformed response (fail-open, same philosophy
-    as every other check_*/translate_text here -- an infrastructure hiccup
+    None once every attempt below has failed (fail-open, same philosophy as
+    every other check_*/translate_text here -- an infrastructure hiccup
     must default to SHOWING the message, never to silently swallowing one
     that might have mattered). The caller (ChatSession.deliver_relayed_reply)
-    treats None the same as worth_relaying=True."""
+    treats None the same as worth_relaying=True.
+
+    Retried (2026-10-19), per explicit instruction: this is the ONE gate
+    standing between Caroline's own routine background chores (a backup
+    confirming it ran, a mailbox sweep finding nothing) and the user's real,
+    visible chat -- unlike an ordinary reply check, a transient infra blip
+    HERE specifically means fail-open lets exactly the kind of noise this
+    agent exists to catch straight through. _RELAY_WORTH_ATTEMPTS flat
+    retries (no exponential backoff, same convention as every other retry
+    loop in this backend) before giving up to the existing fail-open
+    default -- deliberately NOT flipped to fail-closed (that risks
+    swallowing a genuine finding that only failed to judge because of the
+    SAME infra hiccup, not because it was actually routine), just made far
+    less likely to ever actually happen."""
     from app.evolution_client import run_reply_agent
     from app.microagents.background_relay_worth import WORTH
 
-    try:
-        result = await run_reply_agent(WORTH, {"task": task or "", "text": text})
-    except Exception as exc:
-        log_event("plugin:voice", "check_background_relay_worth_failed", reason="request_failed", error=str(exc))
-        return None
-    if result.get("status") != "ok":
-        log_event("plugin:voice", "check_background_relay_worth_failed", reason="bad_response", error=result.get("error"))
-        return None
-    output = result.get("output")
-    if not isinstance(output, dict) or not isinstance(output.get("worth_relaying"), bool):
-        log_event("plugin:voice", "check_background_relay_worth_failed", reason="malformed")
-        return None
-    return {"worth_relaying": output["worth_relaying"], "reason": str(output.get("reason") or "")}
+    last_error: str | None = None
+    for attempt in range(_RELAY_WORTH_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(_RELAY_WORTH_RETRY_DELAY_S)
+        try:
+            result = await run_reply_agent(WORTH, {"task": task or "", "text": text})
+        except Exception as exc:
+            last_error = str(exc)
+            log_event("plugin:voice", "check_background_relay_worth_attempt_failed", reason="request_failed", attempt=attempt, error=last_error)
+            continue
+        if result.get("status") != "ok":
+            last_error = result.get("error")
+            log_event("plugin:voice", "check_background_relay_worth_attempt_failed", reason="bad_response", attempt=attempt, error=last_error)
+            continue
+        output = result.get("output")
+        if not isinstance(output, dict) or not isinstance(output.get("worth_relaying"), bool):
+            last_error = "malformed"
+            log_event("plugin:voice", "check_background_relay_worth_attempt_failed", reason="malformed", attempt=attempt)
+            continue
+        return {"worth_relaying": output["worth_relaying"], "reason": str(output.get("reason") or "")}
+    log_event("plugin:voice", "check_background_relay_worth_failed", attempts=_RELAY_WORTH_ATTEMPTS, error=last_error)
+    return None
 
 
 async def check_reply_expected(task: str, channel: str, sent_message: str, session: str | None = None, timeout: float = 15.0) -> dict[str, Any] | None:

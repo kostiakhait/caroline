@@ -1598,15 +1598,42 @@ async def handle_control_request(
     if op == "shutdown_sync":
         # Best-effort: the WPF shell calls this before killing the backend
         # process, which doesn't wait for a real answer -- this just gets
-        # the memory-backup nudge queued as fast as possible. Deliberately
-        # the PRIMARY tab specifically (not the calling `session`, if any)
-        # -- the whole app is closing, not just one tab, and the backup
-        # itself writes one shared "Caroline:Vault" note regardless of
-        # which tab does it.
+        # the memory-backup nudge queued as fast as possible.
+        #
+        # Bug fix (2026-10-19), confirmed live from caroline.log: this used
+        # to go straight to primary_session().inject_proactive(...) -- the
+        # PRIMARY tab's own real, visible session. Since shutdown_sync never
+        # waits for the turn to finish (the process gets killed right after),
+        # this turn's own pending-turn file (durability.py, keyed on the
+        # PRIMARY tab id) was left populated on almost every single close --
+        # confirmed by 7 separate "resuming_unfinished_turn" log entries over
+        # the last 2 days, all tab_id "1", all this exact BACKUP_NUDGE text.
+        # Two confirmed consequences: (a) main.py's own "fresh launch ->
+        # greet" check a few hundred lines up reads peek_pending_turn for the
+        # PRIMARY tab and skips the greeting whenever it's truthy -- so the
+        # startup greeting silently stopped firing on almost every launch;
+        # (b) the resumed backup turn then ran as a REAL, visible-tab reply,
+        # bypassing deliver_relayed_reply's own check_background_relay_worth
+        # gate entirely (that gate only ever runs for a pseudo-tab's own
+        # result being RELAYED into a real tab -- see pseudo_tab.py's own
+        # _flush_pending_pseudo_turn), so a model reply that didn't say
+        # exactly [[NO_UPDATE]] reached the user's real chat unfiltered.
+        #
+        # Fixed by routing through the SAME pseudo-tab indirection
+        # _on_reminder_due already uses for the hourly version of this exact
+        # chore (see that function, a few hundred lines up) -- the pseudo
+        # session has its own, separate pending-turn file, so it never
+        # blocks the primary tab's own fresh-launch greeting, and its result
+        # (if the model ever does say something) is relayed through
+        # deliver_relayed_reply/check_background_relay_worth like every
+        # other background chore's output already is.
         log_event("engine", "shutdown_sync")
-        p = primary_session()
-        if p is not None:
-            p.inject_proactive("The app is closing right now. " + BACKUP_NUDGE + " Do it immediately, as briefly as possible.")
+        pseudo = pseudo_tab.get_or_create_pseudo_session_sync(PRIMARY_TAB_ID, sessions.get)
+        if pseudo is not None:
+            pseudo.inject_proactive(
+                "The app is closing right now. " + BACKUP_NUDGE + " Do it immediately, as briefly as possible.",
+                suppress_narration=True,
+            )
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "get_history":
         entries = read_recent_history(WORKSPACE_DIR)
