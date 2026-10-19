@@ -32,7 +32,8 @@ for node in shared_tree.body:
 WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speech_state", "_client_quiet_for",
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
-          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval"}
+          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval", "_note_answer_candidate",
+          "_answer_being_checked"}
 # Module-level helpers (now in chat_session_shared.py) the copied methods call.
 HELPERS = {"_spoken_duration"}
 helpers = [n for n in shared_tree.body if isinstance(n, ast.FunctionDef) and n.name in HELPERS]
@@ -148,7 +149,8 @@ def make_session(voice=True, reports=True):
     s.send = send
     return s
 
-async def scenario(name, *, turn_s, fact_every=None, voice=True, reports=True, model_delay=3.0, empty=False, first_remark_at=None):
+async def scenario(name, *, turn_s, fact_every=None, voice=True, reports=True, model_delay=3.0, empty=False, first_remark_at=None,
+                   candidate_at=None):
     events.clear(); state.update(model_delay=model_delay, empty=empty, calls=0, with_audio=[], live=0, max_live=0)
     global T0; T0 = time.monotonic()
     s = make_session(voice, reports)
@@ -168,6 +170,19 @@ async def scenario(name, *, turn_s, fact_every=None, voice=True, reports=True, m
             s._first_voice_remark_covers_start = True
             s._first_voice_remark_task = asyncio.create_task(s._say_first_voice_remark(s._narration_turn_seq, s._first_voice_remark, None))
         asyncio.create_task(first())
+    if candidate_at is not None:
+        async def candidate():
+            # A tier's answer goes to the verifier: the facts stop, and the check adds its one
+            # line -- in the same order, and counted the same way, as run_small_model_turn's
+            # emit()/on_candidate and ChatSession's on_activity.
+            await asyncio.sleep(candidate_at * SCALE)
+            ft.cancel()
+            s.small_model_activity.append("Tier 1 produced an answer; moving on to checking it.")
+            s._note_answer_candidate()
+            s.small_model_activity.append("Checking the result (no tools).")
+            s._lines_since_answer_candidate += 1
+            s._voice_narration_wake.set()
+        asyncio.create_task(candidate())
     await asyncio.sleep(turn_s * SCALE)
     # final answer: same order as _finish_small_model_turn_answered
     s._reset_voice_narration(); answer_at = now_s()
@@ -282,6 +297,31 @@ async def main():
     def ci(sp, sent, ans):
         return [("the remark is never spoken", not any(x[3] for x in sp)), ("final answer is spoken", any(not x[3] for x in sp))]
     all_ok &= report("I", s, ans, ci)
+
+    hold = consts["VOICE_NARRATION_ANSWER_HOLD_S"]
+    s, ans = await scenario("J: the answer is checked for 4s after a busy turn", turn_s=24, fact_every=3, candidate_at=20)
+    def cj(sp, sent, ans):
+        narr = [x for x in sp if x[3]]
+        real = [x for x in sp if not x[3]]
+        return [
+            ("no remark starts while the answer is being checked", not any(20 <= x[0] < ans for x in narr)),
+            (f"the answer is not kept waiting (starts {real[0][0] - ans if real else -1:.1f}s after it is ready)",
+             bool(real) and real[0][0] - ans <= 0.5),
+            ("no two lines ever overlap", no_overlap(sp)),
+        ]
+    all_ok &= report("J", s, ans, cj)
+
+    s, ans = await scenario("K: the check runs long (20s)", turn_s=40, fact_every=3, candidate_at=20)
+    def ck(sp, sent, ans):
+        narr = [x for x in sp if x[3]]
+        during = [x for x in narr if 20 <= x[0] < ans]
+        g = gaps([x for x in sp if x[0] >= 15])
+        return [
+            ("a long check still gets a remark", len(during) >= 1),
+            (f"no silence much over the hold during it (max {max(g, default=0):.1f}s, hold {hold:g}s)", all(x <= hold + 2 for x in g)),
+            ("no two lines ever overlap", no_overlap(sp)),
+        ]
+    all_ok &= report("K", s, ans, ck)
 
     print("\nALL OK" if all_ok else "\nSOME CHECKS FAILED")
 

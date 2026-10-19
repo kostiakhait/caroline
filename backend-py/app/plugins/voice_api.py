@@ -1801,13 +1801,16 @@ async def generate_progress_comment(
 async def generate_progress_comment_direct(
     task: str, activity: str, already_said: list[str], language: str,
     resolve: Callable[[str], Awaitable[str]], gender: str | None = None, addressee_gender: str | None = None,
-    repeat_window: int | None = None,
+    repeat_window: int | None = None, max_chars: int | None = None, too_long: str | None = None,
 ) -> str | None:
     """One-call narration (2026-10-10): drafted straight in `language` by the model
     behind `resolve` (prompt -> raw reply), checked exactly like
     generate_progress_comment's output. Same return contract: the remark, "" for
     nothing new to say (including a repeat of `already_said`), None on failure --
     callers fall back to generate_progress_comment.
+
+    max_chars: a remark longer than this is asked for once more, shorter (`too_long` is
+    the draft that was too long); a second long one is dropped as "".
 
     Measured on a narrator golden set before switching (see the commit): the
     two-call SMALL + translate route vs this one."""
@@ -1820,6 +1823,12 @@ async def generate_progress_comment_direct(
         task, activity, already_said, draft_language=language,
         gender_clause=_gender_agreement_clause(gender, addressee_gender),
     )
+    if too_long:
+        prompt += (
+            f"\n\nA draft of this remark was too long to be said aloud while the user waits: \"{too_long}\". "
+            "Say it again as ONE short sentence of at most 14 words, with at most one figure and no list of "
+            "places or prices."
+        )
     try:
         raw = (await resolve(prompt)) or ""
     except Exception as exc:  # noqa: BLE001
@@ -1853,6 +1862,14 @@ async def generate_progress_comment_direct(
     if _states_figure_as_settled(text, activity, task):
         log_event("plugin:voice", "generate_progress_comment_rejected_settled_figure", text=text[:300], direct=True)
         return ""
+    if max_chars and len(text) > max_chars:
+        log_event("plugin:voice", "generate_progress_comment_rejected_too_long", text=text[:300], direct=True, retried=bool(too_long))
+        if too_long:
+            return ""
+        return await generate_progress_comment_direct(
+            task, activity, already_said, language, resolve, gender=gender, addressee_gender=addressee_gender,
+            repeat_window=repeat_window, max_chars=max_chars, too_long=text,
+        )
     log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True)
     return text
 

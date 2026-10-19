@@ -522,6 +522,10 @@ class ChatSession(
         # remarks have gone out in a row (see VOICE_NARRATION_STALE_STEP_S).
         self._prepared_narration_stale = False
         self._stale_remarks_in_row = 0
+        # Lines of activity since a tier's answer went to the verifier; None when no answer
+        # is being checked (see _answer_being_checked).
+        self._lines_since_answer_candidate: int | None = None
+        self._held_for_answer: str | None = None
         self._narration_facts_at_last_draft: str | None = None
         self._narration_last_draft_at: float | None = None
         self._voice_narration_failed_at: float | None = None

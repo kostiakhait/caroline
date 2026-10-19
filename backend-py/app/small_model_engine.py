@@ -2006,10 +2006,17 @@ _FIRST_REMARK_MIN_CHARS = 8
 _FIRST_REMARK_MAX_CHARS = 140
 
 
-def _first_remark_from_decline(text: str) -> str | None:
+def _first_remark_from_decline(text: str, user_text: str = "") -> str | None:
     lines = text[text.rindex("]]") + 2:].strip().splitlines()
     remark = lines[0].strip().strip("\"«»") if lines else ""
-    if not _FIRST_REMARK_MIN_CHARS <= len(remark) <= _FIRST_REMARK_MAX_CHARS or _FIRST_REMARK_FORBIDDEN.search(remark):
+    # A number the request itself has is a name, not a figure ("iPhone 17"), as in
+    # voice_api._states_figure_as_settled. Live 2026-10-17: "Ищу цены на iPhone 17 в
+    # украинских магазинах." was dropped for its "17", and the first remark was heard 11s
+    # after the question instead of about 6.
+    checked = remark
+    for number in set(re.findall(r"\d+", user_text)):
+        checked = re.sub(rf"(?<!\d){number}(?!\d)", " ", checked)
+    if not _FIRST_REMARK_MIN_CHARS <= len(remark) <= _FIRST_REMARK_MAX_CHARS or _FIRST_REMARK_FORBIDDEN.search(checked):
         return None
     return remark
 
@@ -2102,7 +2109,7 @@ async def _fast_lane_gate(
     ms = int((time.monotonic() - started) * 1000)
     if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
         start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
-        first_remark = _first_remark_from_decline(text) if is_voice else None
+        first_remark = _first_remark_from_decline(text, user_text) if is_voice else None
         log_event("engine", "fast_lane_gate", verdict="tools", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
         return True, start_tier, first_remark
     if FAST_LANE_ANSWERABLE in text:
@@ -2225,7 +2232,7 @@ async def try_fast_answer(
         return None, None, None
     if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
         start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
-        first_remark = _first_remark_from_decline(text) if is_voice else None
+        first_remark = _first_remark_from_decline(text, user_text) if is_voice else None
         log_event("engine", "fast_lane_declined", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
         return None, start_tier, first_remark
     if _FAST_LANE_NO_HISTORY.search(text):
@@ -2247,6 +2254,12 @@ NARRATOR_MODEL = FAST_LANE_MODEL
 # писем от Анны не найдено" about three found letters, gpt-5-nano announced the work
 # finished and slipped into Ukrainian.
 NARRATOR_FIRST_MODEL = "google/gemini-2.5-flash-lite"
+# The longest remark said aloud, as drafted (numbers already in words): about 8s of speech.
+# The prompt asks for one short sentence with at most one figure; both models broke it on
+# lists of prices or cities. 354 remarks heard live up to 2026-10-17: median 59 chars, 90%
+# within 103, 19 over 120 (6 by the first model, 13 by the second). One of them, 197 chars,
+# took 13.6s to say, and the answer that was ready meanwhile waited for it.
+NARRATOR_MAX_CHARS = 120
 
 
 async def resolve_narration_prompt(prompt: str, model: str | None = None, reasoning: dict[str, str] | None = None) -> str:
@@ -2277,13 +2290,13 @@ async def draft_narration_remark(
         return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
 
     remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
-                                                    repeat_window=repeat_window)
+                                                    repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS)
     if remark:
         log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
         return remark
     remark = await generate_progress_comment_direct(
         task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
-        repeat_window=repeat_window,
+        repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS,
     )
     log_event("engine", "narration_drafted", by="second", model=NARRATOR_MODEL, said=bool(remark))
     return remark

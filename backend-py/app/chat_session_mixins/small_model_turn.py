@@ -118,6 +118,8 @@ class SmallModelTurnMixin:
             # line-based processing elsewhere -- one fact is one line.
             self.small_model_activity.append(" ".join(line.split())[:300])
             del self.small_model_activity[:-20]
+            if self._lines_since_answer_candidate is not None:
+                self._lines_since_answer_candidate += 1
             # A new fact is what the narrator waits for: drafting starts now, not at the
             # loop's next tick (up to a second later).
             self._voice_narration_wake.set()
@@ -159,9 +161,11 @@ class SmallModelTurnMixin:
                     send=self.send, on_live_dialogue_update=on_live_dialogue_update,
                     get_new_user_comments=get_new_user_comments, on_activity=on_activity,
                     start_tier=start_tier, is_voice=is_voice,
-                    # Review of a tier's answer runs alongside its verification (_review_ahead).
+                    # Review of a tier's answer runs alongside its verification (_review_ahead);
+                    # the voice narrator holds back meanwhile (_answer_being_checked).
                     on_candidate=(
-                        (lambda candidate: (self._review_ahead(candidate, text), is_voice and self._speech_ahead(candidate, language)))
+                        (lambda candidate: (self._note_answer_candidate(), self._review_ahead(candidate, text),
+                                            is_voice and self._speech_ahead(candidate, language)))
                         if is_real_user else None
                     ),
                 )

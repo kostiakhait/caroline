@@ -396,6 +396,12 @@ def _spoken_duration(seconds: float) -> str:
 # 14, not 18: with 18 the silences heard live reached 17-20s (the interval plus drafting
 # and review), which already sounds like a pause.
 VOICE_NARRATION_STALE_MAX_S = 14.0
+# While a tier's answer is with the verifier, a drafted remark waits until the user has
+# heard nothing for this long: the answer is most likely a few seconds away (the check
+# takes 2.5-4.5s, the answer's audio is made meanwhile). Live 2026-10-17: a 13.6s remark
+# went out 0.6s before the verified answer, which then waited 12s behind it and repeated
+# its prices. A check that runs longer than this still gets a remark, not a silence.
+VOICE_NARRATION_ANSWER_HOLD_S = 6.0
 # A drafted remark not yet shown by then describes a state that has moved on.
 VOICE_NARRATION_MAX_AGE_S = 20.0
 # Shorter than NARRATION_FAILURE_RETRY_S: on a live call, 15s is itself the gap.
@@ -1740,6 +1746,7 @@ __all__ = [
     'VOICE_NARRATION_STALE_STEP_S',
     '_spoken_duration',
     'VOICE_NARRATION_STALE_MAX_S',
+    'VOICE_NARRATION_ANSWER_HOLD_S',
     'VOICE_NARRATION_MAX_AGE_S',
     'VOICE_NARRATION_FAILURE_RETRY_S',
     'VOICE_NARRATION_EST_CHARS_PER_S',
