@@ -30,6 +30,7 @@ import json
 import random
 from typing import Any
 
+from app import evolution_journal
 from app.evolvable_roles_client import EVOLVABLE_ROLES, ladder_from_json, resolve_agent_for_clone
 from app.logging_setup import log_event
 from app.microagent_client import build_local_runtime, new_budget
@@ -111,7 +112,10 @@ def _run_pair_sync(champion: Any, challenger: Any, agent_input: dict[str, Any]) 
     return results[0], results[1]
 
 
-async def run_reply_agent(role: str, agent_input: dict[str, Any]) -> dict[str, Any]:
+async def run_reply_agent(
+    role: str, agent_input: dict[str, Any], *,
+    workspace_dir: str | None = None, action_id: str | None = None, track_id: str | None = None,
+) -> dict[str, Any]:
     """Runs one `reply:` domain microagent call -- plain, or as part of an
     evolution tournament -- entirely on this client. Returns the same
     {"status", "output", "error"} shape Microagent.Runtime.run() always
@@ -122,7 +126,19 @@ async def run_reply_agent(role: str, agent_input: dict[str, Any]) -> dict[str, A
     same philosophy as every other microagent check in this codebase. Only
     raises if the LOCAL runtime itself is unavailable (Microagent.py
     couldn't be resolved) or the role is unknown -- a genuine programmer
-    error, not a transient condition."""
+    error, not a transient condition.
+
+    `workspace_dir`/`action_id`/`track_id` (2026-10-19, the evolution-
+    feedback loop, per explicit special order): when a call actually
+    resolves through the tournament branch below (a real evolution.selector
+    verdict happens), the round is journaled (app/evolution_journal.py)
+    against whatever action/track it was serving -- the only way the new
+    reaction-scoring/backpropagation agents can later find "the recent
+    rounds for this action/track" at all, since Camerlengo itself never
+    sees this correlation (see that module's own docstring). Any caller
+    that omits workspace_dir simply gets no journal entry for its calls --
+    never a hard requirement, same fail-open posture as everything else
+    here."""
     entry = EVOLVABLE_ROLES[role]
     default_agent = entry.parent_agent()
     api_path = API_PATH_BY_ROLE[role]
@@ -201,4 +217,48 @@ async def run_reply_agent(role: str, agent_input: dict[str, Any]) -> dict[str, A
         winner_side = "champion" if (verdict == "A") == a_is_champion else "challenger"
 
     await _evolution_post("evolution:recordOutcome", tournamentId=resolution["tournamentId"], winner=winner_side)
+    if workspace_dir:
+        evolution_journal.append(
+            workspace_dir, role=role, api_path=api_path, tournament_id=resolution["tournamentId"],
+            winner=winner_side, verdict_reason=select_result["output"].get("reason"),
+            action_id=action_id, track_id=track_id,
+        )
     return challenger_result if winner_side == "challenger" else champion_result
+
+
+async def get_role_settings(role: str) -> dict[str, Any] | None:
+    """evolution:getSettings for one role's own api_path -- `scope` is
+    deliberately omitted (Camerlengo defaults it to this caller's own key
+    identity, same as resolveCalls/mintClone/recordOutcome already do --
+    2026-10-19 addition to Api2EvolutionCommands.py's getSettings/
+    setSettings, so a non-admin client never has to know its own opaque
+    scope string just to read/adjust its own weight_selector). Returns the
+    wire-shaped settings dict, or None on any failure or unknown role."""
+    api_path = API_PATH_BY_ROLE.get(role)
+    if not api_path:
+        return None
+    data = await _evolution_post("evolution:getSettings", apiPath=api_path, role=role)
+    if data is None:
+        return None
+    return data.get("settings")
+
+
+async def apply_weight_selector_delta(role: str, delta: float) -> tuple[float, float] | None:
+    """evolution.backprop's own apply step (2026-10-19, per explicit special
+    order): the model only ever RECOMMENDS a bounded delta (see
+    app/microagents/evolution_backprop.py's own module docstring) -- this
+    function is the deterministic code that actually fetches the current
+    weight_selector, clamps the result to [0.0, 1.0], and writes it back.
+    Returns (weight_before, weight_after) on success, or None on any
+    failure (fail-open: a skipped adjustment is never retried
+    synchronously, same posture as every network call in this module)."""
+    api_path = API_PATH_BY_ROLE.get(role)
+    if not api_path:
+        return None
+    settings = await get_role_settings(role)
+    before = float((settings or {}).get("weightSelector", 1.0))
+    after = max(0.0, min(1.0, before + delta))
+    result = await _evolution_post("evolution:setSettings", apiPath=api_path, role=role, weightSelector=after)
+    if result is None:
+        return None
+    return before, after

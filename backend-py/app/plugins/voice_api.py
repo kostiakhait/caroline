@@ -403,6 +403,7 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
 async def check_permission_guard(
     task: str, recent_dialogue: str, previous_block_reason: str | None = None,
     session: str | None = None, timeout: float = 190.0, facts: dict[str, Any] | None = None,
+    workspace_dir: str | None = None, action_id: str | None = None, track_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Per explicit instruction (2026-10-11): Caroline often asks a yes/no
     permission question and then, a turn or two later, does the thing
@@ -474,7 +475,16 @@ async def check_permission_guard(
     guard call is even needed at all), it passes the already-fetched facts
     straight through instead of this function repeating the same local
     model call a second time. None (the common case: every other call site)
-    means run identify locally here, same as always."""
+    means run identify locally here, same as always.
+
+    `workspace_dir`/`action_id`/`track_id` (2026-10-19, the evolution-feedback
+    loop): forwarded straight through to run_reply_agent so a tournament
+    round actually resolved by this call gets journaled against whatever
+    action/track it was serving (see app/evolution_journal.py) -- the only
+    call site that passes these today is permission_guard.py's own
+    _check_action_before_send, since turn.permission.guard is the one
+    reply-domain role evolution is piloted on; every other call site
+    omits them and that round simply never attributes."""
     if facts is None:
         facts = await _identify_pending_action_locally(task, recent_dialogue)
     if facts is not None and facts.get("action_type", "none") == "none":
@@ -494,7 +504,7 @@ async def check_permission_guard(
             "wording_shown_and_accepted": bool(facts.get("wording_shown_and_accepted")),
         })
     try:
-        result = await run_reply_agent(GUARD, agent_input)
+        result = await run_reply_agent(GUARD, agent_input, workspace_dir=workspace_dir, action_id=action_id, track_id=track_id)
     except Exception as exc:
         log_event("plugin:voice", "check_permission_guard_failed", reason="request_failed", error=str(exc))
         return None
@@ -850,6 +860,67 @@ async def check_delivery_completeness(final_text: str, recent_dialogue: str) -> 
         log_event("plugin:voice", "check_delivery_completeness_failed", reason="malformed")
         return None
     return {"complete": output["complete"], "missing": str(output.get("missing") or "")}
+
+
+async def score_reaction(
+    message: str, open_actions: list[dict[str, str]], candidate_track_ids: list[str],
+) -> dict[str, Any] | None:
+    """turn.reaction.score, Agent 1 of the evolution-feedback loop (per
+    explicit special order, 2026-10-19). Called from chat_session_mixins/
+    permission_guard.py's _check_reaction_score on every real user message.
+
+    Returns {"reaction_score", "target_action_id", "target_track_id"}, or
+    None on any error/malformed response -- fail-open: the caller treats
+    None exactly like a 0.0 score with no target."""
+    from app.microagents.reaction_score import SCORE
+
+    try:
+        result = await _run_local_microagent(
+            SCORE, "app.microagents.reaction_score",
+            {"message": message, "open_actions": open_actions, "candidate_track_ids": candidate_track_ids},
+        )
+    except Exception as exc:
+        log_event("plugin:voice", "score_reaction_failed", reason="request_failed", error=str(exc))
+        return None
+    if result is None or result.get("status") != "ok":
+        log_event("plugin:voice", "score_reaction_failed", reason="bad_response", error=(result or {}).get("error"))
+        return None
+    output = result.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("reaction_score"), (int, float)):
+        log_event("plugin:voice", "score_reaction_failed", reason="malformed")
+        return None
+    return output
+
+
+async def run_evolution_backprop(
+    target_summary: str, reaction_score: float, recent_rounds: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """evolution.backprop, Agent 2 of the evolution-feedback loop (per
+    explicit special order, 2026-10-19). Called from chat_session_mixins/
+    permission_guard.py's _run_evolution_backprop, only when Agent 1 found a
+    non-trivial, attributed reaction with at least one matching journaled
+    round.
+
+    Returns {"adjustments": [...]} (possibly empty), or None on any error/
+    malformed response -- fail-open: the caller applies nothing."""
+    from app.microagents.evolution_backprop import BACKPROP
+
+    try:
+        result = await _run_local_microagent(
+            BACKPROP, "app.microagents.evolution_backprop",
+            {"target_summary": target_summary, "reaction_score": reaction_score, "recent_rounds": recent_rounds},
+        )
+    except Exception as exc:
+        log_event("plugin:voice", "evolution_backprop_failed", reason="request_failed", error=str(exc))
+        return None
+    if result is None or result.get("status") != "ok":
+        log_event("plugin:voice", "evolution_backprop_failed", reason="bad_response", error=(result or {}).get("error"))
+        return None
+    output = result.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("adjustments"), list):
+        log_event("plugin:voice", "evolution_backprop_failed", reason="malformed")
+        return None
+    return output
 
 
 # Guards against the failure modes seen live rather than trusting any
