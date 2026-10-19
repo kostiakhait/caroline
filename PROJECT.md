@@ -29,9 +29,11 @@ binaries and skills content copied into every build, not as a running process.
   copied into every install by the root `Makefile`, which explicitly labels `backend-py` as "the
   live backend" in its own build-step comments.
 - **The backing SquirrelWisdom/Camerlengo service** (a separate repository, `reforce`) — every
-  SW-gated feature (Notes/memory, email, consult, voice, pay-as-you-go chat billing) and the whole
-  server-side **microagent layer** (see "Memory and microagents" below) live here, not in
-  Caroline's own process. Caroline talks to it exclusively over its versioned HTTP API
+  SW-gated feature (Notes/memory, email, consult, voice, pay-as-you-go chat billing) and the
+  cross-product **microagent layer** (memory/documents/contacts/search — see "Memory and
+  microagents" below) live here, not in Caroline's own process; Caroline's own `reply:`-domain
+  microagents execute client-side instead, reached through this same service's one generic
+  raw-model-call command. Caroline talks to it exclusively over its versioned HTTP API
   (`app/plugins/sw_api.py`'s `call_v2`/`CAROLINE_SW_KEY`), never by importing its code.
 - **`Windows/CarolineInstaller/`** — a separate, no-admin-rights WPF bootstrapper that downloads
   `Caroline.zip` from `downloader.multi-portal.org`, installs isolated Node/Python runtimes under
@@ -163,10 +165,7 @@ reads real SMS through a paired Android companion phone's own SIM instead (`comp
 
 Several of Caroline's features don't reason with one big prompt — they hand a narrow, specific
 judgment call to a **microagent**: a small, separately-invoked model call with a strict input
-schema, a strict output schema, and exactly one job. Every microagent runs inside the backing
-SquirrelWisdom/Camerlengo service (`apps/microagents/` in the `reforce` repository), never inside
-Caroline's own process, and is reached from `backend-py` over the same versioned API every other
-SW-backed feature uses.
+schema, a strict output schema, and exactly one job.
 
 **Why a microagent instead of a bigger prompt or hand-written code.** Two things, confirmed
 independently, by different incidents: (1) a system-prompt instruction is a request, not a
@@ -177,27 +176,52 @@ leak something it shouldn't, did the user's reply actually mean yes) — that de
 left to a model, never to hand-written string/keyword comparison, which quietly stops matching the
 day something is phrased a little differently.
 
-**The escalation ladder.** Every microagent call starts on the cheapest model that can plausibly
-do the job (`nano`), and only escalates to a stronger one (`nano` again, told what failed; then
-`mini`) if the cheaper attempt's answer fails *validation* — malformed structure, a failed sanity
-check — never merely because an answer seemed debatable but was still well-formed. A single,
-shared `Runtime` (one adapter, one ladder, one concurrency limit) backs every microagent; each
-domain registers its own agents into it from its own point in the code, so unrelated domains never
-have to share files just to share the Runtime.
+**Where a microagent runs — the universal-server boundary (2026-10-18).** Camerlengo is a
+*universal* server, shared by every product built on it (Caroline, BeautySqrl, Ratatosk, …) —
+nothing specific to one product belongs living there. Memory, document indexing, the address book
+and fuzzy search (`apps/microagents/FactMemory.py`, `TopicMemory.py`, `DocumentMemory.py`,
+`AddressBook.py`, `Search.py` in `reforce`) are genuinely cross-product infrastructure and stay
+server-executed for exactly that reason. Everything that's Caroline's own judgment call — the
+`reply:` domain covered below — executes **in Caroline's own process** instead, reached only
+through one domain-agnostic primitive the server exposes (`microagent:call`: model class, prompt,
+timeout in, text and usage out — no idea what agent or product is calling). Real provider keys and
+billing never leave the server either way; what moved is only *whose code decides what the prompt
+says and whether the result is good enough*.
+
+**The escalation ladder** (same on both sides of that boundary). Every microagent call starts on
+the cheapest model that can plausibly do the job (`nano`), and only escalates to a stronger one
+(`nano` again, told what failed; then `mini`) if the cheaper attempt's answer fails *validation* —
+malformed structure, a failed sanity check — never merely because an answer seemed debatable but
+was still well-formed. A single, shared `Runtime` (one adapter, one ladder, one concurrency limit)
+backs every microagent; each domain registers its own agents into it from its own point in the
+code, so unrelated domains never have to share files just to share the Runtime.
 
 **The microagents today:**
 
-| Microagent | What it decides |
-|---|---|
-| `FactMemory` | What's actually worth remembering out of something the user said |
-| `AddressBook` | Whether a name in conversation is an existing contact, by meaning, not spelling |
-| `TopicMemory` | Which stored memories a new question is actually about |
-| `DocumentMemory` | How a saved document gets indexed and searched later |
-| `reply.review` | Whether an outbound reply is on-topic, free of internal leakage, and sounds human |
-| `turn.permission.guard` | Whether the assistant actually has the user's OK for what it's about to do |
+| Microagent | Runs | What it decides |
+|---|---|---|
+| `FactMemory` | server | What's actually worth remembering out of something the user said |
+| `AddressBook` | server | Whether a name in conversation is an existing contact, by meaning, not spelling |
+| `TopicMemory` | server | Which stored memories a new question is actually about |
+| `DocumentMemory` | server | How a saved document gets indexed and searched later |
+| `turn.permission.identify` | client | Pure fact-finding: is a pending send/spend outstanding, and whose identity does it go out under |
+| `turn.permission.guard` | client | Whether the assistant actually has the user's OK for what it's about to do |
+| `reply.review` | client | Whether an outbound reply is on-topic, free of internal leakage, and sounds human |
+| `turn.refusal.guard` | client | Whether the assistant is quietly declining a real task on its own judgment |
+| `turn.action.summary` | client | One-sentence description of exactly what a send-type tool call is about to do |
+| `turn.reply.expected` | client | Whether a reply is actually expected after a message just sent |
+| `turn.background.relay.worth` | client | Whether a background/reminder result is worth interrupting the user for at all |
+| `content.summarize` | client | Compressing a long piece of text to its gist |
+| `reply.translate` | client | Translating outbound text, preserving deliberate quotes/examples in another language |
+| `action.sanction` | client | Whether a real user message just granted or revoked approval for an open action |
+| `turn.delivery.completeness` | client | Whether an outbound message actually contains what it claims to be delivering right now |
 
-The first four back `memory_plugin.py`'s `save_info`/`request_info`. The last two are newer and
-about trust rather than usefulness, added 2026-10-11 directly in response to observed failures:
+The first four back `memory_plugin.py`'s `save_info`/`request_info` and stay server-side. Everything
+from `turn.permission.identify` down is Caroline's own `reply:` domain, client-executed, living in
+`backend-py/app/microagents/` (vendored from `reforce` for the first eight — business logic
+unchanged, only the `Microagent` import differs — plus two written directly for Caroline:
+`action_sanction.py`, `delivery_completeness.py`). Three of them are about trust rather than
+usefulness and worth a closer look:
 
 - **`reply.review`** checks every outbound message — including the small "still working on it"
   progress remarks — for three things: is it actually about the task, does it leak anything about
@@ -211,17 +235,37 @@ about trust rather than usefulness, added 2026-10-11 directly in response to obs
   An unanswered (or ambiguous) yes/no question is now treated as a **refusal**, not permission by
   default. The same strict rule applies even without a spoken question: anything that communicates
   with a third party on the user's behalf, or touches the user's money, needs a clear, *specific*
-  approval already on record — a general "sure, go ahead" for the task doesn't count. When the
-  check (`app/plugins/voice_api.py`'s `check_permission_guard()`, called after every outbound
-  message and after every real user message) finds a live gap, `ChatSession.pending_unapproved_action`
-  is set; the very next tool call of any kind — the actual enforcement point is
-  `app/operations.py`'s `dispatch()`, which never even calls the real handler — stops the **whole
-  turn**, the same hard stop as the user's own Stop button, and the user's next message carries a
-  plain note explaining why and what needs a real answer.
+  approval already on record — a general "sure, go ahead" for the task doesn't count. As of
+  2026-10-18, that approval is also tracked explicitly, not just re-derived from a dialogue window
+  every time (see "Action boundaries" below) — an approval the user already gave can no longer
+  scroll out of view and get re-asked.
+- **`turn.delivery.completeness`** (2026-10-18) closes the mirror-image gap: Caroline *believing*
+  she showed the user something (a draft, a figure, an attachment) that the actual outbound message
+  never contained. Checked right after `reply.review`/translation, on every outbound block; never
+  blocks the send, corrects course with a proactive follow-up note instead.
 
-Both are exposed as their own SW API commands (`reply:review`, `reply:permissionGuard`,
-`API/Api2ReplyCommands.py` in `reforce`), with their own billing label — deliberately not labeled
-"memory," since neither is about the user's own memory.
+**Action boundaries** (`app/action_registry.py`, 2026-10-18). A short-lived, per-tab record of a
+*bounded operation* ("send the renewal email to Jessica Zhou") — distinct from a **track**
+(`TopicMemory`'s long-lived, cross-tab topic; unrelated, untouched by this). `turn.permission.
+identify` matches a pending action against up to 5 open ones (LRU-evicted) on the same call it
+already makes; a separate microagent, `action.sanction`, reconsiders every open action's approval
+after each real user message. An action already flagged `approved` skips `turn.permission.guard`
+entirely for that one call — no re-derivation, no window to scroll out of.
+
+**Agentic evolution** (`API/Api2Evolution.py` in `reforce`). The main model can't be retrained on
+the fly — a system prompt or a microagent's own instructions are the only lever available in the
+moment. But a microagent's *prompt* can improve from real experience, continuously, without ever
+touching the main model: Camerlengo can clone one of its own prompts, mutate the clone
+(`evolution.mutator`), and run the mutant head-to-head against the original on the exact same real
+task the original was about to handle anyway. An independent judge (`evolution.selector`) picks
+the better result for that one call, blind to which side is the incumbent; win/loss/tie accumulates
+in `microagent_tournaments`, and a challenger that keeps winning gets promoted — the new default,
+from that point on, with no shadow period. A role with no settings row, or whose dice roll says
+"not this time," pays zero extra cost — the overwhelming majority of calls. For the client-executed
+`reply:` domain, the server only ever hands back *which* genome to run (`evolution:resolveCalls`/
+`mintClone`/`recordOutcome`) — it never executes a model call itself for those roles; the mutation,
+the champion/challenger run, and the judging all happen in Caroline's own process, same as every
+other client-executed microagent.
 
 ## Security: secrets handling
 
