@@ -684,10 +684,32 @@
     html = html.replace(/^##\s+(.+)$/gm, "<h3>$1</h3>");
     html = html.replace(/^#\s+(.+)$/gm, "<h2>$1</h2>");
 
-    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    html = html.replace(/__([^_]+)__/g, "<strong>$1</strong>");
-    html = html.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
-    html = html.replace(/(?<!_)_([^_]+)_(?!_)/g, "<em>$1</em>");
+    // Bug fix (2026-10-18), confirmed live: a message with two unrelated
+    // file paths on separate lines, each containing exactly one underscore
+    // (e.g. "...\tunnel_cat\..." twice), rendered with both underscores
+    // swallowed and everything between them -- including the newline --
+    // turned italic. [^_]+ (and [^*]+) matched across the WHOLE string,
+    // including line breaks, so the regex paired the first path's
+    // underscore with the SECOND path's underscore as an open/close pair,
+    // neither of which was ever meant as emphasis. Two independent fixes,
+    // both needed:
+    //  1. Exclude newlines from the matched content ([^_\n]+ / [^*\n]+) --
+    //     emphasis never spans a line break in any Markdown dialect, so
+    //     this alone stops cross-line pairing.
+    //  2. Require a non-word character (or string/line boundary) on both
+    //     OUTER sides of underscore emphasis specifically -- GFM's own
+    //     "intraword underscore" rule, there precisely so identifiers like
+    //     snake_case_names or file paths are never touched even on a
+    //     SINGLE line. \w already includes "_", so this one pair of
+    //     lookaround assertions covers both "don't open on a preceding
+    //     letter/digit" and "don't open next to another underscore".
+    //     Asterisk emphasis intentionally keeps allowing intraword matches
+    //     (unlike underscore, that's standard Markdown behavior, not a bug) --
+    //     only the newline exclusion applies to it.
+    html = html.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/(?<!\w)__([^_\n]+)__(?!\w)/g, "<strong>$1</strong>");
+    html = html.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
+    html = html.replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, "<em>$1</em>");
 
     // GFM-style pipe tables (| a | b |\n| --- | --- |\n| c | d |). Run AFTER
     // bold/italic so cell text already has its inline formatting resolved
