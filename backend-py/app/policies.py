@@ -560,23 +560,38 @@ def running_agents_pointer_instruction(file_path: str | None) -> str:
     )
 
 
-def pseudo_tab_pointer_instruction(file_path: str | None) -> str:
-    """Per explicit instruction (2026-10-15), part of the per-tab pseudo-session
-    rework (see app/pseudo_tab.py): "основная модель вообще не должна заниматься
-    фоновыми задачами, только знать об их существовании" -- this tab's reminders
-    and any sub-agents ITS pseudo-session launches run entirely in that separate,
-    invisible session; the real tab's own model never orchestrates any of it,
-    only knows it exists (a read-only pointer, same shape as
-    running_agents_pointer_instruction above, which already covers sub-agents
-    THIS session itself launches directly)."""
-    if not file_path:
+def pseudo_tab_pointer_instruction(applies: bool) -> str:
+    """Per explicit instruction (2026-10-15, reshaped 2026-10-19): "основная
+    модель вообще не должна заниматься фоновыми задачами, только знать об их
+    существовании" -- every background chore (a reminder, an async sub-agent
+    report) runs in its OWN separate, invisible, single-use pseudo-session
+    (app/pseudo_tab.py) -- the real tab's own model never orchestrates any of
+    it, and never shares a thread/session with it either. No longer a pointer
+    to one stable status file (2026-10-19): since each chore now gets its own
+    freshly-created-and-disposed session, there is no longer one persistent
+    file to point at -- this is now purely the awareness statement, same
+    intent, without a now-inapplicable concrete path.
+
+    Bug fix (2026-10-19), confirmed live, the same incident that forced the
+    reshape above: "you never run those yourself" was true for reminders but
+    NOT enforced for the model's own ad hoc self-scheduling (it could still
+    reach the SDK's native ScheduleWakeup tool directly) -- that tool is now
+    blocked outright (see chat_session_mixins/engine_lifecycle.py's own
+    disallowed_tools); this instruction now also names the one correct
+    alternative explicitly, schedule_reminder, so the model has a clear,
+    legitimate path for "check this again later" instead of reaching for
+    something that no longer exists."""
+    if not applies:
         return ""
     return (
-        f"This tab has its own invisible background pseudo-session, handling its reminders and any sub-agents "
-        f"IT launches on its own -- you never run those yourself. Its current activity is tracked in {file_path} "
-        "(same shape as your own agent registry above), purely so you know it exists. You never act on it "
-        "directly: anything it finds worth telling the user is merged into this chat automatically once it "
-        "decides so."
+        "Every background chore of this tab (a reminder firing, a sub-agent's own asynchronous completion "
+        "report) runs in its own separate, invisible, single-use session -- you never run those yourself, and "
+        "you have no tool that lets you self-reschedule a check for later inside your own current session "
+        "either. If you need something checked again later (not right now, in this same turn), use "
+        "schedule_reminder -- it persists the schedule and note, and the backend itself fires it later in its "
+        "own separate session; never write 'I'll check back on this' and try to make that happen yourself. "
+        "Anything a background chore finds worth telling the user is merged into this chat automatically, on "
+        "its own, once it decides so -- you never act on it directly."
     )
 
 

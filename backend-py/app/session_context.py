@@ -24,6 +24,7 @@ PermissionBlockerFn = Callable[[], "str | None"]
 SendActionGuardFn = Callable[[str, "dict[str, Any]"], Awaitable["str | None"]]
 ReplyWatchFn = Callable[[str, dict, Any], None]
 RecentDirectivesFn = Callable[[], str]
+GetSessionFn = Callable[[str], Any]
 
 _current_send: contextvars.ContextVar[SendFn | None] = contextvars.ContextVar("current_send", default=None)
 _current_tab_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_tab_id", default=None)
@@ -234,6 +235,27 @@ def register_recent_real_user_directives(tab_id: str, fn: RecentDirectivesFn) ->
 def get_recent_real_user_directives(tab_id: str | None) -> str:
     fn = _recent_directives_by_tab.get(tab_id) if tab_id else None
     return fn() if fn else ""
+
+
+# The single, process-wide `sessions.get` accessor (main.py's own live-tab
+# registry) -- registered once at startup. Lets chat_session_mixins/
+# watchdog.py (a ChatSession mixin, which cannot import main.py -- see
+# pseudo_tab.py's own module docstring for why) resolve a background
+# activity's OWNING real tab back to its live ChatSession, the same
+# `get_target_session` callback main.py's own _on_reminder_due already
+# passes to pseudo_tab.get_or_create_pseudo_session_sync directly.
+_sessions_getter: GetSessionFn | None = None
+
+
+def register_sessions_getter(fn: "GetSessionFn") -> None:
+    """Called once, at startup (main.py), with `sessions.get` itself --
+    never per-tab (there is exactly one process-wide session registry)."""
+    global _sessions_getter
+    _sessions_getter = fn
+
+
+def get_sessions_getter() -> "GetSessionFn | None":
+    return _sessions_getter
 
 
 def get_cli_pid_sink() -> CliPidSinkFn | None:

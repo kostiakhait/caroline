@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from app import memory_turns
 from app import pseudo_tab
+from app.session_context import register_sessions_getter
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
@@ -188,6 +189,14 @@ async def _require_remote_owner_session(request: Request, call_next):
 
 
 sessions: dict[str, ChatSession] = {}
+# Per explicit instruction (2026-10-19): lets chat_session_mixins/watchdog.py
+# (a ChatSession mixin, which cannot import main.py -- see pseudo_tab.py's
+# own module docstring) resolve a background activity's owning real tab back
+# to its live session, the same `get_target_session` callback this module's
+# own _on_reminder_due already passes to pseudo_tab directly. `sessions.get`
+# stays valid for the dict's whole lifetime (the dict itself is mutated in
+# place, never reassigned) -- registered once, here, not per-tab.
+register_sessions_getter(sessions.get)
 _ratatosk_session: ChatSession | None = None
 # Per explicit instruction: the owner-DM channel must never go silent. A
 # turn triggered by an owner message can end (SDK "result") WITHOUT ever
@@ -282,7 +291,11 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     owner = sessions.get(real_tab_id)
     if reminder.get("priority") == "background" and owner is not None and owner.has_live_dialog():
         return False
-    pseudo = pseudo_tab.get_or_create_pseudo_session_sync(real_tab_id, sessions.get)
+    # activity_id = this reminder's own id (2026-10-19, per-activity pseudo-
+    # sessions): a recurring reminder reuses its own id every firing, so
+    # each firing's pseudo-session is a fresh instance of "this reminder's
+    # own thread" -- never shared with a DIFFERENT reminder or sub-agent.
+    pseudo = pseudo_tab.get_or_create_pseudo_session_sync(real_tab_id, reminder["id"], sessions.get)
     if pseudo is None:
         return False  # still starting up -- the scheduler retries on its own next tick
     # Bug fix (2026-09-11), per explicit instruction: used to pass
@@ -325,7 +338,7 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     memory_turns.start_service_turn(pseudo.tab_id)
     # So check_background_relay_worth (deliver_relayed_reply) can judge the
     # eventual result against what was actually asked, not in isolation.
-    pseudo_tab.set_pseudo_turn_task(real_tab_id, reminder.get("note"))
+    pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, reminder.get("note"))
     delivered = pseudo.inject_proactive(
         f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n{instruction}",
         suppress_narration=True,
@@ -1628,7 +1641,7 @@ async def handle_control_request(
         # deliver_relayed_reply/check_background_relay_worth like every
         # other background chore's output already is.
         log_event("engine", "shutdown_sync")
-        pseudo = pseudo_tab.get_or_create_pseudo_session_sync(PRIMARY_TAB_ID, sessions.get)
+        pseudo = pseudo_tab.get_or_create_pseudo_session_sync(PRIMARY_TAB_ID, "shutdown-backup", sessions.get)
         if pseudo is not None:
             pseudo.inject_proactive(
                 "The app is closing right now. " + BACKUP_NUDGE + " Do it immediately, as briefly as possible.",

@@ -146,7 +146,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import get_action_closer, get_recent_real_user_directives, register_action_closer, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_send_action_guard, register_send_for_tab, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import get_action_closer, get_recent_real_user_directives, get_sessions_getter, register_action_closer, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_send_action_guard, register_send_for_tab, register_sessions_getter, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -1820,6 +1820,8 @@ __all__ = [
     'clear_action_state',
     'register_action_closer',
     'get_action_closer',
+    'register_sessions_getter',
+    'get_sessions_getter',
 ]
 
 

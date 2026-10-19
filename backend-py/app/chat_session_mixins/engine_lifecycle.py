@@ -573,10 +573,7 @@ class EngineLifecycleMixin:
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
                     running_agents_pointer_instruction(agent_registry.ensure_status_file(self.workspace_dir, self.tab_id)),
-                    pseudo_tab_pointer_instruction(
-                        agent_registry.ensure_status_file(self.workspace_dir, pseudo_tab.pseudo_tab_id(self.tab_id))
-                        if not self.headless else None
-                    ),
+                    pseudo_tab_pointer_instruction(not self.headless),
                     language_hint_instruction(self._system_prompt_language),
                     OPENAI_TOOL_HONESTY_INSTRUCTION if self.engine_kind == "openai" else None,
                 ]
@@ -592,7 +589,28 @@ class EngineLifecycleMixin:
                     "cwd": self.workspace_dir,
                     "permission_mode": "bypassPermissions",
                     "mcp_servers": mcp_servers,
-                    "disallowed_tools": ["mcp__caroline-notes__notes_login", *dynamic_disallowed_tools],
+                    # ScheduleWakeup/CronCreate/CronList/CronDelete (2026-10-19, per explicit
+                    # instruction, confirmed live): the underlying Claude Agent SDK/CLI's own
+                    # NATIVE self-scheduling tools -- not Caroline's own (absent from
+                    # build_mcp_servers()) -- resubmit a prompt directly into whatever session
+                    # called them, completely independent of submit()/inject_proactive(), and
+                    # so completely bypass the pseudo-tab architecture (app/pseudo_tab.py) this
+                    # whole system prompt otherwise enforces. Confirmed live: the model used
+                    # ScheduleWakeup from a REAL, visible tab's own live session to self-
+                    # reschedule an ongoing background check, re-waking that same live session
+                    # repeatedly and eventually mixing a background status check with the user's
+                    # own real question in the same turn. Caroline's own schedule_reminder
+                    # (app/plugins/scheduler_plugin.py) is the correct replacement for ANY
+                    # "check again later" need -- it only ever persists a schedule/note and
+                    # always fires later through the tab's own dedicated pseudo-session, never
+                    # executing in the caller's own session. Blocked unconditionally, for every
+                    # ChatSession (real tabs and pseudo-sessions alike -- a pseudo-session's own
+                    # recurring work is already driven externally by the scheduler's own poll
+                    # loop, never by self-scheduling from inside its own turn either).
+                    "disallowed_tools": [
+                        "mcp__caroline-notes__notes_login", "ScheduleWakeup", "CronCreate", "CronList", "CronDelete",
+                        *dynamic_disallowed_tools,
+                    ],
                     # Only Caroline's OWN in-process MCP servers -- ignore every other MCP configuration (user/
                     # project scope in ~/.claude.json, claude.ai connectors). Confirmed live (2026-09-24): those
                     # belong to whoever's dev setup shares that file, come and go with their connection state,
@@ -693,7 +711,7 @@ class EngineLifecycleMixin:
                     # Ground-truth tool-outcome tracking -- see
                     # _track_tool_outcomes' own docstring.
                     self._track_tool_outcomes(message)
-                    self._track_background_tasks(message)
+                    await self._track_background_tasks(message)
 
                     # --- classifier refusal ---
                     if isinstance(message, AssistantMessage):

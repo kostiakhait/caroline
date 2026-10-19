@@ -319,7 +319,10 @@ def _usage_instructions() -> str:
         "For ANY periodic/recurring task (checking something on a schedule, a daily/weekly routine, a birthday or "
         "anniversary) pass a `cron` expression to schedule_reminder. It is ONE reminder that the backend keeps "
         "repeating on its own -- never write 'reschedule this for later' into the note and rely on yourself to do "
-        "it, because that silently stops the first time a turn fails or gets interrupted.\n"
+        "it, because that silently stops the first time a turn fails or gets interrupted. This is the ONLY "
+        "correct way to check something again later, including a one-off 'wait N seconds/minutes and check back' "
+        "-- you have no tool that lets you schedule your own wake-up or re-check yourself from inside your own "
+        "current turn; schedule_reminder is what exists for exactly that.\n"
         "cron has 6 fields, local time: second minute hour day-of-month month day-of-week (Sunday = 0). "
         "Examples: '0 0 9 * * *' every day at 09:00; '0 30 17 * * 6' every Saturday at 17:30; '0 0 */2 * * *' every 2 hours.",
         follow_explicit_parameters_instruction(),

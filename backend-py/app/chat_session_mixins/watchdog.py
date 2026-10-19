@@ -69,7 +69,7 @@ class WatchdogMixin:
             f"them now, directly, in {current_language_name(self.tab_id)}. Don't mention this note itself.]",
             [], False, False,
         )
-    def _track_background_tasks(self, message: Any) -> None:
+    async def _track_background_tasks(self, message: Any) -> None:
         """Feeds agent_registry from the SDK's typed task lifecycle events (see that module's docstring for
         why). A background task can end with a TaskNotificationMessage OR only a TaskUpdatedMessage whose
         status is terminal (e.g. a stopped task) -- either one clears it.
@@ -77,13 +77,24 @@ class WatchdogMixin:
         Bug fix (2026-10-15), confirmed live: a real sub-agent ("Periodic 8-mailbox sweep") finished with a
         genuine TaskNotificationMessage.summary carrying its actual findings, but nothing here ever read
         that field -- the launching session had already wrapped up its OWN turn with "NOTHING NEW" before
-        the sub-agent even finished, and its real report was lost for good. TaskNotificationMessage always
-        carries `summary` (can be empty); a terminal TaskUpdatedMessage does not carry one at all, so only
-        the TaskNotificationMessage branch can ever have something to report. On a non-empty summary, the
-        session that LAUNCHED the sub-agent (self -- a real tab or its own pseudo-session, see
-        app/pseudo_tab.py; this runs identically for either, no self.headless branching needed) is
-        reactivated with the sub-agent's own report via self.inject_proactive -- the same uniform mechanism
-        the user asked for: whichever session launched a sub-agent is the one that gets to react to it."""
+        the sub-agent even finished, and its real report was lost for good.
+
+        Bug fix (2026-10-19), confirmed live, a second incident from the SAME underlying gap: this used to
+        reactivate `self` directly (self.inject_proactive) -- whichever session launched the sub-agent,
+        including a REAL, visible tab's own live session. A sub-agent spawned directly from a real tab's own
+        live turn (not through a reminder/pseudo-session) therefore had its own async completion report
+        land straight back in that SAME live session as a brand-new turn, mixed into the user's own ongoing
+        conversation -- never through check_background_relay_worth's "is this worth surfacing unasked" gate
+        at all (that gate only exists for a pseudo-session's result being RELAYED into a real tab; a real
+        tab reactivating itself never passes through it). Per explicit instruction ("каждая фоновая
+        активность должна быть ОТДЕЛЬНОЙ ниткой рассуждений... никогда они не должны поступать одной и той
+        же модели"): now ALWAYS routes through a fresh, dedicated pseudo-session for this specific sub-agent
+        (app/pseudo_tab.py, activity_id=message.task_id) instead of reactivating `self` -- uniformly, whether
+        the spawning session was a real tab or itself already a pseudo-session (a sub-agent spawned BY a
+        reminder's own pseudo-session is a DIFFERENT activity from that reminder, and gets its own thread
+        too, never bundled into the spawning session's own history). TaskNotificationMessage always carries
+        `summary` (can be empty); a terminal TaskUpdatedMessage does not carry one at all, so only the
+        TaskNotificationMessage branch can ever have something to report."""
         try:
             if isinstance(message, TaskStartedMessage):
                 agent_registry.register(self.workspace_dir, self.tab_id, message.task_id, message.description, message.task_type, message.tool_use_id)
@@ -93,21 +104,26 @@ class WatchdogMixin:
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status)
                 summary = (message.summary or "").strip()
                 if summary:
-                    if pseudo_tab.is_pseudo_tab_id(self.tab_id):
-                        real_tab_id = pseudo_tab.real_tab_id_from_pseudo(self.tab_id)
-                        pseudo_tab.set_pseudo_turn_task(real_tab_id, description)
-                        # Per explicit instruction (2026-10-15): stays on the SAME
-                        # engine as its real tab, even if that tab switched mode
-                        # since this pseudo-session was created/last ran.
-                        pseudo_tab.sync_pseudo_tab_engine(self.workspace_dir, real_tab_id)
-                    self.inject_proactive(
+                    real_tab_id = pseudo_tab.real_tab_id_from_pseudo(self.tab_id) if pseudo_tab.is_pseudo_tab_id(self.tab_id) else self.tab_id
+                    notification_text = (
                         f"[Your sub-agent (agentId {message.task_id}"
                         f"{f', {description}' if description else ''}) just finished (status: {message.status}). "
                         f"Its report:\n\n{summary}\n\nYou are being reactivated specifically because this is your "
                         "own sub-agent's result -- decide what, if anything, to do with it now. If nothing further "
-                        "is needed, reply exactly [[NO_UPDATE]].]",
-                        suppress_narration=True,
+                        "is needed, reply exactly [[NO_UPDATE]].]"
                     )
+                    sessions_getter = get_sessions_getter()
+                    if sessions_getter is not None:
+                        pseudo = await pseudo_tab.get_or_create_pseudo_session(real_tab_id, message.task_id, sessions_getter)
+                        pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, description)
+                        pseudo.inject_proactive(notification_text, suppress_narration=True)
+                    else:
+                        # Fail-open: the sessions getter is only unset this early in
+                        # process startup, before main.py's own registration call
+                        # runs -- never silently drop a real sub-agent's report over
+                        # that, even though this one instance can't be isolated.
+                        log_event("engine", "track_background_tasks_no_sessions_getter", tab_id=self.tab_id, task_id=message.task_id)
+                        self.inject_proactive(notification_text, suppress_narration=True)
             elif isinstance(message, TaskUpdatedMessage) and (message.status or (message.patch or {}).get("status")) in TERMINAL_TASK_STATUSES:
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status or (message.patch or {}).get("status"))
         except Exception as exc:
