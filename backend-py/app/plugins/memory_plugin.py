@@ -1080,12 +1080,17 @@ _USAGE_INSTRUCTIONS = (
     "deprecated and read-only: what they hold can still be read, nothing new is written "
     "through them. notes_* tools work as before for notes the user asks about by name.\n"
     "TRACK STATUS. Each track in your system prompt's topic list may be marked [CURRENT TRACK of this tab] "
-    "(the one save_info last wrote to, from this tab) and/or [closed] (nothing open on it right now -- "
-    "close_track marks this; saving into it again reopens it on its own). Before ever telling the user you "
-    "have no record of something, or that context was lost and you need them to repeat it: check this tab's "
-    "current track if one is marked, check every track NOT marked [closed] (with request_info(topic=<id>) for "
-    "its real content), and check your recent dialogue history -- in that order. Only say you have nothing "
-    "once all three have genuinely come up empty."
+    "(the one save_info last wrote to, from this tab) and/or [closed] (finished -- close_track marks this). "
+    "Before ever telling the user you have no record of something, or that context was lost and you need "
+    "them to repeat it: check this tab's current track if one is marked, check every track NOT marked "
+    "[closed] (with request_info(topic=<id>) for its real content), and check your recent dialogue history "
+    "-- in that order. Only say you have nothing once all three have genuinely come up empty.\n"
+    "[closed] is a HARD STOP on redoing work, not just a label. A generic cue to revisit old ground -- "
+    "\"look at my previous message\", a stale item in your recent dialogue history, your own initiative -- "
+    "must NEVER make you silently redo, continue or re-research a [closed] track. If something you're about "
+    "to do matches one, stop, tell the user in one short sentence that it's already done, and ask whether "
+    "they want anything new on top of it. Only the user's own explicit request to return to that specific "
+    "topic lifts this -- then acting on it (save_info) reopens the track automatically, same as always."
 )
 
 
@@ -1134,10 +1139,14 @@ PLUGIN = Plugin(
         PluginTool(
             "close_track",
             "Marks a track (topic) closed: it is done, nothing is currently open on it. \"topic\" is its id, "
-            "from your own topic list or an earlier request_info/save_info reply. Saving a new episode into a "
-            "closed track (save_info) reopens it on its own -- there is no separate reopen tool. Closing is "
-            "informational only: a closed track is still found and read exactly like an open one. Also closes "
-            "any viewer/browser windows that were opened while this was the tab's current track.",
+            "from your own topic list or an earlier request_info/save_info reply. Call this whenever you "
+            "finish a substantial task/topic, not just when the user says to. Once closed, the track is "
+            "read-only: redoing or continuing its work on a generic cue (not the user specifically asking to "
+            "return to it) is not allowed -- see TRACK STATUS above. Saving a new episode into a closed track "
+            "(save_info) reopens it on its own -- there is no separate reopen tool, but that reopening must "
+            "only happen because the USER asked to return to it, never on your own initiative. A closed "
+            "track is still found and read by request_info like any other. Also closes any viewer/browser "
+            "windows that were opened while this was the tab's current track.",
             {"topic": str},
             close_track,
         ),

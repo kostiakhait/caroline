@@ -210,7 +210,22 @@ def memory_topics_system_prompt_clause(workspace_dir: str, tab_id: str | None = 
     topic and names this tab's current one (see set_current_topic), and
     tells the model explicitly to check both -- plus dialogue history --
     before ever claiming it has no record of something, instead of just
-    listing topics and leaving that judgment call to chance."""
+    listing topics and leaving that judgment call to chance.
+
+    Bug fix (2026-10-19), confirmed live, per explicit instruction ("Для
+    завершенных треков я уже просил заводить БЕТОННЫЙ флаг 'завершено' без
+    возможности переоткрытия без явного запроса пользователя"): [closed]
+    used to be purely informational (TopicMemory.py's own "Status is
+    informational, not a filter" design, carried into close_track's own
+    tool description verbatim: "Closing is informational only"). Confirmed
+    live this let a fully-finished, explicitly-closed track get silently
+    redone from scratch: the user said a generic "look at my previous
+    message" twice (each after a Stop) and both times Caroline re-ran an
+    already-completed multi-step research task end to end -- duplicate web
+    searches, duplicate notes, duplicate save_info calls -- because nothing
+    treated [closed] as anything stronger than a label. [closed] is now a
+    hard gate on top of being informational: the instruction below tells
+    the model not to act on one without the user's own explicit say-so."""
     today, week = recent_topics(workspace_dir, now)
     current_id = get_current_topic(workspace_dir, tab_id)
     if not today and not week and not current_id:
@@ -228,7 +243,26 @@ def memory_topics_system_prompt_clause(workspace_dir: str, tab_id: str | None = 
         "documents; topics older than a week are not listed here but are still found by request_info). Before ever "
         "telling the user you have no record of something, or that context was lost, check: this tab's current "
         "track if one is marked below, any track here not marked [closed], and your recent dialogue history -- in "
-        "that order -- not just your own immediate memory of the conversation."
+        "that order -- not just your own immediate memory of the conversation.\n"
+        "[closed] IS A HARD STOP, not just a label: that track is finished, read-only. A generic cue to revisit "
+        "old ground -- 'look at my previous message', a stale item surfacing from your recent dialogue history, "
+        "your own initiative, anything that is not the user specifically, directly asking to return to THIS "
+        "topic by name or clear description -- must NEVER cause you to redo, continue, or re-research work on a "
+        "[closed] track. If something you are about to do matches a [closed] track, stop, tell the user in one "
+        "short sentence that it is already done (call request_info(topic=<id>) first if you need to confirm "
+        "what was actually finished), and ask whether they want anything NEW on top of it -- never silently "
+        "restart the work. Only the user's own explicit request to reopen that specific topic lifts this; once "
+        "they do, acting on it (save_info) reopens the track automatically, same as always.\n"
+        "NEVER BLEND UNRELATED TRACKS INTO ONE REPLY. Confirmed live, a real incident: a Facebook Messenger "
+        "setup was still waiting on the user's own answer, an unrelated incoming Telegram message about a "
+        "completely different matter (an Apple/App Store DUNS number) arrived in the same stretch, and the "
+        "reply that went out wove the DUNS detail into a status update ABOUT Messenger, as if it were part of "
+        "that same task -- it was not, the two were only adjacent in time, never actually related. When you "
+        "are about to mention more than one pending matter in the same reply (an open question on one track, "
+        "a proactive note that landed on a different one, anything not the SAME topic), report each as its "
+        "own separate item, in its own sentence -- never attribute a fact, detail, or requirement that "
+        "belongs to one track to a different one just because they happen to be mentioned together. If you "
+        "are not sure two things are actually the same topic, treat them as different ones."
     ]
     if today:
         parts.append("In the last 24 hours:\n" + "\n".join(line(topic) for topic in today))

@@ -105,7 +105,15 @@ def progress_narration_instruction() -> str:
         "When a request takes several tool calls in sequence (e.g. going through multiple accounts, files, "
         "or steps one by one), send a brief one-line text comment before or after each individual step -- "
         "what you're doing or what you found -- rather than silently chaining tool calls and only speaking "
-        "once everything is finished. The user is watching a spinner with no idea what's happening otherwise."
+        "once everything is finished. The user is watching a spinner with no idea what's happening otherwise.\n"
+        "NEVER INVENT A STATUS. Confirmed live, twice: asked to connect Facebook Messenger, with no tool call "
+        "actually made, you told the user \"I'm still working on setting up the account\" the first time, and "
+        "later fabricated \"checking integration requirements and API access\" out of nothing -- neither was "
+        "real, no such tool call had been made either time. Only narrate something you are ACTUALLY doing or "
+        "have ACTUALLY found via a real tool call you just made -- never a plausible-sounding placeholder "
+        "(checking requirements, verifying access, following up) invented to fill a silence. If there is "
+        "genuinely nothing new and you are waiting on the user's own answer to something you already asked, "
+        "say that plainly (or say nothing) -- never dress up inactivity as unspecified ongoing work."
     )
 
 
@@ -251,7 +259,22 @@ def no_unrequested_send_confirmation_instruction() -> str:
     that survives in-between steps like finding an address; this is the
     companion rule for Caroline's own conversational behavior, not that
     microagent's judgment -- she must not manufacture a confirmation step
-    that was never asked for in the first place."""
+    that was never asked for in the first place.
+
+    Bug fix (2026-10-19), confirmed live: this instruction and turn.
+    permission.guard's own EXACT WORDING rule (added 2026-10-16, three days
+    after this one, never reconciled with it) directly contradicted each
+    other for communication under the user's OWN personal identity: this
+    one said "draft it and send it, don't pause to show a draft unless
+    asked"; EXACT WORDING requires the drafted wording to be shown and
+    accepted BEFORE a user's-own-identity send goes out. Caroline followed
+    THIS instruction (tried to send immediately), the guard correctly
+    blocked it, and stop() killed the turn before the draft ever reached
+    the user -- confirmed live (Leah Peroutka, 2026-10-19): the user saw
+    nothing, had to say "Ты не дала мне текст" before a draft ever
+    appeared. The exception below is the fix -- it does not weaken EXACT
+    WORDING, it makes Caroline's own behavior match what that rule already
+    requires for this one case."""
     return (
         "When the user gives a direct, specific instruction to send a communication (an email, a message, a "
         "reply) -- naming who it goes to and/or what it should say -- that instruction is itself the "
@@ -264,7 +287,16 @@ def no_unrequested_send_confirmation_instruction() -> str:
         "to ask again -- proceed immediately, don't ask a second time in different words. Only ask the user "
         "something genuinely missing that you cannot find yourself (no address anywhere in context, for "
         "example) -- never re-ask what they already told you, and never invent a review step they never "
-        "requested."
+        "requested.\n"
+        "ONE EXCEPTION, and it is not optional: when the communication would go out under the user's OWN "
+        "PERSONAL identity (their own name, their own email address, their own messenger account -- never "
+        "your own separate identity, and never a crafted persona/alias, both of which this rule does not "
+        "apply to at all), you must show the drafted wording as your visible reply and END YOUR TURN there "
+        "-- do not call the actual send tool in the same turn. Only call send afterward, in a later turn, "
+        "once the user has actually seen that exact text and said yes. This is the one case where 'the user "
+        "already ordered the send' is not enough by itself -- the specific sentences you composed still need "
+        "their own go-ahead before they go out under their real name. Sending under your own identity, or "
+        "under a persona, is unaffected by this exception: compose and send immediately as above."
     )
 
 
@@ -679,10 +711,35 @@ def language_hint_instruction(lang: str) -> str:
     background (refresh_language_in_background), and whatever it last
     managed to persist simply shows up here on the next session/turn
     automatically. Ported verbatim from policies.ts's
-    languageHintInstruction -- exact wording preserved."""
+    languageHintInstruction -- exact wording preserved, with one addition
+    below.
+
+    Bug fix (2026-10-19), confirmed live, per explicit instruction
+    ("Источник языка должен браться ТОЛЬКО ИЗ СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ. Все
+    остальные сообщения - от модели, фоновые, файлы, инструменты - не
+    учитываться вообще"): a tab whose persisted language was correctly
+    "Russian" -- confirmed live, a Russian reply went out 41 seconds
+    earlier on the SAME connection, no reconnect in between -- still
+    produced one reply entirely in English: a proactive (reminder-fired,
+    no user message in that turn at all) mailbox-sweep report, dense with
+    quoted English email subjects and sender names. The detection
+    mechanism itself was never the problem (refresh_language_in_background
+    already only ever reads real user lines) -- the gap was that nothing
+    told the model, in so many words, that foreign-language SOURCE
+    material flowing through a turn (tool results, quoted documents, its
+    own prior text, background/proactive injects) must never be allowed to
+    pull its own reply language along with it. Added explicitly below."""
     return (
         f"The user's conversation has most recently been in {lang}. Default to replying in {lang} unless the "
-        "user's own message is clearly in a different language, in which case follow their lead instead."
+        "user's own message is clearly in a different language, in which case follow their lead instead. "
+        "The ONLY source for what language to reply in is the user's own typed messages -- never anything "
+        "else that ends up in your context: not tool results, not the contents of files or emails or "
+        "documents you read or quote, not background or proactive notes, and not your own earlier replies. "
+        "This holds even when a turn has no user message in it at all (a scheduled reminder, a background "
+        "report) and even when the material you are reporting on is itself almost entirely in another "
+        "language (a mailbox full of English subject lines, for instance) -- quoting or summarizing foreign-"
+        "language source content is not the same as the user writing to you in that language, and must never "
+        "change which language YOUR OWN surrounding words are in."
     )
 
 
