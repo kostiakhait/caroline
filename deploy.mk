@@ -44,16 +44,19 @@ MODEL_FILES := CarolineA.xcfa CarolineB.xcfa PeterA.xcfa PeterB.xcfa
 # behind a firewalled reverse proxy (plain HTTP end-to-end -- see
 # Uploader/main.go's -http flag).
 #
-# Depends on the real installer output files, BUT that chain is not actually
-# cheap when nothing changed, despite the comment this replaced claiming so
-# (2026-10-17, confirmed live): $(OUT)/Caroline.exe depends on the phony
-# camerlengo-vendor target, which Make always treats as stale -- so
-# Caroline.exe's mtime bumps on every `make deploy`, which cascades into a
-# full Caroline.zip re-zip (443MB, real cost) and a full `dotnet publish`
-# of the installer, every single time, build-vs-no-build. A deploy retried
-# after an upload failure (the server/network side, not a code change) pays
-# that full cascade again for nothing. Use `make upload` instead to retry
-# the upload alone against whatever is already sitting in $(INSTALLER_OUT).
+# Depends on the real installer output files. Used to NOT actually be cheap
+# when nothing changed (2026-10-17, confirmed live): $(OUT)/Caroline.exe
+# depended on the phony camerlengo-vendor target, which Make always treated
+# as stale, cascading into a full Caroline.zip re-zip (443MB) and a full
+# `dotnet publish` of the installer on every single `make deploy`, build-vs-
+# no-build. Fixed (2026-10-20, per explicit instruction: "Скопировать один
+# раз и перестать"): camerlengo-vendor is no longer phony -- see the main
+# Makefile's own $(OUT)/backend-py/camerlengo/.stamp rule -- so `make
+# deploy` with nothing actually changed is now cheap again. Still, a deploy
+# retried after a pure upload failure (the server/network side, not a code
+# change) has no reason to re-walk the whole dependency graph at all. Use
+# `make upload` instead to retry the upload alone against whatever is
+# already sitting in $(INSTALLER_OUT).
 #
 # Requires $(UPLOADER_DIR)/deploy_token.txt (the bearer token printed when
 # the caroline-uploader systemd service was first started on the remote

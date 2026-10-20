@@ -68,7 +68,7 @@ LINUX_SHELL_SRC := $(shell find "$(LINUX_SHELL_DIR)" -type f 2>/dev/null)
 WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
 OUT_LINUX := $(SCRIPT_DIR)/dist-linux
 
-.PHONY: help build installer clean dist-linux appimage-linux camerlengo-vendor
+.PHONY: help build installer clean dist-linux appimage-linux
 
 help:
 	@echo "Targets: build, installer, clean, dist-linux, appimage-linux"
@@ -156,30 +156,27 @@ $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	rm -f "$(OUT)/.caroline-exe.rc" "$(OUT)/.nativehost.rc"
 	touch -m "$@"
 
-# CAMERLENGO_VENDOR_STUBS/Config.py listed explicitly (2026-10-03 bug fix, confirmed
-# live): this recipe copies it into dist/backend-py/camerlengo/Config.py, but the
-# actual vendored AI.py/etc. content (pulled live via `git show caroline:...` from
-# CAMERLENGO_REPO) has no file it could depend on here -- a change on the reforce
-# side alone wouldn't otherwise be noticed. Made .PHONY instead (2026-10-12) rather
-# than chasing a fake file-based dependency: this step is a handful of `git show`
-# calls, cheap enough to just always re-run, and it fixes a real standing gap
-# (previously needed `make clean` to pick up a reforce-only change at all).
-.PHONY: camerlengo-vendor
-camerlengo-vendor: $(CAMERLENGO_VENDOR_STUBS)/Config.py
+# Vendored ONCE (2026-10-20, per explicit instruction: "Отказать. Скопировать
+# один раз и перестать.") from CAMERLENGO_REPO@caroline straight into
+# $(CAMERLENGO_VENDOR_STUBS) as real, git-tracked files -- NOT pulled live on
+# every build anymore. The previous design (`git show caroline:...` on every
+# `make deploy`/`make build`) deliberately never went stale, but the cost of
+# that was real: camerlengo-vendor was .PHONY, so Make always treated
+# Caroline.exe's build as stale too, forcing a full dotnet publish (+ full
+# Caroline.zip re-zip on deploy) even when NOTHING had actually changed,
+# C# or camerlengo-side. Now a real file-dependency rule: Make only
+# redoes this (a handful of cheap local copies, no git call at all) when one
+# of the actual stub files changed, and Caroline.exe's build only reruns
+# when THIS step's own output changed. Picking up a genuine reforce-side
+# change again requires manually re-running the same `git show caroline:<f>
+# > $(CAMERLENGO_VENDOR_STUBS)/<f>` commands by hand (see git history for
+# the exact file list) -- a deliberate, infrequent, explicit step now,
+# not an automatic one.
+$(OUT)/backend-py/camerlengo/.stamp: $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py
 	@echo "--- camerlengo (small-model primary path, see small_model_engine.py's own doc comment) ---"
-	@mkdir -p "$(OUT)"
-	@if git -C "$(CAMERLENGO_REPO)" cat-file -e caroline:AI.py 2>/dev/null; then \
-		mkdir -p "$(OUT)/backend-py/camerlengo"; \
-		for f in AI.py Cache.py EmailBasics.py Logger.py JSONStorage.py; do \
-			git -C "$(CAMERLENGO_REPO)" show caroline:$$f > "$(OUT)/backend-py/camerlengo/$$f"; \
-		done; \
-		git -C "$(CAMERLENGO_REPO)" show caroline:apps/microagents/Microagent.py > "$(OUT)/backend-py/camerlengo/Microagent.py"; \
-		cp "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT)/backend-py/camerlengo/Config.py"; \
-		echo "vendored from $(CAMERLENGO_REPO)@caroline"; \
-	else \
-		echo "WARNING: $(CAMERLENGO_REPO) has no reachable 'caroline' branch -- skipping camerlengo vendoring."; \
-		echo "         small_model_engine.py degrades to always-escalate on this build (never a hard dependency)."; \
-	fi
+	@mkdir -p "$(OUT)/backend-py/camerlengo"
+	cp $^ "$(OUT)/backend-py/camerlengo/"
+	@touch "$@"
 
 # Split out of .backend-node.stamp (2026-10-12, confirmed live): node_modules
 # is 6415 files / ~285 MB -- `cp -r` through Git Bash on that many small files
@@ -235,7 +232,7 @@ $(OUT)/.messenger-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/messenger-sidecar/
 	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT)/messenger-sidecar/fca-config.json"
 	touch -m "$@"
 
-$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp camerlengo-vendor $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
+$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
 	@touch -m "$@"
 
@@ -252,7 +249,7 @@ build: $(OUT)/Caroline.exe
 # itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
 # back into Windows/Caroline/), matching caroline_shell.py's own
 # _default_wwwroot() packaged-install lookup.
-$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/Config.py
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py
 	@echo "=== Caroline Linux shell package ==="
 	rm -rf "$(OUT_LINUX)"
 	mkdir -p "$(OUT_LINUX)/linux-shell"
@@ -270,17 +267,9 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	cp "$(BACKEND_PY_DIR)/requirements-linux.txt" "$(OUT_LINUX)/backend-py/requirements-linux.txt"
 	find "$(OUT_LINUX)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find "$(OUT_LINUX)/linux-shell" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	@echo "--- camerlengo (small-model primary path, same conditional vendoring as the Windows build) ---"
-	@if git -C "$(CAMERLENGO_REPO)" cat-file -e caroline:AI.py 2>/dev/null; then \
-		mkdir -p "$(OUT_LINUX)/backend-py/camerlengo"; \
-		for f in AI.py Cache.py EmailBasics.py Logger.py JSONStorage.py; do \
-			git -C "$(CAMERLENGO_REPO)" show caroline:$$f > "$(OUT_LINUX)/backend-py/camerlengo/$$f"; \
-		done; \
-		cp "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/Config.py"; \
-		echo "vendored from $(CAMERLENGO_REPO)@caroline"; \
-	else \
-		echo "WARNING: $(CAMERLENGO_REPO) has no reachable 'caroline' branch -- skipping camerlengo vendoring."; \
-	fi
+	@echo "--- camerlengo (small-model primary path, vendored once -- see the Windows build's own stamp rule for why) ---"
+	mkdir -p "$(OUT_LINUX)/backend-py/camerlengo"
+	cp "$(CAMERLENGO_VENDOR_STUBS)/AI.py" "$(CAMERLENGO_VENDOR_STUBS)/Cache.py" "$(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py" "$(CAMERLENGO_VENDOR_STUBS)/Logger.py" "$(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py" "$(CAMERLENGO_VENDOR_STUBS)/Microagent.py" "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/"
 	@echo "Linux shell package complete: $(OUT_LINUX)"
 	@echo "NOTE: runtime/python and runtime/codex are NOT produced by this recipe (it's plain file"
 	@echo "      copying, cross-platform by design). Run on a Linux host:"
