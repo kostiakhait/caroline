@@ -255,6 +255,15 @@ class DialogueTranscriptMixin:
             # guard on every outbound message -- see _check_permission_guard's
             # own docstring for why this runs here too, not just in submit().
             await self._check_permission_guard()
+            # Per explicit instruction (2026-10-20), after a real incident:
+            # a clarifying question the user already answered earlier in the
+            # dialogue must never be asked again -- see
+            # _check_question_already_answered's own docstring. Checked
+            # BEFORE delivery-completeness (and suppresses it if it fires):
+            # a message about to be hidden from the user has nothing worth
+            # checking for completeness.
+            if not is_silent and await self._check_question_already_answered(text):
+                is_silent = True
             # Per explicit instruction (2026-10-18), after a real incident:
             # also check that THIS message actually delivers everything it
             # claims to -- see _check_delivery_completeness's own docstring.
@@ -276,6 +285,47 @@ class DialogueTranscriptMixin:
                 return None
             wire["message"]["content"] = kept
         return wire
+    async def _check_question_already_answered(self, final_text: str) -> bool:
+        """Per explicit instruction (2026-10-20), after a real incident:
+        Caroline asked which Facebook account to connect, the user
+        answered, and when they later said "go ahead", she asked the exact
+        same question again from scratch -- the earlier answer was right
+        there in the dialogue the whole time, unused. Backed by a new,
+        client-only microagent (turn.question.already_answered, app/
+        microagents/question_already_answered.py -- see that module's own
+        docstring; never deployed to Camerlengo, same as delivery_
+        completeness.py/permission_identify.py).
+
+        Unlike _check_delivery_completeness (which never blocks the send,
+        only corrects afterward), a positive result HERE returns True so
+        the caller suppresses this message outright -- the user must never
+        see a question they already answered, not even once more before a
+        correction could land. Also inject_proactive()s the found answer as
+        an internal note, same non-blocking follow-up pattern
+        _on_permission_block_checked already uses, so the model picks the
+        turn back up with the answer in hand instead of just going silent.
+
+        Fail-open on any error: False (never already answered) -- an
+        infrastructure hiccup must never itself suppress a real question
+        the user hasn't actually answered yet."""
+        from app.plugins.voice_api import check_question_already_answered
+
+        dialogue = self._gather_recent_dialogue_for_permission_guard()
+        try:
+            result = await check_question_already_answered(final_text, dialogue)
+        except Exception as exc:
+            log_event("engine", "check_question_already_answered_failed", tab_id=self.tab_id, error=str(exc))
+            return False
+        if result is None or not result["already_answered"]:
+            return False
+        answer = result["answer"]
+        log_event("engine", "question_already_answered_suppressed", tab_id=self.tab_id, answer=answer, suppressed_text=final_text)
+        self.inject_proactive(
+            f"[Internal: you just started to ask the user a question they already answered earlier in this "
+            f"conversation -- {answer} That question was suppressed, the user never saw it. Proceed using "
+            f"that answer now; do not ask it again.]"
+        )
+        return True
     async def _check_delivery_completeness(self, final_text: str) -> None:
         """Per explicit instruction (2026-10-18), after a real incident:
         Caroline narrated having shown the user a Chinese email draft for

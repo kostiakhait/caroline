@@ -891,6 +891,39 @@ async def check_delivery_completeness(final_text: str, recent_dialogue: str) -> 
     return {"complete": output["complete"], "missing": str(output.get("missing") or "")}
 
 
+async def check_question_already_answered(final_text: str, recent_dialogue: str) -> dict[str, Any] | None:
+    """Per explicit instruction (2026-10-20), after a real incident: checks
+    whether `final_text` (a clarifying question about to reach the user)
+    was already answered earlier in the dialogue, even if worded
+    differently -- see app/microagents/question_already_answered.py's own
+    docstring for the incident. Called from chat_session_mixins/
+    dialogue_transcript.py on EVERY outbound text block, same pipeline
+    check_delivery_completeness runs on.
+
+    Returns {"already_answered": bool, "answer": str}, or None on any
+    error/malformed response -- fail-open: the caller treats None as "not
+    already answered" (an infrastructure hiccup must never itself suppress
+    a real question the user hasn't actually answered yet)."""
+    from app.microagents.question_already_answered import ALREADY_ANSWERED
+
+    try:
+        result = await _run_local_microagent(
+            ALREADY_ANSWERED, "app.microagents.question_already_answered",
+            {"final_text": final_text, "recent_dialogue": recent_dialogue},
+        )
+    except Exception as exc:
+        log_event("plugin:voice", "check_question_already_answered_failed", reason="request_failed", error=str(exc))
+        return None
+    if result is None or result.get("status") != "ok":
+        log_event("plugin:voice", "check_question_already_answered_failed", reason="bad_response", error=(result or {}).get("error"))
+        return None
+    output = result.get("output")
+    if not isinstance(output, dict) or not isinstance(output.get("already_answered"), bool):
+        log_event("plugin:voice", "check_question_already_answered_failed", reason="malformed")
+        return None
+    return {"already_answered": output["already_answered"], "answer": str(output.get("answer") or "")}
+
+
 async def score_reaction(
     message: str, open_actions: list[dict[str, str]], candidate_track_ids: list[str],
 ) -> dict[str, Any] | None:
