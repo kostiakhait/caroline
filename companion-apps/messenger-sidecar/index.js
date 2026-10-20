@@ -69,6 +69,54 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
 
+// Per explicit instruction (2026-10-20), after a real incident: a
+// successful-but-empty getThreadList result had nothing logging WHY it
+// was empty, so diagnosing it needed a manual standalone reproduction
+// instead of just reading caroline.log. Every meaningful operation and
+// sub-step in this file now goes through this -- a new "log" message type,
+// handled on the Python side (messenger_channel.py's own on_line) as a
+// plain log_event, so any future anomaly is already in the log, not
+// something that needs re-reproducing by hand. `extra` values that could
+// be long (message text, raw API args) are truncated here, not omitted --
+// matching this codebase's existing convention elsewhere of logging a
+// bounded preview, never full message content, never silence.
+const LOG_PREVIEW_CHARS = 300;
+function previewValue(v) {
+  if (v === undefined || v === null) return v;
+  if (typeof v === 'string') return v.length > LOG_PREVIEW_CHARS ? v.slice(0, LOG_PREVIEW_CHARS) + '…' : v;
+  try {
+    const s = JSON.stringify(v);
+    return s.length > LOG_PREVIEW_CHARS ? s.slice(0, LOG_PREVIEW_CHARS) + '…' : v;
+  } catch {
+    return String(v);
+  }
+}
+function log(message, extra) {
+  const out = { type: 'log', message };
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) out[k] = previewValue(v);
+  }
+  emit(out);
+}
+
+// Bug fix (2026-10-20), confirmed live: plain `String(e)` on whatever
+// fca-unofficial rejects a callback with gave the useless literal string
+// "[object Object]" when the rejected value wasn't a real Error instance
+// (its own toString never got a chance to run) -- a getThreadList page 2
+// failure logged and reported as exactly that, with the real cause lost.
+// Used everywhere this file used to just do String(e)/String(err) for a
+// log or an outbound error message.
+function describeError(e) {
+  if (e instanceof Error) return e.stack || e.message || String(e);
+  try {
+    const s = JSON.stringify(e);
+    if (s && s !== '{}') return s;
+  } catch {
+    // fall through
+  }
+  return String(e);
+}
+
 const appStatePath = process.env.MESSENGER_APPSTATE_PATH || path.join(__dirname, 'appstate.json');
 
 // The user's own explicit choice (2026-10-20) for listChats' per-call
@@ -115,24 +163,51 @@ function findAttachmentUrl(attachment) {
   return (attachment && (attachment.url || attachment.previewUrl || attachment.downloadUrl || attachment.hiresUrl)) || null;
 }
 
+let apiCallSeq = 0;
 function apiCall(method, ...args) {
   // Wraps one of ctx.api's callback-style methods as a Promise -- every flat
   // method here accepts an optional trailing callback(err, result) per
-  // docs/DOCS.md section 3.1.
+  // docs/DOCS.md section 3.1. Every call and its outcome is logged here,
+  // in ONE place, so every fca-unofficial call this sidecar ever makes
+  // (sendMessage, getThreadList, createNewGroup, all of it) is covered
+  // without needing to instrument each command handler separately.
+  const callId = ++apiCallSeq;
+  log(`apiCall#${callId} ${method} starting`, { args });
   return new Promise((resolve, reject) => {
     if (typeof api[method] !== 'function') {
-      reject(new Error(`ctx.api.${method} is not a function in this version of fca-unofficial`));
+      const err = new Error(`ctx.api.${method} is not a function in this version of fca-unofficial`);
+      log(`apiCall#${callId} ${method} failed: method not found`, { error: describeError(err) });
+      reject(err);
       return;
     }
-    api[method](...args, (err, result) => (err ? reject(err instanceof Error ? err : new Error(String(err))) : resolve(result)));
+    api[method](...args, (err, result) => {
+      if (err) {
+        // Preserve the ORIGINAL rejected value's real content (describeError),
+        // not a generic `new Error(String(err))` whose .message would already
+        // have lost it to "[object Object]" for a non-Error rejection -- the
+        // real incident this fixes (2026-10-20): a getThreadList page 2
+        // failure logged and surfaced as exactly that useless string.
+        const wrapped = err instanceof Error ? err : new Error(describeError(err));
+        log(`apiCall#${callId} ${method} failed`, { error: describeError(err) });
+        reject(wrapped);
+        return;
+      }
+      log(`apiCall#${callId} ${method} succeeded`, {
+        resultType: Array.isArray(result) ? `array(${result.length})` : typeof result,
+        result,
+      });
+      resolve(result);
+    });
   });
 }
 
 async function login() {
+  log('login starting', { appStatePath });
   if (!fs.existsSync(appStatePath)) {
     throw new Error(`no appState at ${appStatePath} -- messenger_login wasn't completed yet, or Python hasn't written this file`);
   }
   const appState = JSON.parse(fs.readFileSync(appStatePath, 'utf8'));
+  log('appState loaded', { cookieCount: Array.isArray(appState) ? appState.length : 'not-an-array' });
 
   // Note (confirmed live, 2026-10-19): the library writes its own human-
   // readable log lines straight to this process's stdout regardless (e.g.
@@ -147,6 +222,7 @@ async function login() {
   const ctx = await fca({ appState }, { listenEvents: true, selfListen: false, autoMarkRead: false, online: false });
   api = ctx.api;
   selfID = ctx.userID || ctx.fbid || null;
+  log('fca login resolved', { userID: selfID });
 
   // Re-save the (possibly refreshed) appState after every successful
   // connect -- Facebook can rotate session cookies over time, and this
@@ -154,11 +230,13 @@ async function login() {
   try {
     const state = api.getAppState();
     fs.writeFileSync(appStatePath, JSON.stringify(state));
+    log('appState re-saved', { cookieCount: Array.isArray(state) ? state.length : 'not-an-array' });
   } catch (e) {
     emit({ type: 'error', message: `connected but re-saving appState failed: ${e}` });
   }
 
   emit({ type: 'ready', userID: selfID });
+  log('listenMqtt starting');
 
   // Lifecycle-event forwarding -- guarded since it is not confirmed which
   // object these actually fire on in this version. Confirmed live
@@ -185,9 +263,12 @@ async function login() {
 
   api.listenMqtt((err, event) => {
     if (err) {
-      emit({ type: 'error', message: `listenMqtt error: ${err}` });
+      const described = describeError(err);
+      log('listenMqtt error', { error: described });
+      emit({ type: 'error', message: `listenMqtt error: ${described}` });
       return;
     }
+    log('listenMqtt event', { eventType: event && event.type });
     if (!event || (event.type !== 'message' && event.type !== 'message_reply')) return;
     const text = (event.body || '').trim();
     const attachments = event.attachments || [];
@@ -220,7 +301,9 @@ rl.on('line', async (line) => {
   } catch {
     return;
   }
+  log('command received', { command: msg });
   if (!api) {
+    log('command rejected: not logged in yet', { cmd: msg.cmd, id: msg.id });
     if (msg.id) emit({ type: 'sendResult', id: msg.id, ok: false, error: 'not logged in yet' });
     return;
   }
@@ -243,11 +326,37 @@ rl.on('line', async (line) => {
       // short/empty page, i.e. there is nothing left to fetch.
       const threads = [];
       let cursor = null;
+      let pageNum = 0;
       while (true) {
-        const page = await apiCall('getThreadList', THREAD_PAGE_SIZE, cursor, ['INBOX']);
-        if (!page || !page.length) break;
+        pageNum += 1;
+        // Bug fix (2026-10-20), confirmed live: page 1 of a real account's
+        // getThreadList succeeded with 20 real threads, page 2 (continuing
+        // pagination with a real cursor) then rejected -- and since that
+        // rejection used to propagate straight out of this whole loop, the
+        // ENTIRE already-fetched page 1 was thrown away too, surfacing as
+        // one hard failure (or, in a separate real occurrence, an empty
+        // array) instead of the 20 real chats this account actually has.
+        // A later page failing is now non-fatal: log it clearly and return
+        // whatever was successfully gathered so far, same "partial is
+        // better than nothing" principle whatsapp_channel.py's own
+        // attachment/group code already follows elsewhere in this codebase.
+        let page;
+        try {
+          page = await apiCall('getThreadList', THREAD_PAGE_SIZE, cursor, ['INBOX']);
+        } catch (e) {
+          log(`listChats page ${pageNum} failed, returning ${threads.length} already-fetched thread(s) instead of failing the whole call`, { error: describeError(e), totalSoFar: threads.length });
+          break;
+        }
+        log(`listChats page ${pageNum}`, { cursor, pageLength: page ? page.length : null });
+        if (!page || !page.length) {
+          log(`listChats page ${pageNum} empty, stopping pagination`, { totalSoFar: threads.length });
+          break;
+        }
         threads.push(...page);
-        if (page.length < THREAD_PAGE_SIZE) break;
+        if (page.length < THREAD_PAGE_SIZE) {
+          log(`listChats page ${pageNum} short (${page.length} < ${THREAD_PAGE_SIZE}), this was the last page`, { totalSoFar: threads.length });
+          break;
+        }
         // `timestamp` as the pagination cursor field is the classic
         // facebook-chat-api-family convention (well-established across this
         // whole lineage of forks), not independently confirmed against
@@ -255,11 +364,26 @@ rl.on('line', async (line) => {
         // findAttachmentUrl's own best-effort field guesses above; the
         // safety-net check just below (cursor not advancing -> stop) covers
         // the case where this turns out wrong rather than looping forever.
-        const nextCursor = page[page.length - 1].timestamp;
+        //
+        // Bug fix (2026-10-20), confirmed live: Facebook's own response
+        // carries this field as a STRING (large numeric ids/timestamps
+        // commonly are, in GraphQL responses), but getThreadList's own
+        // cursor argument rejects anything that isn't a real number --
+        // confirmed live: "getThreadList: timestamp must be an integer or
+        // null". Passed through as a string, page 1 always worked (its own
+        // cursor argument is the literal `null`) and EVERY subsequent page
+        // always failed -- Number(...) here is the actual fix, not just the
+        // fallback (the per-page try/catch above) that made that failure
+        // non-fatal.
+        const nextCursor = Number(page[page.length - 1].timestamp);
         // Safety net only (never a real-world cap): if the cursor somehow
-        // doesn't advance, stop rather than loop forever on an unexpected
-        // response shape -- better an incomplete list than a hang.
-        if (!nextCursor || nextCursor === cursor) break;
+        // doesn't advance (or isn't a usable number at all), stop rather
+        // than loop forever on an unexpected response shape -- better an
+        // incomplete list than a hang.
+        if (!nextCursor || Number.isNaN(nextCursor) || nextCursor === cursor) {
+          log(`listChats page ${pageNum}: cursor did not advance, stopping pagination (safety net)`, { nextCursor, totalSoFar: threads.length });
+          break;
+        }
         cursor = nextCursor;
       }
       const chats = (threads || []).map((t) => {
@@ -268,6 +392,7 @@ rl.on('line', async (line) => {
         if (id) knownChats.set(id, name);
         return { id, name, isGroup: !!t.isGroup };
       });
+      log('listChats done', { totalPages: pageNum, totalChats: chats.length });
       emit({ type: 'chats', id: msg.id, chats });
     } else if (msg.cmd === 'setBlock') {
       await apiCall('changeBlockedStatus', msg.userID, msg.block ? 'block' : 'unblock');
@@ -319,13 +444,19 @@ rl.on('line', async (line) => {
       for (const userID of others) await apiCall('removeUserFromGroup', userID, msg.threadID);
       if (selfID) await apiCall('removeUserFromGroup', selfID, msg.threadID);
       emit({ type: 'sendResult', id: msg.id, ok: true });
+    } else {
+      log('command unrecognized', { cmd: msg.cmd, id: msg.id });
     }
   } catch (e) {
-    if (msg.id) emit({ type: 'sendResult', id: msg.id, ok: false, error: String(e) });
+    const described = describeError(e);
+    log('command failed', { cmd: msg.cmd, id: msg.id, error: described });
+    if (msg.id) emit({ type: 'sendResult', id: msg.id, ok: false, error: described });
   }
 });
 
 login().catch((e) => {
-  emit({ type: 'error', message: String(e) });
+  const described = describeError(e);
+  log('login failed, process exiting', { error: described });
+  emit({ type: 'error', message: described });
   process.exit(1);
 });

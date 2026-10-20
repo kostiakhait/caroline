@@ -326,6 +326,16 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
                     f'specific reply (messenger_send_message(to="{thread_id}", text=..., account="owner")).]'
                 )
             inject_proactive(note)
+        elif msg_type == "log":
+            # Per explicit instruction (2026-10-20), after a real incident: a
+            # successful-but-empty getThreadList result had nothing logging
+            # WHY it was empty, so diagnosing it needed a manual standalone
+            # reproduction instead of just reading caroline.log. index.js
+            # now logs every operation and sub-step through this message
+            # type -- plain-passed through to the real log, not filtered or
+            # summarized, so a future anomaly is already on the record.
+            extra = {k: v for k, v in msg.items() if k not in ("type", "message")}
+            log_event("plugin:messenger", "sidecar_log", account=account, message=msg.get("message"), **extra)
         elif msg_type in ("sendResult", "chats"):
             op_id = msg.get("id")
             fut = _pending[account].pop(op_id, None) if op_id else None
