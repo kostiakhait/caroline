@@ -101,10 +101,19 @@ _PROMPT = (
     "it outright ('send it', 'looks good') or did not object after seeing it, OR the user dictated the "
     "message's actual words themselves (quoted it, or gave text so precise and complete there was nothing "
     "left for the assistant to compose). Otherwise false, including whenever sender_identity is not "
-    "\"user_own\" (this fact only matters for that one case).\n\n"
+    "\"user_own\" (this fact only matters for that one case).\n"
+    "- explicitly_instructed_by_user: true when the user's OWN most recent real message is itself a DIRECT "
+    "COMMAND to perform this exact action -- an imperative telling the assistant to send/write/pay/do this "
+    "specific thing (e.g. 'Write to Leah and ask about X', 'Send Oksana the schedule', 'Pay the invoice'), "
+    "not merely the user discussing, mentioning, or describing a situation the assistant then decided on its "
+    "own to act on. This is a DIFFERENT fact from wording_shown_and_accepted: the user does not need to have "
+    "seen or approved the exact drafted TEXT for this to be true -- they only need to have clearly, directly "
+    "told the assistant to carry out this action, in so many words, themselves. True regardless of "
+    "sender_identity. False whenever the action was the assistant's OWN idea/initiative, or only loosely "
+    "implied, or the user's message was ambiguous about whether to actually act.\n\n"
     "If NEITHER (a) nor (b) applies to anything currently pending, set has_pending_action=false, "
     "action_type=\"none\", and leave action_summary/recipient empty and sender_identity=\"n/a\"/"
-    "wording_shown_and_accepted=false.\n\n"
+    "wording_shown_and_accepted=false/explicitly_instructed_by_user=false.\n\n"
     "Decide using ONLY what is actually said in the dialogue below -- never guess or assume. When the "
     "dialogue shows SEVERAL distinct pending actions under different identities (e.g. one correction sent "
     "under the assistant's own name and another under a persona in the same breath), report the MOST "
@@ -149,6 +158,8 @@ def verify_identify(input: Any, output: Any) -> Optional[str]:
         return '"has_pending_action" must be a boolean'
     if not isinstance(output.get("wording_shown_and_accepted"), bool):
         return '"wording_shown_and_accepted" must be a boolean'
+    if not isinstance(output.get("explicitly_instructed_by_user"), bool):
+        return '"explicitly_instructed_by_user" must be a boolean'
     if action_type != "none" and not (output.get("action_summary") or "").strip():
         return '"action_summary" must be a non-empty string when action_type is not "none"'
     matched_action_id = output.get("matched_action_id")
@@ -179,11 +190,12 @@ def llm_agents() -> List["M.Agent"]:
                     "recipient": _STRING,
                     "sender_identity": {"type": "string", "enum": list(_SENDER_IDENTITIES)},
                     "wording_shown_and_accepted": {"type": "boolean"},
+                    "explicitly_instructed_by_user": {"type": "boolean"},
                     "matched_action_id": {"type": ["string", "null"]},
                 },
                 required=[
                     "has_pending_action", "action_type", "action_summary", "recipient", "sender_identity",
-                    "wording_shown_and_accepted", "matched_action_id",
+                    "wording_shown_and_accepted", "explicitly_instructed_by_user", "matched_action_id",
                 ],
             ),
             build_prompt=prompt_identify, verify=verify_identify,

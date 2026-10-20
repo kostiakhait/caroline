@@ -343,6 +343,23 @@ class PermissionGuardMixin:
                 from app.memory_topics import get_current_topic
                 track_hint = get_current_topic(self.workspace_dir, self.tab_id)
                 action = self.action_registry.open_new(facts.get("action_summary") or summary, track_hint=track_hint)
+                # Per explicit instruction (2026-10-20), confirmed live: the user's
+                # own real message gave a direct, explicit command to do exactly
+                # this ("Напиши, пожалуйста, Leah...") and PermissionGuard still
+                # stopped the turn to ask again -- "если я явно дал команду,
+                # контролёр не должен срабатывать повторно". A brand-new action
+                # whose own identify facts say the user's message directly
+                # commanded it is approved the instant it opens, same short-circuit
+                # as an already-approved existing action just below -- never for a
+                # MATCHED existing action above, whose approval state is this
+                # tab's own ongoing sanction history, not something to silently
+                # override here.
+                if facts.get("explicitly_instructed_by_user"):
+                    self.action_registry.set_approved(action.id, True)
+                    log_event(
+                        "engine", "action_auto_approved_explicit_instruction", tab_id=self.tab_id,
+                        action_id=action.id, summary=action.summary,
+                    )
             self._action_id_for_pending_send = action.id
             self._persist_action_state()
             if action.approved:

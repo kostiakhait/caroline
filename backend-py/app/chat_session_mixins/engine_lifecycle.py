@@ -1033,25 +1033,37 @@ class EngineLifecycleMixin:
                             was_awaiting_post_turn_check_reply = self._awaiting_post_turn_check_reply
                             self._awaiting_post_turn_check_reply = False
                             self.turn_pending = False
-                            # Per explicit instruction (2026-10-19), after a confirmed live
-                            # incident: no operation this turn dispatched and walked away
-                            # from (app/operations.py's "running" slow-path) may outlive the
-                            # turn itself -- a turn that's genuinely, successfully concluding
-                            # (this is the one result_is_fake==False branch, not a fake/
-                            # compaction/hang-recovery result) is the moment to hard-cancel
-                            # anything of this tab's still running. Confirmed live: 10 such
-                            # operations finished within 15ms of each other, long after their
-                            # own turns had ended, and each independently reactivated this
-                            # same tab via a disconnected inject_proactive, piling into a
-                            # stuck compaction's own queue. Same keep_tools exception
-                            # ChatSession.stop() already relies on (an in-flight memory write
-                            # is left to finish, never corrupted mid-save) -- orthogonal
-                            # safety, not an exception to the new policy. Cancelling flips
-                            # the task's own status to "cancelled" before its finally: block
-                            # runs (operations.py's run()), which already skips
-                            # _notify_operation_completed for anything cancelled -- no
-                            # changes needed there at all.
-                            REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
+                            # Reverted (2026-10-20), per explicit instruction, after a
+                            # confirmed live incident: the 2026-10-19 hard-cancel here (see
+                            # git history for its own full reasoning) killed a
+                            # messenger_find_chat operation 1.2s after its own turn
+                            # concluded -- the sidecar had ALREADY produced a real, correct
+                            # result by then, but dispatch()'s own `await asyncio.wait_for
+                            # (asyncio.shield(op.task), timeout=FAST_PATH_TIMEOUT_S)` was
+                            # still inside its own fast-path window when the cancel arrived,
+                            # so asyncio.CancelledError (a BaseException, not an Exception)
+                            # propagated straight out of dispatch() uncaught -- no
+                            # operation_running/operation_done/operation_error log line at
+                            # all, and the model never learned the call had actually
+                            # succeeded. It then fabricated a plausible-sounding but entirely
+                            # invented error message instead of admitting it didn't know.
+                            # The 2026-10-19 incident this cancel was meant to fix (10
+                            # operations finishing within 15ms of each other, each firing an
+                            # inject_proactive into a stuck compaction's own queue) is a real
+                            # but narrower problem than "any operation outliving its own
+                            # turn is bad" -- submit()'s own forced_compaction_result_pending
+                            # check already queues a proactive notify safely instead of
+                            # injecting it live, so the pile-up is now a batch of queued
+                            # turns replayed in order once compaction ends, not live chaos.
+                            # A walked-away operation is now left to finish on its own and
+                            # report back through the EXISTING notify_on_completion ->
+                            # _notify_unless_collected mechanism (NOTIFY_GRACE_S, the
+                            # `collected` dedup flag) -- built for exactly this "model
+                            # walked away" case. REGISTRY.cancel_for_tab is still called,
+                            # unchanged, from ChatSession.stop() (an explicit user Stop is a
+                            # genuine "abort everything in this tab now") and from clear_tab
+                            # -- only this ordinary, successful-turn-conclusion call site is
+                            # removed.
                             self.pending_user_text = None
                             self.pending_attachments = []
                             clear_pending_turn(self.workspace_dir, self.tab_id)

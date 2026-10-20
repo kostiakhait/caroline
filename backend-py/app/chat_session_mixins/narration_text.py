@@ -61,6 +61,21 @@ class TextNarrationMixin:
         real one."""
         if not self.last_real_user_question and self.approval_bridge_tab_id and self.pending_user_text:
             return self.pending_user_text.strip()[:600]
+        # Bug fix (2026-10-20), confirmed live: a proactively-triggered turn
+        # (pending_is_real_user=False -- a scheduled send, a background-op
+        # completion nudge, etc.) has its OWN task, described by its own
+        # pending_user_text -- but last_real_user_question only ever reflects
+        # the last REAL conversational question, which can be about a
+        # completely different, unrelated track still sitting there from
+        # earlier. Confirmed live: review_reply, fed last_real_user_question
+        # for an unrelated earlier Messenger investigation while reviewing a
+        # proactive reply about a just-sent email, judged the (correct) email
+        # reply "off-task" and rewrote it into fabricated Messenger-flavored
+        # text. Only applies when the CURRENT turn itself isn't a real user
+        # message -- a real user turn still always wants its own real
+        # question, unchanged from before.
+        if not self.pending_is_real_user and self.pending_user_text:
+            return self.pending_user_text.strip()[:600]
         question = (self.last_real_user_question or "").strip()
         # A question that went out with interim notes in front (_with_interim_notes):
         # the narrator is told the user's own words, not the notes.
