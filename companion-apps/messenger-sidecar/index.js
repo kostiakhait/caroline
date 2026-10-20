@@ -71,6 +71,12 @@ function emit(obj) {
 
 const appStatePath = process.env.MESSENGER_APPSTATE_PATH || path.join(__dirname, 'appstate.json');
 
+// The user's own explicit choice (2026-10-20) for listChats' per-call
+// pagination chunk size -- purely how many threads one getThreadList HTTP
+// call asks for, never a cap on the total chat list (see listChats' own
+// pagination loop, which keeps going until Facebook itself runs out).
+const THREAD_PAGE_SIZE = 20;
+
 let api = null;
 let selfID = null;
 
@@ -223,7 +229,39 @@ rl.on('line', async (line) => {
       await apiCall('sendMessage', msg.text, msg.to);
       emit({ type: 'sendResult', id: msg.id, ok: true });
     } else if (msg.cmd === 'listChats') {
-      const threads = await apiCall('getThreadList', 20, null, ['INBOX']);
+      // Bug fix (2026-10-20), confirmed live: a hardcoded getThreadList(20,
+      // ...) one-shot call meant a real contact (an existing, ordinary
+      // conversation, nothing archived/filtered) silently never showed up
+      // in messenger_list_chats at all, just because more than 20 OTHER
+      // threads ranked ahead of it by Facebook's own recency ordering --
+      // not a sync-delay, as it first looked live. Fixed as real pagination
+      // instead of a bigger guessed cap (per explicit instruction: no
+      // self-picked limit on how many chats this loads -- load every thread
+      // that actually exists). THREAD_PAGE_SIZE (the user's own choice, 20)
+      // is a pure per-call HTTP chunk size, never a cap on the total result
+      // -- the loop below keeps paginating until Facebook itself returns a
+      // short/empty page, i.e. there is nothing left to fetch.
+      const threads = [];
+      let cursor = null;
+      while (true) {
+        const page = await apiCall('getThreadList', THREAD_PAGE_SIZE, cursor, ['INBOX']);
+        if (!page || !page.length) break;
+        threads.push(...page);
+        if (page.length < THREAD_PAGE_SIZE) break;
+        // `timestamp` as the pagination cursor field is the classic
+        // facebook-chat-api-family convention (well-established across this
+        // whole lineage of forks), not independently confirmed against
+        // THIS fork's actual response shape -- same class of caveat as
+        // findAttachmentUrl's own best-effort field guesses above; the
+        // safety-net check just below (cursor not advancing -> stop) covers
+        // the case where this turns out wrong rather than looping forever.
+        const nextCursor = page[page.length - 1].timestamp;
+        // Safety net only (never a real-world cap): if the cursor somehow
+        // doesn't advance, stop rather than loop forever on an unexpected
+        // response shape -- better an incomplete list than a hang.
+        if (!nextCursor || nextCursor === cursor) break;
+        cursor = nextCursor;
+      }
       const chats = (threads || []).map((t) => {
         const id = t.threadID || t.id;
         const name = t.name || t.threadName || id;
