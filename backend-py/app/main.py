@@ -72,6 +72,7 @@ from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
 from app.discord_channel import get_discord_channel_status, start_discord_channel
 from app.whatsapp_channel import get_whatsapp_channel_status, start_whatsapp_channel
+from app.messenger_channel import get_messenger_channel_status, start_messenger_channel
 from app.signal_channel import get_signal_channel_status, start_signal_channel
 from app.subscription_mode import (
     chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
@@ -500,6 +501,7 @@ async def _start_ratatosk_background_loops() -> None:
     start_telegram_channel(WORKSPACE_DIR, _inject_from_telegram)
     start_discord_channel(WORKSPACE_DIR, _inject_from_discord)
     start_whatsapp_channel(WORKSPACE_DIR, _inject_from_whatsapp)
+    start_messenger_channel(WORKSPACE_DIR, _inject_from_messenger)
     start_signal_channel(WORKSPACE_DIR, _inject_from_signal)
     # Checked every 20s (plus once immediately, catching anything that came
     # due while the app was closed); a reminder is only marked fired once
@@ -998,6 +1000,11 @@ def _inject_from_whatsapp(text: str) -> None:
     _inject_messenger_proactive(text)
 
 
+def _inject_from_messenger(text: str) -> None:
+    """Same shape as _inject_from_slack above, for Facebook Messenger."""
+    _inject_messenger_proactive(text)
+
+
 def _inject_from_signal(text: str) -> None:
     """Same shape as _inject_from_slack above, for Signal."""
     _inject_messenger_proactive(text)
@@ -1232,6 +1239,9 @@ async def handle_control_request(
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
     if op == "whatsapp_channel_status":
         status = get_whatsapp_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op == "messenger_channel_status":
+        status = get_messenger_channel_status()
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
     if op == "signal_channel_status":
         status = get_signal_channel_status()

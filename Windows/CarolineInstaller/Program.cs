@@ -313,6 +313,10 @@ internal static class Program
             p => window.SetDownloadProgress("Setting up Node.js…", p),
             ct));
         await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct));
+        // Step 4c-2: the Messenger sidecar's own npm dependencies
+        // (app/messenger_channel.py, docs/MESSENGER_INTEGRATIONS_PLAN.md) --
+        // same Node runtime provisioned just above, no separate runtime step.
+        await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct));
 
         // Step 4d: Java runtime + signal-cli (app/signal_channel.py, same plan
         // as the WhatsApp sidecar above -- Signal has no official bot API at

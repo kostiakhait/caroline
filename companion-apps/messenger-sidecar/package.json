@@ -1,0 +1,11 @@
+{
+  "name": "caroline-messenger-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Facebook Messenger personal-account connection for Caroline (docs/MESSENGER_INTEGRATIONS_PLAN.md) -- runs as a child process of the Python backend (app/messenger_channel.py via app/sidecar_process.py), talking newline-delimited JSON over stdio. Uses fca-unofficial (unofficial Facebook Messenger web-protocol client), not an official API -- there isn't one for a personal inbox, only for business Pages.",
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@dongdev/fca-unofficial": "^4.0.3"
+  }
+}

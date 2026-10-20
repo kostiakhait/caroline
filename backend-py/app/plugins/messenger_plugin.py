@@ -1,0 +1,396 @@
+"""messenger -- LLM-facing tools over app/messenger_channel.py's Facebook
+Messenger connections. Fifth and last of the planned messenger integrations
+(docs/MESSENGER_INTEGRATIONS_PLAN.md, 2026-10-06).
+
+TWO accounts, same split as every other messenger plugin here: "self"
+(default) is Caroline's own Messenger account -- she may read and reply
+there as herself, no extra permission needed; "owner" is the human owner's
+own personal Messenger account -- read freely, but only send AS the owner
+when they have explicitly asked for that specific message. Acts via an
+unofficial protocol library (fca-unofficial, Node sidecar) either way --
+there is no official API for a personal Messenger inbox, only for business
+Pages. Login is browser-based (changed 2026-10-19: 2FA is universal enough
+now that a direct email/password login isn't realistic) -- messenger_login
+just opens Caroline's own embedded browser window and the user logs in
+there BY HAND, same as any ordinary browser; see messenger_channel.py's own
+doc comment for the full flow (cookie-jar polling, appState export). No
+password or 2FA code ever passes through this plugin at all.
+
+Groups, attachments (2026-10-19), matching the WhatsApp/Telegram plugins'
+surface where Messenger's own protocol actually has an equivalent --
+messenger_delete_group approximates it (see its own description) rather
+than claiming something Messenger can't actually do, same as
+whatsapp_delete_group.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.messenger_channel import (
+    ACCOUNTS,
+    DEFAULT_ACCOUNT,
+    MessengerError,
+    browser_label,
+    create_group,
+    delete_group,
+    download_attachment,
+    is_valid_account,
+    leave_group,
+    list_chats,
+    login_start,
+    send_file,
+    send_message,
+    set_block,
+    update_group_participants,
+)
+from app.workspace_dir import WORKSPACE_DIR
+from app.context_cap import cap_count
+from app.memory_topics import get_current_topic
+from app.plugins.loader import Plugin, PluginTool
+from app.plugins.messenger_search import find_by_name
+from app.session_context import get_tab_id
+from app.window_registry import register_window
+
+
+def _account_or_error(args: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    account = str(args.get("account") or DEFAULT_ACCOUNT).strip()
+    if not is_valid_account(account):
+        return account, {"text": f'"account" must be one of {", ".join(ACCOUNTS)}, not {account!r}.', "is_error": True}
+    return account, None
+
+
+async def messenger_login(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    try:
+        message = await login_start(account)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    tab_id = get_tab_id()
+    register_window(
+        f"browser:{browser_label(account)}", kind="browser", label=browser_label(account),
+        purpose=f"Facebook login for the Messenger \"{account}\" account", tab_id=tab_id,
+        topic_id=get_current_topic(WORKSPACE_DIR, tab_id),
+    )
+    return {"text": message}
+
+
+async def messenger_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    try:
+        chats = await list_chats(account)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    chats, _cut = cap_count(chats)
+    return {"text": str(chats)}
+
+
+async def messenger_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    query = str(args["query"]).strip()
+    if not query:
+        return {"text": 'messenger_find_chat needs "query".', "is_error": True}
+    try:
+        chats = await list_chats(account)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    matches = await find_by_name(query, chats)
+    matches, _cut = cap_count(matches)
+    return {"text": str(matches)}
+
+
+async def messenger_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    to = str(args.get("to") or "").strip()
+    text = str(args.get("text") or "")
+    if not to or not text:
+        return {"text": 'messenger_send_message needs "to" and "text".', "is_error": True}
+    try:
+        await send_message(account, to, text)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Sent to {to}."}
+
+
+async def messenger_block_user(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    user_id = str(args.get("userId") or "").strip()
+    if not user_id:
+        return {"text": 'messenger_block_user needs "userId".', "is_error": True}
+    try:
+        await set_block(account, user_id, True)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Blocked {user_id}."}
+
+
+async def messenger_unblock_user(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    user_id = str(args.get("userId") or "").strip()
+    if not user_id:
+        return {"text": 'messenger_unblock_user needs "userId".', "is_error": True}
+    try:
+        await set_block(account, user_id, False)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Unblocked {user_id}."}
+
+
+async def messenger_download_attachment(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    ref = str(args.get("ref") or "").strip()
+    if not ref:
+        return {"text": 'messenger_download_attachment needs "ref" from a proactive Messenger notification.', "is_error": True}
+    save_path = str(args.get("savePath") or "").strip() or None
+    try:
+        path = await download_attachment(WORKSPACE_DIR, account, ref, save_path)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Saved to {path}."}
+
+
+async def messenger_send_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    to = str(args.get("to") or "").strip()
+    path = str(args.get("path") or "").strip()
+    if not to or not path:
+        return {"text": 'messenger_send_file needs "to" and "path".', "is_error": True}
+    try:
+        await send_file(account, to, path, args.get("caption"))
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Sent {path} to {to}."}
+
+
+async def messenger_create_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    subject = str(args.get("subject") or "").strip()
+    participants = [str(p) for p in (args.get("participants") or [])]
+    if not subject:
+        return {"text": 'messenger_create_group needs "subject".', "is_error": True}
+    if not participants:
+        return {"text": 'messenger_create_group needs at least one "participants" user id.', "is_error": True}
+    try:
+        thread_id = await create_group(account, subject, participants)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f'Created group "{subject}" (threadID {thread_id}).'}
+
+
+async def _group_participants_tool(args: dict[str, Any], action: str, verb: str) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    thread_id = str(args.get("threadId") or "").strip()
+    participants = [str(p) for p in (args.get("participants") or [])]
+    if not thread_id or not participants:
+        return {"text": 'needs "threadId" and at least one "participants" entry.', "is_error": True}
+    try:
+        await update_group_participants(account, thread_id, participants, action)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"{verb} {len(participants)} participant(s) in {thread_id}."}
+
+
+async def messenger_add_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    return await _group_participants_tool(args, "add", "Added")
+
+
+async def messenger_remove_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    return await _group_participants_tool(args, "remove", "Removed")
+
+
+async def messenger_promote_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    return await _group_participants_tool(args, "promote", "Promoted")
+
+
+async def messenger_demote_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    return await _group_participants_tool(args, "demote", "Demoted")
+
+
+async def messenger_leave_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    thread_id = str(args.get("threadId") or "").strip()
+    if not thread_id:
+        return {"text": 'messenger_leave_group needs "threadId".', "is_error": True}
+    try:
+        await leave_group(account, thread_id)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"Left {thread_id}."}
+
+
+async def messenger_delete_group(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    thread_id = str(args.get("threadId") or "").strip()
+    if not thread_id:
+        return {"text": 'messenger_delete_group needs "threadId".', "is_error": True}
+    try:
+        await delete_group(account, thread_id)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": f"{thread_id} emptied and left -- Messenger has no true group delete, so every other participant this account could remove was removed first, then this account left too."}
+
+
+def _usage_instructions() -> str:
+    return (
+        "Two accounts, same split as the other messenger plugins: `account=\"self\"` (default) is Caroline's own "
+        "Messenger account -- read/reply there freely, no extra permission needed. `account=\"owner\"` is the "
+        "human owner's own personal Messenger (their real chats) -- read freely, but only send AS the owner "
+        "when they have explicitly asked you to send that specific message; an unofficial protocol library "
+        "(fca-unofficial) either way, since there is no official API for a personal Messenger inbox, only for "
+        "business Pages. messenger_login(account=...) is one-time setup per account -- it opens Caroline's own "
+        "embedded browser window on facebook.com and the USER logs in there by hand (password, 2FA code, "
+        "checkpoint -- whatever Facebook asks for, exactly like any ordinary browser login); no password or code "
+        "ever passes through you at all. Call it only when the user has explicitly asked to connect that "
+        "account, never on your own initiative -- after that, just tell them the window is open and to log in "
+        "there; you don't need to watch or poll for them, the connection completes on its own once they do. "
+        "messenger_find_chat(query) finds a chat by name/"
+        "description, judged by meaning -- use it instead of messenger_list_chats when looking for one specific "
+        "chat; both only ever see chats fetched since that account's connection came up.\n"
+        "`to`/`userId`/`threadId`/`participants` everywhere are Messenger's own numeric ids (from "
+        "messenger_list_chats, a proactive notification, or a group's own threadID) -- never a guessed name.\n"
+        "Attachments: a proactive notification for an incoming photo/video/file says so (\"media\": ...) and "
+        "gives a \"ref\" -- download it with messenger_download_attachment(ref) before using it (omit savePath "
+        "for a default location); that ref only works for a short while after the message arrives, same "
+        "limitation as whatsapp_download_attachment's own ref. messenger_send_file(to, path, caption) sends a "
+        "local file.\n"
+        "Groups: messenger_create_group(subject, participants) needs at least one other member. "
+        "messenger_add_members/messenger_remove_members/messenger_promote_members/messenger_demote_members all "
+        "take (threadId, participants). messenger_delete_group is an approximation, not a true delete -- see its "
+        "own description; messenger_leave_group just leaves."
+    )
+
+
+PLUGIN = Plugin(
+    name="messenger",
+    usage_instructions=_usage_instructions(),
+    tools=[
+        PluginTool(
+            "messenger_login",
+            "Connects Caroline to a Facebook Messenger account: opens Caroline's own embedded browser window on "
+            "facebook.com for the user to log in BY HAND (password, 2FA, checkpoint -- whatever Facebook asks, "
+            "same as any ordinary browser). `account`: \"self\" to connect Caroline's own Messenger account, "
+            "\"owner\" to connect the human owner's personal account -- always confirm which one before calling "
+            "this. Call only when the user has explicitly asked to connect that account. Returns immediately -- "
+            "the connection itself completes automatically once the user finishes logging in, no further tool "
+            "call needed.",
+            {"account": str | None}, messenger_login,
+        ),
+        PluginTool(
+            "messenger_list_chats",
+            "Lists an account's Messenger chats seen since the connection came up, each with its id (threadID) -- "
+            "the id to use for messenger_send_message. `account`: \"self\" (default) or \"owner\".",
+            {"account": str | None}, messenger_list_chats,
+        ),
+        PluginTool(
+            "messenger_find_chat",
+            "Finds the chat(s) matching a name/description, by MEANING (transliteration, diminutives, typos, word "
+            "order) -- never exact text. Use this instead of messenger_list_chats whenever you're looking for one "
+            "specific person/group rather than browsing. Returns the same row shape as messenger_list_chats, only "
+            "the ones that actually match -- possibly empty if genuinely nothing fits. `account`: \"self\" "
+            "(default) or \"owner\".",
+            {"query": str, "account": str | None}, messenger_find_chat,
+        ),
+        PluginTool(
+            "messenger_send_message",
+            "Sends a Messenger message. `to` is the exact threadID (see this plugin's own usage_instructions). "
+            "`account`: \"self\" (default) or \"owner\" -- only send as \"owner\" when the user has explicitly "
+            "asked for this specific message.",
+            {"to": str, "text": str, "account": str | None}, messenger_send_message,
+        ),
+        PluginTool(
+            "messenger_block_user",
+            "Blocks someone on Messenger. `userId` is their Messenger user id. `account`: \"self\" (default) or "
+            "\"owner\" -- blocking on the owner's own account is a real decision about who can reach them; only "
+            "do it when they have asked for it.",
+            {"userId": str, "account": str | None}, messenger_block_user,
+        ),
+        PluginTool(
+            "messenger_unblock_user",
+            "Reverses messenger_block_user. `userId` is their Messenger user id. `account`: \"self\" (default) or "
+            "\"owner\".",
+            {"userId": str, "account": str | None}, messenger_unblock_user,
+        ),
+        PluginTool(
+            "messenger_download_attachment",
+            "Downloads a Messenger message's attached media to a local file. `ref` comes from a proactive "
+            "Messenger notification (\"media\": ...) -- only usable for a while after the message arrives. "
+            "`savePath` is optional -- omit it to save under a default Caroline folder and get the resulting "
+            "path back. `account`: \"self\" (default) or \"owner\".",
+            {"ref": str, "savePath": str | None, "account": str | None}, messenger_download_attachment,
+        ),
+        PluginTool(
+            "messenger_send_file",
+            "Sends a local file as a Messenger attachment. `to` is a threadID. Optional `caption`. `account`: "
+            "\"self\" (default) or \"owner\" -- same owner-impersonation rule as messenger_send_message.",
+            {"to": str, "path": str, "caption": str | None, "account": str | None}, messenger_send_file,
+        ),
+        PluginTool(
+            "messenger_create_group",
+            "Creates a Messenger group chat. `participants` needs at least one other user id -- a group cannot be "
+            "created with just yourself. `account`: \"self\" (default) or \"owner\".",
+            {"subject": str, "participants": list, "account": str | None}, messenger_create_group,
+        ),
+        PluginTool(
+            "messenger_add_members",
+            "Adds members to a Messenger group. `threadId` is the group's id; `participants` is a list of user "
+            "ids. `account`: \"self\" (default) or \"owner\".",
+            {"threadId": str, "participants": list, "account": str | None}, messenger_add_members,
+        ),
+        PluginTool(
+            "messenger_remove_members",
+            "Removes members from a Messenger group. `threadId` is the group's id; `participants` is a list of "
+            "user ids. `account`: \"self\" (default) or \"owner\".",
+            {"threadId": str, "participants": list, "account": str | None}, messenger_remove_members,
+        ),
+        PluginTool(
+            "messenger_promote_members",
+            "Promotes members to admin in a Messenger group. `threadId` is the group's id; `participants` is a "
+            "list of user ids. `account`: \"self\" (default) or \"owner\".",
+            {"threadId": str, "participants": list, "account": str | None}, messenger_promote_members,
+        ),
+        PluginTool(
+            "messenger_demote_members",
+            "Demotes admins back to regular members in a Messenger group. `threadId` is the group's id; "
+            "`participants` is a list of user ids. `account`: \"self\" (default) or \"owner\".",
+            {"threadId": str, "participants": list, "account": str | None}, messenger_demote_members,
+        ),
+        PluginTool(
+            "messenger_leave_group",
+            "Leaves a Messenger group (does not delete it). `threadId` is the group's id. `account`: \"self\" "
+            "(default) or \"owner\".",
+            {"threadId": str, "account": str | None}, messenger_leave_group,
+        ),
+        PluginTool(
+            "messenger_delete_group",
+            "Approximates deleting a Messenger group: removes every other participant this account can, then "
+            "leaves. Messenger has no true group-delete call, so this is the closest available -- the group ends "
+            "up empty and inaccessible, including to this account. `threadId` is the group's id. `account`: "
+            "\"self\" (default) or \"owner\".",
+            {"threadId": str, "account": str | None}, messenger_delete_group,
+        ),
+    ],
+)

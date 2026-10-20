@@ -150,6 +150,9 @@ def _child_env() -> dict[str, str]:
         # _ROOT_DIR) -- same layout CAROLINE_NATIVEHOST_EXE_PATH above uses,
         # since the Makefile publishes it there too (see its own "whatsapp-sidecar" recipe).
         env["CAROLINE_WHATSAPP_SIDECAR_DIR"] = str(_APP_DIR / "whatsapp-sidecar")
+        # app/messenger_channel.py's fca-unofficial sidecar -- same sibling-
+        # of-app-dir convention as CAROLINE_WHATSAPP_SIDECAR_DIR just above.
+        env["CAROLINE_MESSENGER_SIDECAR_DIR"] = str(_APP_DIR / "messenger-sidecar")
         # app/signal_channel.py's signal-cli daemon -- same two-piece
         # (runtime + tool) shape as Node/whatsapp-sidecar just above.
         env["CAROLINE_JAVA_HOME"] = str(_ROOT_DIR / "runtime" / "java")

@@ -53,6 +53,7 @@ internal static class ErrorCodes
     public const string WhatsappSidecarInstall = "E19";
     public const string JavaRuntimeInstall = "E20";
     public const string SignalCliInstall = "E21";
+    public const string MessengerSidecarInstall = "E22";
     /// <summary>Anything not wrapped by a specific step -- a bug, not a foreseen failure mode.</summary>
     public const string Unexpected = "E99";
 }

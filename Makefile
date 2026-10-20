@@ -146,7 +146,7 @@ $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	# subtrees/stamps the other targets below own (backend/, backend-py/,
 	# whatsapp-sidecar/, every *.stamp file) -- same "narrower cleanup, same
 	# effect, scoped" principle already applied to those, just missed here.
-	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend ! -name backend-py ! -name whatsapp-sidecar ! -name "*.stamp" -exec rm -rf {} +
+	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend ! -name backend-py ! -name whatsapp-sidecar ! -name messenger-sidecar ! -name "*.stamp" -exec rm -rf {} +
 	( rc=0; dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.caroline-exe.rc" ) & \
 	( echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"; \
 	  rc=0; dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.nativehost.rc" ) & \
@@ -227,7 +227,15 @@ $(OUT)/.whatsapp-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/pa
 	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
 	touch -m "$@"
 
-$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp camerlengo-vendor $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp
+$(OUT)/.messenger-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
+	@echo "--- messenger-sidecar (fca-unofficial, Node -- see app/messenger_channel.py) ---"
+	mkdir -p "$(OUT)/messenger-sidecar"
+	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json" "$(OUT)/messenger-sidecar/package.json"
+	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js" "$(OUT)/messenger-sidecar/index.js"
+	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT)/messenger-sidecar/fca-config.json"
+	touch -m "$@"
+
+$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp camerlengo-vendor $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
 	@touch -m "$@"
 

@@ -7,6 +7,10 @@ backend/vault-client/node_modules/
 backend/mcp-servers-src/*/node_modules/
 backend/mcp-servers-src/*/dist/
 companion-apps/*/node_modules/
+# fca-unofficial's own runtime cache DB (messenger-sidecar), auto-created in
+# its CWD on every start -- not config, nothing to ship or review, same
+# category as node_modules/ above.
+companion-apps/messenger-sidecar/Fca_Database/
 dist/
 dist_installer/
 

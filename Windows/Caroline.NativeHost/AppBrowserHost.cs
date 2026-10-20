@@ -440,6 +440,22 @@ public sealed class AppBrowserHost : IDisposable
                 return (200, JsonSerializer.Serialize(new { imageBase64 = Convert.ToBase64String(png) }));
             }
 
+            case "/get_cookies":
+            {
+                // First user: app/messenger_channel.py's browser-based Facebook
+                // login (2026-10-19) -- see AppBrowserWindow.GetCookiesAsync's
+                // own doc comment for why this goes through WebView2's native
+                // CookieManager rather than document.cookie/ExecuteScriptAsync.
+                // Lowercase field names here (not the record's own PascalCase)
+                // to match fca-unofficial's documented appState cookie-object
+                // shape exactly -- Python reads this response as-is, no
+                // reshaping on that side.
+                var uri = root.GetProperty("uri").GetString()!;
+                var cookies = await target.GetCookiesAsync(uri);
+                Logger.Log($"[app-browser-host] Dispatch(/get_cookies): {cookies.Count} cookie(s) for {uri}");
+                return (200, JsonSerializer.Serialize(cookies.Select(c => new { key = c.Key, value = c.Value, domain = c.Domain, path = c.Path })));
+            }
+
             default:
                 Logger.Log($"[app-browser-host] Dispatch: unknown op {path}");
                 return (404, JsonSerializer.Serialize(new { error = $"Unknown op: {path}" }));

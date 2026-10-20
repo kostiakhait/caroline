@@ -16,6 +16,12 @@ using Microsoft.Web.WebView2.Wpf;
 
 namespace Caroline.NativeHost;
 
+/// <summary>One cookie as WebView2's own CookieManager reports it -- see
+/// AppBrowserWindow.GetCookiesAsync. Field names/casing match fca-unofficial's own
+/// documented "appState" cookie-object shape directly (key/value/domain/path) so
+/// AppBrowserHost.cs's /get_cookies response needs no reshaping on the Python side.</summary>
+public sealed record BrowserCookie(string Key, string Value, string Domain, string Path);
+
 /// <summary>
 /// One persistent, labeled embedded browser window (e.g. "whatsapp",
 /// "telegram", "facebook", "slack") -- Caroline's own multi-window browser,
@@ -516,6 +522,25 @@ public partial class AppBrowserWindow : Window
         var croppedBytes = outStream.ToArray();
         Logger.Log($"[app-browser-window:{Label}] ScreenshotAsync: done, cropped/resized ({croppedBytes.Length} bytes, {final.Width}x{final.Height})");
         return croppedBytes;
+    }
+
+    /// <summary>Every cookie WebView2's own cookie jar holds for this window's profile,
+    /// scoped to `uri` (CoreWebView2.CookieManager.GetCookiesAsync -- the WebView2 SDK's own
+    /// native cookie store, NOT document.cookie/ExecuteScriptAsync: a site's httpOnly session
+    /// cookies (Facebook's own "xs", in particular) are invisible to JS by design, but this
+    /// API sees them regardless, same as a real browser's own devtools cookie panel would.
+    /// First user: app/messenger_channel.py's login flow (2026-10-19) -- the user logs into
+    /// Facebook by hand in this window (so they see and answer any 2FA/checkpoint prompt
+    /// themselves), then this exports the resulting session as fca-unofficial's own
+    /// "appState" cookie-array shape directly, no separate conversion step needed here.</summary>
+    public async Task<List<BrowserCookie>> GetCookiesAsync(string uri)
+    {
+        await EnsureInitializedAsync();
+        Logger.Log($"[app-browser-window:{Label}] GetCookiesAsync: reading cookie jar for {uri}");
+        var cookies = await _webView!.CoreWebView2.CookieManager.GetCookiesAsync(uri);
+        var result = cookies.Select(c => new BrowserCookie(c.Name, c.Value, c.Domain, c.Path)).ToList();
+        Logger.Log($"[app-browser-window:{Label}] GetCookiesAsync: {result.Count} cookie(s)");
+        return result;
     }
 
     private static Bitmap ApplyCropAndDownscale(Bitmap source, int? cropX, int? cropY, int? cropWidth, int? cropHeight, int? maxWidth)
