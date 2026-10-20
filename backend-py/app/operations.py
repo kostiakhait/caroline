@@ -339,7 +339,23 @@ async def dispatch(
         if op.tab_id:
             save_pending_operation(WORKSPACE_DIR, op.tab_id, op.id, tool_name, args)
         log_event(f"plugin:{plugin_name}", "operation_running", tool=tool_name, operation_id=op.id)
-        return _with_note({"operation_id": op.id, "status": "running"}, memory_note)
+        # Per explicit instruction (2026-10-19): told right here, the one
+        # moment it's actually relevant, rather than relying on a system-
+        # prompt paragraph the model may not attend to -- engine_lifecycle.py's
+        # own turn-conclusion code now hard-cancels any operation still
+        # running for this tab the instant the turn genuinely ends, so an
+        # operation walked away from here has no guarantee of ever finishing
+        # unless the model either waits on it (check_operation_status) within
+        # this same turn, or -- for anything actually meant to outlive the
+        # turn -- hands it to the scheduler up front instead.
+        note = (
+            "This operation is still running and is NOT guaranteed to survive past your current turn -- if you "
+            "don't plan to actively wait for it (check_operation_status) before you finish replying, it will be "
+            "CANCELLED the moment this turn ends and its result will be lost. For anything you expect to "
+            "genuinely outlive this turn (the user asked for something long-running/background), use "
+            "schedule_reminder up front instead of just calling the tool and walking away."
+        )
+        return _with_note({"operation_id": op.id, "status": "running", "note": note}, memory_note)
     except Exception as exc:  # noqa: BLE001 -- op.status/op.error already set by run()
         duration_ms = round((time.monotonic() - op.started_at) * 1000, 1)
         log_event(f"plugin:{plugin_name}", "operation_error", tool=tool_name, operation_id=op.id, duration_ms=duration_ms, error=str(exc))

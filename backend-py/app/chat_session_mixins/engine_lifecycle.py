@@ -1033,6 +1033,25 @@ class EngineLifecycleMixin:
                             was_awaiting_post_turn_check_reply = self._awaiting_post_turn_check_reply
                             self._awaiting_post_turn_check_reply = False
                             self.turn_pending = False
+                            # Per explicit instruction (2026-10-19), after a confirmed live
+                            # incident: no operation this turn dispatched and walked away
+                            # from (app/operations.py's "running" slow-path) may outlive the
+                            # turn itself -- a turn that's genuinely, successfully concluding
+                            # (this is the one result_is_fake==False branch, not a fake/
+                            # compaction/hang-recovery result) is the moment to hard-cancel
+                            # anything of this tab's still running. Confirmed live: 10 such
+                            # operations finished within 15ms of each other, long after their
+                            # own turns had ended, and each independently reactivated this
+                            # same tab via a disconnected inject_proactive, piling into a
+                            # stuck compaction's own queue. Same keep_tools exception
+                            # ChatSession.stop() already relies on (an in-flight memory write
+                            # is left to finish, never corrupted mid-save) -- orthogonal
+                            # safety, not an exception to the new policy. Cancelling flips
+                            # the task's own status to "cancelled" before its finally: block
+                            # runs (operations.py's run()), which already skips
+                            # _notify_operation_completed for anything cancelled -- no
+                            # changes needed there at all.
+                            REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
                             self.pending_user_text = None
                             self.pending_attachments = []
                             clear_pending_turn(self.workspace_dir, self.tab_id)

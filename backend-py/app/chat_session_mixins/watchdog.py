@@ -32,6 +32,7 @@ class WatchdogMixin:
                     self._check_user_wait_nudge()
                     await self._check_progress_narration()
                     self._check_forced_compaction()
+                    self._check_compaction_stuck()
                     self._check_deferred_engine_switch()
                     self._check_funds_exhaustion_status()
                 except asyncio.CancelledError:

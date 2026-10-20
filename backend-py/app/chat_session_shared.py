@@ -541,6 +541,14 @@ _RECENT_24H_REFRESH_SLOT = asyncio.Semaphore(1)
 # connect()+generator wiring, content-as-block-list included, not just the
 # SDK's query(str) convenience path).
 FORCED_COMPACTION_HOURLY_MS = 3_600_000
+# Per explicit instruction (2026-10-19), after a confirmed live incident:
+# tab 1's own native "/compact" sat completely stuck for 14+ minutes, its
+# live transcript never touched again after forced_compaction_triggered --
+# with zero automatic recovery, since the regular hang watchdog bails out
+# immediately whenever turn_pending is False, and compaction deliberately
+# never sets turn_pending (see _push_internal_command's own docstring). See
+# chat_session_mixins/compaction.py's own _check_compaction_stuck.
+COMPACTION_STUCK_TIMEOUT_S = 120
 # Per explicit instruction (2026-10-10): messages the user sends one after
 # another are one message for the model. A user message waits this long;
 # every further one within the window joins it and restarts the wait. The

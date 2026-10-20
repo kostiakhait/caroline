@@ -207,6 +207,47 @@ class CompactionMixin:
             return
         self.forced_compaction_result_pending = True
         self._push_internal_command("/compact")
+    def _check_compaction_stuck(self) -> None:
+        """Per explicit instruction (2026-10-19), after a real incident:
+        the CLI's own native "/compact" can simply never finish -- confirmed
+        live, a real tab's transcript sat completely untouched for 14+
+        minutes after forced_compaction_triggered fired, with zero
+        recovery. The regular hang watchdog (_check_hang) cannot catch this
+        by construction: its very first check bails out immediately
+        whenever turn_pending is False, and compaction deliberately never
+        sets turn_pending (see _push_internal_command's own docstring:
+        "bypasses submit()/_push_message entirely... isn't a conversational
+        turn at all") -- so a stuck compaction is invisible to it entirely.
+
+        If native compaction hasn't resolved within
+        COMPACTION_STUCK_TIMEOUT_S, force it: fall through to Caroline's own
+        local, no-model "hard" compaction (_run_fallback_compaction) --
+        already used today when native compaction finishes but isn't
+        enough (the "fallback_still_too_large" reason above), just
+        triggered by TIMEOUT here instead of by an insufficient result.
+        _run_fallback_compaction forks the CURRENT on-disk transcript
+        (which the stuck native attempt never actually touched) and ends
+        with its own client.disconnect() -- the same stuck-client-recovery
+        primitive _check_hang's own escalation already relies on --
+        abandoning whatever the native attempt was doing and reconnecting
+        onto the freshly forked, trimmed session.
+
+        Reuses last_forced_compaction_at (already set the instant a
+        compaction is triggered, right before forced_compaction_result_
+        pending flips True a few lines above) as "since when has THIS
+        pending compaction been running" -- it isn't touched again until
+        the NEXT compaction triggers, so no new timestamp field is needed."""
+        if self.ended or not self.forced_compaction_result_pending:
+            return
+        if self.last_forced_compaction_at is None:
+            return
+        elapsed = time.monotonic() - self.last_forced_compaction_at
+        if elapsed < COMPACTION_STUCK_TIMEOUT_S:
+            return
+        log_event("engine", "compaction_stuck_forcing_hard_fallback", tab_id=self.tab_id, elapsed_s=round(elapsed, 1))
+        self.forced_compaction_result_pending = False
+        self._drain_compaction_queue()  # replay whatever piled up while stuck
+        asyncio.create_task(self._run_fallback_compaction())
     async def _run_fallback_compaction(self) -> None:
         """The local, no-model second pass (app/compaction.py) for when
         native/forced compaction already ran and tokens_at_last_forced_
