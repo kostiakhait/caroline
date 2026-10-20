@@ -51,8 +51,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -82,6 +83,10 @@ NODE_EXE = os.environ.get("CAROLINE_NODE_PATH", "")
 SIDECAR_DIR = os.environ.get("CAROLINE_MESSENGER_SIDECAR_DIR", "")
 SEND_TIMEOUT_S = 30.0
 DOWNLOAD_TIMEOUT_S = 60.0
+# The user's own explicit choice (2026-10-20): how long a cached chat-list
+# page stays fresh before the first page is re-checked live against
+# Facebook. See list_chats_page's own docstring for the full cache design.
+CHATS_CACHE_TTL_S = 300.0
 
 # Same reasoning as whatsapp_channel.py's own CHANNEL_HEARTBEAT_TIMEOUT_S --
 # generous because this watches the _run_sidecar coroutine specifically
@@ -176,9 +181,85 @@ async def send_message(account: str, to: str, text: str) -> None:
     _require_ok(await _call(account, "sendMessage", to=to, text=text))
 
 
+@dataclass
+class _ChatsPageCacheEntry:
+    # Keyed by the cursor that LEADS to that page: None is page 1 (the
+    # newest chats -- getThreadList's own default order with no cursor,
+    # confirmed live), a page's own returned nextCursor is the key for the
+    # page after it. Each value is {"chats": [...], "nextCursor": ...}.
+    pages_by_cursor: dict[Any, dict[str, Any]] = field(default_factory=dict)
+    last_refresh_at: float = 0.0
+
+
+_chats_cache: dict[str, _ChatsPageCacheEntry] = {account: _ChatsPageCacheEntry() for account in ACCOUNTS}
+
+
+async def list_chats_page(account: str, cursor: int | None = None) -> dict[str, Any]:
+    """Per explicit instruction (2026-10-20), after a real incident: a full
+    exhaustive messenger_list_chats (paginating through every thread,
+    ~200 for a real account) took ~40s -- long enough that the model gave
+    up waiting and wrongly concluded the Messenger connector itself was
+    broken, when every call was actually completing successfully. Replaced
+    with real on-demand paging (one page -- the sidecar's own
+    THREAD_PAGE_SIZE, 20 -- per call) plus a per-account cache, so "load
+    the first page"/"load the next page" are each fast.
+
+    Caching: once a page is fetched for a given `cursor`, it is served
+    instantly on a later call with that same cursor -- `cursor=None` (page
+    1, the newest chats) is the one exception: it is re-validated LIVE
+    against Facebook once CHATS_CACHE_TTL_S has passed since the last
+    refresh (the user's own explicit choice, periodic-update-checking, not
+    just caching forever). If that live page 1 differs from the cached one
+    (different thread ids in a different order), the WHOLE cache is
+    dropped -- later pages may no longer line up with a changed page 1 --
+    and refilled starting from this fresh page 1. If it matches, the
+    existing cache (including any later pages already fetched) stays valid
+    and just gets its TTL clock reset.
+
+    Returns {"chats": [...], "nextCursor": int | None, "fromCache": bool}.
+    Each chat row carries "lastActivity" (epoch ms, or None) -- the user's
+    own explicit request to see when a chat last had activity, straight
+    from the same timestamp field the pagination cursor itself is built
+    from."""
+    entry = _chats_cache[account]
+    now = time.monotonic()
+    if cursor is None:
+        stale = (now - entry.last_refresh_at) >= CHATS_CACHE_TTL_S
+        cached = entry.pages_by_cursor.get(None)
+        if cached is not None and not stale:
+            return {**cached, "fromCache": True}
+        result = await _call(account, "listChats", cursor=None)
+        fresh = {"chats": result.get("chats") or [], "nextCursor": result.get("nextCursor")}
+        changed = cached is None or [c.get("id") for c in cached["chats"]] != [c.get("id") for c in fresh["chats"]]
+        if changed:
+            log_event("plugin:messenger", "chats_cache_invalidated", account=account, had_cache=cached is not None)
+            entry.pages_by_cursor.clear()
+        entry.pages_by_cursor[None] = fresh
+        entry.last_refresh_at = now
+        return {**fresh, "fromCache": False}
+    cached = entry.pages_by_cursor.get(cursor)
+    if cached is not None:
+        return {**cached, "fromCache": True}
+    result = await _call(account, "listChats", cursor=cursor)
+    page = {"chats": result.get("chats") or [], "nextCursor": result.get("nextCursor")}
+    entry.pages_by_cursor[cursor] = page
+    return {**page, "fromCache": False}
+
+
 async def list_chats(account: str) -> list[dict[str, Any]]:
-    result = await _call(account, "listChats")
-    return result.get("chats") or []
+    """Exhaustive fetch (every page, oldest page last) -- used by
+    messenger_find_chat, which genuinely needs to search the whole list.
+    Walks list_chats_page in a loop, so it benefits from the exact same
+    per-account cache the paged messenger_list_chats tool fills."""
+    all_chats: list[dict[str, Any]] = []
+    cursor: int | None = None
+    first = True
+    while first or cursor is not None:
+        first = False
+        page = await list_chats_page(account, cursor)
+        all_chats.extend(page["chats"])
+        cursor = page.get("nextCursor")
+    return all_chats
 
 
 async def set_block(account: str, user_id: str, block: bool) -> None:

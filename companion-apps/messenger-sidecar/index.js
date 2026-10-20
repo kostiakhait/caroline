@@ -333,88 +333,47 @@ rl.on('line', async (line) => {
       await apiCall('sendMessage', msg.text, msg.to);
       emit({ type: 'sendResult', id: msg.id, ok: true });
     } else if (msg.cmd === 'listChats') {
-      // Bug fix (2026-10-20), confirmed live: a hardcoded getThreadList(20,
-      // ...) one-shot call meant a real contact (an existing, ordinary
-      // conversation, nothing archived/filtered) silently never showed up
-      // in messenger_list_chats at all, just because more than 20 OTHER
-      // threads ranked ahead of it by Facebook's own recency ordering --
-      // not a sync-delay, as it first looked live. Fixed as real pagination
-      // instead of a bigger guessed cap (per explicit instruction: no
-      // self-picked limit on how many chats this loads -- load every thread
-      // that actually exists). THREAD_PAGE_SIZE (the user's own choice, 20)
-      // is a pure per-call HTTP chunk size, never a cap on the total result
-      // -- the loop below keeps paginating until Facebook itself returns a
-      // short/empty page, i.e. there is nothing left to fetch.
-      const threads = [];
-      let cursor = null;
-      let pageNum = 0;
-      while (true) {
-        pageNum += 1;
-        // Bug fix (2026-10-20), confirmed live: page 1 of a real account's
-        // getThreadList succeeded with 20 real threads, page 2 (continuing
-        // pagination with a real cursor) then rejected -- and since that
-        // rejection used to propagate straight out of this whole loop, the
-        // ENTIRE already-fetched page 1 was thrown away too, surfacing as
-        // one hard failure (or, in a separate real occurrence, an empty
-        // array) instead of the 20 real chats this account actually has.
-        // A later page failing is now non-fatal: log it clearly and return
-        // whatever was successfully gathered so far, same "partial is
-        // better than nothing" principle whatsapp_channel.py's own
-        // attachment/group code already follows elsewhere in this codebase.
-        let page;
-        try {
-          page = await apiCall('getThreadList', THREAD_PAGE_SIZE, cursor, ['INBOX']);
-        } catch (e) {
-          log(`listChats page ${pageNum} failed, returning ${threads.length} already-fetched thread(s) instead of failing the whole call`, { error: describeError(e), totalSoFar: threads.length });
-          break;
-        }
-        log(`listChats page ${pageNum}`, { cursor, pageLength: page ? page.length : null });
-        if (!page || !page.length) {
-          log(`listChats page ${pageNum} empty, stopping pagination`, { totalSoFar: threads.length });
-          break;
-        }
-        threads.push(...page);
-        if (page.length < THREAD_PAGE_SIZE) {
-          log(`listChats page ${pageNum} short (${page.length} < ${THREAD_PAGE_SIZE}), this was the last page`, { totalSoFar: threads.length });
-          break;
-        }
-        // `timestamp` as the pagination cursor field is the classic
-        // facebook-chat-api-family convention (well-established across this
-        // whole lineage of forks), not independently confirmed against
-        // THIS fork's actual response shape -- same class of caveat as
-        // findAttachmentUrl's own best-effort field guesses above; the
-        // safety-net check just below (cursor not advancing -> stop) covers
-        // the case where this turns out wrong rather than looping forever.
-        //
-        // Bug fix (2026-10-20), confirmed live: Facebook's own response
-        // carries this field as a STRING (large numeric ids/timestamps
-        // commonly are, in GraphQL responses), but getThreadList's own
-        // cursor argument rejects anything that isn't a real number --
-        // confirmed live: "getThreadList: timestamp must be an integer or
-        // null". Passed through as a string, page 1 always worked (its own
-        // cursor argument is the literal `null`) and EVERY subsequent page
-        // always failed -- Number(...) here is the actual fix, not just the
-        // fallback (the per-page try/catch above) that made that failure
-        // non-fatal.
-        const nextCursor = Number(page[page.length - 1].timestamp);
-        // Safety net only (never a real-world cap): if the cursor somehow
-        // doesn't advance (or isn't a usable number at all), stop rather
-        // than loop forever on an unexpected response shape -- better an
-        // incomplete list than a hang.
-        if (!nextCursor || Number.isNaN(nextCursor) || nextCursor === cursor) {
-          log(`listChats page ${pageNum}: cursor did not advance, stopping pagination (safety net)`, { nextCursor, totalSoFar: threads.length });
-          break;
-        }
-        cursor = nextCursor;
-      }
-      const chats = (threads || []).map((t) => {
+      // Redesigned (2026-10-20, per explicit instruction) from an earlier
+      // version that paginated through EVERY page internally (confirmed
+      // live: ~40s for a real ~200-chat account, long enough the model gave
+      // up waiting mid-call and wrongly concluded the connector was broken,
+      // when every call was actually completing). Now fetches exactly ONE
+      // page per command -- app/messenger_channel.py's own list_chats_page
+      // is what paginates (and caches) across repeated calls, so "load the
+      // first page"/"load the next page" are each fast and the exhaustive
+      // walk (messenger_find_chat) still happens, just spread across
+      // several fast calls with caching instead of one slow one.
+      // `cursor`: a plain number (the previous page's own nextCursor), or
+      // anything else (including absent/null) treated as "start from the
+      // newest page" -- getThreadList's own default order with no cursor.
+      const cursor = typeof msg.cursor === 'number' ? msg.cursor : null;
+      const page = await apiCall('getThreadList', THREAD_PAGE_SIZE, cursor, ['INBOX']);
+      const chats = (page || []).map((t) => {
         const id = t.threadID || t.id;
         const name = deriveThreadName(t, id);
         if (id) knownChats.set(id, name);
-        return { id, name, isGroup: !!t.isGroup };
+        // Bug fix (2026-10-20), confirmed live: this field comes back as a
+        // STRING (large numeric timestamps commonly are, in GraphQL
+        // responses) -- Number(...) here for the same reason the pagination
+        // cursor itself needs it (see nextCursor just below). Exposed as
+        // "lastActivity" per explicit instruction: the user wants to see
+        // when each chat last had activity, not just its name/id.
+        const lastActivity = Number(t.timestamp) || null;
+        return { id, name, isGroup: !!t.isGroup, lastActivity };
       });
-      log('listChats done', { totalPages: pageNum, totalChats: chats.length });
-      emit({ type: 'chats', id: msg.id, chats });
+      // Classic facebook-chat-api-family convention (confirmed live for
+      // this fork too): the next page's cursor is the LAST thread's own
+      // timestamp, must be a real number (getThreadList's own cursor
+      // argument rejects a string -- "timestamp must be an integer or
+      // null", confirmed live). Only offered when this page was actually
+      // full -- a short page means there is nothing more to fetch.
+      let nextCursor = null;
+      if (page && page.length === THREAD_PAGE_SIZE) {
+        const candidate = Number(page[page.length - 1].timestamp);
+        if (candidate && !Number.isNaN(candidate) && candidate !== cursor) nextCursor = candidate;
+      }
+      log('listChats page done', { cursor, pageLength: chats.length, nextCursor });
+      emit({ type: 'chats', id: msg.id, chats, nextCursor });
     } else if (msg.cmd === 'readHistory') {
       // Confirmed live (2026-10-20) against a real account: getThreadHistory(
       // threadID, amount, timestamp, callback) -- classic facebook-chat-api

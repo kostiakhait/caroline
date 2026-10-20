@@ -25,6 +25,7 @@ whatsapp_delete_group.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.messenger_channel import (
@@ -38,6 +39,7 @@ from app.messenger_channel import (
     is_valid_account,
     leave_group,
     list_chats,
+    list_chats_page,
     login_start,
     read_thread_history,
     send_file,
@@ -78,16 +80,42 @@ async def messenger_login(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": message}
 
 
+def _format_chat_row(chat: dict[str, Any]) -> dict[str, Any]:
+    """Converts the sidecar's raw epoch-ms "lastActivity" into an ISO-8601
+    string -- per explicit instruction, the user wants each chat's last-
+    activity date/time visible, not a bare millisecond number."""
+    row = dict(chat)
+    ts = row.pop("lastActivity", None)
+    row["lastActivity"] = (
+        datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        if isinstance(ts, (int, float)) and ts > 0 else None
+    )
+    return row
+
+
 async def messenger_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Per explicit instruction (2026-10-20): returns ONE page at a time --
+    fast, instead of the earlier exhaustive fetch that took ~40s for a real
+    account and made the model give up waiting mid-call. Pass the previous
+    call's own "nextCursor" back as `cursor` to load the next page ("load
+    the first page" = call with no cursor; "load the next page" = call
+    again with the cursor just returned); `nextCursor: null` means there is
+    nothing more. Chats come newest-activity-first. A short-TTL per-account
+    cache (see list_chats_page's own docstring) makes repeated calls fast
+    without silently going stale forever."""
     account, error = _account_or_error(args)
     if error:
         return error
+    cursor = args.get("cursor")
+    if cursor is not None and not isinstance(cursor, int):
+        return {"text": '"cursor" must be the integer nextCursor a previous messenger_list_chats call returned, or omitted for the first page.', "is_error": True}
     try:
-        chats = await list_chats(account)
+        page = await list_chats_page(account, cursor)
     except MessengerError as exc:
         return {"text": str(exc), "is_error": True}
+    chats = [_format_chat_row(c) for c in page["chats"]]
     chats, _cut = cap_count(chats)
-    return {"text": str(chats)}
+    return {"text": str({"chats": chats, "nextCursor": page["nextCursor"], "fromCache": page["fromCache"]})}
 
 
 async def messenger_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -286,12 +314,15 @@ def _usage_instructions() -> str:
         "ever passes through you at all. Call it only when the user has explicitly asked to connect that "
         "account, never on your own initiative -- after that, just tell them the window is open and to log in "
         "there; you don't need to watch or poll for them, the connection completes on its own once they do. "
-        "messenger_find_chat(query) finds a chat by name/"
-        "description, judged by meaning -- use it instead of messenger_list_chats when looking for one specific "
-        "chat; both fetch the account's REAL, full thread list fresh on every call (paginated under the hood), "
-        "not just chats seen live since the connection came up. messenger_list_chats/messenger_find_chat only "
-        "ever show the thread list itself (name, id) -- to see what was actually SAID in a thread, call "
-        "messenger_read_history(threadId, amount).\n"
+        "messenger_list_chats(cursor=...) returns ONE page of the real thread list at a time, newest-activity-"
+        "first -- omit cursor for the first page, pass back the previous call's own nextCursor for the next one; "
+        "nextCursor: null means there is nothing more. Only page further if you actually need to (still haven't "
+        "found what you're after) -- don't walk the whole list reflexively. messenger_find_chat(query) finds a "
+        "chat by name/description, judged by meaning, searching the FULL thread list across as many pages as it "
+        "takes -- use it instead of messenger_list_chats when looking for one specific chat rather than browsing. "
+        "Both are backed by a short-lived per-account cache, so repeated calls are fast. Neither ever shows what "
+        "was actually SAID in a thread (only name/id/last-activity) -- call messenger_read_history(threadId, "
+        "amount) for that.\n"
         "`to`/`userId`/`threadId`/`participants` everywhere are Messenger's own numeric ids (from "
         "messenger_list_chats, a proactive notification, or a group's own threadID) -- never a guessed name.\n"
         "Attachments: a proactive notification for an incoming photo/video/file says so (\"media\": ...) and "
@@ -323,11 +354,16 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "messenger_list_chats",
-            "Lists an account's real, full Messenger thread list (fetched fresh, paginated under the hood -- not "
-            "just chats seen live since the connection came up), each with its id (threadID) -- the id to use for "
-            "messenger_send_message. Shows the thread list only (name, id), never message content -- use "
-            "messenger_read_history for that. `account`: \"self\" (default) or \"owner\".",
-            {"account": str | None}, messenger_list_chats,
+            "Lists one PAGE of an account's real Messenger thread list, newest-activity-first, each row with its "
+            "id (threadID), name, isGroup, and lastActivity (ISO 8601 date/time of that chat's last activity). "
+            "Omit `cursor` to load the first (newest) page; to load the next page, pass back the exact "
+            "\"nextCursor\" value the previous call returned -- `nextCursor: null` means there are no more pages. "
+            "Keep calling with the returned cursor only as long as you actually need more (e.g. still looking for "
+            "something) -- there is no need to page through everything if what you need is already on an earlier "
+            "page. Recently-fetched pages are served from a short-lived cache, so repeat calls are fast. Shows the "
+            "thread list only (name, id, last activity), never message content -- use messenger_read_history for "
+            "that. `account`: \"self\" (default) or \"owner\".",
+            {"cursor": int | None, "account": str | None}, messenger_list_chats,
         ),
         PluginTool(
             "messenger_find_chat",
