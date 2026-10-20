@@ -39,6 +39,7 @@ from app.messenger_channel import (
     leave_group,
     list_chats,
     login_start,
+    read_thread_history,
     send_file,
     send_message,
     set_block,
@@ -103,6 +104,24 @@ async def messenger_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     matches = await find_by_name(query, chats)
     matches, _cut = cap_count(matches)
     return {"text": str(matches)}
+
+
+async def messenger_read_history(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    thread_id = str(args.get("threadId") or "").strip()
+    if not thread_id:
+        return {"text": 'messenger_read_history needs "threadId".', "is_error": True}
+    amount = args.get("amount")
+    if not isinstance(amount, int) or amount <= 0:
+        return {"text": 'messenger_read_history needs "amount" (a positive integer) -- how many of the most recent messages to load.', "is_error": True}
+    try:
+        messages = await read_thread_history(account, thread_id, amount)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    messages, _cut = cap_count(messages)
+    return {"text": str(messages)}
 
 
 async def messenger_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -269,14 +288,17 @@ def _usage_instructions() -> str:
         "there; you don't need to watch or poll for them, the connection completes on its own once they do. "
         "messenger_find_chat(query) finds a chat by name/"
         "description, judged by meaning -- use it instead of messenger_list_chats when looking for one specific "
-        "chat; both only ever see chats fetched since that account's connection came up.\n"
+        "chat; both fetch the account's REAL, full thread list fresh on every call (paginated under the hood), "
+        "not just chats seen live since the connection came up. messenger_list_chats/messenger_find_chat only "
+        "ever show the thread list itself (name, id) -- to see what was actually SAID in a thread, call "
+        "messenger_read_history(threadId, amount).\n"
         "`to`/`userId`/`threadId`/`participants` everywhere are Messenger's own numeric ids (from "
         "messenger_list_chats, a proactive notification, or a group's own threadID) -- never a guessed name.\n"
         "Attachments: a proactive notification for an incoming photo/video/file says so (\"media\": ...) and "
-        "gives a \"ref\" -- download it with messenger_download_attachment(ref) before using it (omit savePath "
-        "for a default location); that ref only works for a short while after the message arrives, same "
-        "limitation as whatsapp_download_attachment's own ref. messenger_send_file(to, path, caption) sends a "
-        "local file.\n"
+        "gives a \"ref\"; messenger_read_history gives the same kind of ref for a past message's own attachment. "
+        "Either way, download it with messenger_download_attachment(ref) before using it (omit savePath for a "
+        "default location) -- that ref only works for a short while, same limitation as whatsapp_download_"
+        "attachment's own ref. messenger_send_file(to, path, caption) sends a local file.\n"
         "Groups: messenger_create_group(subject, participants) needs at least one other member. "
         "messenger_add_members/messenger_remove_members/messenger_promote_members/messenger_demote_members all "
         "take (threadId, participants). messenger_delete_group is an approximation, not a true delete -- see its "
@@ -301,8 +323,10 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "messenger_list_chats",
-            "Lists an account's Messenger chats seen since the connection came up, each with its id (threadID) -- "
-            "the id to use for messenger_send_message. `account`: \"self\" (default) or \"owner\".",
+            "Lists an account's real, full Messenger thread list (fetched fresh, paginated under the hood -- not "
+            "just chats seen live since the connection came up), each with its id (threadID) -- the id to use for "
+            "messenger_send_message. Shows the thread list only (name, id), never message content -- use "
+            "messenger_read_history for that. `account`: \"self\" (default) or \"owner\".",
             {"account": str | None}, messenger_list_chats,
         ),
         PluginTool(
@@ -313,6 +337,17 @@ PLUGIN = Plugin(
             "the ones that actually match -- possibly empty if genuinely nothing fits. `account`: \"self\" "
             "(default) or \"owner\".",
             {"query": str, "account": str | None}, messenger_find_chat,
+        ),
+        PluginTool(
+            "messenger_read_history",
+            "Reads the most recent messages in one Messenger thread -- the only way to see a thread's actual "
+            "content; messenger_list_chats/messenger_find_chat only ever show the thread list itself (name, id), "
+            "never what was said in it. `threadId` is the thread's id. `amount` is how many of the most recent "
+            "messages to load -- always give an explicit number here, there is no built-in default; ask the user "
+            "if you're not sure how much history they want. Returns each message's sender, text, timestamp, and "
+            "an attachment ref (if any) usable with messenger_download_attachment. `account`: \"self\" (default) "
+            "or \"owner\".",
+            {"threadId": str, "amount": int, "account": str | None}, messenger_read_history,
         ),
         PluginTool(
             "messenger_send_message",

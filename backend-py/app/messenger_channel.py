@@ -185,6 +185,19 @@ async def set_block(account: str, user_id: str, block: bool) -> None:
     _require_ok(await _call(account, "setBlock", userID=user_id, block=block))
 
 
+async def read_thread_history(account: str, thread_id: str, amount: int) -> list[dict[str, Any]]:
+    """Confirmed live (2026-10-20) against a real account: fca-unofficial's
+    getThreadHistory really does return real past message content for a
+    thread -- closing the exact gap the user asked about ("А доступ к
+    содержимому?") after Caroline correctly reported she could only see the
+    thread LIST, never a thread's own messages. `amount` is never defaulted
+    or capped here -- per explicit instruction, every caller (messenger_
+    plugin.py's own tool) must pass an explicit value; this module picks no
+    number of its own."""
+    result = await _call(account, "readHistory", timeout=DOWNLOAD_TIMEOUT_S, threadID=thread_id, amount=amount)
+    return result.get("messages") or []
+
+
 MESSENGER_DOWNLOADS_DIR_NAME = "messenger_downloads"
 
 
@@ -336,7 +349,7 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             # summarized, so a future anomaly is already on the record.
             extra = {k: v for k, v in msg.items() if k not in ("type", "message")}
             log_event("plugin:messenger", "sidecar_log", account=account, message=msg.get("message"), **extra)
-        elif msg_type in ("sendResult", "chats"):
+        elif msg_type in ("sendResult", "chats", "history"):
             op_id = msg.get("id")
             fut = _pending[account].pop(op_id, None) if op_id else None
             if fut is not None and not fut.done():

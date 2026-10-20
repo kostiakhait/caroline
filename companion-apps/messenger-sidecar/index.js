@@ -163,6 +163,27 @@ function findAttachmentUrl(attachment) {
   return (attachment && (attachment.url || attachment.previewUrl || attachment.downloadUrl || attachment.hiresUrl)) || null;
 }
 
+// Bug fix (2026-10-20), confirmed live: a 1:1 DM (and an unnamed group) has
+// no thread-level name at all -- getThreadList's own `name`/`threadName`
+// come back empty, and messenger_list_chats used to fall straight through
+// to the bare numeric thread id, with no way to tell WHO that id actually
+// is without reading the thread's own participants (which this tool never
+// exposed at all). Confirmed live: this is exactly why a real contact
+// (Anastasia Halldin) was unfindable by name -- her thread had no title of
+// its own, only her as a participant. Derives a usable name from
+// `participants` (excluding this account's own selfID) when the thread
+// itself has none: the other person's name for a 1:1, or up to 3 names
+// joined (+N more) for an unnamed group.
+function deriveThreadName(t, id) {
+  const own = (t.name || t.threadName || '').trim();
+  if (own) return own;
+  const others = (t.participants || []).filter((p) => p && p.userID !== selfID);
+  const names = others.map((p) => p.name || p.shortName).filter(Boolean);
+  if (!names.length) return id;
+  if (names.length <= 3) return names.join(', ');
+  return `${names.slice(0, 3).join(', ')} +${names.length - 3} more`;
+}
+
 let apiCallSeq = 0;
 function apiCall(method, ...args) {
   // Wraps one of ctx.api's callback-style methods as a Promise -- every flat
@@ -388,12 +409,40 @@ rl.on('line', async (line) => {
       }
       const chats = (threads || []).map((t) => {
         const id = t.threadID || t.id;
-        const name = t.name || t.threadName || id;
+        const name = deriveThreadName(t, id);
         if (id) knownChats.set(id, name);
         return { id, name, isGroup: !!t.isGroup };
       });
       log('listChats done', { totalPages: pageNum, totalChats: chats.length });
       emit({ type: 'chats', id: msg.id, chats });
+    } else if (msg.cmd === 'readHistory') {
+      // Confirmed live (2026-10-20) against a real account: getThreadHistory(
+      // threadID, amount, timestamp, callback) -- classic facebook-chat-api
+      // family convention, confirmed to also hold for this fork. `amount` is
+      // never defaulted or capped here -- per explicit instruction, the
+      // caller (messenger_channel.py's own read_thread_history) always
+      // passes an explicit value, this file picks no number of its own.
+      const history = await apiCall('getThreadHistory', msg.threadID, msg.amount, undefined);
+      const messages = (history || []).map((m) => {
+        const attachments = m.attachments || [];
+        const media = describeAttachments(attachments);
+        let attachmentRef;
+        if (attachments.length) {
+          attachmentRef = `${m.threadID}:${m.messageID}`;
+          rememberAttachments(attachmentRef, attachments);
+        }
+        return {
+          messageID: m.messageID,
+          senderID: m.senderID,
+          fromSelf: m.senderID === selfID,
+          text: m.body || '',
+          timestamp: m.timestamp,
+          media: media || undefined,
+          attachmentRef,
+        };
+      });
+      log('readHistory done', { threadID: msg.threadID, requestedAmount: msg.amount, totalMessages: messages.length });
+      emit({ type: 'history', id: msg.id, messages });
     } else if (msg.cmd === 'setBlock') {
       await apiCall('changeBlockedStatus', msg.userID, msg.block ? 'block' : 'unblock');
       emit({ type: 'sendResult', id: msg.id, ok: true });
