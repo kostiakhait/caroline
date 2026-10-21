@@ -90,6 +90,7 @@ from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
+from app.untrusted_text import web_pages_text
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
 from app import policies
@@ -1068,13 +1069,15 @@ def _run_web_search_tool(name: str, args: dict[str, Any], ai: Any, cfg: Any) -> 
         if not sources:
             reason = "the search returned no pages"
             continue
-        lines = [f"Web search results for: {question}"]
+        lines = []
         for index, source in enumerate(sources, 1):
             excerpt = " ".join(str(source.get("content") or "").split())[:WEB_SEARCH_EXCERPT_CHARS]
             lines.append(f"{index}. {source.get('title') or '(untitled)'} -- {source['url']}" + (f"\n   {excerpt}" if excerpt else ""))
         if answer:
             lines.append("Summary by the search model (it read the same pages; where it differs from them, trust the pages):\n" + answer)
-        return "\n".join(lines)
+        # Marked as data (2026-10-21), as app_browser_plugin's _UNTRUSTED_DATA_PREFIX does for a
+        # browsed page: the tier reading this has tools that run commands and send files.
+        return f"Web search results for: {question}\n" + web_pages_text("\n".join(lines))
     return (
         f"ERROR: the web search did not work ({reason}); nothing was found out. Do not answer from memory as if it "
         "were current -- say that the search failed, or get the information another way."
