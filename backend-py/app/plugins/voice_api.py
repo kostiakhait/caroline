@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
@@ -2100,12 +2101,53 @@ def speech_needs_cleanup(text: str) -> bool:
     return bool(_NEEDS_TTS_CLEANUP.search(text))
 
 
+_MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_HTML_TAG = re.compile(r"<[a-z/][^>]*>", re.IGNORECASE)
+_MD_LINE_PREFIX = re.compile(r"^\s*(?:#{1,6}\s+|>\s?|[-*+•]\s+|\d+[.)]\s+)", re.MULTILINE)
+_MD_RULE = re.compile(r"^\s*(?:[-*_]\s*){3,}$|^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$", re.MULTILINE)
+_MD_EMPHASIS = re.compile(r"(\*\*|\*|~~|`+)(?=\S)(.+?)(?<=\S)\1")
+_MD_UNDERSCORE = re.compile(r"(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\1(?!\w)")  # not inside snake_case
+_TABLE_BAR = re.compile(r"[ \t]*\|[ \t]*")
+_DIGIT = re.compile(r"\d")
+# One attempt, this long: a sentence waits for its sound meanwhile. Measured 2026-10-19 on
+# real answer pieces with an idle server: 1.9-4.4s (median 2.5s); a busy one took 9-14s,
+# and _post_json's defaults (30s x 3 attempts) allowed far more.
+SPEECH_CLEANUP_TIMEOUT_S = 5.0
+
+
+def strip_markup_for_speech(text: str) -> str:
+    """Markdown/HTML down to plain prose, locally: links keep their text, list and
+    header markers, emphasis marks, rules and table bars go."""
+    out = _MD_LINK.sub(r"\1", text)
+    out = _HTML_TAG.sub(" ", out)
+    out = _MD_RULE.sub("", out)
+    out = _MD_LINE_PREFIX.sub("", out)
+    out = _MD_EMPHASIS.sub(r"\2", out)
+    out = _MD_UNDERSCORE.sub(r"\2", out)
+    lines = (_TABLE_BAR.sub(", ", line.strip().strip("|")).strip() for line in out.splitlines())
+    out = "\n".join(line for line in lines if line)
+    out = out.replace("`", "").replace("#", "")
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
 async def clean_text_for_speech(text: str, session: str | None = None) -> str:
     """Strips markdown/HTML formatting and rewrites digits/numerals into
     their spoken, correctly-inflected form before text reaches TTS/Visual
-    Mode."""
+    Mode.
+
+    2026-10-21: the markup goes locally; the model is asked only when digits
+    remain (inflecting "5 книг" is what it is for), for at most
+    SPEECH_CLEANUP_TIMEOUT_S, one attempt. When it does not answer in time the
+    text goes as stripped, digits and all -- the speech service reads digits
+    itself, only without the case agreement."""
     if not speech_needs_cleanup(text):
         return text
+    started = time.monotonic()
+    stripped = strip_markup_for_speech(text)
+    if not _DIGIT.search(stripped):
+        log_event("plugin:voice", "speech_cleanup", how="local", ms=int((time.monotonic() - started) * 1000))
+        return stripped
+    text = stripped
     prompt = (
         "Rewrite the following text so it is ready to be read aloud by a text-to-speech engine. "
         "Perform exactly these transformations, nothing else:\n"
@@ -2128,13 +2170,15 @@ async def clean_text_for_speech(text: str, session: str | None = None) -> str:
         session = await get_cached_v2_session()
     if session:
         body["session"] = session
+    how = "model"
     try:
-        data = await _post_json(body)
-    except Exception:
-        return text
-    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
-        return text
-    return data["result"]
+        data = await asyncio.wait_for(_post_json(body, timeout=SPEECH_CLEANUP_TIMEOUT_S, retries=1), SPEECH_CLEANUP_TIMEOUT_S + 0.5)
+        if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
+            how, data = "model_refused", None
+    except Exception as exc:  # noqa: BLE001 -- the text still goes, as stripped
+        how, data = f"model_failed:{type(exc).__name__}", None
+    log_event("plugin:voice", "speech_cleanup", how=how, ms=int((time.monotonic() - started) * 1000))
+    return data["result"] if data else text
 
 
 async def describe_image_cheap(base64_png: str) -> dict[str, Any]:

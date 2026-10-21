@@ -5,12 +5,17 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 class VoiceNarrationMixin:
     async def _synthesize_narration_audio(self, comment: str) -> str | None:
-        """Same pipeline as main.py's "tts" control op. None on any failure -- chat.js
-        then synthesizes on its own, exactly as before."""
-        from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, voice_for_gender
+        """Same pipeline as main.py's "tts" control op, without its model call. None on
+        any failure -- chat.js then synthesizes on its own, exactly as before.
+
+        No model cleanup (2026-10-21): the narrator already writes numbers out in words
+        (its prompt says so); the digits left are names from the request ("iPhone 17"),
+        which the speech service reads as they are. Live 2026-10-17 that call cost a
+        remark 9s of silence on a busy server."""
+        from app.plugins.voice_api import strip_markup_for_speech, synthesize_speech, voice_for_gender
 
         try:
-            cleaned = await clean_text_for_speech(comment)
+            cleaned = strip_markup_for_speech(comment)
             iso = {"Russian": "ru", "English": "en"}.get(current_language_name(self.tab_id))
             return await synthesize_speech(cleaned, voice_for_gender(get_persona_gender(self.workspace_dir)), language=iso)
         except asyncio.CancelledError:
