@@ -59,6 +59,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
+from app.file_guard import download_target_refusal, outbound_file_refusal
+from app.untrusted_text import third_party_label, third_party_text
 from app.plugins.app_browser_plugin import _call as _app_browser_call
 from app.secret_store import messenger_secrets_dir
 from app.sidecar_process import SidecarProcess
@@ -283,6 +285,8 @@ MESSENGER_DOWNLOADS_DIR_NAME = "messenger_downloads"
 
 
 async def download_attachment(workspace_dir: str, account: str, ref: str, save_path: str | None = None) -> str:
+    if save_path and (refusal := download_target_refusal(save_path)):
+        raise MessengerError(refusal)
     if not save_path:
         downloads_dir = Path(workspace_dir) / MESSENGER_DOWNLOADS_DIR_NAME
         downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -294,6 +298,8 @@ async def download_attachment(workspace_dir: str, account: str, ref: str, save_p
 async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
     if not Path(path).is_file():
         raise MessengerError(f"No such local file: {path}")
+    if refusal := outbound_file_refusal(path):
+        raise MessengerError(refusal)
     _require_ok(await _call(account, "sendFile", timeout=DOWNLOAD_TIMEOUT_S, to=to, path=path, caption=caption))
 
 
@@ -391,12 +397,13 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             if not text:
                 return
             thread_id = msg.get("threadID") or "unknown"
-            name = msg.get("chatName") or thread_id
+            name = third_party_label(msg.get("chatName") or thread_id)
             _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             log_event("plugin:messenger", "message_received", account=account, thread_id=thread_id)
             note = (
                 f'[New Messenger message in {_ACCOUNT_LABEL[account]} Messenger account, from "{name}" '
-                f'(threadID={thread_id}, senderID={msg.get("senderID")}, account="{account}"):\n{text}'
+                f'(threadID={thread_id}, senderID={msg.get("senderID")}, account="{account}"):\n'
+                f'{third_party_text(text, name)}'
             )
             media = msg.get("media")
             attachment_ref = msg.get("attachmentRef")

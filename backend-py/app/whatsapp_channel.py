@@ -61,6 +61,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
+from app.file_guard import download_target_refusal, outbound_file_refusal
+from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import messenger_secrets_dir
 from app.session_context import get_send_for_tab, get_tab_id
 from app.sidecar_process import SidecarProcess
@@ -222,6 +224,8 @@ DOWNLOAD_TIMEOUT_S = 60.0
 
 
 async def download_media(account: str, ref: str, save_path: str | None = None) -> str:
+    if save_path and (refusal := download_target_refusal(save_path)):
+        raise WhatsAppError(refusal)
     if not save_path:
         WHATSAPP_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
         # No file extension guessed here (unlike Telegram's default-path
@@ -234,6 +238,8 @@ async def download_media(account: str, ref: str, save_path: str | None = None) -
 
 
 async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
+    if refusal := outbound_file_refusal(path):
+        raise WhatsAppError(refusal)
     if not Path(path).is_file():
         raise WhatsAppError(f"No such local file: {path}")
     _require_ok(await _call(account, "sendFile", timeout=DOWNLOAD_TIMEOUT_S, to=to, path=path, caption=caption))
@@ -331,12 +337,13 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             if not text:
                 return
             frm = msg.get("from") or "unknown"
-            name = msg.get("chatName") or frm
+            name = third_party_label(msg.get("chatName") or frm)
             _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             log_event("plugin:whatsapp", "message_received", account=account, frm=frm)
             note = (
                 f'[New WhatsApp message in {_ACCOUNT_LABEL[account]} WhatsApp account, from "{name}" '
-                f'(jid={frm}, account="{account}"):\n{text or "(no caption)"}'
+                f'(jid={frm}, account="{account}"):\n'
+                f'{third_party_text(text, name) if text else "(no caption)"}'
             )
             if account == "self":
                 note += (

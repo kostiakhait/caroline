@@ -64,6 +64,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
+from app.file_guard import download_target_refusal, outbound_file_refusal
+from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import messenger_secrets_dir
 from app.session_context import get_send_for_tab, get_tab_id
 from app.task_supervisor import supervise
@@ -335,6 +337,8 @@ SIGNAL_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "signal_downloads"
 
 
 async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
+    if refusal := outbound_file_refusal(path):
+        raise SignalError(refusal)
     if not Path(path).is_file():
         raise SignalError(f"No such local file: {path}")
     key = "groupId" if _is_group_id(to) else "recipient"
@@ -350,6 +354,8 @@ async def download_attachment(account: str, ref: str, save_path: str | None = No
     group id the attachment arrived from -- getAttachment requires one,
     mutually exclusive with the other, to look it up), as handed out in
     the proactive notification built by _dispatch_rpc_line below."""
+    if save_path and (refusal := download_target_refusal(save_path)):
+        raise SignalError(refusal)
     try:
         attachment_id, source = ref.split("|", 1)
     except ValueError:
@@ -548,12 +554,12 @@ def _dispatch_rpc_line(account: str, msg: dict[str, Any], inject_proactive: Call
             return
         group_info = data_message.get("groupInfo")
         source = envelope.get("sourceNumber") or envelope.get("source") or "unknown"
-        name = envelope.get("sourceName") or source
+        name = third_party_label(envelope.get("sourceName") or source)
         target = (group_info or {}).get("groupId") or source
-        kind = f'group "{group_info.get("groupName") or target}"' if group_info else "DM"
+        kind = f'group "{third_party_label(group_info.get("groupName") or target)}"' if group_info else "DM"
         _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_event("plugin:signal", "message_received", account=account, source=source, kind=kind, has_media=bool(attachments))
-        note = f'[New Signal {kind} message in {_ACCOUNT_LABEL[account]} Signal account, from "{name}" ({source}, account="{account}"):\n{text or "(no text)"}'
+        note = f'[New Signal {kind} message in {_ACCOUNT_LABEL[account]} Signal account, from "{name}" ({source}, account="{account}"):\n{third_party_text(text, name) if text else "(no text)"}'
         for att in attachments:
             att_id = att.get("id")
             if not att_id:

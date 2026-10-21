@@ -48,6 +48,7 @@ import json
 import re
 from typing import Any
 
+from app.file_guard import download_target_refusal, outbound_file_refusal
 from app.plugins.contacts_plugin import upsert_contacts_from_emails
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, call_v2
@@ -248,6 +249,8 @@ async def email_download_attachment(args: dict[str, Any], _rp: Any) -> dict[str,
     if not isinstance(content_b64, str):
         raise RuntimeError(f'Attachment {args["attachmentIndex"]} on uid {args["uid"]} had no content.')
     data = base64.b64decode(content_b64)
+    if refusal := download_target_refusal(args["savePath"]):
+        raise RuntimeError(refusal)
     Path(args["savePath"]).write_bytes(data)
     return {"text": f'Downloaded {len(data)} byte(s) ("{result.get("filename")}") to "{args["savePath"]}".'}
 
@@ -326,6 +329,8 @@ async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         if args.get("attachments"):
             wire_attachments = []
             for a in args["attachments"]:
+                if refusal := outbound_file_refusal(a["path"]):
+                    raise RuntimeError(refusal)
                 p = Path(a["path"])
                 wire_attachments.append({
                     "filename": a.get("filename") or p.name,

@@ -51,6 +51,8 @@ from telethon.tl.functions.messages import CreateChatRequest, DeleteChatRequest
 from telethon.tl.types import Channel, Chat, InputPhoneContact
 
 from app.logging_setup import log_event
+from app.file_guard import download_target_refusal, outbound_file_refusal
+from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
@@ -266,6 +268,8 @@ async def download_attachment(client: TelegramClient, chat_id: int, message_id: 
     if message is None or not message.media:
         raise TelegramLoginError(f"Message {message_id} in chat {chat_id} has no downloadable attachment.")
     if save_path:
+        if refusal := download_target_refusal(save_path):
+            raise ValueError(refusal)
         target: str | Path = save_path
     else:
         name = (message.file.name if message.file else None) or f"{message_id}{(message.file.ext if message.file else '') or ''}"
@@ -278,6 +282,8 @@ async def download_attachment(client: TelegramClient, chat_id: int, message_id: 
 
 
 async def send_file(client: TelegramClient, chat_id: int, path: str, caption: str | None = None) -> None:
+    if refusal := outbound_file_refusal(path):
+        raise ValueError(refusal)
     if not Path(path).is_file():
         raise TelegramLoginError(f"No such local file: {path}")
     await client.send_file(chat_id, path, caption=caption)
@@ -389,7 +395,7 @@ async def _start_background(
         if not text and not media:
             return
         sender = await event.get_sender()
-        name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or str(event.sender_id)
+        name = third_party_label(getattr(sender, "first_name", None) or getattr(sender, "title", None) or str(event.sender_id))
         kind = "DM" if event.is_private else "group mention"
         status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_event("plugin:telegram", "message_received", account=account, kind=kind, chat_id=event.chat_id, has_media=bool(media))
@@ -397,7 +403,8 @@ async def _start_background(
             return
         note = (
             f'[New Telegram {kind} in {_ACCOUNT_LABEL[account]} Telegram account, from "{name}" '
-            f'(chat_id={event.chat_id}, message_id={event.id}, account="{account}"):\n{text or "(no caption)"}'
+            f'(chat_id={event.chat_id}, message_id={event.id}, account="{account}"):\n'
+            f'{third_party_text(text, name) if text else "(no caption)"}'
         )
         if media:
             note += (
