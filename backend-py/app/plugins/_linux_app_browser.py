@@ -146,6 +146,22 @@ async def get_port(label: str) -> int | None:
     return window.port if window is not None else None
 
 
+async def get_cookies(label: str, url: str) -> list[dict[str, Any]]:
+    """Added 2026-10-21 (Linux parity pass, messenger-integrations testing
+    plan): messenger_channel.py's Facebook login flow polls this to detect
+    when the user finishes logging in by hand. On Windows this goes through
+    AppBrowserHost.cs's own /get_cookies (WebView2's native CookieManager,
+    returning {"key": ..., "value": ...} per cookie) -- Playwright's own
+    `BrowserContext.cookies()` is the direct equivalent here, just reshaped
+    to that same {"key", "value"} field naming so the caller needs no
+    platform branch of its own for the shape, only for which function to call."""
+    window = _windows.get(label)
+    if window is None:
+        return []
+    cookies = await window.context.cookies([url])
+    return [{"key": c["name"], "value": c["value"]} for c in cookies]
+
+
 async def screenshot(label: str, x: int | None, y: int | None, width: int | None, height: int | None, max_width: int | None) -> dict[str, Any]:
     """Playwright's own page.screenshot() (a real CDP Page.captureScreenshot
     call) in place of the Windows HTTP bridge's PrintWindow-based capture --

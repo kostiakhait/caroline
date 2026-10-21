@@ -100,19 +100,39 @@ async def run_python(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 def _usage_instructions() -> str:
+    # Platform-branched 2026-10-21 (Linux parity pass, messenger-integrations
+    # testing plan): this used to be hardcoded Windows text (tasklist/
+    # taskkill) unconditionally, which would actively mislead the model into
+    # issuing Windows-only commands on a Linux tab -- same reasoning
+    # files_plugin.py's own Linux port note (2026-10-05) already applied to
+    # that plugin's instructions.
+    if sys.platform == "win32":
+        return (
+            "Before telling the user a process/application has stopped or isn't running, don't conclude that from "
+            "a single exact-name check (`tasklist /FI \"IMAGENAME eq foo.exe\"`, `taskkill /IM foo.exe`) alone. Many "
+            "Windows applications run as a thin launcher that exits almost immediately after spawning the real "
+            "worker process under a DIFFERENT name -- the process you started is not necessarily the one that keeps "
+            "running, so a negative result from an exact-name filter only means that one name isn't running right "
+            "now, not that the application itself has stopped. Before reporting it stopped, run a broader check "
+            "first -- a plain `tasklist` (or `tasklist | findstr <partial-name>`) and actually look at the full "
+            "list for anything plausibly related, not just the one name you expected. If the application has its "
+            "own status mechanism (a CLI like `adb`, a PID/lock file, a management API), prefer that over guessing "
+            "at a Windows process name."
+        )
     return (
         "Before telling the user a process/application has stopped or isn't running, don't conclude that from "
-        "a single exact-name check (`tasklist /FI \"IMAGENAME eq foo.exe\"`, `taskkill /IM foo.exe`) alone. Many "
-        "Windows applications run as a thin launcher that exits almost immediately after spawning the real "
-        "worker process under a DIFFERENT name -- the process you started is not necessarily the one that keeps "
-        "running, so a negative result from an exact-name filter only means that one name isn't running right "
-        "now, not that the application itself has stopped. Before reporting it stopped, run a broader check "
-        "first -- a plain `tasklist` (or `tasklist | findstr <partial-name>`) and actually look at the full "
-        "list for anything plausibly related, not just the one name you expected. If the application has its "
-        "own status mechanism (a CLI like `adb`, a PID/lock file, a management API), prefer that over guessing "
-        "at a Windows process name."
+        "a single exact-name check (`pgrep -x foo`, `pkill foo`) alone. Many applications run as a thin launcher "
+        "that exits almost immediately after spawning the real worker process under a DIFFERENT name -- the "
+        "process you started is not necessarily the one that keeps running, so a negative result from an "
+        "exact-name filter only means that one name isn't running right now, not that the application itself has "
+        "stopped. Before reporting it stopped, run a broader check first -- a plain `ps aux` (or `ps aux | grep "
+        "<partial-name>`) and actually look at the full list for anything plausibly related, not just the one "
+        "name you expected. If the application has its own status mechanism (a CLI like `adb`, a PID/lock file, "
+        "a management API), prefer that over guessing at a process name."
     )
 
+
+_SHELL_KIND = "Windows shell" if sys.platform == "win32" else "shell"
 
 PLUGIN = Plugin(
     name="shell",
@@ -120,7 +140,7 @@ PLUGIN = Plugin(
     tools=[
         PluginTool(
             "run_command",
-            "Run a Windows shell command and return its exit code, stdout, and stderr. Use this for anything a "
+            f"Run a {_SHELL_KIND} command and return its exit code, stdout, and stderr. Use this for anything a "
             "human would run in a terminal -- inspecting/moving files, calling a CLI tool, etc. Defaults to a "
             f"{DEFAULT_TIMEOUT_S}s timeout (override with timeout_s); the process is killed if it exceeds it.",
             {"command": str, "cwd": str | None, "timeout_s": int | None}, run_command,

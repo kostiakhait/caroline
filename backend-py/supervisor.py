@@ -161,6 +161,23 @@ def _child_env() -> dict[str, str]:
         env["CAROLINE_FFMPEG_PATH"] = str(_ROOT_DIR / "runtime" / "ffmpeg" / "ffmpeg")
         env["CAROLINE_CODEX_PATH"] = str(_ROOT_DIR / "runtime" / "codex" / "bin" / "codex-app-server")
         env["CAROLINE_PYTHON_PATH"] = str(_ROOT_DIR / "runtime" / "python" / "bin" / "python3")
+        # Added 2026-10-21 (Linux parity pass, messenger-integrations testing
+        # plan) -- these four had no Linux branch at all before, so every
+        # messenger channel needing one silently had nothing to resolve.
+        # whatsapp-sidecar/messenger-sidecar are copied as siblings of
+        # backend-py by `make dist-linux` now too (same convention as the
+        # Windows build's own stamp rules), so _APP_DIR (backend-py's
+        # parent) is the right base on both platforms even though it
+        # happens to equal _ROOT_DIR here (no versioned app-<hash> subdir
+        # on Linux).
+        env["CAROLINE_NODE_PATH"] = str(_ROOT_DIR / "runtime" / "node" / "bin" / "node")
+        env["CAROLINE_WHATSAPP_SIDECAR_DIR"] = str(_APP_DIR / "whatsapp-sidecar")
+        env["CAROLINE_MESSENGER_SIDECAR_DIR"] = str(_APP_DIR / "messenger-sidecar")
+        # signal-cli's "-Linux-native" build (see linux-shell/provision_
+        # runtime.sh) is a self-contained GraalVM native-image binary --
+        # no JRE, so no CAROLINE_JAVA_HOME here; app/signal_channel.py's
+        # own _require_tooling() only checks JAVA_HOME on win32.
+        env["CAROLINE_SIGNAL_CLI_BAT"] = str(_ROOT_DIR / "runtime" / "signal-cli" / "signal-cli")
     return env
 
 

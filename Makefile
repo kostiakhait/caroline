@@ -249,7 +249,7 @@ build: $(OUT)/Caroline.exe
 # itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
 # back into Windows/Caroline/), matching caroline_shell.py's own
 # _default_wwwroot() packaged-install lookup.
-$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
 	@echo "=== Caroline Linux shell package ==="
 	rm -rf "$(OUT_LINUX)"
 	mkdir -p "$(OUT_LINUX)/linux-shell"
@@ -270,10 +270,21 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	@echo "--- camerlengo (small-model primary path, vendored once -- see the Windows build's own stamp rule for why) ---"
 	mkdir -p "$(OUT_LINUX)/backend-py/camerlengo"
 	cp "$(CAMERLENGO_VENDOR_STUBS)/AI.py" "$(CAMERLENGO_VENDOR_STUBS)/Cache.py" "$(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py" "$(CAMERLENGO_VENDOR_STUBS)/Logger.py" "$(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py" "$(CAMERLENGO_VENDOR_STUBS)/Microagent.py" "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/"
+	@echo "--- whatsapp-sidecar / messenger-sidecar (Node, same source the Windows build ships -- added 2026-10-21, Linux parity pass) ---"
+	mkdir -p "$(OUT_LINUX)/whatsapp-sidecar" "$(OUT_LINUX)/messenger-sidecar"
+	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT_LINUX)/whatsapp-sidecar/"
+	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json" "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js" "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT_LINUX)/messenger-sidecar/"
 	@echo "Linux shell package complete: $(OUT_LINUX)"
-	@echo "NOTE: runtime/python and runtime/codex are NOT produced by this recipe (it's plain file"
-	@echo "      copying, cross-platform by design). Run on a Linux host:"
+	@echo "NOTE: runtime/python, runtime/codex, runtime/node, and runtime/signal-cli are NOT"
+	@echo "      produced by this recipe (it's plain file copying, cross-platform by design), and"
+	@echo "      neither is whatsapp-sidecar/messenger-sidecar's own node_modules/ (needs npm"
+	@echo "      install against the provisioned runtime/node). Run on a Linux host:"
 	@echo "      linux-shell/provision_runtime.sh $(OUT_LINUX)"
+	@echo "      PATH=\"$(OUT_LINUX)/runtime/node/bin:\$$PATH\" npm install --prefix $(OUT_LINUX)/whatsapp-sidecar"
+	@echo "      PATH=\"$(OUT_LINUX)/runtime/node/bin:\$$PATH\" npm install --prefix $(OUT_LINUX)/messenger-sidecar"
+	@echo "      (npm's own shebang needs \"node\" resolvable on PATH, not just npm's own absolute path --"
+	@echo "       confirmed live 2026-10-21: calling npm by its full runtime/node/bin path alone fails with"
+	@echo "       \"env: node: No such file or directory\")."
 
 dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
 

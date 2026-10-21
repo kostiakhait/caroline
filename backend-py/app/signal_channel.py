@@ -57,6 +57,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -134,8 +135,14 @@ def _env_for_subprocess() -> dict[str, str]:
 
 
 def _require_tooling() -> None:
-    if not SIGNAL_CLI_BAT or not Path(SIGNAL_CLI_BAT).exists() or not JAVA_HOME or not Path(JAVA_HOME).exists():
-        raise SignalError("Signal isn't set up in this build yet -- signal-cli/Java weren't provisioned. Reinstall Caroline.")
+    # Linux parity pass (2026-10-21): the Linux build provisions signal-cli's
+    # own "-Linux-native" (GraalVM native-image) release -- self-contained,
+    # no separate JRE, so no CAROLINE_JAVA_HOME to check there at all (see
+    # supervisor.py's _child_env and linux-shell/provision_runtime.sh).
+    if not SIGNAL_CLI_BAT or not Path(SIGNAL_CLI_BAT).exists():
+        raise SignalError("Signal isn't set up in this build yet -- signal-cli wasn't provisioned. Reinstall Caroline.")
+    if sys.platform == "win32" and (not JAVA_HOME or not Path(JAVA_HOME).exists()):
+        raise SignalError("Signal isn't set up in this build yet -- Java wasn't provisioned. Reinstall Caroline.")
 
 
 async def start_login(workspace_dir: str, account: str) -> str:

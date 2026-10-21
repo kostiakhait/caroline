@@ -3,10 +3,24 @@
 # `pip freeze` after iteratively resolving every ModuleNotFoundError hit by
 # `from app.main import PORT, app` on a clean python-build-standalone
 # CPython 3.12.15 interpreter -- NOT the full backend-py dependency set for
-# every platform. Windows-only extras tied to automation plugins that are
-# out of scope for this port (pywin32, playwright, edge-tts/edge-playback)
-# are intentionally absent; those plugins fail to import on Linux and are
-# skipped, same as already verified in earlier Linux-port phases.
+# every platform. pywin32/edge-tts/edge-playback (genuinely Windows-only
+# automation extras) are intentionally absent; those plugins fail to import
+# on Linux and are skipped, same as already verified in earlier Linux-port
+# phases.
+#
+# Corrected 2026-10-21 (Linux parity pass, messenger-integrations testing
+# plan): this file's own header used to ALSO claim playwright was a
+# Windows-only extra -- wrong, contradicted by live code.
+# app/plugins/app_browser_cdp.py and _linux_app_browser.py (Phase 3 of
+# docs/LINUX_PORT_PLAN.md, done and verified 2026-10-05) both import
+# playwright directly and ARE the Linux embedded-browser path; it was
+# simply never added to this pin file, so every Linux provision has been
+# silently missing it (loader.py's own per-plugin import-failure catch
+# masked this rather than crashing the backend, so it went unnoticed).
+# Added here, pinned to the same version the Windows runtime ships.
+# Also added: qrcode, Pillow -- needed by whatsapp_channel.py's and
+# signal_channel.py's QR-login image generation, same gap, same cause
+# (never added when those channels landed).
 #
 # Regenerated 2026-10-16, same incident: re-ran the iterative resolution for
 # the first time since the Slack/Telegram/Discord messenger integrations
@@ -60,6 +74,8 @@ mcp-types==2.3.0
 multidict==7.1.0
 openai==3.24.0
 opentelemetry-api==1.45.0
+Pillow==12.3.0
+playwright==1.62.0
 propcache==0.5.4
 psutil==7.2.2
 pyaes==1.6.1
@@ -71,6 +87,7 @@ PyJWT==2.15.1
 pymupdf==1.28.2
 python-multipart==0.0.32
 python-xlib==0.33
+qrcode==8.2
 referencing==0.37.0
 requests==2.34.2
 rpds-py==2026.9.1
