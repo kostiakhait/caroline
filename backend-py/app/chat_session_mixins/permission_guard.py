@@ -308,26 +308,36 @@ class PermissionGuardMixin:
         the operation closes once actually sent) can find it once this
         call's real handler succeeds.
 
+        Semi-mechanical control (2026-10-20, per explicit instruction: "ЛЛМ
+        проверяет тип операции и от чьего имени, а алгоритм (!) разрешает или
+        блокирует"): the identify step -- now shown the call itself, name and
+        (secret-masked) arguments, since its own "account" argument is the
+        surest fact of whose identity it goes out under -- establishes the
+        facts, and app/permission_policy.py's send_block_reason, plain code,
+        decides. No model judges approval policy here any more (the LLM
+        guard blocked a send from Caroline's own account over an "unapproved
+        caption", and again after the user's explicit "Разрешаю").
+
         Fail-open throughout, same philosophy as every other microagent
-        check here: a failed summary or failed identify call just falls
-        back to today's pre-existing behavior (the plain text-only guard
-        check, or no check at all), never a new way to get stuck."""
-        from app.plugins.voice_api import _identify_pending_action_locally, summarize_action
+        check here: a failed identify call lets the send through (logged),
+        never a new way to get stuck."""
+        from app.permission_policy import send_block_reason
+        from app.plugins.voice_api import _identify_pending_action_locally, summarize_action, tool_call_for_model
 
         try:
             summary = await summarize_action(tool_name, args)
         except Exception as exc:
             log_event("engine", "summarize_action_failed", tab_id=self.tab_id, tool=tool_name, error=str(exc))
             summary = None
-        if not summary:
-            return None
-        log_event("engine", "action_summarized", tab_id=self.tab_id, tool=tool_name, summary=summary)
+        if summary:
+            log_event("engine", "action_summarized", tab_id=self.tab_id, tool=tool_name, summary=summary)
 
-        extra_context = f"About to happen, not yet done: {summary}"
+        extra_context = f"About to happen, not yet done: {summary or tool_name}"
         open_actions_wire = [{"id": a.id, "summary": a.summary} for a in self.action_registry.open_actions()]
         try:
             facts = await _identify_pending_action_locally(
                 self._narration_task(), self._dialogue_with_note(extra_context), open_actions=open_actions_wire,
+                tool_call=tool_call_for_model(tool_name, args),
             )
         except Exception as exc:
             log_event("engine", "action_identify_failed", tab_id=self.tab_id, error=str(exc))
@@ -362,12 +372,26 @@ class PermissionGuardMixin:
                     )
             self._action_id_for_pending_send = action.id
             self._persist_action_state()
-            if action.approved:
-                log_event("engine", "action_approved_short_circuit", tab_id=self.tab_id, action_id=action.id, summary=action.summary)
-                return None
 
-        await self._check_permission_guard(extra_context=extra_context, facts=facts, action_id=self._action_id_for_pending_send)
-        return self.pending_unapproved_action
+        if facts is None:
+            log_event("engine", "send_policy_no_facts_allowed", tab_id=self.tab_id, tool=tool_name)
+            return None
+        action = self.action_registry.get(self._action_id_for_pending_send) if self._action_id_for_pending_send else None
+        reason = send_block_reason(facts, approved=bool(action and action.approved))
+        log_event(
+            "engine", "send_policy_decided", tab_id=self.tab_id, tool=tool_name,
+            action_type=facts.get("action_type"), sender_identity=facts.get("sender_identity"),
+            explicitly_instructed=bool(facts.get("explicitly_instructed_by_user")),
+            approved=bool(action and action.approved), allowed=reason is None, reason=reason,
+        )
+        # A block stops the turn the same way the dialogue guard's does (see
+        # _on_permission_block_checked: the model is told to ask, and from the
+        # second block of the same thing the user is asked directly).
+        # Never cleared here: an allowed send says nothing about what the
+        # dialogue guard may have flagged.
+        if reason:
+            self.pending_unapproved_action = reason
+        return reason
 
     def _persist_action_state(self) -> None:
         save_action_state(self.workspace_dir, self.tab_id, self.action_registry.to_wire())

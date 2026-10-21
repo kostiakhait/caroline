@@ -120,6 +120,15 @@ _PROMPT = (
     "RECENT/most pressing one -- the one a reader would need a policy decision about right now -- as a "
     "single, specific action; never merge two different actions or two different identities into one "
     "vague summary.\n\n"
+    "THE TOOL CALL, when given below, is the action itself, exactly as it is about to run -- the most "
+    "reliable fact you have, more reliable than any retelling of it in the dialogue or the summary. Its "
+    "own arguments settle whose identity it goes out under: an \"account\" argument of \"self\" (or no "
+    "account argument on a messenger tool, whose default is \"self\") is the ASSISTANT'S OWN separate "
+    "account -- sender_identity \"assistant_own\"; \"owner\" is the user's own account -- \"user_own\". A "
+    "text message sent from one of the user's paired phones (companion_sms_send) is always \"user_own\": "
+    "it goes out from the user's real number. Never let a summary or the dialogue overrule what the "
+    "arguments say (confirmed live, 2026-10-20: a retelling called a send from account \"self\" a send "
+    "from the user's own account).\n\n"
     "Per explicit instruction (2026-10-18, the action-boundary tracking system): when action_type is not "
     "\"none\", also decide whether the pending action you just identified is the SAME bounded operation as "
     "one already listed under OPEN ACTIONS below (e.g. \"send the Four Faith renewal email to Jessica Zhou\" "
@@ -130,6 +139,7 @@ _PROMPT = (
     f"TASK (the user's request):\n---\n{{task}}\n---\n\n"
     f"RECENT DIALOGUE (oldest first, last line is the newest):\n{{recent_dialogue}}\n\n"
     f"OPEN ACTIONS (operations already tracked, each with its own id -- empty means none are open):\n{{open_actions_block}}\n\n"
+    f"{{tool_call_block}}"
     "Reply now."
 )
 
@@ -140,10 +150,17 @@ def _open_actions_block(open_actions: Any) -> str:
     return "\n".join(f"- id: {a['id']} -- summary: {a['summary']}" for a in open_actions)
 
 
+def _tool_call_block(tool_call: Any) -> str:
+    if not tool_call:
+        return ""
+    return f"THE TOOL CALL about to run (tool name and its own arguments):\n{tool_call}\n\n"
+
+
 def prompt_identify(input: Any, context: Any) -> str:
     return _PROMPT.format(
         task=input["task"] or "(not given)", recent_dialogue=input["recent_dialogue"] or "(empty)",
         open_actions_block=_open_actions_block(input.get("open_actions")),
+        tool_call_block=_tool_call_block(input.get("tool_call")),
     )
 
 
@@ -179,7 +196,7 @@ def llm_agents() -> List["M.Agent"]:
             "does it go out under, and (per the action-boundary system) which already-open action -- "
             "if any -- it is the same operation as. No approval judgment.",
             input_schema=_object(
-                {"task": _STRING, "recent_dialogue": _STRING, "open_actions": {"type": "array", "items": {"type": "object"}}},
+                {"task": _STRING, "recent_dialogue": _STRING, "open_actions": {"type": "array", "items": {"type": "object"}}, "tool_call": _STRING},
                 required=["task", "recent_dialogue"],
             ),
             output_schema=_object(

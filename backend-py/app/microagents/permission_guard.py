@@ -143,7 +143,18 @@ established. The orchestration (two sequential calls, short-circuiting
 straight to needs_approval=false when step 1 finds no pending action at
 all) lives in Api2ReplyCommands.cmdV2ReplyPermissionGuard, not here --
 this module still owns only the single GUARD agent and its own prompt/
-verify/schema."""
+verify/schema.
+
+Narrowed (2026-10-20), per explicit instruction: deciding whether a send or
+a payment is allowed moved out of this agent entirely, into plain code run
+right before every send (app/permission_policy.py: the identify step
+establishes the facts, a table decides -- "ЛЛМ проверяет тип операции и от
+чьего имени, а алгоритм (!) разрешает или блокирует"). This agent keeps its
+own, different job only: "чтобы модель не отвечала сама себе" -- catching
+the assistant going ahead on a question it asked the user and the user
+never answered. It blocked a send from Caroline's own Telegram account over
+an "unapproved caption", and again right after the user's explicit
+"Разрешаю"; neither is a question left unanswered."""
 
 from __future__ import annotations
 
@@ -206,88 +217,30 @@ def _object(properties: dict, required: Optional[List[str]] = None) -> dict:
 # GUARD_RULES_TEXT is exactly the string prompt_guard already built, up to
 # (not including) the per-call data section, byte for byte.
 GUARD_RULES_TEXT = (
-    "You are watching an AI assistant's conversation with its user, looking for exactly one thing: "
-    "is there, right now, an action the assistant is about to do (or may already be doing) that needed "
-    "the user's explicit permission and does not have it?\n\n"
-    "Approval is required ONLY for these two kinds of action -- nothing else, ever, under this agent, no "
-    "matter how the dialogue reads:\n\n"
-    "(a) COMMUNICATION ON THE USER'S BEHALF: communication sent to a third party ON THE USER'S OWN "
-    "BEHALF, through any channel (a message, an email, a post, a call, anything read by someone other "
-    "than the user).\n\n"
-    "(b) MONEY: anything that affects the user's own money or finances (a payment, a purchase, a "
-    "transfer, anything that spends or commits their funds).\n\n"
-    "For either kind, that specific action always needs a clear, explicit, specific approval already "
-    "present in the dialogue. A general 'go ahead' or 'do what's needed for this task' does NOT count as "
-    "specific approval for a particular send or a particular spend; it needs an answer that is clearly "
-    "about that exact action. An unanswered yes/no permission question ('can I...', 'should I...', 'may "
-    "I...') about a send or a spend counts the same way: no reply, a reply about something else, or an "
-    "ambiguous/non-committal reply are ALL treated as not approved.\n\n"
-    "A DIRECT, SPECIFIC INSTRUCTION FROM THE USER IS ITSELF THE APPROVAL -- this is the common case, not "
-    "an edge case, and it needs no separate yes/no exchange on top of it. Most of the time nobody asks "
-    "'can I send this?' at all: the user simply orders the send/spend outright ('thank X for their audit "
-    "findings and tell them the issues are already being fixed', 'send Y the attached file', 'pay the "
-    "$50 invoice'). When the user's own words already name who the message goes to and/or what it should "
-    "say, or which payment to make, that instruction IS the clear, explicit, specific approval this agent "
-    "requires, the moment it's given -- never flag needs_approval for it, and never wait for the user to "
-    "additionally confirm 'yes' to a question that was never asked, because the assistant correctly "
-    "going on to do exactly what it was just told is not a new action still awaiting approval. The "
-    "yes/no-question rule above is for a DIFFERENT situation: the assistant itself proposing a send/spend "
-    "and asking the user whether to proceed -- there, an actual answer is still required. Do not collapse "
-    "the two: an order from the user needs no question asked of them at all; a question from the "
-    "assistant needs an actual answer.\n\n"
-    "Nothing else ever needs approval here. An unanswered yes/no question about anything OTHER than a "
-    "send or a spend -- checking something, restarting a process, reading more files, continuing "
-    "ordinary exploration or work -- is NOT a reason to flag needs_approval, answered or not; only (a) "
-    "and (b) are in scope.\n\n"
-    "STICKY APPROVAL: once the dialogue already shows a clear approval for a specific send/spend, that "
-    "approval covers that same action from then on -- do not flag needs_approval again for an action the "
-    "user already clearly approved just because this check runs again later (it runs after every "
-    "outbound message). Only flag a genuinely NEW/different send or spend that hasn't itself been "
-    "approved yet; do not re-litigate one that already was.\n\n"
-    "MULTI-STEP SEND: when the user's own order to send/spend requires the assistant to do a bit of work "
-    "first -- find the recipient's address from notes or prior messages, look up an account number, "
-    "finish writing the draft, ask the user a factual question like which address to use -- that "
-    "in-between work does NOT create a new approval gap for the ACTION itself (whether to send/spend "
-    "something to this recipient at all). Do not flag needs_approval partway through just because the "
-    "assistant is still gathering information, still drafting, or has asked (or already gotten an answer "
-    "to) a follow-up logistics question like which address to use.\n\n"
-    "ESTABLISHED FACTS below (from a separate classification step that already ran -- trust them, do not "
-    "re-derive whose identity the action is under or what the action is; they are your ground truth for "
-    "that, the dialogue is still yours to read for everything about approval itself) tell you, for the "
-    "current pending action if there is one: its type, a one-sentence summary, the recipient, whose "
-    "identity it goes out under (sender_identity: \"user_own\" the user's real personal name/account, "
-    "\"assistant_own\" the assistant's own separate identity -- never needs approval under (a) at all, the "
-    "same way a human secretary doesn't need sign-off to answer their own phone -- \"persona\" a crafted "
-    "sender alias/brand never mistakable for the user's own real words, or \"n/a\"), and whether the "
-    "SPECIFIC drafted wording was already shown to and accepted by the user (wording_shown_and_accepted).\n"
-    "If sender_identity is \"assistant_own\", this is not rule (a) communication at all -- never flag it.\n\n"
-    "EXACT WORDING, for sender_identity \"user_own\" specifically (never for \"assistant_own\" or "
-    "\"persona\" -- a persona send still needs rule (a)'s own clear order/approval of the action, covering "
-    "every recipient in a list once given for the list as a whole per STICKY APPROVAL, but never this "
-    "extra per-message wording sign-off, because nobody reading it could ever mistake it for the user's "
-    "own real words in the first place): approval of the ACTION (that a message should go to this "
-    "recipient, saying roughly this) is NOT, by itself, approval of the exact sentences the assistant "
-    "drafted to say it. The user describing what the message should cover or achieve -- the facts to "
-    "include, the tone, the ask -- is an order to act, not a transcript to send verbatim; the assistant "
-    "still composed the actual wording itself. Flag needs_approval if wording_shown_and_accepted is false "
-    "for a user_own send. The one exception, already folded into wording_shown_and_accepted: the user "
-    "dictated the message's actual words themselves (quoted it, or gave text so precise and complete "
-    "there was nothing left for the assistant to compose) -- there, sending it as given needs no separate "
-    "re-approval. This is EXTRA weight on top of rule (a) above, not a replacement for it -- both must "
-    "hold: the action itself must have a clear order or approval, AND (for sender_identity \"user_own\") "
-    "wording_shown_and_accepted must be true. Only flag needs_approval if the assistant is about to send "
-    "something genuinely DIFFERENT from what was ordered (a different recipient, a materially different "
-    "message) with no approval for that difference, OR -- per EXACT WORDING above -- wording_shown_and_"
-    "accepted is false for a user_own send. The TASK field below is only the single most recent user "
-    "message, which is very often a short follow-up ('yes, send it', 'use the address from our chat', "
-    "'the text is fine') rather than a restatement of the whole request -- always read the FULL dialogue "
-    "for the actual standing instruction and whatever approval is already in it; a terse or "
-    "logistics-only TASK field is never itself a sign that approval is missing.\n\n"
-    "Decide using ONLY what is actually said in the dialogue below (plus the ESTABLISHED FACTS given to "
-    "you) -- never guess or assume consent. If "
-    "neither (a) nor (b) applies, or the needed approval is clearly already there, say so. If you do find a "
-    "live gap, describe in one short, plain sentence (for the assistant itself to read) exactly what "
-    "still needs the user's permission.\n\n"
+    "You are watching an AI assistant's conversation with its user, looking for exactly ONE thing: is the "
+    "assistant answering its own question?\n\n"
+    "That is: the assistant ITSELF asked the user something that needs the USER's decision -- whether to "
+    "do something, which of several options to take, a yes/no, a confirmation of a draft it showed -- and "
+    "the user has not actually answered it, yet the assistant is going ahead (or is about to) as if they "
+    "had: taking silence, its own guess, or a reply about something else as the answer.\n\n"
+    "Flag needs_approval ONLY in that case. Never flag anything else; in particular:\n"
+    "- Whose name or account something goes out under, whether a message or a payment is allowed at all, "
+    "whether its exact wording was approved -- none of that is your concern. A separate rule checks every "
+    "send and every payment right before it runs; do not repeat its job, and never flag because of it.\n"
+    "- A direct order from the user ('send X to Y', 'write to Leah and ask about Z', 'pay this invoice') is "
+    "not a question the assistant asked. Carrying it out is never answering itself.\n"
+    "- Any actual answer from the user answers the question, however short: 'yes', 'да', 'Разрешаю', "
+    "'go ahead', 'send it', 'ok', picking one of the options, giving the information asked for. Once "
+    "answered, a question stays answered: this check runs again after every message -- never flag the "
+    "same, already answered question a second time.\n"
+    "- A question the user answered with a different instruction instead: the new instruction stands, and "
+    "acting on it is not answering itself.\n"
+    "- A question the assistant itself withdrew, and remarks that hold nothing up ('let me know if you "
+    "want...', 'I can also...'), are not open questions.\n\n"
+    "The ESTABLISHED FACTS below only tell you which action is pending; they are context, not something "
+    "to judge. Decide using ONLY what is actually said in the dialogue -- never guess at an answer the "
+    "user did not give. If you flag, say in one short, plain sentence (for the assistant itself to read) "
+    "which question still waits for the user's answer.\n\n"
 )
 
 
@@ -356,9 +309,8 @@ def llm_agents() -> List[M.Agent]:
     return [
         M.Agent(
             GUARD, "1",
-            "Decides, from the recent dialogue plus turn.permission.identify's already-established facts, "
-            "whether an un-approved communication-on-the-user's-behalf or financial action is currently "
-            "outstanding; an already-approved action is never flagged again.",
+            "Decides, from the recent dialogue, whether the assistant is going ahead on a question it asked "
+            "the user and the user never answered -- answering its own question.",
             input_schema=_object(
                 {
                     "task": _STRING, "recent_dialogue": _STRING, "previous_block_reason": _STRING,

@@ -529,7 +529,7 @@ async def check_permission_guard(
 
 
 async def _identify_pending_action_locally(
-    task: str, recent_dialogue: str, open_actions: list[dict[str, str]] | None = None,
+    task: str, recent_dialogue: str, open_actions: list[dict[str, str]] | None = None, tool_call: str | None = None,
 ) -> dict[str, Any] | None:
     """turn.permission.identify, step 1 of check_permission_guard's gate,
     run LOCALLY in this process (2026-10-17 pilot -- see
@@ -565,6 +565,11 @@ async def _identify_pending_action_locally(
     try:
         context = runtime.new_context(budget=new_budget())
         agent_input = {"task": task, "recent_dialogue": recent_dialogue, "open_actions": open_actions or []}
+        if tool_call:
+            # The call itself, name and arguments (2026-10-20): its own "account"
+            # argument settles whose identity it goes out under -- see the agent's
+            # own prompt, THE TOOL CALL.
+            agent_input["tool_call"] = tool_call
         result = await asyncio.to_thread(runtime.run, IDENTIFY, agent_input, context)
     except Exception as exc:
         log_event("plugin:voice", "permission_identify_local_failed", error=str(exc))
@@ -577,6 +582,26 @@ async def _identify_pending_action_locally(
         log_event("plugin:voice", "permission_identify_local_failed", reason="malformed")
         return None
     return output
+
+
+_SECRET_ARG = re.compile(r"pass(word|wd)?|secret|token|api[_-]?key|credential", re.IGNORECASE)
+
+
+def masked_args(value: Any) -> Any:
+    """Tool arguments with the value of every argument whose name says it is
+    a secret (password, token, API key...) masked, at any depth -- what a
+    model may be shown. Found 2026-10-20: summarize_action used to send
+    email_send's SMTP password to the model provider in every prompt."""
+    if isinstance(value, dict):
+        return {key: ("***" if _SECRET_ARG.search(str(key)) else masked_args(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [masked_args(item) for item in value]
+    return value
+
+
+def tool_call_for_model(tool_name: str, args: dict[str, Any]) -> str:
+    """A tool call as text for a model to read: its name and masked arguments."""
+    return json.dumps({"tool": tool_name, "arguments": masked_args(args)}, ensure_ascii=False, default=str)
 
 
 async def summarize_action(
@@ -607,10 +632,7 @@ async def summarize_action(
     from app.evolution_client import run_reply_agent
     from app.microagents.action_summary import SUMMARY
 
-    try:
-        args_json = json.dumps(args, ensure_ascii=False, default=str)
-    except Exception:
-        args_json = str(args)
+    args_json = json.dumps(masked_args(args), ensure_ascii=False, default=str)
     try:
         result = await run_reply_agent(SUMMARY, {"tool_name": tool_name, "args_json": args_json})
     except Exception as exc:
