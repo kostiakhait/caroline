@@ -843,12 +843,27 @@ async def _expand_notes_candidates(results: list[dict[str, Any]]) -> None:
                     break
 
 
+def _is_keep_only(part: dict[str, Any]) -> bool:
+    """Fact memory's last portion: no facts, only its whole-set verdict."""
+    output = part.get("output") or {}
+    return "keep" in output and not output.get("facts")
+
+
 def _merge_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The parts of an answer as the reply of a whole request: one entry per
-    source, the facts (or the documents) of all its portions together."""
+    source, the facts (or the documents) of all its portions together.
+
+    Fact memory ends a read with a portion that holds no facts, only "keep":
+    the ids its sanitizer kept after seeing the whole set at once (each
+    portion before it was sanitized one leaf at a time). When that verdict is
+    here, only the facts it names are kept."""
     merged: dict[str, dict[str, Any]] = {}
+    keep: dict[str, set[str]] = {}
     for part in parts:
         source, output = part.get("source"), dict(part.get("output") or {})
+        if _is_keep_only(part):
+            keep[source] = set(output["keep"])
+            continue
         known = merged.get(source)
         listed = next((name for name in ("facts", "documents") if isinstance(output.get(name), list)), None)
         if known is not None and listed and isinstance(known.get(listed), list):
@@ -857,7 +872,11 @@ def _merge_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 known[flag] = bool(known.get(flag)) or bool(output.get(flag))
         else:
             merged[source] = output
-    return [{"source": source, "output": output} for source, output in merged.items()]
+    for source, kept in keep.items():
+        output = merged.get(source)
+        if output is not None and isinstance(output.get("facts"), list):
+            output["facts"] = [fact for fact in output["facts"] if fact.get("id") in kept]
+    return [{"source": source, "output": output} for source, output in merged.items() if output.get("facts") != [] or "facts" not in output]
 
 
 def _late_text(query: str, parts: list[dict[str, Any]]) -> str:
@@ -883,6 +902,9 @@ def _continue_in_background(read: _Read) -> None:
                 new = await read.poll(POLL_WAIT_S)
                 if new:
                     _cache_topics_from_parts(new)  # late-arriving topic facts warm the cache too
+                # The whole-set verdict alone says nothing new once the reply is
+                # given: the facts it would filter already reached the model.
+                new = [part for part in new if not _is_keep_only(part)]
                 if new and inject is not None:
                     inject(_late_text(read.query, new))
                     log_event("plugin:memory", "late_facts_injected", parts=len(new))
@@ -901,6 +923,43 @@ def _continue_in_background(read: _Read) -> None:
             OPERATIONS.forget(op.id)
 
     op.task = asyncio.create_task(run())
+
+
+async def correct_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """memory:correctFact -- one stored fact gets the right wording in place
+    (FactMemory.py, "Correcting": same id, the old wording kept in its
+    history, its counter starting again at 1)."""
+    refused = await _gate()
+    if refused:
+        return refused
+    fact_id, text = (args.get("fact_id") or "").strip(), (args.get("text") or "").strip()
+    if not fact_id or not text:
+        return {"text": 'correct_info needs "fact_id" (the "id" of a fact from a request_info reply) and "text" (its right wording).', "is_error": True}
+    reply = await _memory("memory:correctFact", fact=fact_id, text=text, traceId=uuid.uuid4().hex, language=_language())
+    reaction = await _react_to_status(reply)
+    failure = _failure_text(reply, "Correcting that fact")
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    output = reply.get("output") or {}
+    log_event("plugin:memory", "fact_corrected", fact_id=fact_id)
+    return {"text": f'Corrected. It was: "{output.get("previous")}". It now reads: "{output.get("text")}".'}
+
+
+async def forget_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """memory:forgetFact -- one stored fact removed from memory entirely."""
+    refused = await _gate()
+    if refused:
+        return refused
+    fact_id = (args.get("fact_id") or "").strip()
+    if not fact_id:
+        return {"text": 'forget_info needs "fact_id": the "id" of a fact from a request_info reply.', "is_error": True}
+    reply = await _memory("memory:forgetFact", fact=fact_id, traceId=uuid.uuid4().hex)
+    reaction = await _react_to_status(reply)
+    failure = _failure_text(reply, "Forgetting that fact")
+    if failure:
+        return {"text": " ".join(filter(None, [failure, reaction])), "is_error": True}
+    log_event("plugin:memory", "fact_forgotten", fact_id=fact_id)
+    return {"text": f'Forgotten: "{(reply.get("output") or {}).get("text")}".'}
 
 
 async def save_document(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -1076,6 +1135,12 @@ _USAGE_INSTRUCTIONS = (
     "id>); request_info(document=<id>) alone gives the card and the outline of all parts; add \"save_file_to\" "
     "to get the file itself written to a path. A fact may carry \"documents\": [{\"document\", \"section\"}] -- "
     "the place it was read from; open it the same way when the exact wording matters.\n"
+    "CORRECTING AND FORGETTING. Every fact in a request_info reply carries its \"id\". correct_info(fact_id, "
+    "text) gives that one fact its right wording, in place (the old wording stays in its history); "
+    "forget_info(fact_id) removes it from memory entirely. Use them ONLY when the user explicitly tells you a "
+    "remembered fact is wrong or asks you to forget something -- never on your own judgment. A fact that is "
+    "merely out of date is better saved anew with save_info: memory marks the old one doubtful or denied by "
+    "itself and keeps the history visible.\n"
     "The older memory tools -- recall_memory, working_memory_*, topic_upsert/topics_list/topic_close -- are "
     "deprecated and read-only: what they hold can still be read, nothing new is written "
     "through them. notes_* tools work as before for notes the user asks about by name.\n"
@@ -1135,6 +1200,20 @@ PLUGIN = Plugin(
             "request_info; a part is read in full with request_info(document, section).",
             {"path": str, "note": str | None},
             save_document,
+        ),
+        PluginTool(
+            "correct_info",
+            "Corrects ONE remembered fact in place: \"fact_id\" is the \"id\" of a fact from a request_info reply, "
+            "\"text\" its right wording. Only when the user explicitly says that remembered fact is wrong.",
+            {"fact_id": str, "text": str},
+            correct_info,
+        ),
+        PluginTool(
+            "forget_info",
+            "Removes ONE remembered fact from memory entirely: \"fact_id\" is the \"id\" of a fact from a "
+            "request_info reply. Only when the user explicitly asks you to forget it.",
+            {"fact_id": str},
+            forget_info,
         ),
         PluginTool(
             "close_track",
