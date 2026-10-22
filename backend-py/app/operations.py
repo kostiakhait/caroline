@@ -57,6 +57,18 @@ from app.workspace_dir import WORKSPACE_DIR
 # costs one extra cheap summarize+guard round-trip on something harmless;
 # under-triggering is the dangerous direction).
 _SEND_TOOL_NAME_MARKER = "send"
+# The money actions the guard also covers, beside the send-type calls above.
+_FINANCIAL_TOOLS = frozenset({"purchase_visual_model"})
+
+
+def _guarded_action(tool_name: str) -> bool:
+    """A call the permission guard exists for: a send on the user's behalf, or
+    spending money. Every other call -- reading, searching, drafting -- is not an
+    action and is never stopped by a pending block (2026-10-22, per explicit
+    instruction: "Должно останавливаться только ДЕЙСТВИЕ, но не рассуждение";
+    seen on the test box: a pending block stopped the whole turn at its first
+    request_info, before anything was drafted, and the user got nothing)."""
+    return _SEND_TOOL_NAME_MARKER in tool_name.lower() or tool_name in _FINANCIAL_TOOLS
 
 FAST_PATH_TIMEOUT_S = 0.5
 # A completion notice for an operation the caller walked away from waits
@@ -242,9 +254,12 @@ async def dispatch(
     answer here also means the ChatSession itself just stopped the whole
     turn (see get_permission_block's own caller-side docstring) -- the
     real handler is never invoked for a blocked call, belt-and-suspenders
-    on top of that stop."""
+    on top of that stop.
+
+    Only a guarded action (see _guarded_action) consults that check: anything
+    else runs, and the pending block stays armed for the action itself."""
     tab_id = get_tab_id()
-    blocked_reason = get_permission_block(tab_id)
+    blocked_reason = get_permission_block(tab_id) if _guarded_action(tool_name) else None
     if blocked_reason:
         log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved", tool=tool_name, reason=blocked_reason)
         return {"operation_id": "", "status": "error", "error": f"Blocked: {blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}

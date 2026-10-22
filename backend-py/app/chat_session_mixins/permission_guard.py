@@ -14,8 +14,9 @@ class PermissionGuardMixin:
     def _on_permission_block_checked(self) -> str | None:
         """Per explicit instruction (2026-10-11): registered with
         session_context's register_permission_blocker, called by
-        app/operations.py's dispatch() right before EVERY tool call in
-        either engine, for this tab. A truthy pending_unapproved_action
+        app/operations.py's dispatch() right before every send-type or money
+        tool call in either engine, for this tab (only those since 2026-10-22,
+        see operations._guarded_action -- reading and drafting go on). A truthy pending_unapproved_action
         means a tool call was just attempted while an unanswered yes/no
         permission question, or an un-approved communication/financial
         action, is outstanding (see _check_permission_guard) -- stop the
@@ -77,6 +78,14 @@ class PermissionGuardMixin:
             def _stop_and_explain() -> None:
                 if self.ended:
                     return
+                # An sw turn is stopped by cancelling its task, which only takes
+                # effect once the task unwinds; until then the turn still counts as
+                # running, so a note injected right away became a "live comment" of
+                # that dying turn and was thrown away with it -- the user got no reply
+                # at all (seen on the test box, 2026-10-22). The note waits for the
+                # stopped turn to have actually ended, and then starts its own turn,
+                # as it does for a Claude turn.
+                stopping_sw_turn = self._small_model_task if self.small_model_active else None
                 self.stop()
                 # stop() unconditionally also queues the generic "the user pressed Stop"
                 # note (self._stop_note_pending) -- wrong here (the user didn't click
@@ -85,8 +94,15 @@ class PermissionGuardMixin:
                 self._stop_note_pending = False
                 if escalate:
                     asyncio.ensure_future(self._send_permission_guard_direct_ask(reason))
+                    return
+                note = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
+                if stopping_sw_turn is not None and not stopping_sw_turn.done():
+                    def _explain_after_stop(_task: asyncio.Task[None]) -> None:
+                        if not self.ended:
+                            self.inject_proactive(note)
+                    stopping_sw_turn.add_done_callback(_explain_after_stop)
                 else:
-                    self.inject_proactive(PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason))
+                    self.inject_proactive(note)
 
             asyncio.get_event_loop().call_soon(_stop_and_explain)
         return reason
