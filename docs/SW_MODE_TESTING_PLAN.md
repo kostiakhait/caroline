@@ -120,14 +120,26 @@ Files touched: `backend-py/app/secret_store.py`, `backend-py/requirements-linux.
 
 ## Phase 1 -- Stand up the disposable test box
 
-**Status: not started.**
+**Status: done (2026-10-22), verified live.** Fresh Vultr Ubuntu 24.04 instance (region fra, plan
+`vc2-1c-2gb`), same apt package list `docs/LINUX_PORT_PLAN.md`'s own recipe already uses, plus
+what Phase 0 added (Node.js, signal-cli -- no JRE needed, the native build is self-contained).
+Built with `make dist-linux` (reused the Phase 0 output, unchanged since) and provisioned both
+runtimes via the Phase-0-extended `provision_runtime.sh`; `npm install` for both sidecars against
+the provisioned `runtime/node` (using the Phase-0-corrected `PATH=...runtime/node/bin:$PATH`
+prefix). `Xvfb :1` + `openbox` started for a real virtual X11 desktop. `supervisor.py` launched
+with `CAROLINE_APP_ROOT`/`DISPLAY` set -- reached a healthy state with no manual intervention:
+`GET http://127.0.0.1:48766/status` (the supervisor's own port) returned 200 with
+`backendRunning: true`, and the backend's own `GET http://127.0.0.1:48765/api/status` returned
+200 with `{"ok": true, ...}` -- the same bar `docs/LINUX_PORT_PLAN.md` already used for its own
+Phase 5. Box kept running (not torn down yet) since Phases 2-5 reuse it.
 
-Reuse the existing, already-used-several-times recipe verbatim (`docs/LINUX_PORT_PLAN.md`'s own
-"Disposable test-box recipe" section): fresh Vultr Ubuntu 24.04 instance, `Xvfb :1` + `openbox` for
-a real (if virtual) X11 desktop, the same apt package list already enumerated there, plus what
-Phase 0 added (Node.js, signal-cli -- no JRE needed, the native build is self-contained). Build
-with `make dist-linux` and provision both runtimes via the (now extended) `provision_runtime.sh`.
-Torn down after the run, per standing instruction never to leave test infrastructure lying around.
+**Real gotcha found while standing this up, not anticipated in the original plan**: the Vultr
+account's API key is now IP-allowlisted, and the dev machine's own (dynamic) egress IP isn't on
+it -- every `create`/`poll`/`delete` instance-management API call had to be proxied through
+`snc-ops-1` (188.245.0.102, already-whitelisted IPv4; its own env file holds the same API key) via
+SSH, forcing `curl -4` specifically (that box prefers IPv6 by default, which is NOT allowlisted and
+fails the same way). Direct SSH to the test box itself is unaffected by this -- only Vultr's own
+management API is IP-gated.
 
 ## Phase 2 -- Test harness: how tasks get sent in and verified
 
