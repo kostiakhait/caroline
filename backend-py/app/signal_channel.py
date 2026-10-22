@@ -65,7 +65,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
-from app.file_guard import download_target_refusal, outbound_file_refusal
 from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import messenger_secrets_dir
 from app.session_context import get_send_for_tab, get_tab_id
@@ -344,8 +343,6 @@ SIGNAL_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "signal_downloads"
 
 
 async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
-    if refusal := outbound_file_refusal(path):
-        raise SignalError(refusal)
     if not Path(path).is_file():
         raise SignalError(f"No such local file: {path}")
     key = "groupId" if _is_group_id(to) else "recipient"
@@ -361,8 +358,6 @@ async def download_attachment(account: str, ref: str, save_path: str | None = No
     group id the attachment arrived from -- getAttachment requires one,
     mutually exclusive with the other, to look it up), as handed out in
     the proactive notification built by _dispatch_rpc_line below."""
-    if save_path and (refusal := download_target_refusal(save_path)):
-        raise SignalError(refusal)
     try:
         attachment_id, source = ref.split("|", 1)
     except ValueError:

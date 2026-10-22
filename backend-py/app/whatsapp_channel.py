@@ -61,7 +61,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
-from app.file_guard import download_target_refusal, outbound_file_refusal
 from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import messenger_secrets_dir
 from app.session_context import get_send_for_tab, get_tab_id
@@ -224,8 +223,6 @@ DOWNLOAD_TIMEOUT_S = 60.0
 
 
 async def download_media(account: str, ref: str, save_path: str | None = None) -> str:
-    if save_path and (refusal := download_target_refusal(save_path)):
-        raise WhatsAppError(refusal)
     if not save_path:
         WHATSAPP_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
         # No file extension guessed here (unlike Telegram's default-path
@@ -238,8 +235,6 @@ async def download_media(account: str, ref: str, save_path: str | None = None) -
 
 
 async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
-    if refusal := outbound_file_refusal(path):
-        raise WhatsAppError(refusal)
     if not Path(path).is_file():
         raise WhatsAppError(f"No such local file: {path}")
     _require_ok(await _call(account, "sendFile", timeout=DOWNLOAD_TIMEOUT_S, to=to, path=path, caption=caption))

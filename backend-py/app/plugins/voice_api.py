@@ -597,6 +597,38 @@ async def _identify_pending_action_locally(
     return output
 
 
+async def judge_file_transfer_locally(
+    direction: str, path_facts: list[str], turn_started_by: str, tool_call: str, task: str, recent_dialogue: str,
+) -> dict[str, Any] | None:
+    """turn.file.transfer (app/microagents/file_transfer.py), run on this client the
+    same way as _identify_pending_action_locally: {"decision", "reason"}, or None when
+    the agent could not run -- the caller lets the call through then, fail-open like
+    every other microagent check here."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents.file_transfer import FILE_TRANSFER, llm_agents as file_transfer_agents
+
+    runtime = build_local_runtime()
+    if runtime is None:
+        return None
+    for agent in file_transfer_agents():
+        try:
+            runtime.register(agent)
+        except ValueError:
+            pass
+    agent_input = {"direction": direction, "path_facts": path_facts, "turn_started_by": turn_started_by,
+                   "tool_call": tool_call, "task": task, "recent_dialogue": recent_dialogue}
+    try:
+        result = await asyncio.to_thread(runtime.run, FILE_TRANSFER, agent_input, runtime.new_context(budget=new_budget()))
+    except Exception as exc:
+        log_event("plugin:voice", "file_transfer_judge_failed", error=str(exc))
+        return None
+    output = result.get("output") if result.get("status") == "ok" else None
+    if not isinstance(output, dict) or output.get("decision") not in ("allow", "ask_owner", "refuse"):
+        log_event("plugin:voice", "file_transfer_judge_failed", reason="bad_status_or_output", status=result.get("status"))
+        return None
+    return output
+
+
 _SECRET_ARG = re.compile(r"pass(word|wd)?|secret|token|api[_-]?key|credential", re.IGNORECASE)
 
 

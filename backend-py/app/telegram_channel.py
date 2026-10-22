@@ -51,7 +51,6 @@ from telethon.tl.functions.messages import CreateChatRequest, DeleteChatRequest
 from telethon.tl.types import Channel, Chat, InputPhoneContact
 
 from app.logging_setup import log_event
-from app.file_guard import download_target_refusal, outbound_file_refusal
 from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
 from app.task_supervisor import supervise
@@ -268,8 +267,6 @@ async def download_attachment(client: TelegramClient, chat_id: int, message_id: 
     if message is None or not message.media:
         raise TelegramLoginError(f"Message {message_id} in chat {chat_id} has no downloadable attachment.")
     if save_path:
-        if refusal := download_target_refusal(save_path):
-            raise ValueError(refusal)
         target: str | Path = save_path
     else:
         name = (message.file.name if message.file else None) or f"{message_id}{(message.file.ext if message.file else '') or ''}"
@@ -282,8 +279,6 @@ async def download_attachment(client: TelegramClient, chat_id: int, message_id: 
 
 
 async def send_file(client: TelegramClient, chat_id: int, path: str, caption: str | None = None) -> None:
-    if refusal := outbound_file_refusal(path):
-        raise ValueError(refusal)
     if not Path(path).is_file():
         raise TelegramLoginError(f"No such local file: {path}")
     await client.send_file(chat_id, path, caption=caption)

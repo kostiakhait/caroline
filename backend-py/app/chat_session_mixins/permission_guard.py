@@ -393,6 +393,36 @@ class PermissionGuardMixin:
             self.pending_unapproved_action = reason
         return reason
 
+    async def _check_file_transfer(self, tool_name: str, args: dict[str, Any]) -> str | None:
+        """Registered with session_context's register_file_transfer_guard; awaited by
+        dispatch() before a tool call that sends a local file off the machine or writes
+        a received one. turn.file.transfer decides per file, from app/file_facts.py's
+        facts about the path, who started this turn and the conversation (2026-10-22,
+        replacing a static deny/allow list). Fail-open like _check_action_before_send:
+        an agent that could not run lets the call through, logged."""
+        from app.file_facts import file_transfers_in, path_facts
+        from app.plugins.voice_api import judge_file_transfer_locally, tool_call_for_model
+
+        started_by = ("the owner, in this conversation" if self.pending_is_real_user
+                      else "not the owner: an incoming message or a background event (see TASK)")
+        for direction, path in file_transfers_in(tool_name, args):
+            try:
+                verdict = await judge_file_transfer_locally(
+                    direction, path_facts(path), started_by, tool_call_for_model(tool_name, args),
+                    self._narration_task(), self._gather_recent_dialogue_for_permission_guard(),
+                )
+            except Exception as exc:  # noqa: BLE001 -- fail-open
+                log_event("engine", "file_transfer_judge_failed", tab_id=self.tab_id, tool=tool_name, error=str(exc))
+                verdict = None
+            log_event("engine", "file_transfer_decided", tab_id=self.tab_id, tool=tool_name, direction=direction,
+                      path=path, decision=(verdict or {}).get("decision"), reason=(verdict or {}).get("reason"))
+            if verdict is None or verdict["decision"] == "allow":
+                continue
+            if verdict["decision"] == "ask_owner":
+                return f"{verdict['reason']} Ask the owner explicitly and wait for a real answer before trying this again."
+            return verdict["reason"]
+        return None
+
     def _persist_action_state(self) -> None:
         save_action_state(self.workspace_dir, self.tab_id, self.action_registry.to_wire())
 
