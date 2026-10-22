@@ -49,10 +49,6 @@ _UUID_PREFIX_RE = re.compile(
 _HISTORY_STAMP_PATTERN = re.compile(r"^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )[^\]]*\]\s*", re.IGNORECASE)
 
 
-def _sanitize_project_dir_name(path: str) -> str:
-    return re.sub(r"[\\:]", "-", path)
-
-
 def _extract_attachment_note(block_text: str) -> dict[str, str] | None:
     block_text = block_text.removeprefix(ATTACHMENT_NOTE_MARKER)
     for prefix in _ATTACHMENT_NOTE_PREFIXES:
@@ -75,7 +71,7 @@ def _extract_attachment_note(block_text: str) -> dict[str, str] | None:
 
 
 def _latest_session_file(workspace_dir: str) -> Path | None:
-    project_dir = Path.home() / ".claude" / "projects" / _sanitize_project_dir_name(workspace_dir)
+    project_dir = claude_project_dir(workspace_dir)
     if not project_dir.exists():
         return None
     files = [f for f in project_dir.iterdir() if f.suffix == ".jsonl"]

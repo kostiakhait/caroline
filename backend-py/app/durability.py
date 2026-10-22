@@ -31,10 +31,18 @@ def _sanitize_tab_id(tab_id: str) -> str:
 
 
 def claude_project_dir(workspace_dir: str) -> Path:
-    """Matches Claude Code's own project-dir slugging: every ':' and path
-    separator becomes '-', one-for-one. Used to locate a session's .jsonl
-    transcript directly on disk."""
-    encoded = re.sub(r"[:\\/]", "-", workspace_dir)
+    """Matches Claude Code's own project-dir slugging: every character that
+    isn't an ASCII letter or digit becomes '-', one-for-one. Used to locate a
+    session's .jsonl transcript directly on disk.
+
+    Used to replace only ':' and path separators, which only matched the CLI
+    for paths without other punctuation. Confirmed live (2026-10-22, Linux
+    test box): the CLI turned "/home/caroline/slug probe/a_b.c" into
+    "-home-caroline-slug-probe-a-b-c", so on Linux, whose default workspace is
+    under ~/.local, Caroline looked for every transcript in a directory that
+    doesn't exist. Same failure on Windows for any path with a space, dot or
+    underscore in it."""
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", workspace_dir)
     return Path.home() / ".claude" / "projects" / encoded
 
 
