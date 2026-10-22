@@ -93,6 +93,7 @@ class SmallModelTurnMixin:
             self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW,
         )
         language = current_language_name(self.tab_id)
+        history_messages, history_summary = await self._sw_history_context()
 
         def on_live_dialogue_update(lines: list[str]) -> None:
             self.small_model_live_dialogue = lines
@@ -161,6 +162,8 @@ class SmallModelTurnMixin:
                     send=self.send, on_live_dialogue_update=on_live_dialogue_update,
                     get_new_user_comments=get_new_user_comments, on_activity=on_activity,
                     start_tier=start_tier, is_voice=is_voice,
+                    history_messages=history_messages, history_summary=history_summary,
+                    recorder=self._sw_turn_recorder,
                     # Review of a tier's answer runs alongside its verification (_review_ahead);
                     # the voice narrator holds back meanwhile (_answer_being_checked).
                     on_candidate=(
@@ -185,6 +188,30 @@ class SmallModelTurnMixin:
 
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         await self._finish_small_model_turn_answered(question_text, result["text"], is_voice, translate=translate_answer)
+    async def _sw_history_context(self) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """Phase 2b (2026-10-22, see app/sw_history.py): makes sure this turn's
+        session exists, waits for the previous turn's background work (its
+        tool-work summary, a compaction) so the history is complete, starts a
+        recorder for this turn's tool calls, and returns the conversation so
+        far as (messages, compressed-summary section). (None, None) when the
+        sw history is still empty -- e.g. a tab whose earlier turns ran on
+        Claude -- and the turn falls back to recent_dialogue_lines."""
+        self._sw_turn_recorder = None
+        session_id = _ensure_small_model_session(self.workspace_dir, self.tab_id, self.last_saved_session_id)
+        if session_id is None:
+            return None, None
+        self.last_saved_session_id = session_id
+        job = self._sw_history_job
+        if job is not None and not job.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(job), timeout=SW_HISTORY_WAIT_S)
+            except asyncio.TimeoutError:
+                log_event("engine", "sw_history_wait_timed_out", tab_id=self.tab_id, waited_s=SW_HISTORY_WAIT_S)
+        self._sw_turn_recorder = sw_history.TurnRecorder(self.workspace_dir, session_id)
+        summary, turns = sw_history.load(self.workspace_dir, session_id)
+        if not turns and not summary:
+            return None, None
+        return sw_history.context_messages(turns), sw_history.summary_section(summary)
     async def _finish_small_model_turn_answered(self, question_text: str, text: str, is_voice: bool, translate: bool = True) -> None:
         """Synthesizes the same {assistant} + {result} wire pair a normal
         SDK turn's completion sends (see wire.py's message_to_wire), so
@@ -271,9 +298,20 @@ class SmallModelTurnMixin:
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
         self._reset_voice_narration()
         persisted_to = _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
-        if persisted_to and persisted_to != self.last_saved_session_id:
+        if persisted_to:
             self.last_saved_session_id = persisted_to
-            refresh_language_in_background(persisted_to, self.tab_id)
+            if _load_persisted_language(self.tab_id) is None:
+                refresh_language_in_background(persisted_to, self.tab_id)
+        recorder, self._sw_turn_recorder = self._sw_turn_recorder, None
+        if recorder is not None and recorder.session_id == self.last_saved_session_id:
+            answer = "" if silent else text
+            try:
+                sw_history.append_turn(self.workspace_dir, recorder.session_id, recorder.turn_id, question_text, answer, recorder.calls)
+                self._sw_history_job = asyncio.create_task(sw_history.after_turn(
+                    self.workspace_dir, recorder.session_id, self.tab_id, recorder, question_text, answer,
+                ))
+            except Exception as exc:  # noqa: BLE001 -- the reply itself must still go out
+                log_event("engine", "sw_history_append_failed", tab_id=self.tab_id, error=str(exc))
         assistant_wire = {
             "type": "assistant",
             "message": {

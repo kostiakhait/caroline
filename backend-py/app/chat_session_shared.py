@@ -161,6 +161,7 @@ from app.subscription_mode import (
 )
 from app.wire import message_to_wire
 from app.workspace_dir import WORKSPACE_DIR
+from app import sw_history
 
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 PRIMARY_TAB_ID = "1"
@@ -439,6 +440,13 @@ VOICE_NARRATION_CLIENT_SPEAKING_STALE_S = 120.0
 # feed progress narration, which genuinely needs real back-and-forth
 # (both speakers) to have something to react to.
 RECENT_DIALOGUE_WINDOW = 12
+
+# How long an sw turn waits for the previous turn's background history work
+# (its tool-work summary, a compaction -- see app/sw_history.py's after_turn)
+# before building its context anyway. Without a summary the context falls back
+# to the raw call previews with their links, so nothing is lost by not waiting
+# longer, only made less compact.
+SW_HISTORY_WAIT_S = 60
 
 # Bug fix (2026-10-12), confirmed live (a real false-positive incident: the
 # user HAD explicitly approved a conference submission, in an earlier turn
@@ -1318,6 +1326,38 @@ def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspa
     return str(out_path)
 
 
+def _ensure_small_model_session(workspace_dir: str, tab_id: str, session_id: str | None) -> str | None:
+    """The session an sw turn belongs to, made to exist on disk: mints and
+    saves a new id for a tab that has none, or starts the transcript file
+    under an id the CLI issued but never wrote (a tab that connected in claude
+    mode with no Claude login, or switched to sw right away -- seen live on
+    the test box). Called at the start of an sw turn, since sw_history keys
+    the turn's tool-call files by session id, and again when the turn is
+    persisted. None if the file can't be created."""
+    if not session_id:
+        session_id = str(uuid_mod.uuid4())
+        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=False)
+        except Exception as exc:
+            log_event("engine", "small_model_session_mint_failed", tab_id=tab_id, error=str(exc))
+            return None
+        save_tab_session_id(workspace_dir, tab_id, session_id)
+        log_event("engine", "small_model_session_minted", tab_id=tab_id, session_id=session_id)
+        return session_id
+    path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+    if not path.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+        except Exception as exc:
+            log_event("engine", "small_model_turn_not_persisted_no_session_file", tab_id=tab_id, path=str(path), error=str(exc))
+            return None
+        log_event("engine", "small_model_session_file_started", tab_id=tab_id, session_id=session_id)
+    return session_id
+
+
 def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session_id: str | None, user_text: str, assistant_text: str) -> str | None:
     """Bug fix (2026-09-12), per explicit instruction: the small-model
     primary path (small_model_engine.py) never talks to the Claude Code CLI
@@ -1351,30 +1391,10 @@ def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session
 
     Returns the session id the turn was written to (None if it wasn't), so
     the caller can adopt a newly minted one."""
-    if not session_id:
-        session_id = str(uuid_mod.uuid4())
-        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=False)
-        except Exception as exc:
-            log_event("engine", "small_model_session_mint_failed", tab_id=tab_id, error=str(exc))
-            return None
-        save_tab_session_id(workspace_dir, tab_id, session_id)
-        log_event("engine", "small_model_session_minted", tab_id=tab_id, session_id=session_id)
+    session_id = _ensure_small_model_session(workspace_dir, tab_id, session_id)
+    if session_id is None:
+        return None
     path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
-    if not path.exists():
-        # A tab that connected in claude mode gets a session id from the CLI's
-        # init message even when the CLI never writes a turn (no Claude login,
-        # or switched to sw right away) -- seen live on the test box. Start the
-        # file under that same id rather than dropping the turn.
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
-        except Exception as exc:
-            log_event("engine", "small_model_turn_not_persisted_no_session_file", tab_id=tab_id, path=str(path), error=str(exc))
-            return None
-        log_event("engine", "small_model_session_file_started", tab_id=tab_id, session_id=session_id)
     try:
         last_uuid: str | None = None
         # Only the LAST line matters -- read it from the end of the file
@@ -1792,6 +1812,8 @@ __all__ = [
     'VOICE_NARRATION_EST_CHARS_PER_S',
     'VOICE_NARRATION_CLIENT_SPEAKING_STALE_S',
     'RECENT_DIALOGUE_WINDOW',
+    'SW_HISTORY_WAIT_S',
+    'sw_history',
     'PERMISSION_GUARD_DIALOGUE_WINDOW',
     'REPLY_WATCH_SCHEDULE',
     'POST_TURN_CHECK_MAX_ROUNDS',
@@ -1843,6 +1865,7 @@ __all__ = [
     '_write_system_prompt_file',
     '_write_recent_24h_dialogue_file',
     '_append_small_model_turn_to_session',
+    '_ensure_small_model_session',
     'current_language_name',
     'refresh_language_in_background',
     '_SETTINGS_FILE_NAME',

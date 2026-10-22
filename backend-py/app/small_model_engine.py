@@ -1181,7 +1181,7 @@ def _run_plan_tool(name: str, args: dict[str, Any], tracker: _TurnTracker) -> st
 async def _run_parallel_stage(
     stage_index: int, *, tracker: _TurnTracker, tab_id: str | None, send: session_context.SendFn | None,
     main_loop: asyncio.AbstractEventLoop, registry: "ToolRegistry", ai: Any, cfg: Any,
-    system_text: str, user_text: str, model: str,
+    system_text: str, user_text: str, model: str, recorder: Any = None,
 ) -> str:
     if tracker.plan_stages is None or not (0 <= stage_index < len(tracker.plan_stages)):
         return f"ERROR: the declared plan has no stage {stage_index}."
@@ -1206,6 +1206,8 @@ async def _run_parallel_stage(
                 log_event("engine", "small_model_branch_started", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt)
                 branch_tracker = _TurnTracker()
                 base_executor = _make_executor_fn(registry, tab_id, send, main_loop, branch_tracker, ai, cfg)
+                if recorder is not None:
+                    base_executor = recorder.wrap(base_executor, skip=_PLAN_TOOL_NAMES)
                 calls: list[str] = []
 
                 def traced_executor(name: str, args: dict[str, Any], _base=base_executor, _calls=calls) -> str:
@@ -2346,9 +2348,19 @@ async def run_small_model_turn(
     start_tier: int | None = None,
     is_voice: bool = False,
     on_candidate: Callable[[str], None] | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
+    history_summary: str | None = None,
+    recorder: Any = None,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
+
+    history_messages/history_summary/recorder (Phase 2b, 2026-10-22, see
+    app/sw_history.py): when given, the conversation so far comes from the
+    sw engine's own history (earlier turns with their linked tool-work
+    records, plus a compressed summary of anything older) instead of
+    recent_dialogue_lines, and every tool call this turn makes -- parallel
+    stage branches included -- is written to its own file by `recorder`.
 
     Four-tier cascade (nano -> mini -> AI_MODEL_ALTERNATE/Sonnet -> AI_MODEL_OPUS),
     carrying the previous tier's real tool-call trace forward on every hand-off in
@@ -2400,12 +2412,16 @@ async def run_small_model_turn(
         memory_topics_system_prompt_clause(workspace_dir, tab_id),
         _engine_instructions(language),
         _shared_policy_text(workspace_dir, tab_id),
-    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else []))
+    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else [])
+      + ([history_summary] if history_summary else []))
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
-    for line in recent_dialogue_lines:
-        is_caroline = line.startswith("Caroline:")
-        content = line.split(":", 1)[-1].strip()
-        messages.append({"role": "assistant" if is_caroline else "user", "content": content})
+    if history_messages is not None:
+        messages.extend(history_messages)
+    else:
+        for line in recent_dialogue_lines:
+            is_caroline = line.startswith("Caroline:")
+            content = line.split(":", 1)[-1].strip()
+            messages.append({"role": "assistant" if is_caroline else "user", "content": content})
     # Deferred import: chat_session imports this module at load time, so a
     # top-level import here would be circular -- see this module's own
     # module-level comments for other examples of this pattern.
@@ -2422,7 +2438,7 @@ async def run_small_model_turn(
         return await _run_parallel_stage(
             stage_index, tracker=tracker, tab_id=tab_id, send=send, main_loop=main_loop,
             registry=registry, ai=ai, cfg=cfg, system_text=messages[0]["content"],
-            user_text=user_text, model=current_model["name"],
+            user_text=user_text, model=current_model["name"], recorder=recorder,
         )
 
     live_dialogue = [f"User: {user_text}"]
@@ -2459,6 +2475,8 @@ async def run_small_model_turn(
     executor_fn = _make_executor_fn(
         registry, tab_id, send, main_loop, tracker, ai, cfg, stage_runner=run_stage, on_tool_start=on_tool_start,
     )
+    if recorder is not None:
+        executor_fn = recorder.wrap(executor_fn, skip=_PLAN_TOOL_NAMES)
 
     def on_progress(evt: dict[str, Any]) -> None:
         tracker.touch_progress()

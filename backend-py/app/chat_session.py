@@ -226,6 +226,11 @@ class ChatSession(
         # implicit cancellation of the turn in progress.
         self.small_model_pending_comments: list[str] = []
         self._small_model_task: asyncio.Task[None] | None = None
+        # The sw engine's own memory across turns (app/sw_history.py): the
+        # current turn's tool-call recorder, and the previous turn's
+        # background summary/compaction the next turn waits for.
+        self._sw_turn_recorder: Any = None
+        self._sw_history_job: asyncio.Task[None] | None = None
 
         # Forced compaction (see FORCED_COMPACTION_HOURLY_MS's own comment).
         # needs_startup_compaction is set True by main.py, once per tab_id
