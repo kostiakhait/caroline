@@ -393,8 +393,20 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     from app.evolution_client import run_reply_agent
     from app.microagents.reply_review import REVIEW
 
+    # `timeout` is honored again (2026-10-22): since the review moved to the client
+    # (20739d0) it was accepted and never used, and the voice narrator's
+    # VOICE_NARRATION_REVIEW_TIMEOUT_S (6s, "a review that has not answered in this time
+    # lets the remark go as it was drafted") stopped bounding anything -- measured
+    # 3.2/14.0/5.1s per remark, heard as silences of up to 21.6s. The run is shielded:
+    # past the timeout the caller goes on with its text, and the run itself finishes in
+    # the background, so whatever evolution bookkeeping it does is not cut off midway.
+    job = asyncio.ensure_future(run_reply_agent(REVIEW, {"text": text, "task": task}))
+    job.add_done_callback(lambda j: j.cancelled() or j.exception())  # a late failure is not "never retrieved"
     try:
-        result = await run_reply_agent(REVIEW, {"text": text, "task": task})
+        result = await asyncio.wait_for(asyncio.shield(job), timeout)
+    except asyncio.TimeoutError:
+        log_event("plugin:voice", "review_reply_failed", reason="timeout", timeout_s=timeout)
+        return None
     except Exception as exc:
         log_event("plugin:voice", "review_reply_failed", reason="request_failed", error=str(exc))
         return None
