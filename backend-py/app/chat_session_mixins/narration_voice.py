@@ -228,8 +228,7 @@ class VoiceNarrationMixin:
                 # Data, not a new rule: how many "still working" remarks went before, so the
                 # next one can say something else -- how long it has taken, where the work is.
                 facts_for_model += (
-                    f"\nRemarks in a row with nothing new so far: {self._stale_remarks_in_row} -- the user already knows "
-                    "the work is still going on; say how long it has taken so far, or which part is being done now."
+                    f"\nRemarks in a row with nothing new so far: {self._stale_remarks_in_row} -- {VOICE_NARRATION_SAY_ELSE}"
                 )
         already_said = list(self.turn_narration_remarks)
         if self._first_voice_remark is not None and self._first_voice_remark not in already_said:
@@ -302,6 +301,16 @@ class VoiceNarrationMixin:
             # The turn ended (or a new one started) while drafting -- this remark is about a
             # state nobody is waiting on any more.
             log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=bool(comment))
+            return
+        if comment == "" and stale and VOICE_NARRATION_SAY_ELSE not in facts:
+            # Once more, told outright to say something else (2026-10-22): with nothing new
+            # to tell, the model wrote "Я всё ещё ищу цены на iPhone 17 ..." six drafts
+            # running, each rightly rejected as a repeat of "Ищу цены на iPhone 17 ...",
+            # and the user heard nothing for 21.6s.
+            log_event("engine", "voice_narration_stale_redraft", tab_id=self.tab_id)
+            await self._draft_voice_narration_body(
+                turn_seq, f"{facts}\nThat was already said, in other words -- {VOICE_NARRATION_SAY_ELSE}", task, already_said, stale,
+            )
             return
         if comment == "":
             # Nothing new (or only a repeat). No cooldown needed: the next draft already
