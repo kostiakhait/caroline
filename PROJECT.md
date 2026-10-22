@@ -83,8 +83,8 @@ tell "healthy" from "stuck."
 Anthropic API key (`subscription.json`) — never proxied through SquirrelWisdom. SquirrelWisdom is
 not a Claude backend; it's a client for Notes/email/Ratatosk/voice/consult, and separately bills
 the small-model path pay-as-you-go against a PIA wallet balance (`chat_mode_eligible()` requires
-both a real Claude subscription on the account *and* a SquirrelWisdom login with a positive
-balance — the small-model path is a fallback tier, not a replacement). `app/openai_mode.py` +
+a SquirrelWisdom login with a positive balance — no Claude subscription needed: SW is meant to
+become the primary and eventually only path, and an sw-mode tab never builds a Claude session). `app/openai_mode.py` +
 `app/openai_account.py` resolve the third source the same way as Claude: the user's own
 ChatGPT/Codex sign-in, or a separately pasted `OPENAI_API_KEY`. A tab switches between all three
 with the `Claude / SW / OpenAI` header control; nothing migrates, each source keeps its own resume

@@ -495,7 +495,7 @@ def clear_tab_continuity_archive(workspace_dir: str, tab_id: str) -> None:
 # submit()) or "sw" (the small-model/Camerlengo path billed through the
 # SquirrelWisdom PIA wallet, run_small_model_turn()). Defaults to "claude"
 # for every tab; see subscription_mode.py's chat_mode_eligible() for the
-# gating (both a Claude subscription AND a paid SW balance) that decides
+# gating (a paid SW balance; no Claude subscription needed) that decides
 # whether "sw" can be SET at all -- this module only persists whatever was
 # already validated, same file-per-tab shape as tab-session-<id>.json etc.
 

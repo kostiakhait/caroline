@@ -427,8 +427,8 @@ VOICE_NARRATION_CLIENT_SPEAKING_STALE_S = 120.0
 # global flag: each tab independently persists "claude" (default) or "sw"
 # via durability.py's load_chat_mode/save_chat_mode, and "sw" can only be
 # SET (main.py's chat_mode_set control op) when subscription_mode.py's
-# chat_mode_eligible() holds -- both a real Claude subscription AND a PAID
-# SquirrelWisdom balance. Nothing changes for anyone who never opens that
+# chat_mode_eligible() holds -- a PAID SquirrelWisdom balance (no Claude
+# subscription needed since 2026-10-22). Nothing changes for anyone who never opens that
 # toggle: every tab still starts on "claude", identical to this flag's old
 # permanent False.
 

@@ -192,18 +192,18 @@ async def _has_own_anthropic_oauth(cwd: str) -> bool:
 
 
 async def chat_mode_eligible(workspace_dir: str, tab_id: str) -> bool:
-    """Gates the per-tab "work via sw or claude" Settings toggle (see
-    durability.py's load_chat_mode/save_chat_mode): per explicit
-    instruction (2026-09-14), the toggle is only usable when BOTH
-    subscriptions are active -- a real Claude subscription (own-anthropic
-    OAuth or a pasted key; the small-model path still needs the full SDK
-    available as its escalation target) AND a PAID SquirrelWisdom account
-    (logged in with a positive PIA balance, not just logged in -- the
-    small-model/Camerlengo path bills PIA per call, so a zero balance
-    means "sw" mode would just fail immediately)."""
-    mode = await resolve_mode(workspace_dir, tab_id)
-    if mode.chat_source not in ("own-anthropic-oauth", "own-anthropic-key"):
-        return False
+    """Gates the per-tab "sw" mode (see durability.py's load_chat_mode/
+    save_chat_mode): a PAID SquirrelWisdom account -- logged in with a
+    positive PIA balance, not just logged in, since the small-model/
+    Camerlengo path bills PIA per call and a zero balance means "sw" mode
+    would just fail immediately.
+
+    No Claude subscription required (per explicit instruction 2026-10-22:
+    SquirrelWisdom is meant to become Caroline's primary and eventually only
+    path). The old requirement assumed the small-model path escalates to the
+    full SDK mid-turn -- it doesn't: small_model_engine.py's tier ladder ends
+    inside the small-model tiers, and an sw-mode tab never even builds an SDK
+    session (engine_lifecycle.py's sw-mode branch of _run_loop)."""
     sw = await get_sw_status()
     return sw.logged_in and (sw.balance_pia or 0) > 0
 
