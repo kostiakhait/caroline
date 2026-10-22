@@ -1,7 +1,7 @@
 r"""Runs the narrator golden set (narrator_golden.py) against one narrator route:
   MODE=current  generate_progress_comment (SMALL draft in English + forced translation)
   MODE=direct   generate_progress_comment_direct (NARRATOR_MODEL, drafted in Russian)
-  MODE=ladder   draft_narration_remark (NARRATOR_FIRST_MODEL, then NARRATOR_MODEL) -- what the app runs
+  MODE=ladder   draft_narration_remark (NARRATOR_MODEL alone since 2026-10-22) -- what the app runs
 
 Run with Caroline's own Python, pointing at a backend-py tree and the shipped Camerlengo:
   set CAROLINE_APP=<...>\backend-py

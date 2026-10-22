@@ -63,9 +63,9 @@ async def main():
         results.append(ok)
         print(("PASS " if ok else "FAIL ") + label + (" | " + detail if detail else ""))
 
-    # 1. A plain one-shot prompt (narrator, gate, recognition check all go this way).
+    # 1. A plain one-shot prompt (narrator and recognition check go this way).
     t0 = time.monotonic()
-    text = await e.resolve_narration_prompt("Reply with exactly one word: OK", model=e.NARRATOR_FIRST_MODEL)
+    text = await e.resolve_narration_prompt("Reply with exactly one word: OK", model=e.NARRATOR_MODEL)
     check("one-shot prompt", text.strip() == "OK", f"{text!r} in {time.monotonic() - t0:.2f}s")
 
     # 2. The agentic loop with a tool run on this side, reasoning and transforms passed, usage reported.
@@ -96,15 +96,15 @@ async def main():
     # 4. One session serves the calls; a refused session is replaced once.
     check("session reused", sessions["n"] == 1, f"logins so far: {sessions['n']}")
     MODE["fail"] = {".status": "error", ".errcode": "202", ".reason": "Unknown or expired session"}
-    refused = await asyncio.to_thread(lambda: ai.resolve_agentic([{"role": "user", "content": "hi"}], None, None, model=e.NARRATOR_FIRST_MODEL, max_iterations=1))
+    refused = await asyncio.to_thread(lambda: ai.resolve_agentic([{"role": "user", "content": "hi"}], None, None, model=e.NARRATOR_MODEL, max_iterations=1))
     check("expired session: one new login, then the error as text", sessions["n"] == 2 and refused.startswith("Agent error") and "202" in refused, refused[:120])
 
     # 5. The ACL refusal as it is today, and an empty wallet.
     MODE["fail"] = {".status": "error", ".errcode": "997", ".reason": "Key scope/resource ACL does not permit this call"}
-    acl = await asyncio.to_thread(lambda: ai.resolve_agentic([{"role": "user", "content": "hi"}], None, None, model=e.NARRATOR_FIRST_MODEL, max_iterations=1))
+    acl = await asyncio.to_thread(lambda: ai.resolve_agentic([{"role": "user", "content": "hi"}], None, None, model=e.NARRATOR_MODEL, max_iterations=1))
     check("ACL refusal surfaces as an agent error", acl.startswith("Agent error") and "997" in acl, acl[:140])
     MODE["fail"] = {".status": "error", ".errcode": "402", ".reason": "SquirrelWisdom wallet balance is too low"}
-    funds = await asyncio.to_thread(lambda: ai.resolve_agentic([{"role": "user", "content": "hi"}], None, None, model=e.NARRATOR_FIRST_MODEL, max_iterations=1))
+    funds = await asyncio.to_thread(lambda: ai.resolve_agentic([{"role": "user", "content": "hi"}], None, None, model=e.NARRATOR_MODEL, max_iterations=1))
     check("empty wallet is recognized as funds exhaustion", "insufficient funds" in funds.lower(), funds[:120])
     print(f"{sum(results)}/{len(results)} passed; requests to the command: {len(requests_seen)}")
 

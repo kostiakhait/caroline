@@ -445,10 +445,26 @@ class _TurnStalled(Exception):
     def __init__(self, elapsed_s: float, kind: str) -> None:
         super().__init__(f"{kind} timeout after {elapsed_s:.0f}s")
         self.elapsed_s = elapsed_s
-        self.kind = kind  # "stall" (no progress for STALL_TIMEOUT_S) or "absolute" (ABSOLUTE_TURN_TIMEOUT_S ceiling)
+        # "stall" (no progress for STALL_TIMEOUT_S), "absolute" (ABSOLUTE_TURN_TIMEOUT_S
+        # ceiling) or "parent" (whatever started this attempt was itself given up).
+        self.kind = kind
 
 
-async def _resolve_agentic_with_watchdog(ai: Any, tracker: _TurnTracker, **resolve_kwargs: Any) -> str:
+# The cancellation flag of the resolve_agentic() attempt running on the current
+# worker thread (2026-10-22). A tier attempt that stalls has only ITS flag set, so
+# its abandoned thread stops acting while the next tier, on a fresh attempt, still
+# works; tracker.cancelled stays the whole-turn flag (Stop, the absolute ceiling).
+_attempt_local = threading.local()
+
+
+def _attempt_cancelled() -> bool:
+    flag = getattr(_attempt_local, "cancel", None)
+    return flag is not None and flag.is_set()
+
+
+async def _resolve_agentic_with_watchdog(
+    ai: Any, tracker: _TurnTracker, *, parent_cancels: tuple[threading.Event, ...] = (), **resolve_kwargs: Any,
+) -> str:
     """Runs ai.resolve_agentic(**resolve_kwargs) in a worker thread (it's a
     synchronous, uncancellable call from a third-party module) while
     polling tracker.last_progress_at instead of just awaiting a flat
@@ -459,10 +475,26 @@ async def _resolve_agentic_with_watchdog(ai: Any, tracker: _TurnTracker, **resol
     more generous ABSOLUTE_TURN_TIMEOUT_S backstop gives up. Giving up here
     only stops WAITING -- see _TurnTracker.cancelled for how the abandoned
     thread itself is kept from doing further real-world damage (email
-    sends, logins, ...) once nobody is listening for its result anymore."""
+    sends, logins, ...) once nobody is listening for its result anymore.
+
+    A stall cancels only this attempt (2026-10-22): its thread's own flag is set,
+    so the caller can hand the work to the next tier instead of ending the turn.
+    parent_cancels: the flags of whatever started this attempt (a parallel-stage
+    branch's turn and tier attempt) -- once one of them is set, this attempt is
+    given up too, so an abandoned branch stops waiting and stops acting."""
     tracker.touch_progress()
     started = time.monotonic()
-    task: asyncio.Task[str] = asyncio.create_task(asyncio.to_thread(ai.resolve_agentic, **resolve_kwargs))
+    attempt_cancel = threading.Event()
+    tracker.current_attempt_cancel = attempt_cancel
+
+    def run_attempt() -> str:
+        _attempt_local.cancel = attempt_cancel
+        try:
+            return ai.resolve_agentic(**resolve_kwargs)
+        finally:
+            _attempt_local.cancel = None
+
+    task: asyncio.Task[str] = asyncio.create_task(asyncio.to_thread(run_attempt))
     try:
         while True:
             try:
@@ -484,16 +516,21 @@ async def _resolve_agentic_with_watchdog(ai: Any, tracker: _TurnTracker, **resol
                 # a user-initiated Stop deserves it at least as much as an
                 # automatic giveup does, arguably more.
                 tracker.cancelled.set()
+                attempt_cancel.set()
                 raise
             if task in done:
                 return task.result()
             now = time.monotonic()
+            if any(flag.is_set() for flag in parent_cancels):
+                attempt_cancel.set()
+                raise _TurnStalled(now - started, "parent")
             stalled_for = now - tracker.last_progress_at
             if stalled_for > STALL_TIMEOUT_S:
-                tracker.cancelled.set()
+                attempt_cancel.set()
                 raise _TurnStalled(stalled_for, "stall")
             if now - started > ABSOLUTE_TURN_TIMEOUT_S:
                 tracker.cancelled.set()
+                attempt_cancel.set()
                 raise _TurnStalled(now - started, "absolute")
     finally:
         # Best-effort only -- can't actually stop the underlying OS thread
@@ -1129,6 +1166,11 @@ class _TurnTracker:
     # with real credentials for minutes after this turn had already been
     # reported as escalated.
     cancelled: threading.Event = field(default_factory=threading.Event)
+    # The flag of the tier attempt currently running (see _attempt_local), so a
+    # parallel stage started from it can hand that flag to its branches.
+    current_attempt_cancel: threading.Event | None = None
+    # Plugins whose usage instructions this turn already got (see executor_fn).
+    instructed_plugins: set[str] = field(default_factory=set)
 
     def touch_progress(self) -> None:
         self.last_progress_at = time.monotonic()
@@ -1191,6 +1233,9 @@ async def _run_parallel_stage(
     if stage_index in tracker.parallel_stages_run:
         return f"ERROR: stage {stage_index} already ran."
     tracker.parallel_stages_run.add(stage_index)
+    # The turn's flag and the flag of the tier attempt that started this stage: if
+    # either is set, every branch stops (see _resolve_agentic_with_watchdog).
+    parent_cancels = tuple(flag for flag in (tracker.cancelled, tracker.current_attempt_cancel) if flag is not None)
 
     branch_tools = [
         t for t in registry.tool_defs
@@ -1205,7 +1250,10 @@ async def _run_parallel_stage(
             for attempt in range(1, PARALLEL_BRANCH_ATTEMPTS + 1):
                 log_event("engine", "small_model_branch_started", tab_id=tab_id, stage=stage_index, step=step_index, attempt=attempt)
                 branch_tracker = _TurnTracker()
-                base_executor = _make_executor_fn(registry, tab_id, send, main_loop, branch_tracker, ai, cfg)
+                base_executor = _make_executor_fn(
+                    registry, tab_id, send, main_loop, branch_tracker, ai, cfg,
+                    parent_cancels=parent_cancels, parent_tracker=tracker,
+                )
                 if recorder is not None:
                     base_executor = recorder.wrap(base_executor, skip=_PLAN_TOOL_NAMES)
                 calls: list[str] = []
@@ -1227,7 +1275,7 @@ async def _run_parallel_stage(
                 try:
                     text = await _call_with_funds_wait(
                         lambda: _resolve_agentic_with_watchdog(
-                            ai, branch_tracker,
+                            ai, branch_tracker, parent_cancels=parent_cancels,
                             messages=branch_messages, tool_defs=branch_tools, executor_fn=traced_executor,
                             model=model, max_iterations=MAX_ITERATIONS,
                             transforms=DISABLE_MIDDLE_OUT, reasoning=REASONING_EFFORT,
@@ -1378,6 +1426,8 @@ def _make_executor_fn(
     main_loop: asyncio.AbstractEventLoop, tracker: _TurnTracker, ai: Any, cfg: Any,
     stage_runner: Callable[[int], Awaitable[str]] | None = None,
     on_tool_start: Callable[[str, dict[str, Any]], None] | None = None,
+    parent_cancels: tuple[threading.Event, ...] = (),
+    parent_tracker: _TurnTracker | None = None,
 ) -> Callable[[str, dict[str, Any]], str]:
     """Bridges resolve_agentic()'s synchronous, worker-thread-side
     executor_fn(name, args) -> str callback into Caroline's own async
@@ -1399,7 +1449,10 @@ def _make_executor_fn(
 
     def executor_fn(name: str, args: dict[str, Any]) -> str:
         args = args or {}
-        if tracker.cancelled.is_set():
+        # The turn, this attempt, or -- for a parallel-stage branch -- whatever
+        # started it (parent_cancels, 2026-10-22: an abandoned branch used to keep
+        # acting after its turn ended, e.g. a save_info after the reply went out).
+        if tracker.cancelled.is_set() or _attempt_cancelled() or any(flag.is_set() for flag in parent_cancels):
             # This turn's own watchdog already gave up waiting on us (a
             # genuine stall, see STALL_TIMEOUT_S) and reported that to our
             # caller -- nobody is listening for this call's real result
@@ -1409,6 +1462,11 @@ def _make_executor_fn(
             # own doc comment for the incident this fixes.
             return "ERROR: this turn was already abandoned (stalled/timed out) -- stop, do not attempt further tool calls."
         tracker.touch_progress()
+        if parent_tracker is not None:
+            # A branch's work is progress of the tier that is waiting on the stage
+            # (2026-10-22: the waiting tier was declared stalled at 120s while its
+            # branches were busy).
+            parent_tracker.touch_progress()
         call_key = (name, json.dumps(args, sort_keys=True, default=str))
         seen_calls[call_key] = seen_calls.get(call_key, 0) + 1
         count = seen_calls[call_key]
@@ -1511,6 +1569,21 @@ def _make_executor_fn(
                 text = json.dumps(result, ensure_ascii=False, default=str)
             text = text + note
 
+        # A plugin's usage instructions come with the result of its first tool call in
+        # the turn (2026-10-22, per explicit instruction) -- still on demand, never in the
+        # system prompt, but no longer depending on the model asking for them: on the
+        # test box no small model ever called get_tool_instructions, and an email task
+        # left the mailbox password unsaved because the plugin's own rule for that was
+        # never read.
+        instructions = registry.tool_instructions.get(name)
+        instructed = (parent_tracker or tracker).instructed_plugins
+        if instructions and plugin_name not in instructed:
+            instructed.add(plugin_name)
+            text += (
+                f"\n\n[How the {plugin_name} tools are meant to be used -- shown once, with this plugin's first "
+                f"call in this turn:\n{instructions}]"
+            )
+
         history = tool_call_history.setdefault(name, [])
         history.append(f"- args={json.dumps(args, ensure_ascii=False, default=str)[:200]} -> {text[:200]}")
         call_count = len(history)
@@ -1584,12 +1657,15 @@ def _build_verification_prompt(
             "Parallel-stage branches, each with its own real tool calls and results (ground truth, same rule):\n"
             + "\n".join(tracker.branch_trace[-40:])
         )
-    elif not can_escalate:
-        # No tier_trace at all on the terminal, non-escalating pass usually means no
-        # tier ever got far enough to call anything -- worth saying explicitly, since
-        # its absence could otherwise read as "nothing to check" rather than "nothing
-        # was ever actually done".
-        parts.append("No tool calls were recorded for this attempt at all.")
+    if not tier_trace and not tracker.branch_trace:
+        # Said on every pass, not only the last one (2026-10-22): its absence read as
+        # "nothing to check", and "Подключаю почту ..., проверю соединение и сообщу"
+        # passed as a finished answer with no tool ever called.
+        parts.append(
+            "No tool calls were made in this attempt at all. So any action the reply says is done, is being "
+            "done right now, or is about to be done (connecting, checking, saving, sending, \"I'll ...\") did "
+            "NOT happen."
+        )
     if tracker.plan_steps is not None:
         undone = [s for i, s in enumerate(tracker.plan_steps) if i not in tracker.plan_done]
         if undone:
@@ -1635,7 +1711,9 @@ def _build_verification_prompt(
         forms.append(
             f'- "{VERIFIER_OK}" -- the reply above answers the request, claims nothing the facts above do not show, '
             "and can go to the user exactly as it stands. It is then sent word for word. This is the normal outcome "
-            "for a good reply: never rewrite a reply that is already fine."
+            "for a good reply: never rewrite a reply that is already fine. Never OK a reply that only announces or "
+            "promises the work (\"подключаю\", \"сейчас проверю\", \"I'll send it\") when the request was to do it "
+            "and the facts above show no tool call that did it -- that task is NOT finished."
         )
     if can_escalate:
         forms.append(
@@ -1651,10 +1729,13 @@ def _build_verification_prompt(
             "genuinely NOT finished, but the gap looks like this SAME model simply stopped short -- it used tools "
             "fine for part of the work, then quit before covering the rest of what was named -- not that the task "
             "is beyond what this tier can reason through. Prefer this over escalating up when the same model, told "
-            "specifically what's missing, is likely to finish it; this is very often the case when a request named "
-            "several independent targets (several mailboxes, files, addresses) and the work was never split into a "
-            "declare_plan \"parallel\" stage + run_parallel_stage. Escalate instead only when the gap looks like it "
-            "is genuinely beyond this tier's reasoning, not a matter of doing the rest of the same operation."
+            "specifically what's missing, is likely to finish it. Escalate instead when it never got going at all "
+            "(no real tool work towards the task) or the gap looks genuinely beyond this tier's reasoning."
+            + (
+                " This request names several independent targets, so the rest may well need to be split into a "
+                "declare_plan \"parallel\" stage + run_parallel_stage."
+                if tracker.looks_multi_target else ""
+            )
         )
     if can_deescalate:
         forms.append(
@@ -2037,42 +2118,6 @@ def _first_remark_clause(language: str) -> str:
     )
 
 
-# Per explicit instruction (2026-10-11): the fast model is not called on every message.
-# The cheapest model goes first and only decides whether the fast lane's level is
-# needed at all -- can this be answered without tools? -- and only after its yes is
-# FAST_LANE_MODEL asked for the answer. A request that needs tools never reaches the
-# fast model: the gate itself hands it to the cascade, with the starting tier and, for
-# voice, the first spoken remark. The gate errs towards yes: FAST_LANE_MODEL can still
-# decline, while a wrong no costs the user the whole cascade for a question that needed
-# two seconds. Any failure of the gate also just means the fast model is asked.
-FAST_LANE_GATE_ENABLED = True
-FAST_LANE_GATE_MODEL = "google/gemini-2.5-flash-lite"
-FAST_LANE_GATE_REASONING: dict[str, str] | None = None
-FAST_LANE_GATE_TIMEOUT_S = 6.0
-FAST_LANE_ANSWERABLE = "[[ANSWER]]"
-
-
-def _fast_lane_gate_instructions(language: str, is_voice: bool) -> str:
-    return (
-        "You are the first and cheapest step in front of the assistant. You do NOT answer the user. Decide one "
-        "thing about their last message: can it be answered fully and correctly from this conversation and "
-        "general knowledge alone?\n"
-        "Reply with exactly " + FAST_LANE_ANSWERABLE + " and nothing else if it can: explaining, defining, "
-        "calculating, translating, writing, editing or checking a text, advice, small talk -- however long or "
-        "detailed the answer has to be.\n"
-        "Reply with exactly " + FAST_LANE_DECLINE + " and nothing else if it needs ANYTHING more: current or live "
-        "information (weather, news, prices, the time or the date, schedules), the user's own data (mail, notes, "
-        "files, contacts, calendar, anything about the user themselves or about what they said before this "
-        "conversation), looking something up, or doing anything (sending, saving, opening, scheduling, reminding, "
-        "changing). Reply with exactly " + FAST_LANE_DECLINE_COMPLEX + " instead when that takes several dependent "
-        "tool steps (check, then act, then verify).\n"
-        "The message may be several messages joined by blank lines: if even one of them needs more, the whole "
-        "message does.\n"
-        + (_first_remark_clause(language) + "This applies to the two NEEDS_TOOLS replies only.\n" if is_voice else "")
-        + "When you cannot tell, reply " + FAST_LANE_ANSWERABLE + ": the next step can still decline."
-    )
-
-
 def _fast_lane_messages(
     workspace_dir: str, persona: Persona, instructions: str, recent_dialogue_lines: list[str], user_text: str,
 ) -> list[dict[str, Any]]:
@@ -2086,39 +2131,6 @@ def _fast_lane_messages(
         messages.append({"role": "assistant" if line.startswith("Caroline:") else "user", "content": line.split(":", 1)[-1].strip()})
     messages.append({"role": "user", "content": user_text})
     return messages
-
-
-async def _fast_lane_gate(
-    ai: Any, workspace_dir: str, persona: Persona, user_text: str, recent_dialogue_lines: list[str], language: str, is_voice: bool,
-) -> tuple[bool, int | None, str | None] | None:
-    """(needs tools?, start tier, first remark), or None when the gate gave no usable
-    verdict -- the caller then asks the fast model as if there were no gate."""
-    started = time.monotonic()
-    try:
-        raw = await asyncio.wait_for(
-            asyncio.to_thread(
-                ai.resolve_agentic,
-                _fast_lane_messages(workspace_dir, persona, _fast_lane_gate_instructions(language, is_voice), recent_dialogue_lines, user_text),
-                None, None, model=FAST_LANE_GATE_MODEL, max_iterations=1, reasoning=FAST_LANE_GATE_REASONING,
-            ),
-            timeout=FAST_LANE_GATE_TIMEOUT_S,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log_event("engine", "fast_lane_gate_failed", error=str(exc)[:200], error_type=type(exc).__name__,
-                  ms=int((time.monotonic() - started) * 1000))
-        return None
-    text = str(raw or "").strip()
-    ms = int((time.monotonic() - started) * 1000)
-    if FAST_LANE_DECLINE_COMPLEX in text or FAST_LANE_DECLINE in text:
-        start_tier = 1 if FAST_LANE_DECLINE_COMPLEX in text else 0
-        first_remark = _first_remark_from_decline(text, user_text) if is_voice else None
-        log_event("engine", "fast_lane_gate", verdict="tools", ms=ms, start_tier=start_tier, first_remark=first_remark, raw=text[:200])
-        return True, start_tier, first_remark
-    if FAST_LANE_ANSWERABLE in text:
-        log_event("engine", "fast_lane_gate", verdict="answer", ms=ms)
-        return False, None, None
-    log_event("engine", "fast_lane_gate_failed", error=text[:200], error_type="unparseable", ms=ms)
-    return None
 
 
 def _fast_lane_instructions(language: str, is_voice: bool) -> str:
@@ -2203,7 +2215,14 @@ async def try_fast_answer(
     remark) when it declined -- the tier is 1 for a COMPLEX request, else 0, for
     run_small_model_turn's start_tier; the remark, voice only and possibly None, is
     what to say first while the cascade works. (None, None, None) when it couldn't
-    run, and the cascade picks its tier itself. Never raises."""
+    run, and the cascade picks its tier itself. Never raises.
+
+    One call decides all three (2026-10-22, per explicit instruction): answer it,
+    or needs tools and is simple, or needs tools and is complex. There used to be a
+    cheaper gate model in front deciding "needs tools?" and the starting tier, and
+    a separate complexity estimator before that; the gate's weak model sent clearly
+    multi-step tasks (find an email, summarize it, reply) to the weakest tier, which
+    failed them. The fast model was benchmarked best at exactly this decision."""
     if not FAST_LANE_ENABLED or camerlengo_ai is None:
         return None, None, None
     started = time.monotonic()
@@ -2211,12 +2230,6 @@ async def try_fast_answer(
         ai = await _model_ai()
         if ai is None:
             return None, None, None
-        if FAST_LANE_GATE_ENABLED:
-            gate = await _fast_lane_gate(ai, workspace_dir, persona, user_text, recent_dialogue_lines, language, is_voice)
-            if gate is not None and gate[0]:
-                log_event("engine", "fast_lane_declined", ms=int((time.monotonic() - started) * 1000), start_tier=gate[1],
-                          first_remark=gate[2], by="gate")
-                return None, gate[1], gate[2]
         model = FAST_LANE_MODEL
         messages = _fast_lane_messages(workspace_dir, persona, _fast_lane_instructions(language, is_voice), recent_dialogue_lines, user_text)
         raw = await asyncio.wait_for(
@@ -2247,15 +2260,6 @@ async def try_fast_answer(
 # Same model as the fast lane, for the same reason: on a narrator golden set it beat
 # the SMALL-draft-plus-translation route (see generate_progress_comment_direct).
 NARRATOR_MODEL = FAST_LANE_MODEL
-# Per explicit instruction (2026-10-11): what runs on every turn must not go straight to
-# the fast model. The narrator drafts with the cheapest model first, and NARRATOR_MODEL
-# is asked only when that one has nothing to say or its remark is rejected by the checks
-# (draft_narration_remark). On the golden set, 36 runs, the cheap model alone: 29 right
-# at 0.56s median, and all 7 misses were silences where a remark was due -- never a wrong
-# remark. Its neighbours were worse in the way that matters: gpt-4.1-nano said "Новых
-# писем от Анны не найдено" about three found letters, gpt-5-nano announced the work
-# finished and slipped into Ukrainian.
-NARRATOR_FIRST_MODEL = "google/gemini-2.5-flash-lite"
 # The longest remark said aloud, as drafted (numbers already in words): about 8s of speech.
 # The prompt asks for one short sentence with at most one figure; both models broke it on
 # lists of prices or cities. 354 remarks heard live up to 2026-10-17: median 59 chars, 90%
@@ -2283,24 +2287,21 @@ async def draft_narration_remark(
     task: str, facts: str, already_said: list[str], language: str, gender: str | None = None, addressee_gender: str | None = None,
     repeat_window: int | None = None,
 ) -> str | None:
-    """One narration remark by the ladder: NARRATOR_FIRST_MODEL, then NARRATOR_MODEL when
-    the first has nothing or is rejected. Same contract as
-    generate_progress_comment_direct: the remark, "" for nothing new, None on failure."""
+    """One narration remark by NARRATOR_MODEL. Same contract as
+    generate_progress_comment_direct: the remark, "" for nothing new, None on failure.
+
+    There used to be a cheaper first-draft model (gemini-2.5-flash-lite) tried before
+    NARRATOR_MODEL; removed 2026-10-22 per explicit instruction -- no gemini anywhere.
+    The cheaper alternatives benchmarked for this role were worse in the way that
+    matters (gpt-4.1-nano reported "no letters found" about three found letters,
+    gpt-5-nano announced the work finished and slipped into Ukrainian)."""
     from app.plugins.voice_api import generate_progress_comment_direct
 
-    async def first(prompt: str) -> str:
-        return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
-
-    remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
-                                                    repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS)
-    if remark:
-        log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
-        return remark
     remark = await generate_progress_comment_direct(
         task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
         repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS,
     )
-    log_event("engine", "narration_drafted", by="second", model=NARRATOR_MODEL, said=bool(remark))
+    log_event("engine", "narration_drafted", model=NARRATOR_MODEL, said=bool(remark))
     return remark
 
 
@@ -2671,11 +2672,22 @@ async def run_small_model_turn(
                 tab_id, emit,
             )
         except _TurnStalled as exc:
-            # Not escalated: the stalled worker thread may still be running, and
-            # tracker.cancelled (shared with every later tier) is what keeps it from
-            # acting -- continuing here would either let it act or block the next tier.
             log_event("engine", "small_model_tier_stalled", tab_id=tab_id, tier=index, model=model, kind=exc.kind, elapsed_s=round(exc.elapsed_s))
-            break
+            # A stall gives the work to the next tier (2026-10-22). It used to end the
+            # turn: one shared cancellation flag stopped the stalled thread but would
+            # have blocked every later tier too, so a stalled nano never got a stronger
+            # model -- seen on the test box twice (an email task, a Word report). Now
+            # only the stalled attempt's own flag is set; the next tier starts clean,
+            # with what this one already did. The absolute ceiling still ends the turn.
+            if exc.kind != "stall" or index >= len(tiers) - 1:
+                break
+            emit(f"Tier {index + 1} ({model}) stopped making progress; handing the work to tier {index + 2}.")
+            log_event("engine", "small_model_tier_escalating", tab_id=tab_id, tier=index, model=model, trace_calls=len(tier_trace), reason="stall")
+            if tier_trace:
+                messages.append({"role": "user", "content": _continuation_note(tier_trace)})
+                tier_trace.clear()
+            index += 1
+            continue
         except _FundsExhaustedGivingUp as exc:
             log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
             return _answer(_funds_exhausted_final_answer(exc.reason))
@@ -2709,20 +2721,32 @@ async def run_small_model_turn(
                 messages.append({"role": "user", "content": _continuation_note(tier_trace)})
                 tier_trace.clear()
             if action == "retry":
-                # Per explicit instruction, the fix's own philosophy: this is NOT
-                # "try harder, do more sequential work yourself" -- the nudge below
-                # specifically redirects to decomposition+parallelization (declare_
-                # plan's "parallel" stage + run_parallel_stage), which makes the
-                # retried attempt genuinely EASIER for the same tier, not harder.
+                # Per explicit instruction (2026-10-15), for a request naming several
+                # independent targets the nudge redirects to decomposition+parallelization
+                # (declare_plan's "parallel" stage + run_parallel_stage), which makes the
+                # retried attempt genuinely EASIER for the same tier. Only then, since
+                # 2026-10-22 (explicit instruction): forced on a single sequential task
+                # (a Word report, one email to find and answer) the parallel branches
+                # redid work already done -- a second, English copy of the report's
+                # table -- and stalled. There the nudge just says what is missing.
                 # Same index (not +1): same model, same tier, continuing.
                 same_tier_retries_used += 1
-                emit(f"The check found this tier's work incomplete but likely fixable by splitting it up; retrying tier {index + 1} with what's missing.")
-                messages.append({"role": "user", "content": (
-                    "[Verifier checked the previous attempt and found it incomplete: "
-                    f"{verified_text.replace(RETRY_SENTINEL, '').strip()} Split this into "
-                    "declare_plan(stages=[{\"mode\": \"parallel\", \"steps\": [...]}]) with one step per target, "
-                    "then call run_parallel_stage -- do not try to handle every target yourself in one sequential pass.]"
-                )})
+                missing = verified_text.replace(RETRY_SENTINEL, "").strip()
+                if tracker.looks_multi_target:
+                    emit(f"The check found this tier's work incomplete but likely fixable by splitting it up; retrying tier {index + 1} with what's missing.")
+                    nudge = (
+                        f"[Verifier checked the previous attempt and found it incomplete: {missing} Split this into "
+                        "declare_plan(stages=[{\"mode\": \"parallel\", \"steps\": [...]}]) with one step per target, "
+                        "then call run_parallel_stage -- do not try to handle every target yourself in one sequential pass.]"
+                    )
+                else:
+                    emit(f"The check found this tier's work incomplete; retrying tier {index + 1} with what's missing.")
+                    nudge = (
+                        f"[Verifier checked the previous attempt and found it incomplete: {missing} Do the missing part "
+                        "now, with your tools -- building on what is already done, not redoing it -- and check the real "
+                        "result before you reply.]"
+                    )
+                messages.append({"role": "user", "content": nudge})
                 continue
             if action == "down":
                 deescalations_used += 1

@@ -29,7 +29,7 @@ from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_a
 from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app.stt_adaptation import apply_adaptation, observe_user_message
-from app.stt_sanity import STT_SANITY_MODEL, check_transcript
+from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcript
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
@@ -1125,7 +1125,7 @@ async def handle_control_request(
         async def _sanity_model(prompt: str) -> str:
             from app.small_model_engine import resolve_narration_prompt
 
-            return await resolve_narration_prompt(prompt, model=STT_SANITY_MODEL)
+            return await resolve_narration_prompt(prompt, model=STT_SANITY_MODEL, reasoning=STT_SANITY_REASONING)
 
         checked = await check_transcript(text, dialogue, language, _sanity_model)
         text = checked.text

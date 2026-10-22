@@ -81,7 +81,7 @@ async def main():
         import app.small_model_engine as eng
 
         async def resolve(prompt):
-            return await eng.resolve_narration_prompt(prompt, model=MODEL)
+            return await eng.resolve_narration_prompt(prompt, model=MODEL, reasoning=s.STT_SANITY_REASONING)
 
     rows = []
     for case in CASES * RUNS:

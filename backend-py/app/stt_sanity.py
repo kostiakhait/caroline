@@ -30,9 +30,11 @@ from dataclasses import dataclass
 
 from app.logging_setup import log_event
 
-# Same cheap first-step model as the fast lane's gate and the narrator's first drafter
-# (small_model_engine.py). Picked there by benchmark; here see evals/stt_sanity_eval.py.
-STT_SANITY_MODEL = "google/gemini-2.5-flash-lite"
+# The cascade's own cheapest model (2026-10-22, per explicit instruction: gemini is for
+# image generation only). Minimal reasoning: left at its default it thinks for seconds
+# first, and this step has STT_SANITY_TIMEOUT_S before the transcript passes unchecked.
+STT_SANITY_MODEL = "openai/gpt-5-nano"
+STT_SANITY_REASONING: dict[str, str] | None = {"effort": "minimal"}
 STT_SANITY_TIMEOUT_S = 3.0
 # Short commands and answers ("да", "стоп", "спасибо") are left to step 1: there is
 # nothing in them for a model to judge, and they are the ones that must not wait.
