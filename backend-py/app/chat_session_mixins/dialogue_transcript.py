@@ -568,7 +568,7 @@ class DialogueTranscriptMixin:
             try:
                 async with _RECENT_24H_REFRESH_SLOT:
                     proc = await asyncio.create_subprocess_exec(
-                        sys.executable, str(Path(__file__).resolve().parent / "dialogue_refresh_worker.py"),
+                        sys.executable, str(Path(__file__).resolve().parent.parent / "dialogue_refresh_worker.py"),
                         self.last_saved_session_id or "-", self.tab_id, self.workspace_dir,
                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
