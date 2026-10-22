@@ -202,7 +202,36 @@ called, and wall-clock time -- this is the actual signal the whole test exists t
 
 ## Phase 2b -- SW memory on par with the Claude SDK
 
-**Status: designed (2026-10-22, every point below agreed in chat), not implemented.**
+**Status: implemented and verified live (2026-10-22)** on the DigitalOcean box (the Vultr account
+went "suspended" mid-test -- every instance, cause undetermined; the test box moved to DO, see
+Notes `vault:digitalocean:caroline-sw-mode-test`):
+- three tool turns in one tab: "create /home/caroline/notes/fruits.txt with яблоко/груша/слива" ->
+  "добавь туда ещё одну строку: вишня" (no file name given) -> "what did you change and where is
+  it?" -- all three right, the real file has all four lines; each call went to its own file and the
+  summary microagent added its linked record in the background (6-22 s, never delaying a reply).
+- nine turns crossing a compaction: a code word and a deadline given in turn 1, seven ~25K-char
+  reference texts, then "what code word and deadline did I give at the start?" -- compaction fired
+  after turn 8 (45K tokens, turns 1-2 folded, 12 s), turn 9 answered from the summary. It came back
+  as "Cassiopeia" instead of "Кассиопея": the summary microagent wrote its English record with the
+  word translated; both prompts now require names/code words/user values verbatim.
+
+Cost meter: sw model calls are logged per user with their exact dollar cost by Camerlengo
+(`/mnt/remote/lisinder/logs/openrouter/<date>.jsonl`, client = the SW login). Everything run on
+2026-10-22 for the test account: 107 calls, $0.61 -- claude-haiku-4.5 (fast lane and auxiliary
+passes) $0.35, one claude-sonnet-5 call $0.12, gpt-5.1-codex-mini $0.11 for ~1M prompt tokens.
+
+**Finding -- billing hole (2026-10-22, recorded per explicit instruction):** sw model calls are
+never charged to the user's SW wallet. Camerlengo's `/v1/chat/completions` proxy
+(`API/Api2OpenRouterProxy.py`) only tags and logs them -- "NO wallet billing here ... OpenRouter
+spend here is still paid by Partners Solutions directly". Over all of the day's tests the test
+account's wallet moved by 20 PIA ($0.02, auxiliary calls only). The "positive SW balance" gate on
+sw mode therefore admits usage it never bills. A fix belongs in Camerlengo and is a separate
+decision.
+
+Open: on a brand-new tab's first turn the reply-review pass can still answer in English (the tab's
+language is unknown until the first turn is saved).
+
+Original design, as agreed in chat:
 
 The gap: an sw turn's context is the system prompt plus the last 12 lines of visible dialogue text
 (`RECENT_DIALOGUE_WINDOW`). Tool calls and their results live only inside the turn
