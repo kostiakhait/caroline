@@ -32,7 +32,7 @@ for node in shared_tree.body:
 WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speech_state", "_client_quiet_for",
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
-          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval", "_note_answer_candidate",
+          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval", "_stale_lead", "_note_answer_candidate",
           "_answer_being_checked"}
 # Module-level helpers (now in chat_session_shared.py) the copied methods call.
 HELPERS = {"_spoken_duration"}
@@ -140,7 +140,7 @@ def make_session(voice=True, reports=True):
     s.last_visible_output_at = None; s.consecutive_narration_count = 0; s.pending_interim_notes = []
     s._voice_narration_wake = asyncio.Event(); s._narration_turn_seq = 0
     s._narration_draft_task = None; s.turn_narration_remarks = []
-    s._prepared_narration_stale = False; s._stale_remarks_in_row = 0
+    s._prepared_narration_stale = False; s._stale_remarks_in_row = 0; s._narration_prep_s = None
     s._client_speaking = None; s._client_quiet_since = None; s._client_speech_reported_at = None
     s._last_narration_est_speech_s = 0.0
     s._first_voice_remark_task = None
@@ -341,6 +341,17 @@ async def main():
             ("no two lines ever overlap", no_overlap(sp)),
         ]
     all_ok &= report("L", s, ans, cl)
+
+    s, ans = await scenario("M: nothing new, and a remark takes ~9.5s to prepare", turn_s=70, fact_every=None, model_delay=8)
+    def cm(sp, sent, ans):
+        narr = [x for x in sp if x[3]]
+        g = [narr[i + 1][0] - narr[i][1] for i in range(len(narr) - 1)]
+        return [
+            (f"silences stay near the interval, the start lead follows the measured prep (gaps {[round(x, 1) for x in g]})",
+             bool(g) and all(x <= consts["VOICE_NARRATION_STALE_MAX_S"] + 1.5 for x in g)),
+            ("no two lines ever overlap", no_overlap(sp)),
+        ]
+    all_ok &= report("M", s, ans, cm)
 
     print("\nALL OK" if all_ok else "\nSOME CHECKS FAILED")
 

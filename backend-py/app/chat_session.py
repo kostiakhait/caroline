@@ -511,6 +511,9 @@ class ChatSession(
         self._narration_turn_started_at: float | None = None
         self._narration_draft_task: asyncio.Task[None] | None = None
         self._prepared_narration: tuple[str, float, str | None] | None = None
+        # Seconds a voice remark has been taking from drafting to ready, averaged across
+        # turns (see _stale_lead); None until one has been measured.
+        self._narration_prep_s: float | None = None
         # The remark the fast lane's decline came with (see _say_first_voice_remark). Set
         # as soon as it is known, before it is synthesized, so that the loop doesn't
         # draft a "work has started" of its own beside it.

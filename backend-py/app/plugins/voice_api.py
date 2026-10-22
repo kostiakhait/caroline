@@ -1298,6 +1298,13 @@ def _is_repeat(text: str, previous: str, ignore_stems: frozenset[str] = frozense
     a repeat on the strength of "на" and "в"."""
     if _outcomes(text) != _outcomes(previous):
         return False  # before the containment check: "Не нашла ..." contains "Нашла ..."
+    said, before = _durations(text), _durations(previous)
+    if said and before and said != before:
+        # How long it has taken is news when it has grown (2026-10-22): "Уже пять с
+        # половиной минут работаю над этим" was dropped twice as a repeat of "Уже четыре
+        # с половиной минуты работаю над этим" said a minute before -- the very remark
+        # the stale hint asks for -- in a 35s silence.
+        return False
     if _normalized_overlap(text, previous):
         return True
 
@@ -1313,6 +1320,15 @@ def _is_repeat(text: str, previous: str, ignore_stems: frozenset[str] = frozense
 
 # A crude stem: enough to match "Киеве" in a request with "Киева" in a remark.
 _STEM_LEN = 5
+
+# "<up to three words> минут/секунд/час..." -- an elapsed time as said.
+_DURATION = re.compile(r"((?:[\w-]+\s+){1,3}?)(секунд|минут|час|second|minute|hour)\w*", re.IGNORECASE)
+
+
+def _durations(text: str) -> tuple[tuple[str, str], ...]:
+    """The elapsed times a remark states, as (amount words, unit stem)."""
+    said = text.lower().replace("ё", "е")
+    return tuple((" ".join(m.group(1).split()), m.group(2)) for m in _DURATION.finditer(said))
 
 
 def _request_stems(task: str) -> frozenset[str]:

@@ -154,6 +154,11 @@ def norm(s):
 
 
 _OUTCOME = re.compile(r"\b(?:(нашл|найден|получил|узнал|выяснил|сохранил|отправил|создал|записал)\w*|(ничего|нет|не))\b")
+_DURATION = re.compile(r"((?:[\w-]+\s+){1,3}?)(секунд|минут|час|second|minute|hour)\w*", re.IGNORECASE)
+
+
+def _durations(s):
+    return tuple((" ".join(m.group(1).split()), m.group(2)) for m in _DURATION.finditer(s.lower().replace("ё", "е")))
 
 
 def _outcomes(s):
@@ -162,6 +167,9 @@ def _outcomes(s):
 
 def is_repeat(a, b, ignore=frozenset()):
     if _outcomes(a) != _outcomes(b):  # as voice_api._is_repeat: a different outcome word is news by itself
+        return False
+    da, db = _durations(a), _durations(b)
+    if da and db and da != db:  # as voice_api._is_repeat: a grown elapsed time is news
         return False
     wa, wb = set(norm(a)), set(norm(b))
     # as voice_api._is_repeat (with ignore_stems: the request's own words, after a silence)
