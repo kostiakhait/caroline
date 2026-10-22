@@ -1,5 +1,13 @@
 # Large-scale automated test of Caroline's sw-mode across 4 task categories
 
+## Goal (restated 2026-10-22, per explicit instruction)
+
+Caroline on the SW subscription must work **no worse and no more expensive than on the Claude
+SDK -- with no Claude at all**. The Claude SDK is the reference for behavior: what a Claude turn
+does, an sw turn must do too. Every gap found here is a bug to close, not a limitation to note.
+There is no side-by-side Claude baseline run (explicit decision): behavior is compared against how
+the Claude SDK path works, cost against the Claude subscription price.
+
 ## Context
 
 Caroline can answer a real turn two ways: the full Claude Agent SDK ("claude" mode, today's
@@ -143,7 +151,34 @@ management API is IP-gated.
 
 ## Phase 2 -- Test harness: how tasks get sent in and verified
 
-**Status: not started.**
+**Status: done (2026-10-22), verified live.** The harness (kept outside the repo, under `d:\tmp`
+on the dev machine and `/root` on the box) opens a real WebSocket tab, sets sw mode, sends one or
+more user messages as consecutive turns in that tab, judges completion from the backend's own log
+(not from the first `result` frame, which can belong to an internal turn), and sums token usage
+per model for the tab. The box now runs Caroline as an ordinary user (`caroline`), not root, and
+is logged into SW as the test account `test@navlink.net` (password reset 2026-10-22, in Notes).
+
+Its first runs found real bugs, all fixed, pushed to `main`, verified on the box:
+
+- `74a1029` sw mode needed a Claude subscription on top of SW (`chat_mode_eligible`); now SW only.
+- `a4ebe6d` the 24h-dialogue refresh worker path broke in the 2026-10-17 mixin split (0 successes,
+  741 failures in the live Windows log) -- every tab, both modes.
+- `2236b53` Claude Code project-dir slug didn't match the CLI's rule (any non-ASCII-alphanumeric
+  -> `-`); on Linux every transcript was looked up in a nonexistent directory.
+- `e329e97` sw turns weren't persisted at all in a tab with no Claude session, so the model forgot
+  the previous turn ("remember 4711" -> "which number?" took 4 min and answered wrongly) and replies
+  came back in English; plus no translation into a guessed language on a tab's first turn.
+- `2990817` Claude machinery kept running in sw tabs: a CLI started before the switch to sw,
+  its failure nudge became a 75 s / ~145K-token phantom sw turn, and forced compaction of that CLI
+  replaced the tab's session and lost sw history. Now a Claude-less tab starts in sw, switching to
+  sw tears the CLI down, and none of that machinery touches sw tabs.
+
+After the fixes: "remember 4711" -> "Понял." (18.8 s), "which number?" -> "4711" (15.7 s).
+
+Still open, found by the same runs: per-tab cost of fast-lane and other auxiliary model calls is not
+logged (no `tab_id`, no usage), so Phase 3 can't measure cost honestly yet; every small-model call
+carries 255 tool definitions (~29K prompt tokens); a ready fast-lane answer reached the user 7.5 s
+later than it was produced.
 
 The chat window's own rendering is irrelevant to whether sw-mode can finish a task -- Caroline's
 own tool use (already Linux-ported where Phase 0 closed the gaps) is what's actually under test,
@@ -164,6 +199,41 @@ not pixel-level clicking by the test harness. The harness:
 
 Per task, records: pass/fail, whether sw-mode handled it alone or escalated, which tools were
 called, and wall-clock time -- this is the actual signal the whole test exists to produce.
+
+## Phase 2b -- SW memory on par with the Claude SDK
+
+**Status: designed (2026-10-22, every point below agreed in chat), not implemented.**
+
+The gap: an sw turn's context is the system prompt plus the last 12 lines of visible dialogue text
+(`RECENT_DIALOGUE_WINDOW`). Tool calls and their results live only inside the turn
+(`resolve_agentic` keeps them in its own copy of the message list) and are gone by the next one --
+"now fix the second file too" doesn't know which files the previous turn touched. Fine for a chat
+without tools, not for an agent. The Claude SDK replays the whole trajectory (`tool_use` /
+`tool_result`) since the last compaction, kept cheap by prompt caching, and compacts it into a
+summary when it grows. SW gets the same, in its own way:
+
+1. **Every tool call goes to its own file**, in full: arguments and the complete result. Captured
+   in Caroline's own executor wrapper (`_make_executor_fn`), which sees the result before
+   `resolve_agentic` cuts it to 8000 characters -- no change to Camerlengo.
+2. **A small-model microagent summarizes each turn's tool calls** once the turn ends: what was
+   looked at, changed, found, with each item carrying the link to its call's file. Skipped for a
+   turn that made no tool calls.
+3. **SW keeps its own history file per tab session** (its own format, not Claude Code's): per
+   turn, the user's message, the tool-call summary with links, the final answer. The Claude Code
+   transcript keeps receiving the plain question/answer pairs exactly as now -- the narrator,
+   language detection, the 24h-dialogue file and the permission guard read it.
+4. **The next sw turn's context is built from that history** since the last compaction boundary,
+   not from 12 lines. The model opens a call's file when it needs the full detail.
+5. **A compaction microagent** compresses the older part once the history exceeds ~40K tokens:
+   what's done, what was decided, what's still open, the user's standing instructions, the links
+   that still matter. The last 6 turns always stay verbatim. Both numbers are starting values, to
+   be tuned against measured cost.
+6. Both microagents are Caroline's own local ones (`_run_local_microagent`, same as
+   `content_summary`/`action_summary`), never deployed to Camerlengo.
+
+Verification: multi-turn tool tasks on the box ("create file X with ..." -> "add a line there" with
+no file name -> "what did you change?"), a long conversation that crosses a compaction and still
+answers from before it, and token cost per turn before/after.
 
 ## Phase 3 -- Cost estimate (before committing to the full run)
 
