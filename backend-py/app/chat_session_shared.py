@@ -90,6 +90,7 @@ from app.durability import (
     compute_foreign_tool_overlap,
     dehydrated_dir,
     find_most_recent_claude_session_id,
+    has_chat_mode,
     load_action_state,
     load_chat_mode,
     load_discovered_foreign_tool_overlap,
@@ -100,6 +101,7 @@ from app.durability import (
     save_pending_api_retry,
     save_pending_one_shot_followup,
     save_pending_turn,
+    save_chat_mode,
     save_tab_continuity_archive,
     save_tab_session_id,
     session_transcript_path,
@@ -153,6 +155,7 @@ from app.process_kill import kill_process_tree
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
+    chat_mode_eligible,
     get_model_override,
     resolve_mode,
 )
@@ -1657,7 +1660,10 @@ __all__ = [
     'compute_foreign_tool_overlap',
     'dehydrated_dir',
     'find_most_recent_claude_session_id',
+    'has_chat_mode',
     'load_chat_mode',
+    'save_chat_mode',
+    'chat_mode_eligible',
     'load_discovered_foreign_tool_overlap',
     'load_tab_continuity_archive',
     'load_tab_session_id',

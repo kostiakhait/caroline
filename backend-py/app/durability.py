@@ -511,6 +511,13 @@ def _chat_mode_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"chat-mode-{_sanitize_tab_id(tab_id)}.json"
 
 
+def has_chat_mode(workspace_dir: str, tab_id: str) -> bool:
+    """Whether this tab's mode was ever chosen (by the user or by
+    ChatSession's default-to-sw-without-Claude rule), as opposed to falling
+    back to load_chat_mode's "claude" default."""
+    return _chat_mode_path(workspace_dir, tab_id).exists()
+
+
 def load_chat_mode(workspace_dir: str, tab_id: str) -> str:
     path = _chat_mode_path(workspace_dir, tab_id)
     if not path.exists():
