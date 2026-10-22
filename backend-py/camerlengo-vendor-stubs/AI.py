@@ -12,7 +12,6 @@ import threading
 import httpx
 import Cache
 import Config
-import EmailBasics
 import json
 import openai
 import os
@@ -158,15 +157,17 @@ instructions = {}
 _last_insufficient_funds_email: float = 0.0  # epoch seconds; throttle ≤1/hour
 
 def sendEmail(text):
+    # Caroline's vendored copy (2026-10-22, per explicit instruction): sending mail is
+    # the server's job, and EmailBasics.py is no longer vendored. A client has no SMTP
+    # settings (Config.EMAIL_SERVER is empty), so the send used to fail right here, before
+    # the caller could raise InsufficientFundsError -- an empty wallet then surfaced as
+    # some other error. Kept only as a log line; the caller raises as before.
     global _last_insufficient_funds_email
     now = time.time()
     if now - _last_insufficient_funds_email < 3600:
-        return  # already sent within the last hour
+        return
     _last_insufficient_funds_email = now
-    mail_from="no_reply@partners.solutions"
-    to="kostia.khait@gmail.com"
-    subject="402: insufficient funds"
-    EmailBasics.send(mail_from, to, text, subject)
+    print(f"[AI] 402 insufficient funds: {text[:300]}")
 
 
 class InsufficientFundsError(RuntimeError):

@@ -172,7 +172,7 @@ $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 # > $(CAMERLENGO_VENDOR_STUBS)/<f>` commands by hand (see git history for
 # the exact file list) -- a deliberate, infrequent, explicit step now,
 # not an automatic one.
-$(OUT)/backend-py/camerlengo/.stamp: $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py
+$(OUT)/backend-py/camerlengo/.stamp: $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py
 	@echo "--- camerlengo (small-model primary path, see small_model_engine.py's own doc comment) ---"
 	@mkdir -p "$(OUT)/backend-py/camerlengo"
 	cp $^ "$(OUT)/backend-py/camerlengo/"
@@ -249,7 +249,7 @@ build: $(OUT)/Caroline.exe
 # itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
 # back into Windows/Caroline/), matching caroline_shell.py's own
 # _default_wwwroot() packaged-install lookup.
-$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
 	@echo "=== Caroline Linux shell package ==="
 	rm -rf "$(OUT_LINUX)"
 	mkdir -p "$(OUT_LINUX)/linux-shell"
@@ -269,7 +269,7 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	find "$(OUT_LINUX)/linux-shell" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@echo "--- camerlengo (small-model primary path, vendored once -- see the Windows build's own stamp rule for why) ---"
 	mkdir -p "$(OUT_LINUX)/backend-py/camerlengo"
-	cp "$(CAMERLENGO_VENDOR_STUBS)/AI.py" "$(CAMERLENGO_VENDOR_STUBS)/Cache.py" "$(CAMERLENGO_VENDOR_STUBS)/EmailBasics.py" "$(CAMERLENGO_VENDOR_STUBS)/Logger.py" "$(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py" "$(CAMERLENGO_VENDOR_STUBS)/Microagent.py" "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/"
+	cp "$(CAMERLENGO_VENDOR_STUBS)/AI.py" "$(CAMERLENGO_VENDOR_STUBS)/Cache.py" "$(CAMERLENGO_VENDOR_STUBS)/Logger.py" "$(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py" "$(CAMERLENGO_VENDOR_STUBS)/Microagent.py" "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/"
 	@echo "--- whatsapp-sidecar / messenger-sidecar (Node, same source the Windows build ships -- added 2026-10-21, Linux parity pass) ---"
 	mkdir -p "$(OUT_LINUX)/whatsapp-sidecar" "$(OUT_LINUX)/messenger-sidecar"
 	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT_LINUX)/whatsapp-sidecar/"

@@ -1,8 +1,8 @@
 """Safe, secret-free Config.py replacement used ONLY when vendoring Camerlengo's
-AI.py (+ its own small dependency closure: Cache.py/EmailBasics.py/Logger.py/
+AI.py (+ its own small dependency closure: Cache.py/Logger.py/
 JSONStorage.py) into Caroline's own install for the small-model primary path
 (see backend-py/app/small_model_engine.py). The Makefile copies AI.py/Cache.py/
-EmailBasics.py/Logger.py/JSONStorage.py VERBATIM from reforce's own `caroline`
+Logger.py/JSONStorage.py VERBATIM from reforce's own `caroline`
 branch, but replaces Config.py with THIS file instead of copying the real one --
 reforce's real Config.py holds live Partners Solutions production secrets
 (admin/DB/email passwords, a Google Maps key, etc.) entirely unrelated to this
@@ -70,18 +70,12 @@ TTS_SILERO_VOICES = {
 }
 
 # Camerlengo's own internal API self-call auth (Cache.py's cache-eviction
-# helper reads Config.getSiteConfig for site-scoped cache limits, EmailBasics.py
-# reads these EMAIL_* constants) -- none of this is exercised by Caroline's
+# helper reads Config.getSiteConfig for site-scoped cache limits) -- none of
+# this is exercised by Caroline's
 # small-model path (it never sends email or touches Cache's site-config
 # lookups), so these exist purely so `import AI` succeeds; harmless
 # placeholders, never real credentials.
 api_keys = []
-EMAIL_SERVER = ""
-EMAIL_PORT = "587"
-EMAIL_USER = ""
-EMAIL_PASSWORD = ""
-EMAIL_SOCKET_TIMEOUT = 5
-EMAIL_PS_API = ""
 
 
 def getSiteConfig(var, site=None):
