@@ -137,6 +137,7 @@ class SmallModelTurnMixin:
             asyncio.create_task(self._publish_status())
 
         translate_answer = True
+        from_cascade = False
         try:
             fast = None
             start_tier = None
@@ -172,6 +173,7 @@ class SmallModelTurnMixin:
                         if is_real_user else None
                     ),
                 )
+                from_cascade = True
                 if CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE:
                     translate_answer = not answer_is_in_language(result["text"], language)
         except asyncio.CancelledError:
@@ -187,7 +189,9 @@ class SmallModelTurnMixin:
             result = {"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
-        await self._finish_small_model_turn_answered(question_text, result["text"], is_voice, translate=translate_answer)
+        await self._finish_small_model_turn_answered(
+            question_text, result["text"], is_voice, translate=translate_answer, write_result=from_cascade,
+        )
     async def _sw_history_context(self) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Phase 2b (2026-10-22, see app/sw_history.py): makes sure this turn's
         session exists, waits for the previous turn's background work (its
@@ -212,7 +216,9 @@ class SmallModelTurnMixin:
         if not turns and not summary:
             return None, None
         return sw_history.context_messages(turns), sw_history.summary_section(summary)
-    async def _finish_small_model_turn_answered(self, question_text: str, text: str, is_voice: bool, translate: bool = True) -> None:
+    async def _finish_small_model_turn_answered(
+        self, question_text: str, text: str, is_voice: bool, translate: bool = True, write_result: bool = False,
+    ) -> None:
         """Synthesizes the same {assistant} + {result} wire pair a normal
         SDK turn's completion sends (see wire.py's message_to_wire), so
         chat.js needs no changes at all to render a small-model answer --
@@ -251,6 +257,13 @@ class SmallModelTurnMixin:
         # corrected the answer, nothing had been made ahead for the corrected text, and
         # live its first piece took 11.8s to synthesize after the review. The review
         # leaves a text unchanged far more often than not.
+        # The human-readable result, after the verifier and before the review
+        # (2026-10-22, explicit instruction) -- see app/sw_result_writer.py. Cascade
+        # answers only: a fast-lane answer has no tool output in it to put into words.
+        if write_result and not silent:
+            from app.sw_result_writer import write_result
+
+            text = await write_result(question_text, text)
         if is_voice and not silent:
             self._speech_ahead(text, current_language_name(self.tab_id))
         try:

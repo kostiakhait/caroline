@@ -1664,7 +1664,10 @@ def _build_verification_prompt(
         parts.append(
             "No tool calls were made in this attempt at all. So any action the reply says is done, is being "
             "done right now, or is about to be done (connecting, checking, saving, sending, \"I'll ...\") did "
-            "NOT happen."
+            "NOT happen. And a reply that asks the user for something the assistant could have found or tried "
+            "itself with its tools -- saved credentials, a file, a mailbox, what is in memory -- is not finished "
+            "either: nothing was tried yet. (2026-10-22: asked to check a mailbox whose credentials were already "
+            "saved, the reply asked which credentials to use, with no tool ever called.)"
         )
     if tracker.plan_steps is not None:
         undone = [s for i, s in enumerate(tracker.plan_steps) if i not in tracker.plan_done]
@@ -1713,9 +1716,23 @@ def _build_verification_prompt(
             "and can go to the user exactly as it stands. It is then sent word for word. This is the normal outcome "
             "for a good reply: never rewrite a reply that is already fine. Never OK a reply that only announces or "
             "promises the work (\"подключаю\", \"сейчас проверю\", \"I'll send it\") when the request was to do it "
-            "and the facts above show no tool call that did it -- that task is NOT finished."
+            "and the facts above show no tool call that did it -- that task is NOT finished. "
+            + _RESULT_READ_BACK_RULE
+            + (
+                " Never OK a reply that asks the user something -- which option to take, what to do next, a "
+                "detail, a confirmation -- or hands them a choice instead of finishing the task: escalate it, so a "
+                "stronger model tries to finish the task itself. The only question that goes to the user as it "
+                "is: asking them to approve the exact text of a message (or a payment) about to be sent on their "
+                "behalf, once everything else is done."
+                if can_escalate else ""
+            )
         )
     if can_escalate:
+        # Per explicit instruction (2026-10-22): while a stronger tier exists, a question to
+        # the user is not an answer -- the stronger tier gets the task instead. Seen the same
+        # day: a tool error ("can't search in Cyrillic") came back as a list of options for
+        # the user, though reading the latest messages without a search would have found the
+        # letter. The one question that does go out: confirming a send on the user's behalf.
         forms.append(
             f'- "{ESCALATION_SENTINEL} <one short sentence saying what is still missing or wrong>" -- the task is '
             "genuinely NOT finished yet: real work is still needed, not just a wording issue. A stronger model will "
@@ -1957,9 +1974,34 @@ def _trace_text(lines: list[str], limit: int) -> str:
 def _continuation_note(tier_trace: list[str]) -> str:
     return (
         "[Internal: a previous attempt at this same request already ran these tool calls, with their real "
-        "results. Continue from exactly where it stopped -- do not repeat these calls, do not restart from scratch.]\n"
+        "results. Continue from exactly where it stopped -- do not repeat these calls, do not restart from scratch. "
+        + _CHECK_EARLIER_RESULT
+        + "]\n"
         + _trace_text(tier_trace, 25)
     )
+
+
+# What a retry or a next tier is told about the work already there (2026-10-22): "building
+# on what is already done" was read as "add to it" -- on the test box a Word report got a
+# second table (September missing) and three conclusions instead of one, each attempt
+# appending to the file the one before had left wrong.
+_CHECK_EARLIER_RESULT = (
+    "What the earlier attempt produced may be wrong or incomplete -- duplicated pieces, partial leftovers, "
+    "wrong values. First look at its real current state (open the file again, re-read what was changed), "
+    "then make it exactly what was asked: fix or remove what is wrong, never add a second copy of something "
+    "already there. Read the final result back before you reply."
+)
+
+# The verifier's rule for work that leaves a result behind (2026-10-22, same incident): the
+# report with a duplicate table was approved -- nothing in the facts showed the file as it
+# finally was, and the reply described it as asked.
+_RESULT_READ_BACK_RULE = (
+    "When the request was to create or change a file or document, the task is finished only if the facts "
+    "above (from this attempt or an earlier one) show its FINAL content read back after the last change to "
+    "it, and that content is exactly what was asked -- everything asked for, nothing duplicated or left "
+    "over from an earlier attempt. Without such a read-back, or when it differs, the task is NOT finished: "
+    "say that the final file has to be read back and corrected."
+)
 
 
 COMPLEXITY_TIMEOUT_S = 12.0
@@ -2743,8 +2785,7 @@ async def run_small_model_turn(
                     emit(f"The check found this tier's work incomplete; retrying tier {index + 1} with what's missing.")
                     nudge = (
                         f"[Verifier checked the previous attempt and found it incomplete: {missing} Do the missing part "
-                        "now, with your tools -- building on what is already done, not redoing it -- and check the real "
-                        "result before you reply.]"
+                        f"now, with your tools. {_CHECK_EARLIER_RESULT}]"
                     )
                 messages.append({"role": "user", "content": nudge})
                 continue
