@@ -449,6 +449,58 @@ class _TurnStalled(Exception):
         self.kind = kind  # "stall" (no progress for STALL_TIMEOUT_S) or "absolute" (ABSOLUTE_TURN_TIMEOUT_S ceiling)
 
 
+# A verifier call that hangs (2026-10-15..22, from caroline.log: median 3-11s a day,
+# yet 15-30% of checks over 20s, up to 180s -- one 474-char answer waited 46s for a
+# single verifier call) is asked a second time alongside it once it has taken twice
+# what verifier calls have lately been taking (8-20s), and whichever answers first
+# counts. The verifier has no tools, so a second call changes nothing in the world;
+# a tier call (tools: mail, messages) is never doubled like this.
+VERIFIER_HEDGE_MIN_S = 8.0
+VERIFIER_HEDGE_MAX_S = 20.0
+_verifier_seconds: list[float] = []
+
+
+def _verifier_hedge_after() -> float:
+    if len(_verifier_seconds) < 5:
+        return 12.0
+    recent = sorted(_verifier_seconds[-20:])
+    return min(max(2 * recent[len(recent) // 2], VERIFIER_HEDGE_MIN_S), VERIFIER_HEDGE_MAX_S)
+
+
+async def _hedged_verifier_call(make_call: Callable[[], Awaitable[str]], tab_id: str) -> str:
+    started = time.monotonic()
+    first = asyncio.ensure_future(make_call())
+    second: asyncio.Future[str] | None = None
+    try:
+        done, _ = await asyncio.wait({first}, timeout=_verifier_hedge_after())
+        if first in done:
+            _verifier_seconds.append(time.monotonic() - started)
+            return first.result()
+        log_event("engine", "verifier_hedged", tab_id=tab_id, after_s=round(time.monotonic() - started, 1))
+        second = asyncio.ensure_future(make_call())
+        pending = {first, second}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            winner = next(iter(done))
+            if winner.exception() is None or not pending:
+                for late in pending:  # left to finish on its own: cancelling it would mark the whole turn cancelled
+                    late.add_done_callback(lambda t: t.cancelled() or t.exception())
+                _verifier_seconds.append(time.monotonic() - started)
+                log_event("engine", "verifier_hedge_won", tab_id=tab_id, by="second" if winner is second else "first",
+                          s=round(time.monotonic() - started, 1))
+                return winner.result()
+        raise RuntimeError("unreachable")
+    except asyncio.CancelledError:
+        # Stop: the calls are cancelled as the one awaited call used to be (their
+        # watchdog then marks the turn cancelled).
+        for call in (first, second):
+            if call is not None and not call.done():
+                call.cancel()
+        raise
+    finally:
+        del _verifier_seconds[:-20]
+
+
 async def _resolve_agentic_with_watchdog(ai: Any, tracker: _TurnTracker, **resolve_kwargs: Any) -> str:
     """Runs ai.resolve_agentic(**resolve_kwargs) in a worker thread (it's a
     synchronous, uncancellable call from a third-party module) while
@@ -2263,6 +2315,11 @@ NARRATOR_FIRST_MODEL = "google/gemini-2.5-flash-lite"
 # within 103, 19 over 120 (6 by the first model, 13 by the second). One of them, 197 chars,
 # took 13.6s to say, and the answer that was ready meanwhile waited for it.
 NARRATOR_MAX_CHARS = 120
+# After the first model is rate-limited (HTTP 429 -- "temporarily rate-limited upstream",
+# 10 times on 2026-10-21/22, each failed call costing a remark its time), the ladder
+# starts at NARRATOR_MODEL for this long.
+NARRATOR_FIRST_MODEL_REST_S = 60.0
+_narrator_first_model_resting_until = 0.0
 
 
 async def resolve_narration_prompt(prompt: str, model: str | None = None, reasoning: dict[str, str] | None = None) -> str:
@@ -2288,15 +2345,24 @@ async def draft_narration_remark(
     the first has nothing or is rejected. Same contract as
     generate_progress_comment_direct: the remark, "" for nothing new, None on failure."""
     from app.plugins.voice_api import generate_progress_comment_direct
+    global _narrator_first_model_resting_until
 
     async def first(prompt: str) -> str:
-        return await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
+        global _narrator_first_model_resting_until
+        raw = await resolve_narration_prompt(prompt, model=NARRATOR_FIRST_MODEL)
+        if str(raw).startswith("Agent error") and "429" in str(raw):
+            # Rate-limited upstream: ask the second model straight away for a while
+            # rather than spend every remark on a call that fails.
+            _narrator_first_model_resting_until = time.monotonic() + NARRATOR_FIRST_MODEL_REST_S
+            log_event("engine", "narrator_first_model_resting", model=NARRATOR_FIRST_MODEL, rest_s=NARRATOR_FIRST_MODEL_REST_S)
+        return raw
 
-    remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
-                                                    repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS)
-    if remark:
-        log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
-        return remark
+    if time.monotonic() >= _narrator_first_model_resting_until:
+        remark = await generate_progress_comment_direct(task, facts, already_said, language, first, gender=gender, addressee_gender=addressee_gender,
+                                                        repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS)
+        if remark:
+            log_event("engine", "narration_drafted", by="first", model=NARRATOR_FIRST_MODEL)
+            return remark
     remark = await generate_progress_comment_direct(
         task, facts, already_said, language, resolve_narration_prompt, gender=gender, addressee_gender=addressee_gender,
         repeat_window=repeat_window, max_chars=NARRATOR_MAX_CHARS,
@@ -2519,14 +2585,14 @@ async def run_small_model_turn(
             verification_messages.append({"role": "assistant", "content": not_a_form})
             verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text), can_retry)})
         return await _call_with_funds_wait(
-            lambda: _resolve_agentic_with_watchdog(
+            lambda: _hedged_verifier_call(lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
                 messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
                 model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                 reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
                 app="caroline",
-            ),
+            ), tab_id),
             tab_id, emit,
         )
 
