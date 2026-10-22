@@ -598,11 +598,20 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     # a usage error -- there was no fast "give me this track's current
     # state" path at all, even though the model already has the topic's id
     # from the system prompt's own topic list. See _read_topic.
-    if topic:
+    # A topic id this memory has never seen, given together with a query, is a
+    # guess: the query is searched instead (seen on the sw test box, 2026-10-22:
+    # a made-up topic answered "not in local memory" twice, the query beside it
+    # was never searched, and the turn went on without what was saved).
+    query = (args.get("query") or "").strip()
+    known_topic = bool(topic) and (
+        cached_topic_detail(WORKSPACE_DIR, topic) is not None or bool(topic_description(WORKSPACE_DIR, topic))
+    )
+    if topic and (known_topic or not query):
         return await _read_topic(topic)
+    if topic:
+        log_event("plugin:memory", "unknown_topic_searched_by_query", topic_id=topic)
     if args.get("document"):
         return await _read_document(args["document"], args.get("section"), args.get("offset"), args.get("save_file_to"))
-    query = (args.get("query") or "").strip()
     if not query:
         return {"text": 'request_info needs "query": what you want to recall.', "is_error": True}
     return await _run_memory_query(query, args.get("history"))

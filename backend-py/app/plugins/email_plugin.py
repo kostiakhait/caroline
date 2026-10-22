@@ -6,12 +6,11 @@ RESTful API, no server-side account table, ever) -- every operation below
 takes the full mailbox credentials (password/imapHost/...) as ordinary
 required parameters, passed straight through to Camerlengo on every call.
 
-Per explicit instruction (2026-09-10): there is deliberately no separate
-credential-storage adapter/tool here (no "email_login", no vault module).
-Credentials live as ordinary Notes, found and saved through the SAME
-general-purpose notes_* tools used for everything else -- see
-_usage_instructions below for the exact convention. This plugin never
-reads or writes them itself.
+Per explicit instruction (2026-09-10) there was deliberately no credential
+storage here -- the model found and saved credentials itself, as Notes.
+Changed per explicit instruction (2026-10-22): the tools now keep them
+themselves, locally, in the Notes vault note and in memory, and fill them
+in for a call that names only the address -- see email_credentials.py.
 
 Every command still requires a Camerlengo session (`auth: user_role`) --
 that identifies the CALLER for abuse-prevention/logging, unrelated to
@@ -48,6 +47,7 @@ import json
 import re
 from typing import Any
 
+from app.plugins import email_credentials
 from app.plugins.contacts_plugin import upsert_contacts_from_emails
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, call_v2
@@ -75,9 +75,24 @@ _sessions = SessionManager()
 from app.sw_service_keys_local import EMAIL_SERVICE_KEY  # noqa: E402
 
 _ACCOUNT_PARAM_NOTE = (
-    " Look up this mailbox's saved credentials first (see this plugin's own usage instructions) -- "
-    "every call needs them explicitly, there is no default/active account or server-side registration."
+    " A mailbox that has worked before needs only its `address`: the saved password and servers are "
+    "filled in automatically. A new one needs them all; they are saved once a call with them works."
 )
+
+
+def _with_saved_credentials(handler: Any) -> Any:
+    """Fills a call's missing mailbox credentials from what is kept, and keeps
+    the ones a call just proved to work -- see email_credentials.py. On the
+    module-level functions themselves, so email_batch_plugin's workers get it too."""
+    async def wrapped(args: dict[str, Any], rp: Any) -> dict[str, Any]:
+        args = await email_credentials.fill(args)
+        result = await handler(args, rp)
+        email_credentials.remember_after_success(args)
+        return result
+
+    wrapped.__name__ = handler.__name__
+    wrapped.__doc__ = handler.__doc__
+    return wrapped
 
 
 def _creds_kwargs(args: dict[str, Any]) -> dict[str, Any]:
@@ -96,6 +111,7 @@ def _creds_kwargs(args: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+@_with_saved_credentials
 async def email_list_folders(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         result = await call_v2("email:listFolders", session=session, **_creds_kwargs(args))
@@ -105,6 +121,7 @@ async def email_list_folders(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": json.dumps(data, indent=2, ensure_ascii=False)}
 
 
+@_with_saved_credentials
 async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         extra: dict[str, Any] = {"session": session, "folder": args.get("folder") or "INBOX", **_creds_kwargs(args)}
@@ -185,6 +202,7 @@ def _truncate_body(data: dict[str, Any], body_offset: int) -> None:
             data[field] = window
 
 
+@_with_saved_credentials
 async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         result = await call_v2("email:getMessage", session=session, folder=args["folder"], uid=args["uid"], **_creds_kwargs(args))
@@ -203,6 +221,7 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": json.dumps(data, indent=2, ensure_ascii=False)}
 
 
+@_with_saved_credentials
 async def email_mark(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     await _sessions.with_session(lambda session: call_v2(
         "email:markFlag", session=session, folder=args["folder"], uid=args["uid"],
@@ -211,6 +230,7 @@ async def email_mark(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f'{"Added" if args["set"] else "Removed"} flag {args["flag"]} on uid {args["uid"]} in {args["folder"]}.'}
 
 
+@_with_saved_credentials
 async def email_move(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     await _sessions.with_session(lambda session: call_v2(
         "email:moveMessage", session=session, folder=args["folder"], uid=args["uid"],
@@ -219,6 +239,7 @@ async def email_move(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f'Moved uid {args["uid"]} from {args["folder"]} to {args["destFolder"]}.'}
 
 
+@_with_saved_credentials
 async def email_delete(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     await _sessions.with_session(lambda session: call_v2(
         "email:deleteMessage", session=session, folder=args["folder"], uid=args["uid"], **_creds_kwargs(args),
@@ -226,16 +247,19 @@ async def email_delete(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f'Deleted uid {args["uid"]} from {args["folder"]}.'}
 
 
+@_with_saved_credentials
 async def email_create_folder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     await _sessions.with_session(lambda session: call_v2("email:createFolder", session=session, path=args["path"], **_creds_kwargs(args)))
     return {"text": f'Created folder "{args["path"]}".'}
 
 
+@_with_saved_credentials
 async def email_delete_folder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     await _sessions.with_session(lambda session: call_v2("email:deleteFolder", session=session, path=args["path"], **_creds_kwargs(args)))
     return {"text": f'Deleted folder "{args["path"]}".'}
 
 
+@_with_saved_credentials
 async def email_download_attachment(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     async def do(session: str) -> Any:
         return await call_v2(
@@ -295,6 +319,7 @@ def _validate_addresses(value: Any, field_name: str) -> None:
         _validate_header_value(one, field_name)
 
 
+@_with_saved_credentials
 async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     _validate_addresses(args.get("from"), "from")
     _validate_addresses(args.get("to"), "to")
@@ -350,28 +375,24 @@ async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 def _credentials_convention_instruction() -> str:
     return (
-        "This plugin has no credential storage or \"login\" tool of its own, deliberately -- every mailbox's "
-        "IMAP/SMTP credentials MUST be found and saved through the SAME general-purpose notes_* tools you "
-        'already use for everything else, never through an email-specific adapter. The convention: one note '
-        'per mailbox, in folder "Caroline:Vault" (see vault_security_instruction -- this used to say "Claude '
-        'Credentials", a stale, pre-2026-09-14 folder name that directly contradicted the general vault '
-        "convention; confirmed live, 2026-09-22, that this exact contradiction caused a real mailbox's "
-        'credentials to go unfound), titled exactly "vault:email:<address>" (e.g. '
-        '"vault:email:kostia.khait@gmail.com"), with the rest of the note\'s text being a single-line JSON '
-        'object: {"password": "...", "imapHost": "...", "imapPort": 993, "smtpHost": "...", "smtpPort": 587}. '
-        "Before calling ANY other tool in this plugin for a given address, you MUST look up that note first "
-        "(notes_search or notes_list on that folder). If it's genuinely not there, see the note below on "
-        "searching every folder before concluding no credentials exist -- an OLDER note for the same mailbox "
-        "can still be sitting in a since-renamed folder.\n\n"
+        "These tools keep each mailbox's credentials themselves (2026-10-22): once a call with a mailbox's "
+        "password and servers has worked, they are saved -- locally, as a note in Notes and in memory -- and "
+        "any later call that gives only that mailbox's `address` gets them filled in. So for a mailbox used "
+        "before, just pass the address. For a new one, pass everything the user gave you; you do not need "
+        "to save it yourself. Only when a call answers that no credentials are saved for the address, look "
+        'for them yourself: the Notes vault note is titled exactly "vault:email:<address>" (e.g. '
+        '"vault:email:kostia.khait@gmail.com") in folder "Caroline:Vault", its text after the title being a '
+        'single-line JSON object: {"password": "...", "imapHost": "...", "imapPort": 993, "smtpHost": "...", '
+        '"smtpPort": 587}. If it is genuinely not there, see the note below on searching every folder before '
+        "concluding no credentials exist -- an OLDER note for the same mailbox can still be sitting in a "
+        "since-renamed folder; failing that, ask the user.\n\n"
         "Fill in EVERY field this tool asks for -- match a saved note's (or the user's own) fields to this "
         "tool's parameters BY MEANING, not by requiring an identical spelling: \"imapHost\"/\"imap_host\"/\"IMAP "
         "server\" are all the same thing as this tool's imapHost parameter, and likewise for smtpHost. Never "
         "skip a field just because a source you're reading happened to phrase it differently, and never treat "
         "smtpHost as skippable or assume it equals imapHost -- real providers almost always use two DIFFERENT "
         "hosts for IMAP vs. SMTP (e.g. Gmail: imap.gmail.com vs. smtp.gmail.com); omitting or guessing it wrong "
-        "breaks sending with a confusing low-level error instead of a clear one. If the user gives you a new "
-        "mailbox's credentials to use, save them yourself via notes_create in exactly this format before using "
-        "them, translating whatever they call each field into this convention's own names."
+        "breaks sending with a confusing low-level error instead of a clear one."
     )
 
 
@@ -410,7 +431,7 @@ def _usage_instructions() -> str:
 
 
 _CREDENTIAL_PARAMS = {
-    "address": str, "password": str, "imapHost": str,
+    "address": str, "password": str | None, "imapHost": str | None,
     "imapPort": int | None, "smtpHost": str | None, "smtpPort": int | None,
 }
 
@@ -488,8 +509,8 @@ PLUGIN = Plugin(
             "Sends an email via Camerlengo. To authenticate as one of YOUR OWN mailboxes (own SMTP creds, own "
             "From, a Sent-folder copy), pass ALL of address/password/imapHost/smtpHost together -- these are "
             "not independently optional, and smtpHost is NOT the same host as imapHost for real providers "
-            "(e.g. Gmail: imap.gmail.com vs. smtp.gmail.com) -- a saved credential note has every one of these "
-            "fields, look it up and pass all four rather than sending with some of them missing. Omit ALL of "
+            "(e.g. Gmail: imap.gmail.com vs. smtp.gmail.com). For a mailbox that has worked before, `address` "
+            "alone is enough: its saved password and servers are filled in. Omit ALL of "
             "them together to relay through the shared no_reply@partners.solutions identity instead (no "
             "mailbox authentication, no Sent-folder copy). Use `from` to set a different display From header "
             "while still authenticating as `address` -- double-check they match the identity you intend "
