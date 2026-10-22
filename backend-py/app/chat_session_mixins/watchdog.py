@@ -520,6 +520,18 @@ class WatchdogMixin:
         # self.client-identity check would catch this anyway, but clearing
         # here avoids leaking timers.
         self._clear_mcp_reconnect_timers()
+        if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+            # A Claude stream ending in a tab that answers via SW now (switched
+            # to sw, or the CLI from before the switch died on its own) is not a
+            # failure of the conversation: nothing is resumed and nothing is
+            # injected, the run loop just idles in its sw branch. Seen live on
+            # the test box (2026-10-22): the generic path below injected a
+            # "continue or stay silent" nudge, which in sw mode became a real
+            # small-model turn -- 75s and ~145K tokens to answer [[NO_UPDATE]],
+            # with the user's actual question queued behind it.
+            log_event("engine", "claude_stream_ended_in_sw_tab", tab_id=self.tab_id, engine_switch=engine_switch, error=str(exc))
+            self._set_conn_state("connected")
+            return
         now = time.monotonic()
         self.restart_timestamps = [t for t in self.restart_timestamps if now - t < RESTART_WINDOW_MS / 1000]
         self.restart_timestamps.append(now)

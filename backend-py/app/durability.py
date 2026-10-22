@@ -31,10 +31,18 @@ def _sanitize_tab_id(tab_id: str) -> str:
 
 
 def claude_project_dir(workspace_dir: str) -> Path:
-    """Matches Claude Code's own project-dir slugging: every ':' and path
-    separator becomes '-', one-for-one. Used to locate a session's .jsonl
-    transcript directly on disk."""
-    encoded = re.sub(r"[:\\/]", "-", workspace_dir)
+    """Matches Claude Code's own project-dir slugging: every character that
+    isn't an ASCII letter or digit becomes '-', one-for-one. Used to locate a
+    session's .jsonl transcript directly on disk.
+
+    Used to replace only ':' and path separators, which only matched the CLI
+    for paths without other punctuation. Confirmed live (2026-10-22, Linux
+    test box): the CLI turned "/home/caroline/slug probe/a_b.c" into
+    "-home-caroline-slug-probe-a-b-c", so on Linux, whose default workspace is
+    under ~/.local, Caroline looked for every transcript in a directory that
+    doesn't exist. Same failure on Windows for any path with a space, dot or
+    underscore in it."""
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", workspace_dir)
     return Path.home() / ".claude" / "projects" / encoded
 
 
@@ -495,12 +503,19 @@ def clear_tab_continuity_archive(workspace_dir: str, tab_id: str) -> None:
 # submit()) or "sw" (the small-model/Camerlengo path billed through the
 # SquirrelWisdom PIA wallet, run_small_model_turn()). Defaults to "claude"
 # for every tab; see subscription_mode.py's chat_mode_eligible() for the
-# gating (both a Claude subscription AND a paid SW balance) that decides
+# gating (a paid SW balance; no Claude subscription needed) that decides
 # whether "sw" can be SET at all -- this module only persists whatever was
 # already validated, same file-per-tab shape as tab-session-<id>.json etc.
 
 def _chat_mode_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"chat-mode-{_sanitize_tab_id(tab_id)}.json"
+
+
+def has_chat_mode(workspace_dir: str, tab_id: str) -> bool:
+    """Whether this tab's mode was ever chosen (by the user or by
+    ChatSession's default-to-sw-without-Claude rule), as opposed to falling
+    back to load_chat_mode's "claude" default."""
+    return _chat_mode_path(workspace_dir, tab_id).exists()
 
 
 def load_chat_mode(workspace_dir: str, tab_id: str) -> str:

@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -65,6 +66,9 @@ from app.plugins.app_browser_plugin import _call as _app_browser_call
 from app.secret_store import messenger_secrets_dir
 from app.sidecar_process import SidecarProcess
 from app.task_supervisor import supervise
+
+if sys.platform != "win32":
+    from app.plugins import _linux_app_browser as _linux_browser
 
 FACEBOOK_URL = "https://www.facebook.com/login"
 # GetCookiesAsync (AppBrowserHost.cs) scopes to one URL's cookie jar; the
@@ -123,6 +127,32 @@ def _has_prior_session(workspace_dir: str, account: str) -> bool:
 
 def browser_label(account: str) -> str:
     return f"facebook_{account}"
+
+
+# Linux parity pass (2026-10-21): _app_browser_call always talks HTTP to
+# AppBrowserHost (Windows-only, see app_browser_plugin.py's own _call) --
+# it has no platform branch of its own, unlike the higher-level functions
+# that module exposes for other callers. These three thin wrappers are the
+# platform branch for the Facebook login flow specifically (open/poll-
+# cookies/close), routing to _linux_app_browser.py directly on Linux.
+async def _login_browser_open(label: str, url: str) -> None:
+    if sys.platform != "win32":
+        await _linux_browser.open_window(label, url)
+    else:
+        await _app_browser_call("/open", {"label": label, "url": url}, timeout_s=90.0)
+
+
+async def _login_browser_get_cookies(label: str, uri: str) -> Any:
+    if sys.platform != "win32":
+        return await _linux_browser.get_cookies(label, uri)
+    return await _app_browser_call("/get_cookies", {"label": label, "uri": uri}, timeout_s=15.0)
+
+
+async def _login_browser_close(label: str) -> None:
+    if sys.platform != "win32":
+        await _linux_browser.close_window(label)
+    else:
+        await _app_browser_call("/close", {"label": label})
 
 
 @dataclass
@@ -336,7 +366,7 @@ async def login_start(account: str) -> str:
         raise MessengerError("Messenger isn't set up in this build yet -- Node.js wasn't provisioned.")
     if is_connected(account):
         return f'Already connected (as {_status[account].own_user_id}, account="{account}").'
-    await _app_browser_call("/open", {"label": browser_label(account), "url": FACEBOOK_URL}, timeout_s=90.0)
+    await _login_browser_open(browser_label(account), FACEBOOK_URL)
     _login_requested[account] = True
     return (
         f'Opened a Facebook login window for the "{account}" account -- log in there yourself (including any '
@@ -355,7 +385,7 @@ async def _try_capture_appstate(workspace_dir: str, account: str) -> bool:
     handoff."""
     label = browser_label(account)
     try:
-        cookies = await _app_browser_call("/get_cookies", {"label": label, "uri": FACEBOOK_ORIGIN}, timeout_s=15.0)
+        cookies = await _login_browser_get_cookies(label, FACEBOOK_ORIGIN)
     except Exception as exc:
         log_event("plugin:messenger", "cookie_poll_failed", account=account, error=str(exc))
         return False
@@ -363,7 +393,7 @@ async def _try_capture_appstate(workspace_dir: str, account: str) -> bool:
         return False
     _appstate_path(workspace_dir, account).write_text(json.dumps(cookies), encoding="utf-8")
     try:
-        await _app_browser_call("/close", {"label": label})
+        await _login_browser_close(label)
     except Exception as exc:
         log_event("plugin:messenger", "login_browser_close_failed", account=account, error=str(exc))
     _login_requested[account] = False

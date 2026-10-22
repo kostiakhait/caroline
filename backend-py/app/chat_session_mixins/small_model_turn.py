@@ -243,7 +243,13 @@ class SmallModelTurnMixin:
             log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
         # translate=False: an answer already checked to be in the tab's language
         # (answer_is_in_language) -- the pass took 4-20s live and changed nothing.
-        if not silent and translate:
+        # No translation either while this tab's language is still unknown (its
+        # first turn): current_language_name() then falls back to "English", and
+        # the pass translated a correct Russian "Понял" into "I understood."
+        # (seen on the test box, 2026-10-22). The model already answers in the
+        # user's language; the language is resolved from this turn right after
+        # it is persisted, so later turns are checked as before.
+        if not silent and translate and _load_persisted_language(self.tab_id) is not None:
             try:
                 translated = await translate_text(
                     text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
@@ -264,7 +270,10 @@ class SmallModelTurnMixin:
         asyncio.ensure_future(self._check_permission_guard())
         log_event("engine", "small_model_turn_answered_finishing", tab_id=self.tab_id, text_len=len(text))
         self._reset_voice_narration()
-        _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
+        persisted_to = _append_small_model_turn_to_session(self.workspace_dir, self.tab_id, self.last_saved_session_id, question_text, text)
+        if persisted_to and persisted_to != self.last_saved_session_id:
+            self.last_saved_session_id = persisted_to
+            refresh_language_in_background(persisted_to, self.tab_id)
         assistant_wire = {
             "type": "assistant",
             "message": {

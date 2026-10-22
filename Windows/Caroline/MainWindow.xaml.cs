@@ -745,7 +745,7 @@ public partial class MainWindow : Window
             item.IsChecked = active;
             item.ToolTip = available ? null : modeId switch
             {
-                "sw" => "Needs a Claude subscription and a paid SquirrelWisdom balance",
+                "sw" => "Needs a SquirrelWisdom login with a positive balance",
                 "openai" => "Set up OpenAI in Settings",
                 _ => "Set up Claude in Settings",
             };

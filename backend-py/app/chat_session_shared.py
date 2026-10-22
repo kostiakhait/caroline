@@ -90,6 +90,7 @@ from app.durability import (
     compute_foreign_tool_overlap,
     dehydrated_dir,
     find_most_recent_claude_session_id,
+    has_chat_mode,
     load_action_state,
     load_chat_mode,
     load_discovered_foreign_tool_overlap,
@@ -100,6 +101,7 @@ from app.durability import (
     save_pending_api_retry,
     save_pending_one_shot_followup,
     save_pending_turn,
+    save_chat_mode,
     save_tab_continuity_archive,
     save_tab_session_id,
     session_transcript_path,
@@ -153,6 +155,7 @@ from app.process_kill import kill_process_tree
 from app.sw_gate import require_sw_or_prompt
 from app.subscription_mode import (
     build_options_env,
+    chat_mode_eligible,
     get_model_override,
     resolve_mode,
 )
@@ -433,8 +436,8 @@ VOICE_NARRATION_CLIENT_SPEAKING_STALE_S = 120.0
 # global flag: each tab independently persists "claude" (default) or "sw"
 # via durability.py's load_chat_mode/save_chat_mode, and "sw" can only be
 # SET (main.py's chat_mode_set control op) when subscription_mode.py's
-# chat_mode_eligible() holds -- both a real Claude subscription AND a PAID
-# SquirrelWisdom balance. Nothing changes for anyone who never opens that
+# chat_mode_eligible() holds -- a PAID SquirrelWisdom balance (no Claude
+# subscription needed since 2026-10-22). Nothing changes for anyone who never opens that
 # toggle: every tab still starts on "claude", identical to this flag's old
 # permanent False.
 
@@ -1321,7 +1324,7 @@ def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspa
     return str(out_path)
 
 
-def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session_id: str | None, user_text: str, assistant_text: str) -> None:
+def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session_id: str | None, user_text: str, assistant_text: str) -> str | None:
     """Bug fix (2026-09-12), per explicit instruction: the small-model
     primary path (small_model_engine.py) never talks to the Claude Code CLI
     at all, so its own Q&A never reached the ONE place
@@ -1341,20 +1344,43 @@ def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session
     up immediately via the exact same parser (_extract_entries_from_jsonl)
     a real CLI-written entry would produce.
 
-    No-op (logged, not raised) if this tab has never run a single SDK turn
-    yet -- session_id is None, so there is no session FILE to append onto
-    (inventing one here risks a format Claude Code itself might not accept
-    on a future resume -- Claude Code's own CLI, not Caroline, owns minting
-    a new session id and creating that file in the first place). Once any
-    real SDK turn has run once for this tab, every small-model turn after
-    that appends correctly from then on."""
+    A tab that has never run an SDK turn has no session yet. It used to be
+    left unpersisted, which (seen with the sw-mode test harness, 2026-10-22)
+    left a Claude-less tab with no history at all: the small model could not
+    see its own previous turn ("remember 4711" -> "which number?" took four
+    minutes and ended with "I didn't remember any number"), and language
+    detection, which reads the same history, never ran, so replies came back
+    in English. Per explicit instruction, such a tab now gets its own minted
+    session id, with the file created in Claude Code's own project dir so a
+    later switch to Claude mode can try to resume it; the entries carry the
+    CLI's cwd/isSidechain/userType fields for that reason.
+
+    Returns the session id the turn was written to (None if it wasn't), so
+    the caller can adopt a newly minted one."""
     if not session_id:
-        log_event("engine", "small_model_turn_not_persisted_no_session", tab_id=tab_id)
-        return
+        session_id = str(uuid_mod.uuid4())
+        path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=False)
+        except Exception as exc:
+            log_event("engine", "small_model_session_mint_failed", tab_id=tab_id, error=str(exc))
+            return None
+        save_tab_session_id(workspace_dir, tab_id, session_id)
+        log_event("engine", "small_model_session_minted", tab_id=tab_id, session_id=session_id)
     path = claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
     if not path.exists():
-        log_event("engine", "small_model_turn_not_persisted_no_session_file", tab_id=tab_id, path=str(path))
-        return
+        # A tab that connected in claude mode gets a session id from the CLI's
+        # init message even when the CLI never writes a turn (no Claude login,
+        # or switched to sw right away) -- seen live on the test box. Start the
+        # file under that same id rather than dropping the turn.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+        except Exception as exc:
+            log_event("engine", "small_model_turn_not_persisted_no_session_file", tab_id=tab_id, path=str(path), error=str(exc))
+            return None
+        log_event("engine", "small_model_session_file_started", tab_id=tab_id, session_id=session_id)
     try:
         last_uuid: str | None = None
         # Only the LAST line matters -- read it from the end of the file
@@ -1371,22 +1397,25 @@ def _append_small_model_turn_to_session(workspace_dir: str, tab_id: str, session
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         user_uuid = str(uuid_mod.uuid4())
         assistant_uuid = str(uuid_mod.uuid4())
+        cli_fields = {"cwd": workspace_dir, "isSidechain": False, "userType": "external"}
         user_entry = {
             "type": "user", "uuid": user_uuid, "parentUuid": last_uuid,
-            "timestamp": now_iso, "sessionId": session_id,
+            "timestamp": now_iso, "sessionId": session_id, **cli_fields,
             "message": {"role": "user", "content": user_text},
         }
         assistant_entry = {
             "type": "assistant", "uuid": assistant_uuid, "parentUuid": user_uuid,
-            "timestamp": now_iso, "sessionId": session_id,
+            "timestamp": now_iso, "sessionId": session_id, **cli_fields,
             "message": {"role": "assistant", "content": [{"type": "text", "text": assistant_text}]},
         }
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(user_entry, ensure_ascii=False) + "\n")
             f.write(json.dumps(assistant_entry, ensure_ascii=False) + "\n")
         log_event("engine", "small_model_turn_persisted", tab_id=tab_id, session_id=session_id)
+        return session_id
     except Exception as exc:
         log_event("engine", "small_model_turn_persist_failed", tab_id=tab_id, error=str(exc))
+        return None
 
 
 def current_language_name(tab_id: str) -> str:
@@ -1637,7 +1666,10 @@ __all__ = [
     'compute_foreign_tool_overlap',
     'dehydrated_dir',
     'find_most_recent_claude_session_id',
+    'has_chat_mode',
     'load_chat_mode',
+    'save_chat_mode',
+    'chat_mode_eligible',
     'load_discovered_foreign_tool_overlap',
     'load_tab_continuity_archive',
     'load_tab_session_id',

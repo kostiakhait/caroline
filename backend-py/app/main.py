@@ -1468,7 +1468,7 @@ async def handle_control_request(
         if requested_mode == "sw" and not await chat_mode_eligible(WORKSPACE_DIR, tab_id):
             return {
                 "type": "control_response", "op": op, "ok": False,
-                "stderr": "Both a Claude subscription and a paid SquirrelWisdom balance are required to switch this tab to sw.",
+                "stderr": "A SquirrelWisdom login with a positive balance is required to switch this tab to sw.",
                 "requestId": request_id,
             }
         save_chat_mode(WORKSPACE_DIR, tab_id, requested_mode)

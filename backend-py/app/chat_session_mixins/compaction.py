@@ -99,6 +99,14 @@ class CompactionMixin:
         something to inject into or race with actual work."""
         if self.engine_kind != "claude":
             return  # Codex owns its own compaction; this machinery edits Claude transcripts
+        if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
+            # An sw tab runs no Claude CLI to send /compact to (see
+            # switch_engine_if_needed) -- the command would sit in a queue
+            # nothing reads, with forced_compaction_result_pending stuck True.
+            # Before that, a CLI left alive would compact into a fresh empty
+            # session and replace the tab's own, losing every sw turn (seen
+            # live on the test box, 2026-10-22).
+            return
         if self.ended or self.turn_pending or self.forced_compaction_result_pending:
             return
         if self.conn_state.get("kind") != "connected":

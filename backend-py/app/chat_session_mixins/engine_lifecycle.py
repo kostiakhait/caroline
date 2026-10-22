@@ -19,6 +19,29 @@ class EngineLifecycleMixin:
         self._voice_narration_task = supervise("voice_narration", self._voice_narration_loop, self.tab_id)
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
             asyncio.create_task(self._prewarm_model_key())
+    async def _default_to_sw_without_claude(self) -> None:
+        """Per explicit instruction (2026-10-22): a tab whose mode was never
+        chosen starts in sw, not claude, when there is no Claude access on this
+        machine and SW is usable. Otherwise the run loop would spawn a Claude
+        CLI that can only fail -- and a failing CLI in such a tab is exactly
+        what set off the phantom nudge turns and lost history seen on the test
+        box. Runs at the top of the run loop, not in start(), so opening a tab
+        never waits on the account-state lookups (both are cached and warmed
+        at backend startup anyway)."""
+        if has_chat_mode(self.workspace_dir, self.tab_id):
+            return
+        try:
+            mode = await resolve_mode(self.workspace_dir, self.tab_id)
+            if mode.chat_source != "none":
+                return
+            if not await chat_mode_eligible(self.workspace_dir, self.tab_id):
+                return
+        except Exception as exc:  # noqa: BLE001 -- keep the old default, never block the tab
+            log_event("engine", "default_to_sw_check_failed", tab_id=self.tab_id, error=str(exc))
+            return
+        save_chat_mode(self.workspace_dir, self.tab_id, "sw")
+        log_event("engine", "chat_mode_defaulted_to_sw", tab_id=self.tab_id)
+        asyncio.create_task(self._prewarm_model_key())
     async def _prewarm_model_key(self) -> None:
         """Fetches the provider key now rather than on the first question (2026-10-10):
         live, the first fast-lane call after a start took 4.9s instead of ~1.8s, the
@@ -59,15 +82,29 @@ class EngineLifecycleMixin:
             self.engine_switch_pending = False
             self.switch_engine_if_needed()
     def switch_engine_if_needed(self) -> str:
-        """Called after the tab's answer source changed. Only Claude <-> OpenAI
-        needs a fresh session (they are different agent processes); SW routing
-        is decided per message. Returns "unchanged", "switching" (the running
-        session was torn down and the run loop rebuilds it on the new engine)
-        or "busy" (a turn is in flight -- the switch is saved and applied by the
-        watchdog as soon as the turn ends; nothing is interrupted)."""
-        wanted = "openai" if load_chat_mode(self.workspace_dir, self.tab_id) == "openai" and openai_available(self.workspace_dir) else "claude"
-        if wanted == self.engine_kind or self.client is None:
-            return "unchanged"
+        """Called after the tab's answer source changed. Claude <-> OpenAI needs a
+        fresh session (they are different agent processes); a switch to SW tears
+        the running agent process down and leaves none (the run loop's sw branch
+        builds no session at all). Returns "unchanged", "switching" (the running
+        session was torn down and the run loop rebuilds it on the new engine,
+        or idles for sw) or "busy" (a turn is in flight -- the switch is saved
+        and applied by the watchdog as soon as the turn ends; nothing is
+        interrupted).
+
+        Switching to SW used to leave the Claude CLI running (seen live on the
+        test box, 2026-10-22): the forced-compaction watchdog then sent it
+        /compact, and the compaction's fresh session id replaced the tab's own,
+        so the SW turns written to the old one vanished from the history the
+        next turn reads -- "remember 4711" was forgotten one turn later."""
+        mode = load_chat_mode(self.workspace_dir, self.tab_id)
+        if mode == "sw":
+            wanted = "sw"
+            if self.client is None:
+                return "unchanged"
+        else:
+            wanted = "openai" if mode == "openai" and openai_available(self.workspace_dir) else "claude"
+            if wanted == self.engine_kind or self.client is None:
+                return "unchanged"
         # The mode changed: a retry armed against the OLD engine's failure (bad key, outage)
         # must not fire into the new one -- cancelled here, before the busy check, so it
         # can't slip in while the switch waits for the running turn.
@@ -412,6 +449,7 @@ class EngineLifecycleMixin:
         # moments later, this is strictly an earlier, narrower first read.
         if self.last_saved_session_id is None:
             self.last_saved_session_id = load_tab_session_id(self.workspace_dir, self.tab_id, self.engine_kind)
+        await self._default_to_sw_without_claude()
         while not self.ended:
             try:
                 if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
@@ -430,6 +468,10 @@ class EngineLifecycleMixin:
                     # LOOKED dead while it wasn't). Skip building any real session at
                     # all in this mode; just report healthy and idle, re-checking
                     # whether the mode itself changed (a real reason to start one).
+                    # Any client left over from before a switch to sw is already
+                    # torn down (switch_engine_if_needed); drop the reference so
+                    # nothing keeps treating it as this tab's live agent.
+                    self.client = None
                     self._set_conn_state("connected")
                     while not self.ended and load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
                         await asyncio.sleep(5.0)
