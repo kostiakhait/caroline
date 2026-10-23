@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
+from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import messenger_secrets_dir
 from app.session_context import get_send_for_tab, get_tab_id
 from app.sidecar_process import SidecarProcess
@@ -340,20 +341,21 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             if not text and not media:
                 return
             frm = msg.get("from") or "unknown"
-            name = msg.get("chatName") or frm
+            name = third_party_label(msg.get("chatName") or frm)
             _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             log_event("plugin:whatsapp", "message_received", account=account, frm=frm)
             # Who wrote it (2026-10-23): in a group `from` is the group's jid,
             # and the author's own jid and number were never passed on.
             sender = msg.get("sender") or frm
-            who = f"sender={sender}"
+            who = f"sender={third_party_label(sender)}"
             if msg.get("senderName"):
-                who += f', senderName="{msg["senderName"]}"'
+                who += f', senderName="{third_party_label(msg["senderName"])}"'
             if msg.get("senderPhone"):
-                who += f', senderPhone={msg["senderPhone"]}'
+                who += f', senderPhone={third_party_label(msg["senderPhone"])}'
             note = (
                 f'[New WhatsApp message in {_ACCOUNT_LABEL[account]} WhatsApp account, from "{name}" '
-                f'(jid={frm}, {who}, account="{account}"):\n{text or "(no caption)"}'
+                f'(jid={frm}, {who}, account="{account}"):\n'
+                f'{third_party_text(text, name) if text else "(no caption)"}'
             )
             if media and msg.get("mediaRef"):
                 note += (

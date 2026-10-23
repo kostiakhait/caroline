@@ -148,7 +148,7 @@ from app.operations import REGISTRY
 from app.pdf_pages import extract_pdf_page_texts
 from app.process_activity import ProcessActivityMonitor
 from app import memory_nudge
-from app.session_context import get_action_closer, get_recent_real_user_directives, get_sessions_getter, register_action_closer, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_send_action_guard, register_send_for_tab, register_sessions_getter, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
+from app.session_context import get_action_closer, get_recent_real_user_directives, get_sessions_getter, register_action_closer, register_inject_proactive, register_permission_blocker, register_recent_real_user_directives, register_reply_watch, register_file_transfer_guard, register_send_action_guard, register_send_for_tab, register_sessions_getter, set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id
 from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
@@ -381,6 +381,12 @@ VOICE_NARRATION_STALE_S = 10.0
 # Drafting for that case starts this much sooner (2026-10-11): a draft plus its audio
 # takes 4-6s, and started only once the 10s were up it made the silence 14-15s.
 VOICE_NARRATION_STALE_LEAD_S = 5.0
+# What a "nothing new" draft is told once the user already knows the work goes on: after
+# the first such remark in a row (_step_voice_narration), and right away when such a draft
+# came back as a repeat (_draft_voice_narration_body).
+VOICE_NARRATION_SAY_ELSE = (
+    "the user already knows the work is still going on; say how long it has taken so far, or which part is being done now."
+)
 # A long turn with nothing new to tell (2026-10-15): live, 22 remarks in 4.5 minutes, most
 # of them "Продолжаю ..." every ten seconds. Each further remark in a row with nothing new
 # waits this much longer than the one before, up to VOICE_NARRATION_STALE_MAX_S; the
@@ -1753,6 +1759,7 @@ __all__ = [
     'register_recent_real_user_directives',
     'register_reply_watch',
     'register_send_action_guard',
+    'register_file_transfer_guard',
     'register_send_for_tab',
     'set_cli_pid_sink',
     'set_inject_proactive',
@@ -1807,6 +1814,7 @@ __all__ = [
     '_spoken_duration',
     'VOICE_NARRATION_STALE_MAX_S',
     'VOICE_NARRATION_ANSWER_HOLD_S',
+    'VOICE_NARRATION_SAY_ELSE',
     'VOICE_NARRATION_MAX_AGE_S',
     'VOICE_NARRATION_FAILURE_RETRY_S',
     'VOICE_NARRATION_EST_CHARS_PER_S',

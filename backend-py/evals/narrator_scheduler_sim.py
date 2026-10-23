@@ -32,7 +32,7 @@ for node in shared_tree.body:
 WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speech_state", "_client_quiet_for",
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
-          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval", "_note_answer_candidate",
+          "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval", "_stale_lead", "_note_answer_candidate",
           "_answer_being_checked"}
 # Module-level helpers (now in chat_session_shared.py) the copied methods call.
 HELPERS = {"_spoken_duration"}
@@ -62,6 +62,8 @@ async def generate_progress_comment(dialogue, language, **kw):
     state["live"] -= 1
     if state["empty"]:
         return ""  # the prompt's own "nothing new" reply
+    if state.get("repeats_unless_told") and consts["VOICE_NARRATION_SAY_ELSE"] not in kw["activity"]:
+        return ""  # a "still working" draft rejected as a repeat, until told to say something else
     return f"remark#{state['calls']} facts={kw['activity'].splitlines()[-1]} said={len(kw['already_said'])}"
 
 voice_api = types.ModuleType("app.plugins.voice_api"); voice_api.generate_progress_comment = generate_progress_comment
@@ -72,6 +74,7 @@ async def synthesize_speech(t, voice, language=None):
     state["live"] += 1; state["max_live"] = max(state.get("max_live", 0), state["live"])
     await asyncio.sleep(1.5 * SCALE); state["live"] -= 1; return "AUDIO"
 voice_api.clean_text_for_speech = clean_text_for_speech; voice_api.synthesize_speech = synthesize_speech
+voice_api.strip_markup_for_speech = lambda t: t  # narrator remarks skip the model cleanup (5703f06)
 voice_api.voice_for_gender = lambda g: "Nova"
 # reply.review for a voice remark (VOICE_NARRATION_REVIEW). REVIEW_S=<seconds> gives it the
 # server's real latency (2.2-3.8s measured) to see what that does to the schedule; the
@@ -132,10 +135,12 @@ def make_session(voice=True, reports=True):
     s.conn_state = {"kind": "connected"}; s.current_turn_suppress_narration = False
     s.small_model_activity = []; s._pending_tool_calls = {}; s.turn_tool_outcomes = {}
     s.last_real_user_question = "найди письмо от Анны про счёт"
+    # Read by _narration_task since 8e1d8d2 (a proactive turn narrates its own task):
+    s.pending_is_real_user = True; s.pending_user_text = s.last_real_user_question; s.approval_bridge_tab_id = None
     s.last_visible_output_at = None; s.consecutive_narration_count = 0; s.pending_interim_notes = []
     s._voice_narration_wake = asyncio.Event(); s._narration_turn_seq = 0
     s._narration_draft_task = None; s.turn_narration_remarks = []
-    s._prepared_narration_stale = False; s._stale_remarks_in_row = 0
+    s._prepared_narration_stale = False; s._stale_remarks_in_row = 0; s._narration_prep_s = None
     s._client_speaking = None; s._client_quiet_since = None; s._client_speech_reported_at = None
     s._last_narration_est_speech_s = 0.0
     s._first_voice_remark_task = None
@@ -150,8 +155,9 @@ def make_session(voice=True, reports=True):
     return s
 
 async def scenario(name, *, turn_s, fact_every=None, voice=True, reports=True, model_delay=3.0, empty=False, first_remark_at=None,
-                   candidate_at=None):
-    events.clear(); state.update(model_delay=model_delay, empty=empty, calls=0, with_audio=[], live=0, max_live=0)
+                   candidate_at=None, repeats_unless_told=False):
+    events.clear(); state.update(model_delay=model_delay, empty=empty, calls=0, with_audio=[], live=0, max_live=0,
+                                 repeats_unless_told=repeats_unless_told)
     global T0; T0 = time.monotonic()
     s = make_session(voice, reports)
     loop = asyncio.create_task(s._voice_narration_loop())
@@ -322,6 +328,30 @@ async def main():
             ("no two lines ever overlap", no_overlap(sp)),
         ]
     all_ok &= report("K", s, ans, ck)
+
+    s, ans = await scenario("L: nothing new, and every 'still working' draft is a repeat until told otherwise",
+                            turn_s=45, fact_every=None, repeats_unless_told=True)
+    def cl(sp, sent, ans):
+        narr = [x for x in sp if x[3]]
+        starts = [x[0] for x in narr]
+        g = [starts[i + 1] - narr[i][1] for i in range(len(narr) - 1)]
+        return [
+            (f"the user still hears remarks (starts {[round(x) for x in starts]})", len(narr) >= 2),
+            (f"no silence over 14s between them (max {max(g, default=0):.1f}s)", all(x <= 14 for x in g)),
+            ("no two lines ever overlap", no_overlap(sp)),
+        ]
+    all_ok &= report("L", s, ans, cl)
+
+    s, ans = await scenario("M: nothing new, and a remark takes ~9.5s to prepare", turn_s=70, fact_every=None, model_delay=8)
+    def cm(sp, sent, ans):
+        narr = [x for x in sp if x[3]]
+        g = [narr[i + 1][0] - narr[i][1] for i in range(len(narr) - 1)]
+        return [
+            (f"silences stay near the interval, the start lead follows the measured prep (gaps {[round(x, 1) for x in g]})",
+             bool(g) and all(x <= consts["VOICE_NARRATION_STALE_MAX_S"] + 1.5 for x in g)),
+            ("no two lines ever overlap", no_overlap(sp)),
+        ]
+    all_ok &= report("M", s, ans, cm)
 
     print("\nALL OK" if all_ok else "\nSOME CHECKS FAILED")
 

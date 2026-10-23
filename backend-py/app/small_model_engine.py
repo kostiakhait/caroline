@@ -90,6 +90,7 @@ from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
+from app.untrusted_text import web_pages_text
 from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
 from app import policies
@@ -469,6 +470,59 @@ class _AttemptAbandoned(BaseException):
 def _abandon_if_cancelled(tracker: "_TurnTracker", parent_cancels: tuple[threading.Event, ...] = ()) -> None:
     if tracker.cancelled.is_set() or _attempt_cancelled() or any(flag.is_set() for flag in parent_cancels):
         raise _AttemptAbandoned()
+
+
+# A verifier call that hangs (2026-10-15..22, from caroline.log: median 3-11s a day,
+# yet 15-30% of checks over 20s, up to 180s -- one 474-char answer waited 46s for a
+# single verifier call) is asked a second time alongside it once it has taken twice
+# what verifier calls have lately been taking (8-20s), and whichever answers first
+# counts. The verifier has no tools, so a second call changes nothing in the world;
+# a tier call (tools: mail, messages) is never doubled like this.
+VERIFIER_HEDGE_MIN_S = 8.0
+VERIFIER_HEDGE_MAX_S = 20.0
+_verifier_seconds: list[float] = []
+
+
+def _verifier_hedge_after() -> float:
+    if len(_verifier_seconds) < 5:
+        return 12.0
+    recent = sorted(_verifier_seconds[-20:])
+    return min(max(2 * recent[len(recent) // 2], VERIFIER_HEDGE_MIN_S), VERIFIER_HEDGE_MAX_S)
+
+
+async def _hedged_verifier_call(make_call: Callable[[], Awaitable[str]], tab_id: str) -> str:
+    started = time.monotonic()
+    first = asyncio.ensure_future(make_call())
+    second: asyncio.Future[str] | None = None
+    try:
+        done, _ = await asyncio.wait({first}, timeout=_verifier_hedge_after())
+        if first in done:
+            _verifier_seconds.append(time.monotonic() - started)
+            return first.result()
+        log_event("engine", "verifier_hedged", tab_id=tab_id, after_s=round(time.monotonic() - started, 1))
+        second = asyncio.ensure_future(make_call())
+        pending = {first, second}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            winner = next(iter(done))
+            if winner.exception() is None or not pending:
+                for late in pending:  # left to finish on its own: cancelling it would mark the whole turn cancelled
+                    late.add_done_callback(lambda t: t.cancelled() or t.exception())
+                _verifier_seconds.append(time.monotonic() - started)
+                log_event("engine", "verifier_hedge_won", tab_id=tab_id, by="second" if winner is second else "first",
+                          s=round(time.monotonic() - started, 1))
+                return winner.result()
+        raise RuntimeError("unreachable")
+    except asyncio.CancelledError:
+        # Stop: the calls are cancelled as the one awaited call used to be (their
+        # watchdog then marks the turn cancelled).
+        for call in (first, second):
+            if call is not None and not call.done():
+                call.cancel()
+        raise
+    finally:
+        del _verifier_seconds[:-20]
+
 
 
 async def _resolve_agentic_with_watchdog(
@@ -1155,13 +1209,15 @@ def _run_web_search_tool(name: str, args: dict[str, Any], ai: Any, cfg: Any) -> 
         if not sources:
             reason = "the search returned no pages"
             continue
-        lines = [f"Web search results for: {question}"]
+        lines = []
         for index, source in enumerate(sources, 1):
             excerpt = " ".join(str(source.get("content") or "").split())[:WEB_SEARCH_EXCERPT_CHARS]
             lines.append(f"{index}. {source.get('title') or '(untitled)'} -- {source['url']}" + (f"\n   {excerpt}" if excerpt else ""))
         if answer:
             lines.append("Summary by the search model (it read the same pages; where it differs from them, trust the pages):\n" + answer)
-        return "\n".join(lines)
+        # Marked as data (2026-10-21), as app_browser_plugin's _UNTRUSTED_DATA_PREFIX does for a
+        # browsed page: the tier reading this has tools that run commands and send files.
+        return f"Web search results for: {question}\n" + web_pages_text("\n".join(lines))
     return (
         f"ERROR: the web search did not work ({reason}); nothing was found out. Do not answer from memory as if it "
         "were current -- say that the search failed, or get the information another way."
@@ -3074,14 +3130,14 @@ async def run_small_model_turn(
             verification_messages.append({"role": "assistant", "content": not_a_form})
             verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text), can_retry)})
         return await _call_with_funds_wait(
-            lambda: _resolve_agentic_with_watchdog(
+            lambda: _hedged_verifier_call(lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
                 messages=verification_messages, tool_defs=None, executor_fn=executor_fn,
                 model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                 reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
                 app="caroline",
-            ),
+            ), tab_id),
             tab_id, emit,
         )
 

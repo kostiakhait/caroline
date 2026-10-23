@@ -184,6 +184,17 @@ function deriveThreadName(t, id) {
   return `${names.slice(0, 3).join(', ')} +${names.length - 3} more`;
 }
 
+// What a value is, for the log -- never what it says. Arguments and results here
+// are people's messages, names and chat lists (the owner's and their contacts');
+// caroline.log keeps the shape of every call, which is what diagnosing needs.
+function shapeOf(v) {
+  if (v === undefined || v === null) return String(v);
+  if (Array.isArray(v)) return `array(${v.length})`;
+  if (typeof v === 'string') return `string(${v.length})`;
+  if (typeof v === 'object') return `object{${Object.keys(v).slice(0, 8).join(',')}}`;
+  return typeof v;
+}
+
 let apiCallSeq = 0;
 // The display name of a message's author (2026-10-23: in a group the notice
 // named only the thread). Remembered per id; a failed lookup gives no name,
@@ -212,7 +223,7 @@ function apiCall(method, ...args) {
   // (sendMessage, getThreadList, createNewGroup, all of it) is covered
   // without needing to instrument each command handler separately.
   const callId = ++apiCallSeq;
-  log(`apiCall#${callId} ${method} starting`, { args });
+  log(`apiCall#${callId} ${method} starting`, { args: args.map(shapeOf).join(', ') });
   return new Promise((resolve, reject) => {
     if (typeof api[method] !== 'function') {
       const err = new Error(`ctx.api.${method} is not a function in this version of fca-unofficial`);
@@ -232,10 +243,7 @@ function apiCall(method, ...args) {
         reject(wrapped);
         return;
       }
-      log(`apiCall#${callId} ${method} succeeded`, {
-        resultType: Array.isArray(result) ? `array(${result.length})` : typeof result,
-        result,
-      });
+      log(`apiCall#${callId} ${method} succeeded`, { resultType: shapeOf(result) });
       resolve(result);
     });
   });
@@ -342,7 +350,7 @@ rl.on('line', async (line) => {
   } catch {
     return;
   }
-  log('command received', { command: msg });
+  log('command received', { cmd: msg.cmd, id: msg.id, fields: Object.keys(msg).join(',') });
   if (!api) {
     log('command rejected: not logged in yet', { cmd: msg.cmd, id: msg.id });
     if (msg.id) emit({ type: 'sendResult', id: msg.id, ok: false, error: 'not logged in yet' });

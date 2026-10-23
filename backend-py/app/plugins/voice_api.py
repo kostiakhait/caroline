@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
@@ -392,8 +393,20 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     from app.evolution_client import run_reply_agent
     from app.microagents.reply_review import REVIEW
 
+    # `timeout` is honored again (2026-10-22): since the review moved to the client
+    # (20739d0) it was accepted and never used, and the voice narrator's
+    # VOICE_NARRATION_REVIEW_TIMEOUT_S (6s, "a review that has not answered in this time
+    # lets the remark go as it was drafted") stopped bounding anything -- measured
+    # 3.2/14.0/5.1s per remark, heard as silences of up to 21.6s. The run is shielded:
+    # past the timeout the caller goes on with its text, and the run itself finishes in
+    # the background, so whatever evolution bookkeeping it does is not cut off midway.
+    job = asyncio.ensure_future(run_reply_agent(REVIEW, {"text": text, "task": task}))
+    job.add_done_callback(lambda j: j.cancelled() or j.exception())  # a late failure is not "never retrieved"
     try:
-        result = await run_reply_agent(REVIEW, {"text": text, "task": task})
+        result = await asyncio.wait_for(asyncio.shield(job), timeout)
+    except asyncio.TimeoutError:
+        log_event("plugin:voice", "review_reply_failed", reason="timeout", timeout_s=timeout)
+        return None
     except Exception as exc:
         log_event("plugin:voice", "review_reply_failed", reason="request_failed", error=str(exc))
         return None
@@ -580,6 +593,38 @@ async def _identify_pending_action_locally(
     output = result.get("output")
     if not isinstance(output, dict) or not isinstance(output.get("action_type"), str):
         log_event("plugin:voice", "permission_identify_local_failed", reason="malformed")
+        return None
+    return output
+
+
+async def judge_file_transfer_locally(
+    direction: str, path_facts: list[str], turn_started_by: str, tool_call: str, task: str, recent_dialogue: str,
+) -> dict[str, Any] | None:
+    """turn.file.transfer (app/microagents/file_transfer.py), run on this client the
+    same way as _identify_pending_action_locally: {"decision", "reason"}, or None when
+    the agent could not run -- the caller lets the call through then, fail-open like
+    every other microagent check here."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents.file_transfer import FILE_TRANSFER, llm_agents as file_transfer_agents
+
+    runtime = build_local_runtime()
+    if runtime is None:
+        return None
+    for agent in file_transfer_agents():
+        try:
+            runtime.register(agent)
+        except ValueError:
+            pass
+    agent_input = {"direction": direction, "path_facts": path_facts, "turn_started_by": turn_started_by,
+                   "tool_call": tool_call, "task": task, "recent_dialogue": recent_dialogue}
+    try:
+        result = await asyncio.to_thread(runtime.run, FILE_TRANSFER, agent_input, runtime.new_context(budget=new_budget()))
+    except Exception as exc:
+        log_event("plugin:voice", "file_transfer_judge_failed", error=str(exc))
+        return None
+    output = result.get("output") if result.get("status") == "ok" else None
+    if not isinstance(output, dict) or output.get("decision") not in ("allow", "ask_owner", "refuse"):
+        log_event("plugin:voice", "file_transfer_judge_failed", reason="bad_status_or_output", status=result.get("status"))
         return None
     return output
 
@@ -1253,6 +1298,13 @@ def _is_repeat(text: str, previous: str, ignore_stems: frozenset[str] = frozense
     a repeat on the strength of "на" and "в"."""
     if _outcomes(text) != _outcomes(previous):
         return False  # before the containment check: "Не нашла ..." contains "Нашла ..."
+    said, before = _durations(text), _durations(previous)
+    if said and before and said != before:
+        # How long it has taken is news when it has grown (2026-10-22): "Уже пять с
+        # половиной минут работаю над этим" was dropped twice as a repeat of "Уже четыре
+        # с половиной минуты работаю над этим" said a minute before -- the very remark
+        # the stale hint asks for -- in a 35s silence.
+        return False
     if _normalized_overlap(text, previous):
         return True
 
@@ -1268,6 +1320,15 @@ def _is_repeat(text: str, previous: str, ignore_stems: frozenset[str] = frozense
 
 # A crude stem: enough to match "Киеве" in a request with "Киева" in a remark.
 _STEM_LEN = 5
+
+# "<up to three words> минут/секунд/час..." -- an elapsed time as said.
+_DURATION = re.compile(r"((?:[\w-]+\s+){1,3}?)(секунд|минут|час|second|minute|hour)\w*", re.IGNORECASE)
+
+
+def _durations(text: str) -> tuple[tuple[str, str], ...]:
+    """The elapsed times a remark states, as (amount words, unit stem)."""
+    said = text.lower().replace("ё", "е")
+    return tuple((" ".join(m.group(1).split()), m.group(2)) for m in _DURATION.finditer(said))
 
 
 def _request_stems(task: str) -> frozenset[str]:
@@ -2100,12 +2161,53 @@ def speech_needs_cleanup(text: str) -> bool:
     return bool(_NEEDS_TTS_CLEANUP.search(text))
 
 
+_MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_HTML_TAG = re.compile(r"<[a-z/][^>]*>", re.IGNORECASE)
+_MD_LINE_PREFIX = re.compile(r"^\s*(?:#{1,6}\s+|>\s?|[-*+•]\s+|\d+[.)]\s+)", re.MULTILINE)
+_MD_RULE = re.compile(r"^\s*(?:[-*_]\s*){3,}$|^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$", re.MULTILINE)
+_MD_EMPHASIS = re.compile(r"(\*\*|\*|~~|`+)(?=\S)(.+?)(?<=\S)\1")
+_MD_UNDERSCORE = re.compile(r"(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\1(?!\w)")  # not inside snake_case
+_TABLE_BAR = re.compile(r"[ \t]*\|[ \t]*")
+_DIGIT = re.compile(r"\d")
+# One attempt, this long: a sentence waits for its sound meanwhile. Measured 2026-10-19 on
+# real answer pieces with an idle server: 1.9-4.4s (median 2.5s); a busy one took 9-14s,
+# and _post_json's defaults (30s x 3 attempts) allowed far more.
+SPEECH_CLEANUP_TIMEOUT_S = 5.0
+
+
+def strip_markup_for_speech(text: str) -> str:
+    """Markdown/HTML down to plain prose, locally: links keep their text, list and
+    header markers, emphasis marks, rules and table bars go."""
+    out = _MD_LINK.sub(r"\1", text)
+    out = _HTML_TAG.sub(" ", out)
+    out = _MD_RULE.sub("", out)
+    out = _MD_LINE_PREFIX.sub("", out)
+    out = _MD_EMPHASIS.sub(r"\2", out)
+    out = _MD_UNDERSCORE.sub(r"\2", out)
+    lines = (_TABLE_BAR.sub(", ", line.strip().strip("|")).strip() for line in out.splitlines())
+    out = "\n".join(line for line in lines if line)
+    out = out.replace("`", "").replace("#", "")
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
 async def clean_text_for_speech(text: str, session: str | None = None) -> str:
     """Strips markdown/HTML formatting and rewrites digits/numerals into
     their spoken, correctly-inflected form before text reaches TTS/Visual
-    Mode."""
+    Mode.
+
+    2026-10-21: the markup goes locally; the model is asked only when digits
+    remain (inflecting "5 книг" is what it is for), for at most
+    SPEECH_CLEANUP_TIMEOUT_S, one attempt. When it does not answer in time the
+    text goes as stripped, digits and all -- the speech service reads digits
+    itself, only without the case agreement."""
     if not speech_needs_cleanup(text):
         return text
+    started = time.monotonic()
+    stripped = strip_markup_for_speech(text)
+    if not _DIGIT.search(stripped):
+        log_event("plugin:voice", "speech_cleanup", how="local", ms=int((time.monotonic() - started) * 1000))
+        return stripped
+    text = stripped
     prompt = (
         "Rewrite the following text so it is ready to be read aloud by a text-to-speech engine. "
         "Perform exactly these transformations, nothing else:\n"
@@ -2128,13 +2230,15 @@ async def clean_text_for_speech(text: str, session: str | None = None) -> str:
         session = await get_cached_v2_session()
     if session:
         body["session"] = session
+    how = "model"
     try:
-        data = await _post_json(body)
-    except Exception:
-        return text
-    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
-        return text
-    return data["result"]
+        data = await asyncio.wait_for(_post_json(body, timeout=SPEECH_CLEANUP_TIMEOUT_S, retries=1), SPEECH_CLEANUP_TIMEOUT_S + 0.5)
+        if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
+            how, data = "model_refused", None
+    except Exception as exc:  # noqa: BLE001 -- the text still goes, as stripped
+        how, data = f"model_failed:{type(exc).__name__}", None
+    log_event("plugin:voice", "speech_cleanup", how=how, ms=int((time.monotonic() - started) * 1000))
+    return data["result"] if data else text
 
 
 async def describe_image_cheap(base64_png: str) -> dict[str, Any]:

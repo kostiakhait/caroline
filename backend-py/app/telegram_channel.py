@@ -51,6 +51,7 @@ from telethon.tl.functions.messages import CreateChatRequest, DeleteChatRequest
 from telethon.tl.types import Channel, Chat, InputPhoneContact
 
 from app.logging_setup import log_event
+from app.untrusted_text import third_party_label, third_party_text
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file, messenger_secrets_dir
 from app.task_supervisor import supervise
 from app.workspace_dir import WORKSPACE_DIR
@@ -429,8 +430,9 @@ async def _start_background(
         if not text and not media:
             return
         sender = await event.get_sender()
-        name = " ".join(filter(None, [getattr(sender, "first_name", None), getattr(sender, "last_name", None)])) \
-            or getattr(sender, "title", None) or str(event.sender_id)
+        name = third_party_label(
+            " ".join(filter(None, [getattr(sender, "first_name", None), getattr(sender, "last_name", None)]))
+            or getattr(sender, "title", None) or str(event.sender_id))
         kind = "DM" if event.is_private else "group mention"
         status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_event("plugin:telegram", "message_received", account=account, kind=kind, chat_id=event.chat_id, has_media=bool(media))
@@ -441,8 +443,9 @@ async def _start_background(
         who = ", ".join(f"{key}={value}" for key, value in entity_fields(sender).items() if key not in ("firstName", "lastName"))
         note = (
             f'[New Telegram {kind} in {_ACCOUNT_LABEL[account]} Telegram account, from "{name}" '
-            f'(sender: {who or f"id={event.sender_id}"}; chat_id={event.chat_id}, message_id={event.id}, '
-            f'account="{account}"):\n{text or "(no caption)"}'
+            f'(sender: {third_party_label(who) if who else f"id={event.sender_id}"}; chat_id={event.chat_id}, message_id={event.id}, '
+            f'account="{account}"):\n'
+            f'{third_party_text(text, name) if text else "(no caption)"}'
         )
         if media:
             note += (

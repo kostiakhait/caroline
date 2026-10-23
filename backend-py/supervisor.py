@@ -45,7 +45,7 @@ from fastapi.responses import JSONResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.logging_setup import log_event  # noqa: E402
-from app.origin_guard import is_cross_origin_browser_request  # noqa: E402
+from app.origin_guard import is_cross_origin_browser_request, is_foreign_host  # noqa: E402
 
 # --- Layout -------------------------------------------------------------
 # CarolineInstaller.AppPaths' layout: Root/app-<hash>/backend-py/
@@ -438,6 +438,9 @@ async def _reject_cross_origin_browser_requests(request: Request, call_next):
     if is_cross_origin_browser_request(request.headers.get("origin"), SUPERVISOR_PORT):
         log_event("supervisor", "rejected_cross_origin", origin=request.headers.get("origin"), path=request.url.path)
         return JSONResponse({"ok": False, "error": "Cross-origin requests are not allowed."}, status_code=403)
+    if is_foreign_host(request.headers.get("host")):
+        log_event("supervisor", "rejected_foreign_host", host=request.headers.get("host"), path=request.url.path)
+        return JSONResponse({"ok": False, "error": "Requests must address 127.0.0.1 or localhost."}, status_code=403)
     return await call_next(request)
 
 

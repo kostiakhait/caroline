@@ -33,7 +33,8 @@ from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server,
 from app import memory_nudge
 from app.durability import clear_pending_operation, save_pending_operation
 from app.logging_setup import log_event
-from app.session_context import check_send_action, get_action_closer, get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
+from app.file_facts import file_transfers_in
+from app.session_context import check_file_transfer, check_send_action, get_action_closer, get_inject_proactive, get_permission_block, get_reply_watch, get_tab_id
 from app.workspace_dir import WORKSPACE_DIR
 
 # How long dispatch() waits before giving up on returning a "done" result
@@ -276,6 +277,14 @@ async def dispatch(
         if send_blocked_reason:
             log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved_send", tool=tool_name, reason=send_blocked_reason)
             return {"operation_id": "", "status": "error", "error": f"Blocked: {send_blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}
+    # A local file leaving the machine, or a received one being written (2026-10-22):
+    # the session's turn.file.transfer microagent decides, from what is known about
+    # the path (app/file_facts.py) and the conversation.
+    if file_transfers_in(tool_name, args):
+        file_blocked_reason = await check_file_transfer(tab_id, tool_name, args)
+        if file_blocked_reason:
+            log_event(f"plugin:{plugin_name}", "operation_blocked_file_transfer", tool=tool_name, reason=file_blocked_reason)
+            return {"operation_id": "", "status": "error", "error": f"Blocked: {file_blocked_reason}"}
     op = REGISTRY.create(tool_name, tab_id=tab_id)
     memory_note = memory_nudge.note_tool_call(op.tab_id, tool_name)
 

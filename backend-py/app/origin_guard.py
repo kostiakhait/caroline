@@ -34,3 +34,23 @@ def is_cross_origin_browser_request(origin_header: str | None, port: int) -> boo
         return False
     allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", CAROLINE_FRONTEND_ORIGIN}
     return origin_header not in allowed
+
+
+_LOOPBACK_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_foreign_host(host_header: str | None) -> bool:
+    """True when a request to a loopback listener names some other host. The
+    Origin check above does not cover a page whose own domain was re-pointed at
+    127.0.0.1 (DNS rebinding): its requests are same-origin to it, so a GET
+    carries no Origin at all, and it can read the response. Its Host header
+    still names its own domain. Every real caller here addresses 127.0.0.1 or
+    localhost; no Host header at all (HTTP/1.0) is let through."""
+    if not host_header:
+        return False
+    host = host_header.strip().lower()
+    if host.startswith("["):  # [::1]:port
+        host = host[1:host.find("]")] if "]" in host else host
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host not in _LOOPBACK_HOSTNAMES

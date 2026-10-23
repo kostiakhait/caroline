@@ -162,6 +162,24 @@ async def check_send_action(tab_id: str | None, tool_name: str, args: "dict[str,
     return await fn(tool_name, args) if fn else None
 
 
+_file_transfer_guard_by_tab: dict[str, SendActionGuardFn] = {}
+
+
+def register_file_transfer_guard(tab_id: str, fn: SendActionGuardFn) -> None:
+    """Same shape as register_send_action_guard, for a tool call that sends a local
+    file off the machine or writes a received one (app/file_facts.py's
+    file_transfers_in): dispatch() awaits it before the real handler runs, and the
+    session's turn.file.transfer microagent decides (2026-10-22)."""
+    _file_transfer_guard_by_tab[tab_id] = fn
+
+
+async def check_file_transfer(tab_id: str | None, tool_name: str, args: "dict[str, Any]") -> str | None:
+    """The reason this call's file transfer must not happen now, or None. No live
+    session, no guard -- same non-fatal shape as check_send_action."""
+    fn = _file_transfer_guard_by_tab.get(tab_id) if tab_id else None
+    return await fn(tool_name, args) if fn else None
+
+
 def register_send_for_tab(tab_id: str, fn: SendFn) -> None:
     """Per explicit instruction (2026-10-11): lets a background channel
     loop (e.g. app/whatsapp_channel.py's sidecar event handler) push a WS

@@ -35,7 +35,7 @@ from app.openai_mode import get_own_openai_api_key, openai_available, set_own_op
 from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
-from app.origin_guard import is_cross_origin_browser_request
+from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
 from app.persona import get_persona, get_persona_edit_state, get_persona_gender, reset_profile, save_custom_persona, save_profile_override, set_profile_key
 from app.plugins.files_plugin import open_file_with_default_app
 from app.plugins.notes_api import load_credentials
@@ -162,32 +162,62 @@ async def _require_remote_owner_session(request: Request, call_next):
         if is_cross_origin_browser_request(request.headers.get("origin"), PORT):
             log_event("engine", "local_api_rejected_cross_origin", origin=request.headers.get("origin"), path=request.url.path)
             return JSONResponse({"ok": False, "error": "Cross-origin requests are not allowed."}, status_code=403)
+        if is_foreign_host(request.headers.get("host")):
+            log_event("engine", "local_api_rejected_foreign_host", host=request.headers.get("host"), path=request.url.path)
+            return JSONResponse({"ok": False, "error": "Requests must address 127.0.0.1 or localhost."}, status_code=403)
         return await call_next(request)
 
+    rejection = await _remote_owner_rejection(request.headers.get("authorization") or "")
+    if rejection is not None:
+        status, error = rejection
+        return JSONResponse({"ok": False, "error": error}, status_code=status)
+    log_event("engine", "remote_auth_ok", path=request.url.path)
+    return await call_next(request)
+
+
+async def _remote_owner_rejection(auth_header: str) -> tuple[int, str] | None:
+    """The REMOTE_PORT gate, for HTTP requests (the middleware above) and
+    WebSocket handshakes (ws_endpoint) alike: None when the caller presents a
+    SquirrelWisdom session of this Caroline's own account, else (status, error)."""
     owner_email = logged_in_email()
     if not owner_email:
         # Caroline herself isn't logged into SW -- there is no account to
         # compare a remote caller's session against, so nothing can be
         # proven safe to let through.
-        return JSONResponse({"ok": False, "error": "Caroline is not logged into SquirrelWisdom; remote access is unavailable."}, status_code=503)
+        return 503, "Caroline is not logged into SquirrelWisdom; remote access is unavailable."
 
-    auth_header = request.headers.get("authorization") or ""
     token = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
     if not token:
-        return JSONResponse({"ok": False, "error": 'Missing "Authorization: Bearer <SquirrelWisdom session>" header.'}, status_code=401)
+        return 401, 'Missing "Authorization: Bearer <SquirrelWisdom session>" header.'
 
     try:
         caller_email = await get_session_user(token)
     except Exception as exc:
         log_event("engine", "remote_auth_sw_lookup_failed", error=str(exc))
-        return JSONResponse({"ok": False, "error": "Could not verify session with SquirrelWisdom right now."}, status_code=502)
+        return 502, "Could not verify session with SquirrelWisdom right now."
 
     if not caller_email or caller_email.strip().lower() != owner_email.strip().lower():
         log_event("engine", "remote_auth_rejected", caller_email=caller_email)
-        return JSONResponse({"ok": False, "error": "This SquirrelWisdom session does not belong to this Caroline's own account."}, status_code=403)
+        return 403, "This SquirrelWisdom session does not belong to this Caroline's own account."
+    return None
 
-    log_event("engine", "remote_auth_ok", caller_email=caller_email, path=request.url.path)
-    return await call_next(request)
+
+async def _websocket_rejection(websocket: WebSocket) -> str | None:
+    """The same gates as the middleware above, for a WebSocket handshake: that
+    middleware never sees one (Starlette's BaseHTTPMiddleware passes every
+    non-"http" scope straight through), so before this the chat socket on both
+    listeners took any connection -- from any web page the user had open, and on
+    REMOTE_PORT (0.0.0.0) from anyone on the same network -- and whatever came
+    in on it was the user speaking."""
+    server = websocket.scope.get("server")
+    if server and server[1] == REMOTE_PORT:
+        rejection = await _remote_owner_rejection(websocket.headers.get("authorization") or "")
+        return rejection[1] if rejection is not None else None
+    if is_cross_origin_browser_request(websocket.headers.get("origin"), PORT):
+        return f"cross-origin ({websocket.headers.get('origin')})"
+    if is_foreign_host(websocket.headers.get("host")):
+        return f"foreign host ({websocket.headers.get('host')})"
+    return None
 
 
 sessions: dict[str, ChatSession] = {}
@@ -1769,6 +1799,11 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # ?tab= lands on the primary tab, same as every single-session client
     # before multi-tab existed.
     tab_id = websocket.query_params.get("tab", PRIMARY_TAB_ID)
+    rejection = await _websocket_rejection(websocket)
+    if rejection is not None:
+        log_event("ws", "rejected", tab_id=tab_id, reason=rejection)
+        await websocket.close(code=1008)  # policy violation, before accept: the handshake fails
+        return
     await websocket.accept()
     log_event("ws", "connected", tab_id=tab_id)
 

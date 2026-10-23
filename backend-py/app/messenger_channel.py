@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
+from app.untrusted_text import third_party_label, third_party_text
 from app.plugins.app_browser_plugin import _call as _app_browser_call
 from app.secret_store import messenger_secrets_dir
 from app.sidecar_process import SidecarProcess
@@ -437,14 +438,15 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             if not text:
                 return
             thread_id = msg.get("threadID") or "unknown"
-            name = msg.get("chatName") or thread_id
+            name = third_party_label(msg.get("chatName") or thread_id)
             _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             log_event("plugin:messenger", "message_received", account=account, thread_id=thread_id)
             note = (
                 f'[New Messenger message in {_ACCOUNT_LABEL[account]} Messenger account, from "{name}" '
                 f'(threadID={thread_id}, senderID={msg.get("senderID")}'
-                + (f', senderName="{msg["senderName"]}"' if msg.get("senderName") else "")
-                + f', account="{account}"):\n{text}'
+                + (f', senderName="{third_party_label(msg["senderName"])}"' if msg.get("senderName") else "")
+                + f', account="{account}"):\n'
+                f'{third_party_text(text, name)}'
             )
             media = msg.get("media")
             attachment_ref = msg.get("attachmentRef")

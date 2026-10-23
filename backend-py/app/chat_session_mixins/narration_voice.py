@@ -5,12 +5,17 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 class VoiceNarrationMixin:
     async def _synthesize_narration_audio(self, comment: str) -> str | None:
-        """Same pipeline as main.py's "tts" control op. None on any failure -- chat.js
-        then synthesizes on its own, exactly as before."""
-        from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, voice_for_gender
+        """Same pipeline as main.py's "tts" control op, without its model call. None on
+        any failure -- chat.js then synthesizes on its own, exactly as before.
+
+        No model cleanup (2026-10-21): the narrator already writes numbers out in words
+        (its prompt says so); the digits left are names from the request ("iPhone 17"),
+        which the speech service reads as they are. Live 2026-10-17 that call cost a
+        remark 9s of silence on a busy server."""
+        from app.plugins.voice_api import strip_markup_for_speech, synthesize_speech, voice_for_gender
 
         try:
-            cleaned = await clean_text_for_speech(comment)
+            cleaned = strip_markup_for_speech(comment)
             iso = {"Russian": "ru", "English": "en"}.get(current_language_name(self.tab_id))
             return await synthesize_speech(cleaned, voice_for_gender(get_persona_gender(self.workspace_dir)), language=iso)
         except asyncio.CancelledError:
@@ -134,6 +139,14 @@ class VoiceNarrationMixin:
     def _stale_interval(self) -> float:
         """Silence before the next remark with nothing new -- see VOICE_NARRATION_STALE_STEP_S."""
         return min(VOICE_NARRATION_STALE_S + VOICE_NARRATION_STALE_STEP_S * self._stale_remarks_in_row, VOICE_NARRATION_STALE_MAX_S)
+    def _stale_lead(self) -> float:
+        """How long before the stale interval is up a "nothing new" draft starts: what
+        drafting, review and audio have actually been taking (_narration_prep_s, measured),
+        never less than VOICE_NARRATION_STALE_LEAD_S. Measured 2026-10-22: 8-10s (two
+        narrator models when the first repeats itself, a review of up to 6s) against the
+        fixed 5s lead, so the silences heard were 12-18s where the interval says 10-14."""
+        lead = max(VOICE_NARRATION_STALE_LEAD_S, self._narration_prep_s or 0.0)
+        return min(lead, self._stale_interval() - VOICE_NARRATION_AFTER_SPEECH_GAP_S)
     async def _step_voice_narration(self) -> None:
         if not self._voice_narration_applies():
             return
@@ -201,7 +214,7 @@ class VoiceNarrationMixin:
             # counted from the later of the last draft and the end of the last speech.
             last = self._narration_last_draft_at or started
             wait = self._stale_interval() - VOICE_NARRATION_STALE_LEAD_S
-            if now - last < wait or self._client_quiet_for(now) < wait:
+            if now - last < wait or self._client_quiet_for(now) < self._stale_interval() - self._stale_lead():
                 return
         self._narration_facts_at_last_draft = facts
         self._narration_last_draft_at = now
@@ -223,8 +236,7 @@ class VoiceNarrationMixin:
                 # Data, not a new rule: how many "still working" remarks went before, so the
                 # next one can say something else -- how long it has taken, where the work is.
                 facts_for_model += (
-                    f"\nRemarks in a row with nothing new so far: {self._stale_remarks_in_row} -- the user already knows "
-                    "the work is still going on; say how long it has taken so far, or which part is being done now."
+                    f"\nRemarks in a row with nothing new so far: {self._stale_remarks_in_row} -- {VOICE_NARRATION_SAY_ELSE}"
                 )
         already_said = list(self.turn_narration_remarks)
         if self._first_voice_remark is not None and self._first_voice_remark not in already_said:
@@ -249,11 +261,18 @@ class VoiceNarrationMixin:
         log_event("engine", "voice_narration_drafted", tab_id=self.tab_id, comment=remark, first=True)
         self._voice_narration_wake.set()
     async def _draft_voice_narration(self, turn_seq: int, facts: str, task: str, already_said: list[str], stale: bool = False) -> None:
+        started = time.monotonic()
         try:
             await self._draft_voice_narration_body(turn_seq, facts, task, already_said, stale)
         finally:
             if turn_seq == self._narration_turn_seq:
                 self._narration_draft_task = None
+            # What a remark takes from the start of drafting until it is ready to be said
+            # (see _stale_lead): a running average over the remarks that got that far.
+            prepared = self._prepared_narration
+            if prepared is not None and prepared[1] >= started:
+                took = prepared[1] - started
+                self._narration_prep_s = took if self._narration_prep_s is None else 0.7 * self._narration_prep_s + 0.3 * took
     async def _draft_voice_narration_body(self, turn_seq: int, facts: str, task: str, already_said: list[str], stale: bool = False) -> None:
         from app.plugins.voice_api import generate_progress_comment
 
@@ -297,6 +316,16 @@ class VoiceNarrationMixin:
             # The turn ended (or a new one started) while drafting -- this remark is about a
             # state nobody is waiting on any more.
             log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=bool(comment))
+            return
+        if comment == "" and stale and VOICE_NARRATION_SAY_ELSE not in facts:
+            # Once more, told outright to say something else (2026-10-22): with nothing new
+            # to tell, the model wrote "Я всё ещё ищу цены на iPhone 17 ..." six drafts
+            # running, each rightly rejected as a repeat of "Ищу цены на iPhone 17 ...",
+            # and the user heard nothing for 21.6s.
+            log_event("engine", "voice_narration_stale_redraft", tab_id=self.tab_id)
+            await self._draft_voice_narration_body(
+                turn_seq, f"{facts}\nThat was already said, in other words -- {VOICE_NARRATION_SAY_ELSE}", task, already_said, stale,
+            )
             return
         if comment == "":
             # Nothing new (or only a repeat). No cooldown needed: the next draft already
