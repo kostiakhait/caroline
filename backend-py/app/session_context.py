@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable
 SendFn = Callable[[dict[str, Any]], Awaitable[None]]
 InjectProactiveFn = Callable[[str], bool]
 CliPidSinkFn = Callable[[int], None]
-PermissionBlockerFn = Callable[[], "str | None"]
+PermissionBlockerFn = Callable[[str, "dict[str, Any]"], "str | None"]
 SendActionGuardFn = Callable[[str, "dict[str, Any]"], Awaitable["str | None"]]
 ReplyWatchFn = Callable[[str, dict, Any], None]
 RecentDirectivesFn = Callable[[], str]
@@ -120,14 +120,14 @@ def register_permission_blocker(tab_id: str, fn: PermissionBlockerFn) -> None:
     _permission_blocker_by_tab[tab_id] = fn
 
 
-def get_permission_block(tab_id: str | None) -> str | None:
+def get_permission_block(tab_id: str | None, tool_name: str = "", args: "dict[str, Any] | None" = None) -> str | None:
     """The reason a tool call must not run right now, or None when nothing
     is blocking this tab. Calling this is also how the blocker gets
     consumed/cleared on the ChatSession side (see its own
     _on_permission_block_checked) -- this function itself never caches or
     mutates anything, it just forwards to whatever the tab registered."""
     fn = _permission_blocker_by_tab.get(tab_id) if tab_id else None
-    return fn() if fn else None
+    return fn(tool_name, args or {}) if fn else None
 
 
 # Every live ChatSession's send-action guard by tab id (see register_send_action_guard).

@@ -64,6 +64,14 @@ class EngineLifecycleMixin:
         self._clear_mcp_reconnect_timers()
         if self.client:
             asyncio.create_task(self._safe_interrupt())
+        # An sw turn ends with the session too, as a Claude turn does above (2026-10-22):
+        # it was left running -- on the test box a disposed tab's cascade went on calling
+        # its model until the backend was restarted. Cancelling the task is what Stop
+        # does; the watchdog then flags the attempt and its thread ends.
+        sw_turn = getattr(self, "_small_model_task", None)
+        if sw_turn is not None and not sw_turn.done():
+            log_event("engine", "dispose_cancelled_sw_turn", tab_id=self.tab_id)
+            sw_turn.cancel()
         REGISTRY.cancel_for_tab(self.tab_id)
         self._queue_event.set()
     def force_restart(self) -> None:

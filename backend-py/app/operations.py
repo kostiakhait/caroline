@@ -259,7 +259,7 @@ async def dispatch(
     Only a guarded action (see _guarded_action) consults that check: anything
     else runs, and the pending block stays armed for the action itself."""
     tab_id = get_tab_id()
-    blocked_reason = get_permission_block(tab_id) if _guarded_action(tool_name) else None
+    blocked_reason = get_permission_block(tab_id, tool_name, args) if _guarded_action(tool_name) else None
     if blocked_reason:
         log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved", tool=tool_name, reason=blocked_reason)
         return {"operation_id": "", "status": "error", "error": f"Blocked: {blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}

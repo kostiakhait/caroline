@@ -9,9 +9,29 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 # constant, not user-configurable for v1.
 REACTION_SCORE_BACKPROP_THRESHOLD = 0.2
 
+# Never repeated to the model in the note below: the blocked call's credentials.
+_NOTE_HIDDEN_ARGS = frozenset({"password", "imapHost", "imapPort", "smtpHost", "smtpPort", "key", "token", "session"})
+_NOTE_ARG_MAX_CHARS = 4000
+
+
+def _blocked_call_note(tool_name: str, args: dict[str, Any] | None) -> str:
+    """The blocked call itself, for the note that starts the next turn (2026-10-22,
+    explicit instruction: "черновик в заметку"). The stopped turn is not in the next
+    turn's history, so the draft it had made -- recipient, subject, text -- was gone:
+    on the sw test box the next turn asked whether to draft a reply, and a stronger
+    tier went looking for the draft in files."""
+    if not tool_name:
+        return ""
+    shown = {k: v for k, v in (args or {}).items() if k not in _NOTE_HIDDEN_ARGS and v not in (None, "", [], {})}
+    body = json.dumps(shown, ensure_ascii=False, default=str)[:_NOTE_ARG_MAX_CHARS]
+    return (
+        f"\n[The call that was stopped: {tool_name} with {body}. That is your draft -- show the user exactly "
+        "what it would send and to whom, and ask whether to send it.]"
+    )
+
 
 class PermissionGuardMixin:
-    def _on_permission_block_checked(self) -> str | None:
+    def _on_permission_block_checked(self, tool_name: str = "", args: dict[str, Any] | None = None) -> str | None:
         """Per explicit instruction (2026-10-11): registered with
         session_context's register_permission_blocker, called by
         app/operations.py's dispatch() right before every send-type or money
@@ -95,7 +115,7 @@ class PermissionGuardMixin:
                 if escalate:
                     asyncio.ensure_future(self._send_permission_guard_direct_ask(reason))
                     return
-                note = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason)
+                note = PERMISSION_NOTE_TEXT_TEMPLATE.format(reason=reason) + _blocked_call_note(tool_name, args)
                 if stopping_sw_turn is not None and not stopping_sw_turn.done():
                     def _explain_after_stop(_task: asyncio.Task[None]) -> None:
                         if not self.ended:
