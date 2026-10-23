@@ -31,11 +31,11 @@ import random
 from typing import Any
 
 from app import evolution_journal
-from app.evolvable_roles_client import EVOLVABLE_ROLES, ladder_from_json, resolve_agent_for_clone
+from app.evolvable_roles_client import EVOLVABLE_ROLES, ladder_from_json, ladder_to_json, resolve_agent_for_clone, seed_genome
 from app.logging_setup import log_event
-from app.microagent_client import build_local_runtime, new_budget
+from app.microagent_client import Microagent as M, build_local_runtime, new_budget
 from app.microagents import mutator, selector
-from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json
+from app.plugins.sw_api import CAROLINE_SW_KEY, SessionExpiredError, SessionManager, _post_json
 
 # role -> the api_path string reforce's microagent_evolution_settings/
 # microagent_clones/microagent_tournaments key on -- kept identical to each
@@ -61,10 +61,22 @@ def _safe_json(value: Any) -> str:
         return str(value)
 
 
+_sessions = SessionManager()
+
+
 async def _evolution_post(command: str, **fields: Any) -> dict[str, Any] | None:
-    body = {"command": command, "key": CAROLINE_SW_KEY, **fields}
+    """One evolution: command, made with the user's SW session (2026-10-22): the
+    server keeps this client's evolution per SW account -- every machine the
+    account runs Caroline on shares it -- and takes the account from the session."""
+    async def post(session: str) -> dict[str, Any]:
+        data = await _post_json({"command": command, "key": CAROLINE_SW_KEY, "session": session, **fields}, timeout=30.0, retries=1)
+        reason = str(data.get(".reason") or "")
+        if data.get(".status") != "ok" and "session" in reason.lower():
+            raise SessionExpiredError(reason)
+        return data
+
     try:
-        data = await _post_json(body, timeout=30.0, retries=1)
+        data = await _sessions.with_session(post)
     except Exception as exc:
         log_event("engine", "evolution_client_request_failed", command=command, error=str(exc))
         return None
@@ -112,6 +124,34 @@ def _run_pair_sync(champion: Any, challenger: Any, agent_input: dict[str, Any]) 
     return results[0], results[1]
 
 
+async def _resolve(api_path: str, role: str, seed_version: str) -> dict[str, Any] | None:
+    resolved = await _evolution_post("evolution:resolveCalls", apiPath=api_path, calls=[{"role": role, "seedVersion": seed_version}])
+    results = (resolved or {}).get("results")
+    return results[0] if isinstance(results, list) and len(results) == 1 else None
+
+
+def _ladder_summary(ladder: Any) -> str:
+    """The mutator's view of a ladder -- same text as reforce's Api2Evolution._ladder_summary."""
+    parts = []
+    for r in ladder or M.LADDER:
+        label = r.model_class + (" (with rejection reason)" if r.with_rejection_reason else "")
+        if r.reasoning:
+            label += f", reasoning={r.reasoning}"
+        parts.append(label)
+    return " -> ".join(parts)
+
+
+def _new_ladder(ladder_change: str, parent_ladder: Any) -> Any:
+    """A new clone's ladder from the mutator's ladder_change -- computed here, by the
+    client that owns the agent (the server stores it as given); same mapping as
+    reforce's own mint_clone for server roles."""
+    if ladder_change == "widen_to_mini_first":
+        return (M.Rung(M.MODEL_MINI, False, None), M.Rung(M.MODEL_MINI, True, None))
+    if ladder_change == "narrow_to_nano_only":
+        return (M.Rung(M.MODEL_NANO, False, M.REASONING_LOW), M.Rung(M.MODEL_NANO, True, M.REASONING_LOW))
+    return parent_ladder
+
+
 async def run_reply_agent(
     role: str, agent_input: dict[str, Any], *,
     workspace_dir: str | None = None, action_id: str | None = None, track_id: str | None = None,
@@ -143,44 +183,61 @@ async def run_reply_agent(
     default_agent = entry.parent_agent()
     api_path = API_PATH_BY_ROLE[role]
 
-    resolution: dict[str, Any] | None = None
-    resolved = await _evolution_post("evolution:resolveCalls", apiPath=api_path, calls=[{"role": role}])
-    if resolved is not None:
-        results = resolved.get("results")
-        if isinstance(results, list) and len(results) == 1:
-            resolution = results[0]
+    # 2026-10-22: the server is the genome's one source of truth -- per SW account,
+    # it keeps this role's evolution and always hands back the current genome. This
+    # client only initializes it: the agent's version goes with every call, and the
+    # server answers "seed_needed" when it has no seed yet, or one from an older
+    # version (explicit re-initialization -- an edit of the text alone does not).
+    seed_text, seed_ladder_json, seed_version = seed_genome(role)
+    resolution = await _resolve(api_path, role, seed_version)
+    if resolution is not None and resolution.get("mode") == "seed_needed":
+        registered = await _evolution_post(
+            "evolution:registerSeed", apiPath=api_path, role=role, rulesText=seed_text,
+            ladderJson=seed_ladder_json, seedVersion=seed_version,
+        )
+        log_event("engine", "evolution_seed_registered", role=role, version=seed_version,
+                  outcome=(registered or {}).get("outcome"))
+        resolution = await _resolve(api_path, role, seed_version) if registered is not None else None
 
-    if resolution is None or (resolution.get("mode") == "plain" and resolution.get("rulesText") is None):
-        # No server resolution available (network hiccup, or no
-        # EvolvableRoles entry at all server-side) -- the role's own plain
-        # code-defined agent, unmodified. Same zero-overhead common path as
-        # today whenever nothing is evolving.
+    if resolution is None or resolution.get("mode") == "seed_needed" or (resolution.get("mode") == "plain" and resolution.get("rulesText") is None):
+        # No answer from the server (network, no session) -- the role's own seed,
+        # from this client's code.
+        log_event("engine", "evolution_genome_ran", role=role, genome="seed (local)", reason="no server answer")
         return await asyncio.to_thread(_run_sync, default_agent, agent_input)
 
     mode = resolution.get("mode")
     if mode == "plain":
+        log_event("engine", "evolution_genome_ran", role=role, genome=resolution["agentName"])
         agent = resolve_agent_for_clone(role, resolution["agentName"], resolution["rulesText"], ladder_from_json(resolution.get("ladderJson")))
         return await asyncio.to_thread(_run_sync, agent, agent_input)
 
     if mode == "mutate_needed":
-        mutate_result = await asyncio.to_thread(_run_sync, mutator.llm_agents()[0], resolution["mutatorInput"])
+        champion = resolution["championClone"]
+        parent_ladder = ladder_from_json(champion.get("ladderJson"))
+        mutator_input = {
+            "purpose": default_agent.description, "parent_rules_text": champion["rulesText"],
+            "parent_ladder_summary": _ladder_summary(parent_ladder),
+        }
+        mutate_result = await asyncio.to_thread(_run_sync, mutator.llm_agents()[0], mutator_input)
         minted = None
         if mutate_result.get("status") == "ok":
             mutated = mutate_result["output"]
             minted = await _evolution_post(
                 "evolution:mintClone", apiPath=api_path, role=role,
                 mutatedRulesText=mutated["mutated_rules_text"], ladderChange=mutated["ladder_change"],
+                ladderJson=ladder_to_json(_new_ladder(mutated["ladder_change"], parent_ladder)),
                 rationale=mutated.get("rationale"),
             )
         if minted is None or "result" not in minted:
-            # Mutation (or minting) failed -- fall back to the champion
-            # genome resolve_calls already handed us; never block the real
-            # call on this.
-            champion = resolution["championClone"]
-            agent = resolve_agent_for_clone(role, champion["agentName"], champion["rulesText"], ladder_from_json(champion.get("ladderJson")))
+            # Mutation (or minting) failed -- the current genome the server just
+            # handed us; never block the real call on this.
+            log_event("engine", "evolution_genome_ran", role=role, genome=champion["agentName"], reason="mint failed")
+            agent = resolve_agent_for_clone(role, champion["agentName"], champion["rulesText"], parent_ladder)
             return await asyncio.to_thread(_run_sync, agent, agent_input)
         resolution = minted["result"]
         mode = "tournament"
+    log_event("engine", "evolution_genome_ran", role=role, genome="tournament",
+              champion=resolution["champion"]["agentName"], challenger=resolution["challenger"]["agentName"])
 
     # mode == "tournament"
     champion_g, challenger_g = resolution["champion"], resolution["challenger"]

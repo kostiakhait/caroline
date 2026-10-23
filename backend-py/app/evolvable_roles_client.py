@@ -5,14 +5,15 @@ EXECUTE on that product's own client, never on the server -- see
 app/evolution_client.py's own module docstring for the full protocol this
 supports.
 
-Reforce's EvolvableRoles.py stays the source of truth for the GENOME
-(seed_rules_text) and the structural contract (input_schema/output_schema/
-verify/is_empty/description) -- it still resolves/validates clone shapes for
-the three new server commands (evolution:resolveCalls/mintClone/
-recordOutcome). This file is the client-side counterpart that actually
-BUILDS a runnable M.Agent from a (rules_text, ladder) genome the server
-handed back, exactly like resolve_agent_for_clone does there -- same safety
-property: every fixed field is copied verbatim from the role's own vendored
+The agents themselves live here (2026-10-22): their structural contract
+(input_schema/output_schema/verify/is_empty/description) and the seed they
+start from (seed_rules_text) -- reforce's EvolvableRoles.py no longer lists
+them. The GENOME's one source of truth is the server: per SW account it keeps
+the seed this client initialized it with (seed_genome, evolution:registerSeed
+-- again only from a newer agent version), clones with their texts,
+tournaments and the champion, and always hands back the current genome. This
+file BUILDS a runnable M.Agent from whatever (rules_text, ladder) genome the
+server hands back: every fixed field is copied verbatim from the role's own
 agent module, only `build_prompt`/`ladder` ever differ.
 
 Only the 8 `reply:` domain roles are covered here (the `memory:` domain
@@ -51,31 +52,40 @@ class EvolvableRole:
 
     parent_agent: Callable[[], Any]
     render: Callable[[str, Any], str]
+    # The role's seed rules text, read fresh like parent_agent -- registered on the
+    # server as this role's seed genome (see seed_genome below).
+    seed_rules_text: Callable[[], str] = lambda: ""
 
 
 EVOLVABLE_ROLES: dict[str, EvolvableRole] = {
     permission_guard.GUARD: EvolvableRole(
         parent_agent=lambda: permission_guard.llm_agents()[0],
+        seed_rules_text=lambda: permission_guard.GUARD_RULES_TEXT,
         render=lambda rules_text, input: rules_text + permission_guard._data_section(input),
     ),
     refusal_guard.GUARD: EvolvableRole(
         parent_agent=lambda: refusal_guard.llm_agents()[0],
+        seed_rules_text=lambda: refusal_guard.GUARD_RULES_TEXT,
         render=lambda rules_text, input: rules_text + refusal_guard._data_section(input),
     ),
     reply_review.REVIEW: EvolvableRole(
         parent_agent=lambda: reply_review.llm_agents()[0],
+        seed_rules_text=lambda: reply_review.REVIEW_RULES_TEXT,
         render=lambda rules_text, input: rules_text + reply_review._data_section(input),
     ),
     action_summary.SUMMARY: EvolvableRole(
         parent_agent=lambda: action_summary.llm_agents()[0],
+        seed_rules_text=lambda: action_summary.SUMMARY_RULES_TEXT,
         render=lambda rules_text, input: rules_text + action_summary._data_section(input),
     ),
     reply_expected.EXPECTED: EvolvableRole(
         parent_agent=lambda: reply_expected.llm_agents()[0],
+        seed_rules_text=lambda: reply_expected.EXPECTED_RULES_TEXT,
         render=lambda rules_text, input: rules_text + reply_expected._data_section(input),
     ),
     background_relay_worth.WORTH: EvolvableRole(
         parent_agent=lambda: background_relay_worth.llm_agents()[0],
+        seed_rules_text=lambda: background_relay_worth.WORTH_RULES_TEXT,
         render=lambda rules_text, input: (
             rules_text.replace("{{TASK_CLAUSE}}", background_relay_worth._task_clause(input))
             + background_relay_worth._data_section(input)
@@ -83,6 +93,7 @@ EVOLVABLE_ROLES: dict[str, EvolvableRole] = {
     ),
     content_summary.SUMMARIZE: EvolvableRole(
         parent_agent=lambda: content_summary.llm_agents()[0],
+        seed_rules_text=lambda: content_summary.SUMMARIZE_RULES_TEXT,
         render=lambda rules_text, input: (
             rules_text.replace("{{TARGET_CHARS}}", str(int(input.get("target_chars") or content_summary.DEFAULT_TARGET_CHARS)))
             + content_summary._data_section(input)
@@ -90,6 +101,7 @@ EVOLVABLE_ROLES: dict[str, EvolvableRole] = {
     ),
     reply_translate.TRANSLATE: EvolvableRole(
         parent_agent=lambda: reply_translate.llm_agents()[0],
+        seed_rules_text=lambda: reply_translate.TRANSLATE_RULES_TEXT,
         render=lambda rules_text, input: (
             rules_text.replace("{{LANGUAGE}}", input["language"]) + reply_translate._data_section(input)
         ),
@@ -147,3 +159,14 @@ def resolve_agent_for_clone(role: str, clone_name: str, rules_text: str, ladder:
         ladder=ladder,
         deadline_s=parent.deadline_s,
     )
+
+
+def seed_genome(role: str) -> tuple[str, Optional[str], str]:
+    """(rules text, ladder JSON, agent version) of the role's seed as this client's
+    code has it (2026-10-22). The server is the genome's one source of truth: the
+    client initializes it with this seed when the server has none, and re-initializes
+    it only from a NEWER agent version -- an edit of the text alone never reaches the
+    server; bump the agent's version to send it."""
+    entry = EVOLVABLE_ROLES[role]
+    parent = entry.parent_agent()
+    return entry.seed_rules_text(), ladder_to_json(parent.ladder), str(parent.version)
