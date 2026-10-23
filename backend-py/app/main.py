@@ -63,6 +63,7 @@ from app.plugins.companion_sms_store import (
     load_store as companion_load_sms_store,
 )
 from app.plugins.memory_plugin import start_save_drain_loop, start_topic_prefetch_loop
+from app.sw_tier_stats import start_sync_loop as start_tier_stats_sync_loop
 from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
@@ -516,6 +517,8 @@ async def _start_ratatosk_background_loops() -> None:
     # helpers directly, same as _refresh_topics_if_stale already does.
     start_save_drain_loop()
     start_topic_prefetch_loop()
+    # The sw cascade's tier statistics: merged into the account's Notes hourly (app/sw_tier_stats.py).
+    start_tier_stats_sync_loop(WORKSPACE_DIR)
     # Android companion app: drain phone-originated messages from
     # tabs/<tabId>/inbox into live sessions, and mirror recent history back
     # out to tabs/<tabId>/history. No-op while not logged into SW.

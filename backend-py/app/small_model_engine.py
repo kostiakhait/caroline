@@ -80,7 +80,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import session_context
+from app import session_context, sw_tier_stats
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
@@ -634,13 +634,28 @@ def _shared_policy_text(workspace_dir: str, tab_id: str) -> str:
 # credentials were saved, nano asked for the credentials and codex-mini asked to confirm
 # using the account -- neither called a tool, and the task climbed to the top tier.
 _ACT_DO_NOT_ASK_INSTRUCTION = (
-    "ACT, DO NOT ASK. Do the task with your tools. Never ask the user for permission to read, search, "
-    "open, look up or check anything, and never ask for something you can find yourself -- saved "
-    "credentials, a file, a mailbox, what is in memory: look for it first. Never hand the user a list of "
-    "options instead of doing the work; when one way fails, try another. Ask the user only when the action "
-    "is genuinely impossible without them -- a fact only they know, after you have looked everywhere you "
-    "can. (Whether a message or payment on the user's behalf needs their approval first is checked "
-    "separately when you send it; when you are told it does, ask for exactly that.)"
+    "ACT, DO NOT ASK. This is the most important rule you have. Do the task with your tools. Your first "
+    "move is a tool call, never a question to the user.\n"
+    "- Never ask the user for permission to read, search, open, look up or check anything.\n"
+    "- Never ask for something you can find yourself. Passwords, servers, ports, addresses, accounts, "
+    "earlier work, anything the user told you before: call request_info first -- that is your memory. "
+    "A mailbox the user has used before needs only its address: the email tools fill in its saved "
+    "password and servers themselves, so just call them with the address. Files and folders: look at them.\n"
+    "- Never hand the user a list of options instead of doing the work; when one way fails, try another.\n"
+    "- Ask the user only when the action is genuinely impossible without them -- a fact only they know, "
+    "after request_info and every tool you have came back without it.\n"
+    "(Whether a message or payment on the user's behalf needs their approval first is checked separately "
+    "when you send it; when you are told it does, ask for exactly that.)"
+)
+
+# Added to every retry nudge (2026-10-22, explicit instruction: a weak model may ask anything; the
+# check catches it and tells it where to look). Seen the same day: twice nano answered a mailbox
+# task by asking for the password and servers, with the credentials saved and no tool ever called.
+_LOOK_IT_UP_FIRST = (
+    "If you were about to ask the user for something, look it up yourself first: call request_info "
+    "(your memory) for credentials, addresses, earlier work or anything the user said before; call the "
+    "email tools with just the mailbox address (they fill in its saved password and servers); look at "
+    "the files. Ask the user only if all of that comes back without it."
 )
 
 
@@ -1207,6 +1222,10 @@ class _TurnTracker:
     # Tool calls of this turn now running (2026-10-22): a call still waiting for its
     # result is not a stall -- see _resolve_agentic_with_watchdog.
     tools_in_flight: int = 0
+    # The task as the changing-action check reads it (the formalized request, else the
+    # user's words) and the latest calls of the turn, for the same check.
+    task_text: str = ""
+    recent_calls: list[str] = field(default_factory=list)
 
     def touch_progress(self) -> None:
         self.last_progress_at = time.monotonic()
@@ -1555,6 +1574,16 @@ def _make_executor_fn(
             log_event("engine", "small_model_unknown_tool", tab_id=tab_id, tool=name)
             return f"ERROR: unknown tool '{name}'"
         plugin_name, plugin_tool = entry
+        task_text = (parent_tracker or tracker).task_text
+        if task_text and _changes_something(name, plugin_tool.description, plugin_tool.input_schema, tab_id):
+            # Not part of the task -> not done (2026-10-22, explicit instruction: a checker
+            # for actions nobody asked for). See app/microagents/sw_action_scope.py.
+            in_scope, why = _action_in_scope(task_text, name, args, list(tracker.recent_calls), tab_id)
+            if not in_scope:
+                return (
+                    f"NOT DONE: {name} is not part of the user's task ({why}). Do only what the task asks; "
+                    "do not create, move, delete, rename or change anything else."
+                )
 
         async def _run() -> dict[str, Any]:
             session_context.set_tab_id(tab_id)
@@ -1709,7 +1738,9 @@ def _build_verification_prompt(
             "done right now, or is about to be done (connecting, checking, saving, sending, \"I'll ...\") did "
             "NOT happen. And a reply that asks the user for something the assistant could have found or tried "
             "itself with its tools -- saved credentials, a file, a mailbox, what is in memory -- is not finished "
-            "either: nothing was tried yet. (2026-10-22: asked to check a mailbox whose credentials were already "
+            "either: nothing was tried yet -- say in your one sentence where to look instead of asking: "
+            "request_info (memory) for credentials, addresses or anything said before, the email tools with "
+            "just the mailbox address, the files. (2026-10-22: asked to check a mailbox whose credentials were already "
             "saved, the reply asked which credentials to use, with no tool ever called.)"
         )
     if tracker.plan_steps is not None:
@@ -2013,6 +2044,177 @@ def _trace_text(lines: list[str], limit: int) -> str:
         spent += len(line)
         kept.append(line)
     return "\n".join(reversed(kept))
+
+
+# Whether a tool changes anything -- decided by a model (sw.tool.effect) from the tool's
+# own description, never by a fixed list of name keywords (2026-10-22, explicit
+# instruction). Kept per tool name + description hash in the workspace, so each tool is
+# decided once, and again whenever its description changes.
+TOOL_EFFECTS_FILE = "sw-tool-effects.json"
+_tool_effects_lock = threading.Lock()
+
+
+def _changes_something(tool_name: str, description: str, input_schema: Any, tab_id: str | None) -> bool:
+    import hashlib
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents import sw_tool_effect
+    from app.workspace_dir import WORKSPACE_DIR
+
+    key = hashlib.sha256((tool_name + "\n" + (description or "")).encode("utf-8")).hexdigest()[:16]
+    path = Path(WORKSPACE_DIR) / TOOL_EFFECTS_FILE
+    with _tool_effects_lock:
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+    known = cache.get(tool_name)
+    if isinstance(known, dict) and known.get("key") == key and isinstance(known.get("changes"), bool):
+        return known["changes"]
+    params = ", ".join(sorted((input_schema or {}).keys())) if isinstance(input_schema, dict) else ""
+    try:
+        runtime = build_local_runtime()
+        if runtime is None:
+            return True
+        for agent in sw_tool_effect.llm_agents():
+            try:
+                runtime.register(agent)
+            except ValueError:
+                pass
+        result = runtime.run(sw_tool_effect.TOOL_EFFECT, {
+            "name": tool_name, "description": (description or "")[:2000], "params": params,
+        }, runtime.new_context(budget=new_budget()))
+    except Exception as exc:  # noqa: BLE001 -- unknown means checked: the safe side
+        log_event("engine", "sw_tool_effect_failed", tab_id=tab_id, tool=tool_name, error=str(exc)[:200])
+        return True
+    output = (result or {}).get("output") or {}
+    if (result or {}).get("status") != "ok" or not isinstance(output.get("changes"), bool):
+        log_event("engine", "sw_tool_effect_failed", tab_id=tab_id, tool=tool_name, error=(result or {}).get("error"))
+        return True
+    with _tool_effects_lock:
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+        cache[tool_name] = {"key": key, "changes": output["changes"], "why": str(output.get("why"))[:300]}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    log_event("engine", "sw_tool_effect", tab_id=tab_id, tool=tool_name, changes=output["changes"], why=str(output.get("why"))[:200])
+    return output["changes"]
+
+
+def _action_in_scope(task: str, tool_name: str, args: dict[str, Any], calls: list[str], tab_id: str | None) -> tuple[bool, str]:
+    """sw.action.scope, run synchronously on the tool-call worker thread. Fail-open: a
+    check that cannot be made lets the call through (logged)."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents import sw_action_scope
+
+    shown = {k: v for k, v in (args or {}).items() if k not in ("password", "imapHost", "imapPort", "smtpHost", "smtpPort")}
+    started = time.monotonic()
+    try:
+        runtime = build_local_runtime()
+        if runtime is None:
+            return True, "no local runtime"
+        for agent in sw_action_scope.llm_agents():
+            try:
+                runtime.register(agent)
+            except ValueError:
+                pass
+        result = runtime.run(sw_action_scope.ACTION_SCOPE, {
+            "task": task, "tool": tool_name, "args": json.dumps(shown, ensure_ascii=False, default=str)[:1500],
+            "calls": calls[-15:],
+        }, runtime.new_context(budget=new_budget()))
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        log_event("engine", "sw_action_scope_failed", tab_id=tab_id, tool=tool_name, error=str(exc)[:200])
+        return True, "check failed"
+    output = (result or {}).get("output") or {}
+    if (result or {}).get("status") != "ok" or not isinstance(output.get("in_scope"), bool):
+        log_event("engine", "sw_action_scope_failed", tab_id=tab_id, tool=tool_name, error=(result or {}).get("error"))
+        return True, "check failed"
+    log_event("engine", "sw_action_scope", tab_id=tab_id, tool=tool_name, in_scope=output["in_scope"],
+              why=str(output.get("why"))[:300], ms=int((time.monotonic() - started) * 1000))
+    return output["in_scope"], str(output.get("why") or "")
+
+
+async def _local_agent(agent_name: str, module: str, agent_input: dict[str, Any], tab_id: str | None) -> dict[str, Any] | None:
+    """One local microagent call (the ladder) -> its output, or None on any failure (logged)."""
+    from app.plugins.voice_api import _run_local_microagent
+
+    started = time.monotonic()
+    try:
+        result = await _run_local_microagent(agent_name, module, agent_input)
+    except Exception as exc:  # noqa: BLE001 -- every caller has a plain fallback
+        log_event("engine", "sw_microagent_failed", tab_id=tab_id, agent=agent_name, error=str(exc)[:200], error_type=type(exc).__name__)
+        return None
+    if not result or result.get("status") != "ok":
+        log_event("engine", "sw_microagent_failed", tab_id=tab_id, agent=agent_name, error=(result or {}).get("error"),
+                  ms=int((time.monotonic() - started) * 1000))
+        return None
+    log_event("engine", "sw_microagent_done", tab_id=tab_id, agent=agent_name, ms=int((time.monotonic() - started) * 1000),
+              output=json.dumps(result.get("output"), ensure_ascii=False)[:600])
+    return result.get("output") or {}
+
+
+async def _task_tags(task: str, tab_id: str | None) -> list[str]:
+    """Free tags of a task for the tier statistics (app/microagents/sw_task_tags.py)."""
+    from app.microagents.sw_task_tags import TASK_TAGS
+
+    output = await _local_agent(TASK_TAGS, "app.microagents.sw_task_tags", {"task": task}, tab_id)
+    return [str(t).strip().lower() for t in (output or {}).get("tags") or [] if str(t).strip()]
+
+
+async def _tier_advice(tags: list[str], tiers: list[str], workspace_dir: str, tab_id: str | None) -> int | None:
+    """The tier to start from by the statistics (app/microagents/sw_tier_advice.py), or
+    None when there are no tags or no statistics yet (then no call is made at all)."""
+    from app.microagents.sw_tier_advice import TIER_ADVICE
+
+    stats = sw_tier_stats.rows(workspace_dir)
+    if not tags or not stats:
+        return None
+    output = await _local_agent(TIER_ADVICE, "app.microagents.sw_tier_advice", {"tags": tags, "tiers": tiers, "stats": stats}, tab_id)
+    tier = (output or {}).get("start_tier")
+    return tier if isinstance(tier, int) and 0 <= tier < len(tiers) else None
+
+
+async def _tool_advice(task: str, gap: str, calls: list[str], registry: "ToolRegistry", tried_groups: list[str],
+                       tab_id: str | None) -> str | None:
+    """The tool advisor for a retry (2026-10-22, explicit instruction: the checker that
+    hints knows the tools and says what to try -- most likely first, one group per
+    attempt, independent calls in parallel). Step 1 ranks the plugin groups; step 2 turns
+    the best group not suggested yet in this turn into concrete calls. None on failure --
+    the retry then gets the generic _LOOK_IT_UP_FIRST hint."""
+    from app.microagents.sw_tool_calls import TOOL_CALLS
+    from app.microagents.sw_tool_groups import TOOL_GROUPS
+
+    plugins = {p["server_name"].removeprefix("caroline-"): p["tools"] for p in registry.own_plugins}
+    groups = [{"name": name, "tools": [t["name"] for t in tools]} for name, tools in plugins.items()]
+    ranked_out = await _local_agent(TOOL_GROUPS, "app.microagents.sw_tool_groups", {
+        "task": task, "gap": gap, "calls": calls[-30:], "tried": tried_groups, "groups": groups,
+    }, tab_id)
+    ranked = [g["name"] for g in (ranked_out or {}).get("groups") or [] if g.get("name") in plugins]
+    if not ranked:
+        return None
+    group = next((g for g in ranked if g not in tried_groups), ranked[0])
+    tried_groups.append(group)
+    tools = [{"name": t["name"], "description": str(t.get("description") or "")[:500]} for t in plugins[group]]
+    calls_out = await _local_agent(TOOL_CALLS, "app.microagents.sw_tool_calls", {
+        "task": task, "gap": gap, "calls": calls[-30:], "group": group, "tools": tools,
+    }, tab_id)
+    suggested = (calls_out or {}).get("calls") or []
+    if not suggested:
+        return None
+    lines = "; ".join(f"{c.get('tool')}({c.get('args') or ''}) -- {c.get('why') or ''}" for c in suggested)
+    independent = [c for c in suggested if c.get("independent")]
+    log_event("engine", "sw_tool_advice", tab_id=tab_id, group=group, calls=[c.get("tool") for c in suggested],
+              independent=len(independent))
+    parallel = (
+        " The independent ones can run at the same time: declare_plan with a \"parallel\" stage (one step per "
+        "call), then run_parallel_stage." if len(independent) > 1 else ""
+    )
+    return (
+        f"Try these now, from the tools most likely to get what is missing ({group}): {lines}.{parallel} "
+        "Ask the user only if they come back without it."
+    )
 
 
 async def _attempt_progressed(task: str, earlier: list[str], latest: list[str], tab_id: str | None) -> tuple[bool, str]:
@@ -2574,6 +2776,8 @@ async def run_small_model_turn(
 
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
+    # A real user's task -- what the changing-action check compares calls against.
+    tracker.task_text = (request_spec or user_text) if formalize_request else ""
     current_model = {"name": cfg.AI_MODEL_SMALL}
 
     async def run_stage(stage_index: int) -> str:
@@ -2634,6 +2838,8 @@ async def run_small_model_turn(
             args = json.dumps(evt.get("args") or {}, ensure_ascii=False, default=str)[:300]
             emit(f"Tool call {evt.get('name')} (arguments: {args[:120]}); result: {str(evt.get('result', ''))[:160]}")
             tier_trace.append(_trace_line(evt.get("name"), args, evt.get("result", "")))
+            tracker.recent_calls.append(_trace_line(evt.get("name"), args, str(evt.get("result", ""))[:200]))
+            del tracker.recent_calls[:-20]
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
             if ESCALATION_SENTINEL not in text:
@@ -2796,6 +3002,19 @@ async def run_small_model_turn(
             # score SIMPLE even though it's exactly the shape most likely to
             # get silently abandoned after one shallow pass.
             start_index = max(start_index, 1)
+    # The tier statistics' advice (2026-10-22, explicit instruction): the start is the
+    # higher of the choice above and the tier that does not fail too often on tasks with
+    # these tags -- see app/sw_tier_stats.py. Real user requests only.
+    task_tags: list[str] = []
+    if formalize_request:
+        task_tags = await _task_tags(request_spec or user_text, tab_id)
+        advised = await _tier_advice(task_tags, tiers, workspace_dir, tab_id)
+        if advised is not None and advised > start_index:
+            log_event("engine", "small_model_start_tier_raised", tab_id=tab_id, from_tier=start_index, to_tier=advised)
+            start_index = advised
+    tiers_ran: list[int] = []
+    closed_on: int | None = None
+    tried_groups: list[str] = []
     final_text = ""
     index = start_index
     deescalations_used = 0
@@ -2815,6 +3034,7 @@ async def run_small_model_turn(
         model = tiers[index]
         if index != attempt_tier:
             attempt_tier, tier_attempts, tier_history = index, 0, []
+        tiers_ran.append(index)
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
         emit(f"Tier {index + 1} ({model}) is working.")
         current_model["name"] = model
@@ -2875,6 +3095,7 @@ async def run_small_model_turn(
                 return _answer(_funds_exhausted_final_answer(exc.reason))
             if action == "done":
                 final_text = verified_text
+                closed_on = index
                 break
             attempt_lines = list(tier_trace)
             if action in ("up", "retry"):
@@ -2925,9 +3146,12 @@ async def run_small_model_turn(
                     )
                 else:
                     emit(f"The check found this tier's work incomplete; retrying tier {index + 1} with what's missing.")
+                    advice = await _tool_advice(
+                        request_spec or user_text, missing, tier_history, registry, tried_groups, tab_id,
+                    )
                     nudge = (
                         f"[Verifier checked the previous attempt and found it incomplete: {missing} Do the missing part "
-                        f"now, with your tools. {_CHECK_EARLIER_RESULT}]"
+                        f"now, with your tools. {advice or _LOOK_IT_UP_FIRST} {_CHECK_EARLIER_RESULT}]"
                     )
                 messages.append({"role": "user", "content": nudge})
                 continue
@@ -2949,6 +3173,11 @@ async def run_small_model_turn(
             tier_trace.clear()
         index += 1
 
+    if task_tags:
+        try:
+            sw_tier_stats.record(workspace_dir, task_tags, tiers_ran, closed_on)
+        except Exception as exc:  # noqa: BLE001 -- statistics never cost the answer
+            log_event("engine", "sw_tier_stats_record_failed", tab_id=tab_id, error=str(exc)[:200])
     if not final_text:
         # No tier ever produced a usable candidate (all stalled/errored/escalated
         # mechanically) -- one last, non-escalating, non-de-escalating verification
