@@ -1586,6 +1586,14 @@ def _make_executor_fn(
                     f"NOT DONE: {name} is not part of the user's task ({why}). Do only what the task asks; "
                     "do not create, move, delete, rename or change anything else."
                 )
+            if tracker.recent_calls:
+                consistent, use_account, why_account = _account_consistent(task_text, name, args, list(tracker.recent_calls), tab_id)
+                if not consistent:
+                    return (
+                        f"NOT DONE: {name} would act as a different identity than the rest of this work ({why_account}). "
+                        f"Use the same one ({use_account}) -- an answer goes out from the identity that received the "
+                        "message -- unless the task itself says to act as the other."
+                    )
             grounded, invented = _content_grounded(task_text, name, args, list(tracker.recent_calls), tab_id)
             if not grounded:
                 return (
@@ -2156,6 +2164,55 @@ def _action_in_scope(task: str, tool_name: str, args: dict[str, Any], calls: lis
     return output["in_scope"], str(output.get("why") or "")
 
 
+def _account_consistent(task: str, tool_name: str, args: dict[str, Any], calls: list[str], tab_id: str | None) -> tuple[bool, str, str]:
+    """sw.account.consistency, run synchronously on the tool-call worker thread for a changing
+    call that follows other calls of the turn: (consistent, the identity to use, why).
+    Fail-open (logged)."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents import sw_account_consistency, sw_task_on_behalf
+
+    shown = {k: v for k, v in (args or {}).items() if k not in ("password", "imapHost", "imapPort", "smtpHost", "smtpPort", "text", "html", "body")}
+    started = time.monotonic()
+
+    def run(module: Any, name: str, agent_input: dict[str, Any]) -> dict[str, Any] | None:
+        runtime = build_local_runtime()
+        if runtime is None:
+            return None
+        for agent in module.llm_agents():
+            try:
+                runtime.register(agent)
+            except ValueError:
+                pass
+        result = runtime.run(name, agent_input, runtime.new_context(budget=new_budget()))
+        if (result or {}).get("status") != "ok":
+            log_event("engine", "sw_account_consistency_failed", tab_id=tab_id, tool=tool_name, agent=name, error=(result or {}).get("error"))
+            return None
+        return (result or {}).get("output") or {}
+
+    try:
+        output = run(sw_account_consistency, sw_account_consistency.ACCOUNT_CONSISTENCY, {
+            "task": task, "tool": tool_name, "args": json.dumps(shown, ensure_ascii=False, default=str)[:1500],
+            "calls": calls[-15:],
+        })
+        if output is None or sw_account_consistency.verify_account_consistency({}, output) is not None:
+            return True, "", ""
+        use = str(output["earlier_identity"]).strip()
+        why = f"the earlier calls acted as {output['earlier_identity']}, this one as {output['this_identity']}"
+        consistent, in_users_name = True, None
+        if sw_account_consistency.switched(output):
+            # A switch is right only if the task itself says to act in the user's own name.
+            asked = run(sw_task_on_behalf, sw_task_on_behalf.TASK_ON_BEHALF, {"task": task})
+            in_users_name = bool((asked or {}).get("in_users_name"))
+            consistent = in_users_name
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        log_event("engine", "sw_account_consistency_failed", tab_id=tab_id, tool=tool_name, error=str(exc)[:200])
+        return True, "", ""
+    log_event("engine", "sw_account_consistency", tab_id=tab_id, tool=tool_name, consistent=consistent,
+              earlier=str(output["earlier_identity"])[:80], this=str(output["this_identity"])[:80],
+              task_in_users_name=in_users_name, ms=int((time.monotonic() - started) * 1000))
+    return consistent, use, why
+
+
 def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: list[str], tab_id: str | None) -> tuple[bool, str]:
     """The content-grounding check, run synchronously on the tool-call worker thread for the
     changing call just checked by sw.action.scope: sw.content.extract takes the statements
@@ -2187,19 +2244,40 @@ def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: li
             "tool": tool_name, "args": json.dumps(shown, ensure_ascii=False, default=str)[:6000],
         })
         facts = [str(f) for f in (extracted or {}).get("facts") or []]
-        if not facts:
+        requests = [str(r) for r in (extracted or {}).get("requests") or []][:8]
+        if not facts and not requests:
             log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=True, facts=0,
                       ms=int((time.monotonic() - started) * 1000))
             return True, ""
-        judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": calls[-15:]})
+
+        def judge_facts() -> list[str] | None:
+            if not facts:
+                return []
+            judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": calls[-15:]})
+            if judged is None or sw_content_grounding.verify_content_grounding({}, judged) is not None:
+                return None
+            return [str(x) for x in judged["invented"]]
+
+        def judge_request(request: str) -> str | None:
+            # A request is invented unless the agent quotes words that really are in the task.
+            quoted = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, {"task": task, "request": request})
+            if quoted is None or sw_content_grounding.verify_request_asked({}, quoted) is not None:
+                return None
+            return None if sw_content_grounding.asked(task, quoted) else f"the task does not ask for this: {request}"
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1 + len(requests)) as pool:
+            fact_job = pool.submit(judge_facts)
+            request_jobs = [pool.submit(judge_request, r) for r in requests]
+            invented = list(fact_job.result() or [])
+            invented += [item for item in (job.result() for job in request_jobs) if item]
     except Exception as exc:  # noqa: BLE001 -- fail-open
         log_event("engine", "sw_content_grounding_failed", tab_id=tab_id, tool=tool_name, error=str(exc)[:200])
         return True, ""
-    if judged is None or not isinstance(judged.get("grounded"), bool):
-        return True, ""
-    log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=judged["grounded"], facts=len(facts),
-              checked=facts[:6], invented=str(judged.get("invented"))[:400], ms=int((time.monotonic() - started) * 1000))
-    return judged["grounded"], str(judged.get("invented") or "")
+    # The agents list what is invented; clean or not is decided here, by an empty list.
+    log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=not invented, facts=len(facts),
+              requests=len(requests), checked=(facts + requests)[:6], invented=invented[:4], ms=int((time.monotonic() - started) * 1000))
+    return not invented, "; ".join(invented)
 
 
 async def _result_evidence(task: str, calls: list[str], memo: dict[str, str], tab_id: str | None) -> str:
