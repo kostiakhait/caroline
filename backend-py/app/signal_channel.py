@@ -331,6 +331,29 @@ async def list_contacts(account: str) -> list[dict[str, Any]]:
     return result if isinstance(result, list) else []
 
 
+async def get_person(account: str, who: str) -> dict[str, Any]:
+    """Everything signal-cli knows about one person (2026-10-23): the
+    detailed contact record (number, uuid, username, names, profile with its
+    "about") and the server's own answer whether they are on Signal.
+    `who` is a phone number, a uuid or a username."""
+    value = _recipient_value(who)
+    info: dict[str, Any] = {}
+    try:
+        contacts = await _rpc_call(account, "listContacts", {"recipient": [value], "detailed": True})
+        if isinstance(contacts, list) and contacts:
+            info["contact"] = contacts[0]
+    except SignalError as exc:
+        info["contactError"] = str(exc)
+    try:
+        key = "username" if value.startswith("u:") else "recipient"
+        status = await _rpc_call(account, "getUserStatus", {key: [value.removeprefix("u:") if key == "username" else value]})
+        if isinstance(status, list) and status:
+            info["status"] = status[0]
+    except SignalError as exc:
+        info["statusError"] = str(exc)
+    return info
+
+
 # Attachments (2026-10-11). signal-cli's own send/getAttachment commands
 # (confirmed against the real v0.14.9 source: SendCommand.java,
 # GetAttachmentCommand.java, JsonAttachment.java) move a local file as a
@@ -560,7 +583,10 @@ def _dispatch_rpc_line(account: str, msg: dict[str, Any], inject_proactive: Call
         kind = f'group "{group_info.get("groupName") or target}"' if group_info else "DM"
         _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_event("plugin:signal", "message_received", account=account, source=source, kind=kind, has_media=bool(attachments))
-        note = f'[New Signal {kind} message in {_ACCOUNT_LABEL[account]} Signal account, from "{name}" ({source}, account="{account}"):\n{text or "(no text)"}'
+        # The sender's number when Signal shows it, and their uuid always
+        # (2026-10-23): a number hidden by its owner left only the uuid.
+        ids = ", ".join(filter(None, [envelope.get("sourceNumber"), envelope.get("sourceUuid") and f'uuid={envelope["sourceUuid"]}'])) or source
+        note = f'[New Signal {kind} message in {_ACCOUNT_LABEL[account]} Signal account, from "{name}" ({ids}, account="{account}"):\n{text or "(no text)"}'
         for att in attachments:
             att_id = att.get("id")
             if not att_id:

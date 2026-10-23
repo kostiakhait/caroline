@@ -283,6 +283,46 @@ async def send_file(client: TelegramClient, chat_id: int, path: str, caption: st
     await client.send_file(chat_id, path, caption=caption)
 
 
+def entity_fields(entity: Any) -> dict[str, Any]:
+    """What Telegram itself says about a user, group or channel, from the
+    entity alone (no extra request): ids, names, @username(s), phone, flags.
+    Shared by the incoming-message notice and every tool that names people
+    (2026-10-23: Caroline could not get a phone number, a user id or a
+    username out of a Telegram conversation -- none of the tools returned
+    them). A phone is only there when Telegram shows it to this account: the
+    person is in its contacts or shares the number with everyone. Fields
+    Telegram left empty are left out."""
+    if entity is None:
+        return {}
+    fields: dict[str, Any] = {"id": utils.get_peer_id(entity)}
+    usernames = [u.username for u in (getattr(entity, "usernames", None) or []) if getattr(u, "active", True)]
+    username = getattr(entity, "username", None) or (usernames[0] if usernames else None)
+    if isinstance(entity, (Chat, Channel)):
+        fields.update({
+            "kind": "channel" if getattr(entity, "broadcast", False) else "group",
+            "title": getattr(entity, "title", None),
+            "username": f"@{username}" if username else None,
+            "membersCount": getattr(entity, "participants_count", None),
+        })
+    else:
+        status = getattr(entity, "status", None)
+        was_online = getattr(status, "was_online", None)
+        fields.update({
+            "kind": "bot" if getattr(entity, "bot", False) else "user",
+            "firstName": getattr(entity, "first_name", None),
+            "lastName": getattr(entity, "last_name", None),
+            "username": f"@{username}" if username else None,
+            "otherUsernames": [f"@{u}" for u in usernames if u != username] or None,
+            "phone": f"+{entity.phone}" if getattr(entity, "phone", None) else None,
+            "isContact": getattr(entity, "contact", None),
+            "isMutualContact": getattr(entity, "mutual_contact", None),
+            "verified": getattr(entity, "verified", None) or None,
+            "deleted": getattr(entity, "deleted", None) or None,
+            "lastSeen": was_online.isoformat() if was_online else (type(status).__name__.removeprefix("UserStatus") if status else None),
+        })
+    return {key: value for key, value in fields.items() if value not in (None, "", [])}
+
+
 def _describe_media(event: events.NewMessage.Event) -> str | None:
     """A short human label for an incoming message's attachment, if any --
     checked specific-to-general since Telethon's event.document also
@@ -389,15 +429,20 @@ async def _start_background(
         if not text and not media:
             return
         sender = await event.get_sender()
-        name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or str(event.sender_id)
+        name = " ".join(filter(None, [getattr(sender, "first_name", None), getattr(sender, "last_name", None)])) \
+            or getattr(sender, "title", None) or str(event.sender_id)
         kind = "DM" if event.is_private else "group mention"
         status.last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         log_event("plugin:telegram", "message_received", account=account, kind=kind, chat_id=event.chat_id, has_media=bool(media))
         if inject_proactive is None:
             return
+        # Who wrote it, as Telegram knows them -- in a group chat_id is the
+        # group's, so without this the author's own id was never visible.
+        who = ", ".join(f"{key}={value}" for key, value in entity_fields(sender).items() if key not in ("firstName", "lastName"))
         note = (
             f'[New Telegram {kind} in {_ACCOUNT_LABEL[account]} Telegram account, from "{name}" '
-            f'(chat_id={event.chat_id}, message_id={event.id}, account="{account}"):\n{text or "(no caption)"}'
+            f'(sender: {who or f"id={event.sender_id}"}; chat_id={event.chat_id}, message_id={event.id}, '
+            f'account="{account}"):\n{text or "(no caption)"}'
         )
         if media:
             note += (

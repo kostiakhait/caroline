@@ -28,8 +28,9 @@ from app.slack_channel import (
     get_token_for_account,
     run_oauth_login,
 )
+from app.logging_setup import log_event
 from app.workspace_dir import WORKSPACE_DIR
-from app.context_cap import truncate
+from app.context_cap import cap_batch, skipped_note, truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -153,11 +154,20 @@ async def slack_find_person(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if not query:
         return {"text": 'slack_find_person needs "query".', "is_error": True}
     try:
-        result = await client.users_list(limit=1000)
+        # Every page, until Slack says there are no more (2026-10-23: one
+        # page only, so people past it were never found in a big workspace).
+        members: list[dict[str, Any]] = []
+        cursor = None
+        while True:
+            page = await client.users_list(cursor=cursor)
+            members.extend(page.get("members") or [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
     except SlackApiError as exc:
         return {"text": f"Slack API error: {exc.response.get('error', str(exc))}", "is_error": True}
     rows = []
-    for u in result.get("members", []):
+    for u in members:
         if u.get("deleted") or u.get("is_bot") or u.get("id") == "USLACKBOT":
             continue
         profile = u.get("profile") or {}
@@ -168,6 +178,75 @@ async def slack_find_person(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         })
     matches = await find_by_name(query, rows)
     return {"text": str(matches)}
+
+
+def _person_row(user: dict[str, Any]) -> dict[str, Any]:
+    """One Slack user's profile as the workspace shows it (2026-10-23):
+    names, title, email, phone, time zone, status, flags."""
+    profile = user.get("profile") or {}
+    row = {
+        "id": user.get("id"), "username": user.get("name"), "realName": profile.get("real_name"),
+        "displayName": profile.get("display_name"), "title": profile.get("title"), "email": profile.get("email"),
+        "phone": profile.get("phone"), "timeZone": user.get("tz"), "status": profile.get("status_text"),
+        "isBot": user.get("is_bot") or None, "isAdmin": user.get("is_admin") or None, "deleted": user.get("deleted") or None,
+    }
+    return {key: value for key, value in row.items() if value not in (None, "")}
+
+
+async def slack_get_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
+    who = str(args.get("who") or "").strip()
+    if not who:
+        return {"text": 'slack_get_info needs "who": a user id or an email.', "is_error": True}
+    try:
+        result = await (client.users_lookupByEmail(email=who) if "@" in who else client.users_info(user=who))
+    except SlackApiError as exc:
+        return {"text": f"Slack API error: {exc.response.get('error', str(exc))}", "is_error": True}
+    log_event("plugin:slack", "get_info", account=account)
+    return {"text": str(_person_row(result.get("user") or {}))}
+
+
+async def slack_list_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    client, error = _client_or_error(account)
+    if error:
+        return error
+    channel = str(args.get("channel") or "").strip()
+    if not channel:
+        return {"text": 'slack_list_members needs "channel" (its id).', "is_error": True}
+    try:
+        member_ids: list[str] = []
+        cursor = None
+        while True:   # every page, until Slack says there are no more
+            page = await client.conversations_members(channel=channel, cursor=cursor)
+            member_ids.extend(page.get("members") or [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        users: dict[str, dict[str, Any]] = {}
+        cursor = None
+        while True:
+            page = await client.users_list(cursor=cursor)
+            users.update({u["id"]: u for u in page.get("members") or []})
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError as exc:
+        return {"text": f"Slack API error: {exc.response.get('error', str(exc))}", "is_error": True}
+    rows = [_person_row(users[member_id]) if member_id in users else {"id": member_id} for member_id in member_ids]
+    log_event("plugin:slack", "list_members", account=account, count=len(rows))
+    included, skipped = cap_batch(rows, lambda r: str(r), lambda r: str(r.get("id")))
+    lines = [f"{len(rows)} member(s): {included}"]
+    if skipped:
+        lines.append(skipped_note(skipped, 200_000, "Look up the ones you need with slack_get_info."))
+    return {"text": "\n\n".join(lines)}
 
 
 async def slack_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -284,6 +363,20 @@ PLUGIN = Plugin(
             "slack_send_message accepts directly to message them, even if you've never DMed them before. "
             "`account`: \"self\" (default) or \"owner\".",
             {"query": str, "account": str | None}, slack_find_person,
+        ),
+        PluginTool(
+            "slack_get_info",
+            "One Slack user's profile as the workspace shows it: id, username, real and display name, job "
+            "title, email, phone, time zone, status, bot/admin flags. `who` is a Slack user id (from "
+            "slack_find_person or a message's `user`) or an email. Reads only. `account`: \"self\" (default) or "
+            "\"owner\".",
+            {"who": str, "account": str | None}, slack_get_info,
+        ),
+        PluginTool(
+            "slack_list_members",
+            "Lists every member of a Slack channel with the same profile fields as slack_get_info. `channel` is "
+            "the channel id. `account`: \"self\" (default) or \"owner\".",
+            {"channel": str, "account": str | None}, slack_list_members,
         ),
         PluginTool(
             "slack_send_message",

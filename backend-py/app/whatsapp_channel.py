@@ -208,6 +208,12 @@ async def check_number(account: str, phone: str) -> tuple[bool, str | None]:
     return bool(result.get("exists")), result.get("jid")
 
 
+async def get_info(account: str, jid: str) -> dict[str, Any]:
+    """The sidecar's getInfo: a person's number, names, "about" text and
+    business profile, or a group's subject, description, owner and members."""
+    return _require_ok(await _call(account, "getInfo", jid=jid)).get("info") or {}
+
+
 async def set_block(account: str, jid: str, block: bool) -> None:
     _require_ok(await _call(account, "setBlock", jid=jid, block=block))
 
@@ -328,16 +334,32 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             if msg.get("fromMe"):
                 return
             text = (msg.get("text") or "").strip()
-            if not text:
+            media = msg.get("media")
+            # A media message without a caption is notified too (decision
+            # 2026-10-11, done in the sidecar but undone here until 2026-10-23).
+            if not text and not media:
                 return
             frm = msg.get("from") or "unknown"
             name = msg.get("chatName") or frm
             _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             log_event("plugin:whatsapp", "message_received", account=account, frm=frm)
+            # Who wrote it (2026-10-23): in a group `from` is the group's jid,
+            # and the author's own jid and number were never passed on.
+            sender = msg.get("sender") or frm
+            who = f"sender={sender}"
+            if msg.get("senderName"):
+                who += f', senderName="{msg["senderName"]}"'
+            if msg.get("senderPhone"):
+                who += f', senderPhone={msg["senderPhone"]}'
             note = (
                 f'[New WhatsApp message in {_ACCOUNT_LABEL[account]} WhatsApp account, from "{name}" '
-                f'(jid={frm}, account="{account}"):\n{text or "(no caption)"}'
+                f'(jid={frm}, {who}, account="{account}"):\n{text or "(no caption)"}'
             )
+            if media and msg.get("mediaRef"):
+                note += (
+                    f'\nAttached: {media}. Use whatsapp_download_attachment(ref="{msg["mediaRef"]}", '
+                    f'account="{account}") to save it locally first.'
+                )
             if account == "self":
                 note += (
                     "\nThis is Caroline's own separate WhatsApp account, not the user's -- replying here is "

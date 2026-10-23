@@ -40,6 +40,7 @@ from app.signal_channel import (
     create_group,
     delete_group,
     download_attachment,
+    get_person,
     is_valid_account,
     list_contacts,
     list_groups,
@@ -51,6 +52,7 @@ from app.signal_channel import (
     update_contact_name,
     update_group_members,
 )
+from app.logging_setup import log_event
 from app.workspace_dir import WORKSPACE_DIR
 from app.context_cap import cap_count
 from app.plugins.loader import Plugin, PluginTool
@@ -170,6 +172,41 @@ async def signal_unblock_user(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     except SignalError as exc:
         return {"text": str(exc), "is_error": True}
     return {"text": f"Unblocked {target}."}
+
+
+async def signal_get_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Everything signal-cli knows about one person (2026-10-23)."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    who = str(args.get("who") or "").strip()
+    if not who:
+        return {"text": 'signal_get_info needs "who".', "is_error": True}
+    try:
+        info = await get_person(account, who)
+    except SignalError as exc:
+        return {"text": str(exc), "is_error": True}
+    log_event("plugin:signal", "get_info", account=account, found=bool(info.get("contact") or info.get("status")))
+    return {"text": str(info)}
+
+
+async def signal_list_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """One group's details and members, from the detailed group list."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    group_id = str(args.get("groupId") or "").strip()
+    if not group_id:
+        return {"text": 'signal_list_members needs "groupId".', "is_error": True}
+    try:
+        groups = await list_groups(account)
+    except SignalError as exc:
+        return {"text": str(exc), "is_error": True}
+    group = next((g for g in groups if g.get("id") == group_id), None)
+    if group is None:
+        return {"text": f"No Signal group {group_id} on this account -- signal_list_groups/signal_find_group give the ids.", "is_error": True}
+    log_event("plugin:signal", "list_members", account=account, members=len(group.get("members") or []))
+    return {"text": str(group)}
 
 
 async def signal_list_groups(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -375,6 +412,22 @@ PLUGIN = Plugin(
             "Lists an account's Signal groups with their ids and members. `account`: \"self\" (default) or "
             "\"owner\".",
             {"account": str | None}, signal_list_groups,
+        ),
+        PluginTool(
+            "signal_get_info",
+            "Everything Signal tells this account about one person: phone number (when they share it), uuid, "
+            "username, the name saved in contacts and their own profile name, the profile's \"about\" text, "
+            "whether they are blocked, and whether the number/username is registered on Signal. `who` is a phone "
+            "number, a uuid (from a notification) or a username. Reads only. `account`: \"self\" (default) or "
+            "\"owner\".",
+            {"who": str, "account": str | None}, signal_get_info,
+        ),
+        PluginTool(
+            "signal_list_members",
+            "One Signal group's details and members (numbers/uuids, admins, pending members). `groupId` is the "
+            "group's id from signal_list_groups/signal_find_group or a notification. `account`: \"self\" "
+            "(default) or \"owner\".",
+            {"groupId": str, "account": str | None}, signal_list_members,
         ),
         PluginTool(
             "signal_find_group",

@@ -292,6 +292,22 @@ async def list_chats(account: str) -> list[dict[str, Any]]:
     return all_chats
 
 
+async def get_user_info(account: str, user_ids: list[str]) -> dict[str, Any]:
+    """{user id: what Facebook gives about them} -- the sidecar's getUserInfo,
+    passed on as the library returns it (2026-10-23)."""
+    return _require_ok(await _call(account, "getUserInfo", ids=user_ids)).get("users") or {}
+
+
+async def get_thread_info(account: str, thread_id: str) -> dict[str, Any]:
+    """A thread's details and participants, as the library returns them."""
+    return _require_ok(await _call(account, "getThreadInfo", threadID=thread_id)).get("thread") or {}
+
+
+async def find_user(account: str, name: str) -> list[Any]:
+    """Candidate users for a name or profile username (getUserID)."""
+    return _require_ok(await _call(account, "findUser", name=name)).get("candidates") or []
+
+
 async def set_block(account: str, user_id: str, block: bool) -> None:
     _require_ok(await _call(account, "setBlock", userID=user_id, block=block))
 
@@ -426,7 +442,9 @@ async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Calla
             log_event("plugin:messenger", "message_received", account=account, thread_id=thread_id)
             note = (
                 f'[New Messenger message in {_ACCOUNT_LABEL[account]} Messenger account, from "{name}" '
-                f'(threadID={thread_id}, senderID={msg.get("senderID")}, account="{account}"):\n{text}'
+                f'(threadID={thread_id}, senderID={msg.get("senderID")}'
+                + (f', senderName="{msg["senderName"]}"' if msg.get("senderName") else "")
+                + f', account="{account}"):\n{text}'
             )
             media = msg.get("media")
             attachment_ref = msg.get("attachmentRef")

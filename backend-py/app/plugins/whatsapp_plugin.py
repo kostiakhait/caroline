@@ -35,6 +35,7 @@ from app.whatsapp_channel import (
     create_group,
     delete_group,
     download_media,
+    get_info,
     is_valid_account,
     leave_group,
     list_chats,
@@ -44,8 +45,9 @@ from app.whatsapp_channel import (
     start_login,
     update_group_participants,
 )
+from app.logging_setup import log_event
 from app.workspace_dir import WORKSPACE_DIR
-from app.context_cap import cap_count
+from app.context_cap import cap_batch, cap_count, skipped_note
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -136,6 +138,39 @@ async def whatsapp_check_number(args: dict[str, Any], _rp: Any) -> dict[str, Any
     if not exists:
         return {"text": f"{phone} is not on WhatsApp (or has hidden itself from this check)."}
     return {"text": f"{phone} is on WhatsApp, jid {jid}."}
+
+
+async def whatsapp_get_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """A person's number, names, "about" text and business profile, or a
+    group's subject, description, owner and members (2026-10-23)."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    raw = str(args.get("who") or "").strip()
+    if not raw:
+        return {"text": 'whatsapp_get_info needs "who".', "is_error": True}
+    jid = _to_jid(raw)
+    try:
+        info = await get_info(account, jid)
+    except WhatsAppError as exc:
+        return {"text": str(exc), "is_error": True}
+    log_event("plugin:whatsapp", "get_info", account=account, kind=info.get("kind"))
+    members = info.pop("participants", None)
+    lines = [str({key: value for key, value in info.items() if value not in (None, "")})]
+    if members is not None:
+        included, skipped = cap_batch(members, lambda r: str(r), lambda r: str(r.get("id")))
+        lines.append(f"members: {included}")
+        if skipped:
+            lines.append(skipped_note(skipped, 200_000, "Look up the ones you need with whatsapp_get_info."))
+    return {"text": "\n\n".join(lines)}
+
+
+async def whatsapp_list_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """A group's members only: whatsapp_get_info of the group."""
+    raw = str(args.get("group") or "").strip()
+    if not raw.endswith("@g.us"):
+        return {"text": 'whatsapp_list_members needs "group": a group jid ending in "@g.us" (from whatsapp_list_chats or a notification).', "is_error": True}
+    return await whatsapp_get_info({"who": raw, "account": args.get("account")}, _rp)
 
 
 async def whatsapp_block_user(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -349,6 +384,23 @@ PLUGIN = Plugin(
             "whatsapp_send_message works on a number directly without this. `account`: \"self\" (default) or "
             "\"owner\".",
             {"phone": str, "account": str | None}, whatsapp_check_number,
+        ),
+        PluginTool(
+            "whatsapp_get_info",
+            "Everything WhatsApp tells this account about one person or group. A person: jid, phone number, "
+            "the name saved in contacts and the name they set themselves, whether the number is on WhatsApp, "
+            "their \"about\" text, business profile if any. A group: subject, description, owner, creation date "
+            "and every member (jid, phone, name, admin). `who` is a jid (a person's, an \"@lid\" one, or a "
+            "group's \"...@g.us\" -- from whatsapp_list_chats or a notification's sender/jid) or a phone number. "
+            "A number hidden behind an \"@lid\" id is not revealed by WhatsApp. Reads only. `account`: \"self\" "
+            "(default) or \"owner\".",
+            {"who": str, "account": str | None}, whatsapp_get_info,
+        ),
+        PluginTool(
+            "whatsapp_list_members",
+            "Lists a WhatsApp group's members (jid, phone, name, admin) with the group's own details. `group` "
+            "is the group's jid (\"...@g.us\"). `account`: \"self\" (default) or \"owner\".",
+            {"group": str, "account": str | None}, whatsapp_list_members,
         ),
         PluginTool(
             "whatsapp_block_user",

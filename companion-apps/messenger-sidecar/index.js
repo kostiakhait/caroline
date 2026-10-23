@@ -185,6 +185,25 @@ function deriveThreadName(t, id) {
 }
 
 let apiCallSeq = 0;
+// The display name of a message's author (2026-10-23: in a group the notice
+// named only the thread). Remembered per id; a failed lookup gives no name,
+// never a lost message.
+const senderNames = new Map();
+async function senderNameOf(userID) {
+  if (!userID) return undefined;
+  if (senderNames.has(userID)) return senderNames.get(userID);
+  try {
+    const users = await apiCall('getUserInfo', [userID]);
+    const user = users && users[userID];
+    const name = (user && (user.name || user.firstName)) || undefined;
+    if (name) senderNames.set(userID, name);
+    return name;
+  } catch (e) {
+    log('sender name lookup failed', { userID, error: describeError(e) });
+    return undefined;
+  }
+}
+
 function apiCall(method, ...args) {
   // Wraps one of ctx.api's callback-style methods as a Promise -- every flat
   // method here accepts an optional trailing callback(err, result) per
@@ -282,7 +301,7 @@ async function login() {
     api.on('rateLimit', (payload) => emit({ type: 'error', message: `Facebook lifecycle event "rateLimit": ${payload ? JSON.stringify(payload) : '(no detail)'}` }));
   }
 
-  api.listenMqtt((err, event) => {
+  api.listenMqtt(async (err, event) => {
     if (err) {
       const described = describeError(err);
       log('listenMqtt error', { error: described });
@@ -304,6 +323,7 @@ async function login() {
       type: 'message',
       threadID: event.threadID,
       senderID: event.senderID,
+      senderName: await senderNameOf(event.senderID),
       messageID: event.messageID,
       fromSelf: event.senderID === selfID,
       text,
@@ -402,6 +422,20 @@ rl.on('line', async (line) => {
       });
       log('readHistory done', { threadID: msg.threadID, requestedAmount: msg.amount, totalMessages: messages.length });
       emit({ type: 'history', id: msg.id, messages });
+    } else if (msg.cmd === 'getUserInfo') {
+      // 2026-10-23: Caroline could not get a person's details out of a
+      // conversation. Passed on exactly as fca-unofficial returns them (its
+      // field set is not documented -- name, firstName, vanity, profileUrl,
+      // gender, isFriend... seen in the facebook-chat-api family), keyed by id.
+      const users = await apiCall('getUserInfo', msg.ids);
+      emit({ type: 'sendResult', id: msg.id, ok: true, users: users || {} });
+    } else if (msg.cmd === 'getThreadInfo') {
+      const info = await apiCall('getThreadInfo', msg.threadID);
+      emit({ type: 'sendResult', id: msg.id, ok: true, thread: info || {} });
+    } else if (msg.cmd === 'findUser') {
+      // A name or profile username -> candidate user ids (getUserID).
+      const found = await apiCall('getUserID', msg.name);
+      emit({ type: 'sendResult', id: msg.id, ok: true, candidates: found || [] });
     } else if (msg.cmd === 'setBlock') {
       await apiCall('changeBlockedStatus', msg.userID, msg.block ? 'block' : 'unblock');
       emit({ type: 'sendResult', id: msg.id, ok: true });

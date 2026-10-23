@@ -36,6 +36,9 @@ from app.messenger_channel import (
     create_group,
     delete_group,
     download_attachment,
+    find_user,
+    get_thread_info,
+    get_user_info,
     is_valid_account,
     leave_group,
     list_chats,
@@ -47,6 +50,7 @@ from app.messenger_channel import (
     set_block,
     update_group_participants,
 )
+from app.logging_setup import log_event
 from app.workspace_dir import WORKSPACE_DIR
 from app.context_cap import cap_count
 from app.memory_topics import get_current_topic
@@ -148,8 +152,59 @@ async def messenger_read_history(args: dict[str, Any], _rp: Any) -> dict[str, An
         messages = await read_thread_history(account, thread_id, amount)
     except MessengerError as exc:
         return {"text": str(exc), "is_error": True}
+    # Each message's author by name too (2026-10-23): the history carried
+    # only a senderID. One lookup for all of them; a failed one leaves the ids.
+    sender_ids = sorted({str(m["senderID"]) for m in messages if m.get("senderID")})
+    if sender_ids:
+        try:
+            users = await get_user_info(account, sender_ids)
+        except MessengerError as exc:
+            log_event("plugin:messenger", "history_sender_names_failed", account=account, error=str(exc))
+            users = {}
+        for m in messages:
+            user = users.get(str(m.get("senderID"))) or {}
+            if user.get("name"):
+                m["senderName"] = user["name"]
     messages, _cut = cap_count(messages)
     return {"text": str(messages)}
+
+
+async def messenger_get_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Everything Facebook gives about one person (by id, or candidates for a
+    name or profile username) -- 2026-10-23."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    who = str(args.get("who") or "").strip()
+    if not who:
+        return {"text": 'messenger_get_info needs "who".', "is_error": True}
+    try:
+        if who.isdigit():
+            users = await get_user_info(account, [who])
+            log_event("plugin:messenger", "get_info", account=account, found=bool(users))
+            return {"text": str(users.get(who) or users or f"Facebook returned nothing for id {who}.")}
+        candidates = await find_user(account, who)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    log_event("plugin:messenger", "find_user", account=account, candidates=len(candidates))
+    candidates, _cut = cap_count(candidates)
+    return {"text": f"Candidates for {who!r} (call again with one's id for its details): {candidates}"}
+
+
+async def messenger_list_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """A thread's details and members, as Facebook gives them."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    thread_id = str(args.get("threadId") or "").strip()
+    if not thread_id:
+        return {"text": 'messenger_list_members needs "threadId".', "is_error": True}
+    try:
+        thread = await get_thread_info(account, thread_id)
+    except MessengerError as exc:
+        return {"text": str(exc), "is_error": True}
+    log_event("plugin:messenger", "list_members", account=account, members=len(thread.get("participantIDs") or []))
+    return {"text": str(thread)}
 
 
 async def messenger_send_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -384,6 +439,22 @@ PLUGIN = Plugin(
             "an attachment ref (if any) usable with messenger_download_attachment. `account`: \"self\" (default) "
             "or \"owner\".",
             {"threadId": str, "amount": int, "account": str | None}, messenger_read_history,
+        ),
+        PluginTool(
+            "messenger_get_info",
+            "What Facebook gives this account about one person: name, first name, profile username/link, "
+            "gender, whether they are a friend -- whatever the account may see. `who` is a numeric user id (a "
+            "senderID from a notification or messenger_read_history); a name or profile username instead "
+            "returns the matching candidates with their ids. Facebook does not give phone numbers or emails "
+            "here. Reads only. `account`: \"self\" (default) or \"owner\".",
+            {"who": str, "account": str | None}, messenger_get_info,
+        ),
+        PluginTool(
+            "messenger_list_members",
+            "A Messenger thread's details and members: name, participant ids with each one's name and profile "
+            "details, admins, nicknames. `threadId` is the thread's id. `account`: \"self\" (default) or "
+            "\"owner\".",
+            {"threadId": str, "account": str | None}, messenger_list_members,
         ),
         PluginTool(
             "messenger_send_message",

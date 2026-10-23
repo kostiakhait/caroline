@@ -15,8 +15,9 @@ from typing import Any
 import discord
 
 from app.discord_channel import get_live_client, has_discord_token, set_discord_token
+from app.logging_setup import log_event
 from app.workspace_dir import WORKSPACE_DIR
-from app.context_cap import truncate
+from app.context_cap import cap_batch, skipped_note, truncate
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.messenger_search import find_by_name
 
@@ -152,10 +153,75 @@ async def discord_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, A
     async for m in channel.history(limit=200):
         if query in (m.content or "").lower():
             text, _note = truncate(m.content or "")
-            rows.append({"id": m.id, "author": str(m.author), "createdAt": m.created_at.isoformat(), "text": text})
+            rows.append({"id": m.id, "author": str(m.author), "authorId": m.author.id, "createdAt": m.created_at.isoformat(), "text": text})
             if len(rows) >= limit:
                 break
     return {"text": str(rows)}
+
+
+def _member_row(member: Any) -> dict[str, Any]:
+    """One person as Discord shows them to the bot (2026-10-23)."""
+    row = {"id": member.id, "username": str(member), "displayName": getattr(member, "display_name", None), "bot": member.bot or None}
+    if isinstance(member, discord.Member):
+        row.update({
+            "server": member.guild.name, "nick": member.nick,
+            "roles": [role.name for role in member.roles if not role.is_default()] or None,
+            "joinedAt": member.joined_at.isoformat() if member.joined_at else None,
+        })
+    return {key: value for key, value in row.items() if value not in (None, "")}
+
+
+async def discord_get_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """A Discord user's profile, and what each shared server says about them."""
+    client = get_live_client()
+    if client is None:
+        return {"text": "Discord isn't connected yet -- use discord_set_token first.", "is_error": True}
+    try:
+        user_id = int(str(args.get("who") or "").strip())
+    except ValueError:
+        return {"text": "who must be a numeric Discord user id -- discord_find_member finds one by name.", "is_error": True}
+    try:
+        user = await client.fetch_user(user_id)
+    except discord.DiscordException as exc:
+        return {"text": f"Discord found no user {user_id}: {exc}", "is_error": True}
+    info: dict[str, Any] = _member_row(user)
+    info["createdAt"] = user.created_at.isoformat()
+    memberships = [_member_row(member) for member in (guild.get_member(user_id) for guild in client.guilds) if member]
+    if memberships:
+        info["servers"] = memberships
+    log_event("plugin:discord", "get_info", servers=len(memberships))
+    return {"text": str(info)}
+
+
+async def discord_list_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """The members of a server, or the people who can see one channel."""
+    client = get_live_client()
+    if client is None:
+        return {"text": "Discord isn't connected yet -- use discord_set_token first.", "is_error": True}
+    try:
+        target_id = int(str(args.get("channel") or "").strip())
+    except ValueError:
+        return {"text": "channel must be a numeric channel or server id.", "is_error": True}
+    guild = client.get_guild(target_id)
+    if guild is not None:
+        members = guild.members
+    else:
+        channel = client.get_channel(target_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(target_id)
+            except discord.DiscordException as exc:
+                return {"text": f"Couldn't find a channel or server at id {target_id}: {exc}", "is_error": True}
+        members = getattr(channel, "members", None) or getattr(channel, "recipients", None) or []
+    rows = [_member_row(member) for member in members]
+    log_event("plugin:discord", "list_members", count=len(rows))
+    if not rows:
+        return {"text": "Discord gave no member list here -- the bot may lack the Server Members intent, or see no one."}
+    included, skipped = cap_batch(rows, lambda r: str(r), lambda r: str(r.get("id")))
+    lines = [f"{len(rows)} member(s): {included}"]
+    if skipped:
+        lines.append(skipped_note(skipped, 200_000, "Look up the ones you need with discord_find_member."))
+    return {"text": "\n\n".join(lines)}
 
 
 def _usage_instructions() -> str:
@@ -203,6 +269,21 @@ PLUGIN = Plugin(
             "which discord_send_message accepts directly to DM them cold, even if you've never messaged them "
             "before.",
             {"query": str}, discord_find_member,
+        ),
+        PluginTool(
+            "discord_get_info",
+            "What Discord shows the bot about one user: numeric id, username, display name, bot flag, account "
+            "creation date, and on every server shared with the bot their nickname, roles and join date. `who` "
+            "is a numeric user id (from discord_find_member, a message's authorId or a notification). Discord "
+            "gives bots no phone numbers or emails. Reads only.",
+            {"who": str}, discord_get_info,
+        ),
+        PluginTool(
+            "discord_list_members",
+            "Lists the members of a server, or the people who can see one channel/DM, each with id, username, "
+            "display name, nickname, roles. `channel` is a numeric server or channel id from "
+            "discord_list_channels. A server's full list needs the bot's Server Members intent.",
+            {"channel": str}, discord_list_members,
         ),
         PluginTool(
             "discord_send_message",

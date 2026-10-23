@@ -15,6 +15,7 @@
 //   {"cmd":"sendMessage","id":"...","to":"<jid>","text":"..."}
 //   {"cmd":"listChats","id":"..."}
 //   {"cmd":"checkNumber","id":"...","phone":"<digits>"}             -> sendResult{ok,exists,jid}
+//   {"cmd":"getInfo","id":"...","jid":"<user or group jid>"}        -> sendResult{ok,info} -- profile, or group with participants
 //   {"cmd":"setBlock","id":"...","jid":"...","block":bool}          -> sendResult{ok}
 //   {"cmd":"sendFile","id":"...","to":"...","path":"<local path>","caption":"..."?} -> sendResult{ok}
 //   {"cmd":"downloadMedia","id":"...","ref":"<jid>:<id>","savePath":"<local path>"} -> sendResult{ok,path}
@@ -55,6 +56,7 @@ let sock = null;
 // without the separate (and version-churny) makeInMemoryStore helper, which
 // this deliberately avoids depending on.
 const knownChats = new Map(); // jid -> name
+const knownContacts = new Map(); // jid -> everything WhatsApp told us about the contact (Baileys Contact)
 
 // WhatsApp (unlike Telegram) gives no way to re-fetch an arbitrary message
 // by id later -- the only copy of a media message's envelope is the one
@@ -149,11 +151,19 @@ async function start() {
     }
   });
 
-  sock.ev.on('contacts.upsert', (contacts) => {
+  // Everything WhatsApp told us about each contact (names, lid/phone jids,
+  // verified business name), for getInfo -- 2026-10-23, Caroline could not
+  // get a phone number or an id out of a conversation.
+  const rememberContacts = (contacts) => {
     for (const c of contacts) {
-      if (c.id) knownChats.set(c.id, c.name || c.notify || knownChats.get(c.id) || c.id);
+      if (!c.id) continue;
+      knownContacts.set(c.id, Object.assign({}, knownContacts.get(c.id), c));
+      if (c.name || c.notify) knownChats.set(c.id, c.name || c.notify);
+      else if (!knownChats.has(c.id)) knownChats.set(c.id, c.id);
     }
-  });
+  };
+  sock.ev.on('contacts.upsert', rememberContacts);
+  sock.ev.on('contacts.update', rememberContacts);
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -185,18 +195,73 @@ async function start() {
       // NEXT message from this same jid has it too without needing
       // contacts.upsert to ever fire.
       const pushName = msg.pushName || undefined;
-      if (pushName && !knownChats.has(jid)) knownChats.set(jid, pushName);
+      // Who wrote it: in a group `jid` is the group's, the author is
+      // key.participant (2026-10-23: it was never passed on). Their phone
+      // number comes as a phone-number jid when WhatsApp gives one -- an
+      // @lid id hides it.
+      const sender = msg.key.participant || jid;
+      const senderPn = msg.key.participantPn || msg.key.senderPn || (sender.endsWith('@s.whatsapp.net') ? sender : undefined);
+      if (pushName && !knownChats.has(sender)) knownChats.set(sender, pushName);
       emit({
         type: 'message',
         from: jid,
         fromMe: !!msg.key.fromMe,
         text,
         chatName: knownChats.get(jid) || pushName || jid,
+        sender,
+        senderName: pushName || knownChats.get(sender) || undefined,
+        senderPhone: phoneOf(senderPn),
         media: media || undefined,
         mediaRef,
       });
     }
   });
+}
+
+// "+<digits>" from a phone-number jid (123@s.whatsapp.net, 123:4@s.whatsapp.net), else undefined.
+function phoneOf(jid) {
+  if (!jid || !jid.endsWith('@s.whatsapp.net')) return undefined;
+  return '+' + jid.split('@')[0].split(':')[0];
+}
+
+// Everything WhatsApp gives about one person or group. Every lookup that
+// may be refused (privacy settings, not a business account) is tried on
+// its own: what it could not get is left out, never failing the whole answer.
+async function getInfo(jid) {
+  if (jid.endsWith('@g.us')) {
+    const meta = await sock.groupMetadata(jid);
+    return {
+      kind: 'group', jid: meta.id, subject: meta.subject, description: meta.desc || undefined,
+      owner: meta.ownerJid || meta.owner || undefined, created: meta.creation ? new Date(meta.creation * 1000).toISOString() : undefined,
+      announceOnly: meta.announce || undefined, isCommunity: meta.isCommunity || undefined, size: meta.participants.length,
+      participants: meta.participants.map((p) => {
+        const known = knownContacts.get(p.id) || {};
+        return {
+          id: p.id, phone: phoneOf(p.jid) || phoneOf(p.id), lid: p.lid || (p.id.endsWith('@lid') ? p.id : undefined),
+          name: known.name || known.notify || knownChats.get(p.id) || undefined, admin: p.admin || undefined,
+        };
+      }),
+    };
+  }
+  const known = knownContacts.get(jid) || {};
+  const info = {
+    kind: 'user', jid, phone: phoneOf(jid) || phoneOf(known.jid), lid: known.lid || (jid.endsWith('@lid') ? jid : undefined),
+    savedName: known.name || undefined, ownName: known.notify || undefined, verifiedName: known.verifiedName || undefined,
+  };
+  try {
+    const [found] = await sock.onWhatsApp(jid);
+    info.onWhatsApp = !!(found && found.exists);
+  } catch (e) { info.onWhatsAppError = String(e); }
+  try {
+    const statuses = await sock.fetchStatus(jid);
+    const status = statuses && statuses[0] && statuses[0].status;
+    if (status && status.status) { info.about = status.status; info.aboutSetAt = status.setAt ? new Date(status.setAt).toISOString() : undefined; }
+  } catch (e) { info.aboutError = String(e); }
+  try {
+    const business = await sock.getBusinessProfile(jid);
+    if (business) info.business = { description: business.description, category: business.category, email: business.email, website: business.website, address: business.address };
+  } catch (e) { /* not a business account */ }
+  return info;
 }
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
@@ -218,6 +283,8 @@ rl.on('line', async (line) => {
     } else if (msg.cmd === 'listChats') {
       const chats = Array.from(knownChats.entries()).map(([jid, name]) => ({ jid, name }));
       emit({ type: 'chats', id: msg.id, chats });
+    } else if (msg.cmd === 'getInfo') {
+      emit({ type: 'sendResult', id: msg.id, ok: true, info: await getInfo(msg.jid) });
     } else if (msg.cmd === 'checkNumber') {
       const [result] = await sock.onWhatsApp(msg.phone);
       emit({ type: 'sendResult', id: msg.id, ok: true, exists: !!(result && result.exists), jid: result && result.jid });

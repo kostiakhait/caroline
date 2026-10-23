@@ -66,6 +66,13 @@ from app.telegram_channel import (
     set_admin,
     unblock_user,
 )
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.messages import GetFullChatRequest
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import Channel, Chat
+
+from app.logging_setup import log_event
+from app.telegram_channel import entity_fields
 from app.workspace_dir import WORKSPACE_DIR
 from app.context_cap import cap_batch, cap_count, skipped_note, truncate
 from app.plugins.loader import Plugin, PluginTool
@@ -222,11 +229,20 @@ async def telegram_list_chats(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     client = get_live_client(account)
     limit = min(int(args.get("limit") or 50), 500)
     dialogs = await client.get_dialogs(limit=limit)
-    rows = [
-        {"id": d.id, "name": d.name, "isGroup": d.is_group, "isChannel": d.is_channel, "unread": d.unread_count}
-        for d in dialogs
-    ]
-    return {"text": str(rows)}
+    return {"text": str([_dialog_row(d) for d in dialogs])}
+
+
+def _dialog_row(dialog: Any) -> dict[str, Any]:
+    """One chat of telegram_list_chats/telegram_find_chat: its id, name and
+    kind, plus the @username and phone Telegram shows for it (see
+    telegram_channel.entity_fields) -- 2026-10-23, the list used to carry
+    neither."""
+    row = {"id": dialog.id, "name": dialog.name, "isGroup": dialog.is_group, "isChannel": dialog.is_channel, "unread": dialog.unread_count}
+    fields = entity_fields(dialog.entity)
+    for key in ("username", "phone"):
+        if fields.get(key):
+            row[key] = fields[key]
+    return row
 
 
 async def telegram_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -245,10 +261,7 @@ async def telegram_find_chat(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     # found, not just whatever happens to be most recently active.
     limit = min(int(args.get("limit") or 500), 2000)
     dialogs = await client.get_dialogs(limit=limit)
-    rows = [
-        {"id": d.id, "name": d.name, "isGroup": d.is_group, "isChannel": d.is_channel, "unread": d.unread_count}
-        for d in dialogs
-    ]
+    rows = [_dialog_row(d) for d in dialogs]
     matches = await find_by_name(query, rows)
     matches, _cut = cap_count(matches)
     return {"text": str(matches)}
@@ -299,20 +312,103 @@ async def telegram_search_messages(args: dict[str, Any], _rp: Any) -> dict[str, 
         chat_id = int(args["chat"])
     except (TypeError, ValueError):
         return {"text": "chat must be the numeric chat id from telegram_list_chats -- Telethon has no single-call global search across every chat (unlike Slack), only per-chat.", "is_error": True}
-    query = str(args["query"]).strip()
+    # No query: the latest messages of the chat (Telegram's own search with
+    # an empty string), so a conversation can be read without guessing a word in it.
+    query = str(args.get("query") or "").strip()
     # Bug fix (2026-10-16), confirmed live (full-plugin context-overflow audit, same incident
     # as email_batch_plugin.py's own fix): `limit` had no hard ceiling, and every matched
     # message's FULL raw_text went back with no truncation and no total-char budget -- the
     # same "many full bodies, one call" shape as the email-batch incident.
     limit = min(int(args.get("limit") or 20), 200)
     rows = []
-    async for m in client.iter_messages(chat_id, search=query, limit=limit):
+    async for m in client.iter_messages(chat_id, search=query or None, limit=limit):
         text, _note = truncate(m.raw_text or "")
-        rows.append({"id": m.id, "date": m.date.isoformat() if m.date else None, "text": text})
+        # Who wrote each message (2026-10-23): in a group the rows never said.
+        sender = entity_fields(getattr(m, "sender", None)) or {"id": m.sender_id}
+        rows.append({"id": m.id, "date": m.date.isoformat() if m.date else None, "from": sender, "text": text})
     included, skipped = cap_batch(rows, lambda r: r["text"], lambda r: str(r["id"]))
     lines = [str(included)]
     if skipped:
         lines.append(skipped_note(skipped, 200_000, "Narrow the query or search a smaller limit to see the rest in full."))
+    return {"text": "\n\n".join(lines)}
+
+
+async def _entity_for_lookup(client: Any, raw: str) -> tuple[Any, dict[str, Any] | None]:
+    """The entity named by a numeric id, an @username or a phone number, for
+    reading only: unlike _resolve_chat, a phone number is NOT added to the
+    contacts -- looking someone up must change nothing. Telegram resolves a
+    phone only for a contact of this account."""
+    raw = raw.strip()
+    target: Any = raw
+    if not _looks_like_phone(raw):
+        try:
+            target = int(raw)
+        except ValueError:
+            target = raw.lstrip("@") if _looks_like_username(raw) else raw
+    try:
+        return await client.get_entity(target), None
+    except Exception as exc:
+        hint = (" A phone number is only found for someone in this account's contacts -- telegram_add_contact adds "
+                "them, if that is what you want." if _PHONE.match(raw) else "")
+        return None, {"text": f'Telegram could not find "{raw}": {exc}.{hint}', "is_error": True}
+
+
+async def telegram_get_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Everything Telegram tells this account about one person, group or
+    channel: entity_fields plus the profile's own "about" text and, for a
+    person, the number of chats in common; for a group or channel, its
+    description and member count."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    entity, error = await _entity_for_lookup(client, str(args.get("who") or ""))
+    if error:
+        return error
+    info = entity_fields(entity)
+    try:
+        if isinstance(entity, Channel):
+            full = (await client(GetFullChannelRequest(entity))).full_chat
+            info.update({"about": full.about or None, "membersCount": full.participants_count})
+        elif isinstance(entity, Chat):
+            full = (await client(GetFullChatRequest(entity.id))).full_chat
+            info.update({"about": full.about or None})
+        else:
+            full = (await client(GetFullUserRequest(entity))).full_user
+            info.update({"about": full.about or None, "commonChatsCount": full.common_chats_count})
+    except Exception as exc:  # the basic fields above are still a real answer
+        info["fullProfileError"] = str(exc)
+    log_event("plugin:telegram", "get_info", account=account, kind=info.get("kind"))
+    return {"text": str({key: value for key, value in info.items() if value not in (None, "")})}
+
+
+async def telegram_list_members(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """The members of a group (or of a channel, when this account is allowed
+    to see them), each with entity_fields: id, names, @username, phone."""
+    account, error = _account_or_error(args)
+    if error:
+        return error
+    not_ready = _not_ready(account)
+    if not_ready:
+        return not_ready
+    client = get_live_client(account)
+    entity, error = await _entity_for_lookup(client, str(args.get("chat") or ""))
+    if error:
+        return error
+    rows = []
+    try:
+        async for user in client.iter_participants(entity):
+            rows.append(entity_fields(user))
+    except Exception as exc:
+        return {"text": f"Telegram did not give the member list of this chat: {exc}", "is_error": True}
+    log_event("plugin:telegram", "list_members", account=account, count=len(rows))
+    included, skipped = cap_batch(rows, lambda r: str(r), lambda r: str(r.get("id")))
+    lines = [f"{len(rows)} member(s): {included}"]
+    if skipped:
+        lines.append(skipped_note(skipped, 200_000, "Look up the ones you need by name with telegram_get_info."))
     return {"text": "\n\n".join(lines)}
 
 
@@ -622,10 +718,29 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "telegram_search_messages",
-            "Searches one Telegram chat's own messages for `query`. `chat` is required (the numeric chat id) "
-            "-- see this plugin's own usage_instructions for why there's no cross-chat search. `account`: "
-            "\"self\" (default) or \"owner\".",
-            {"chat": str, "query": str, "limit": int | None, "account": str | None}, telegram_search_messages,
+            "Searches one Telegram chat's own messages for `query`; without `query`, returns the chat's latest "
+            "messages. Every message comes with who wrote it (`from`: id, name, @username, phone when Telegram "
+            "shows it). `chat` is required (the numeric chat id) -- see this plugin's own usage_instructions for "
+            "why there's no cross-chat search. `account`: \"self\" (default) or \"owner\".",
+            {"chat": str, "query": str | None, "limit": int | None, "account": str | None}, telegram_search_messages,
+        ),
+        PluginTool(
+            "telegram_get_info",
+            "Everything Telegram tells this account about one person, group or channel: numeric id, first and "
+            "last name, @username(s), phone number, whether they are a contact, a bot, last seen, the profile's "
+            "own \"about\" text, chats in common; for a group or channel its title, @username, description and "
+            "member count. `who` is a numeric id (a chat id, or a sender id from a notification or a message's "
+            "`from`), an @username, or a phone number of someone in this account's contacts. A phone number is "
+            "only there when Telegram shows it to this account (a contact, or someone sharing it with everyone). "
+            "Reads only, changes nothing. `account`: \"self\" (default) or \"owner\".",
+            {"who": str, "account": str | None}, telegram_get_info,
+        ),
+        PluginTool(
+            "telegram_list_members",
+            "Lists the members of a group (or of a channel, when this account may see them), each with numeric "
+            "id, names, @username and phone when Telegram shows it. `chat` is the group's numeric id or "
+            "@username. `account`: \"self\" (default) or \"owner\".",
+            {"chat": str, "account": str | None}, telegram_list_members,
         ),
         PluginTool(
             "telegram_delete_contact",
