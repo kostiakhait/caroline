@@ -3190,4 +3190,6 @@ async def run_small_model_turn(
         final_text = verified_text if _usable(verified_text) else _UNAVAILABLE_ANSWER
 
     log_event("engine", "small_model_turn_answered", tab_id=tab_id, text_len=len(final_text))
-    return _answer(final_text)
+    # Whether a tier closed the task (the verifier's OK) -- the result writer then strips
+    # offers to do more (2026-10-22, see app/sw_result_writer.py).
+    return {**_answer(final_text), "completed": closed_on is not None}

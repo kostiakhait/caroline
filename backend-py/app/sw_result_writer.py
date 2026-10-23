@@ -42,7 +42,19 @@ _PROMPT = (
 )
 
 
-async def write_result(request: str, answer: str, tab_id: str | None = None) -> str:
+# The task was checked and closed (2026-10-22, explicit instruction): the user asked for
+# this and got it; offers to do more are noise. Seen on the test box: a finished email
+# task ended with "Дальше могу: пометить письмо как прочитанное и/или поместить в нужную
+# папку; приложить краткое резюме к записи по теме...".
+_COMPLETED_RULE = (
+    "\n\nTHE TASK IS FULLY DONE -- checked. So also rewrite the answer when it offers to do anything more "
+    "(\"I can also...\", \"If you want, I can...\", \"Next I could...\", \"Дальше могу...\", \"Если нужно...\", "
+    "a list of further options): remove every such offer and suggestion, keep only what was done and what "
+    "came out. If that is the only change, still reply with the rewritten answer, not OK."
+)
+
+
+async def write_result(request: str, answer: str, tab_id: str | None = None, task_completed: bool = False) -> str:
     """The answer the user reads: `answer` itself, or its human rewrite."""
     from app.small_model_engine import resolve_narration_prompt
 
@@ -50,7 +62,8 @@ async def write_result(request: str, answer: str, tab_id: str | None = None) -> 
         return answer
     started = time.monotonic()
     try:
-        raw = (await resolve_narration_prompt(_PROMPT.format(ok=_UNCHANGED, request=request, answer=answer),
+        prompt = _PROMPT.format(ok=_UNCHANGED, request=request, answer=answer) + (_COMPLETED_RULE if task_completed else "")
+        raw = (await resolve_narration_prompt(prompt,
                                               model=RESULT_WRITER_MODEL, reasoning=RESULT_WRITER_REASONING) or "").strip()
     except Exception as exc:  # noqa: BLE001 -- the answer as it was, never none
         log_event("engine", "sw_result_writer_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__,

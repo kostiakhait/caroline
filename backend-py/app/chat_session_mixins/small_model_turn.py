@@ -138,6 +138,7 @@ class SmallModelTurnMixin:
 
         translate_answer = True
         from_cascade = False
+        task_completed = False
         try:
             fast = None
             start_tier = None
@@ -175,6 +176,7 @@ class SmallModelTurnMixin:
                     ),
                 )
                 from_cascade = True
+                task_completed = bool(result.get("completed"))
                 if CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE:
                     translate_answer = not answer_is_in_language(result["text"], language)
         except asyncio.CancelledError:
@@ -192,6 +194,7 @@ class SmallModelTurnMixin:
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         await self._finish_small_model_turn_answered(
             question_text, result["text"], is_voice, translate=translate_answer, write_result=from_cascade,
+            task_completed=task_completed,
         )
     async def _sw_history_context(self) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Phase 2b (2026-10-22, see app/sw_history.py): makes sure this turn's
@@ -219,6 +222,7 @@ class SmallModelTurnMixin:
         return sw_history.context_messages(turns), sw_history.summary_section(summary)
     async def _finish_small_model_turn_answered(
         self, question_text: str, text: str, is_voice: bool, translate: bool = True, write_result: bool = False,
+        task_completed: bool = False,
     ) -> None:
         """Synthesizes the same {assistant} + {result} wire pair a normal
         SDK turn's completion sends (see wire.py's message_to_wire), so
@@ -264,7 +268,7 @@ class SmallModelTurnMixin:
         if write_result and not silent:
             from app.sw_result_writer import write_result
 
-            text = await write_result(question_text, text, self.tab_id)
+            text = await write_result(question_text, text, self.tab_id, task_completed=task_completed)
         if is_voice and not silent:
             self._speech_ahead(text, current_language_name(self.tab_id))
         try:
