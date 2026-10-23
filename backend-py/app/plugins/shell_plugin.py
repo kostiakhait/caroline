@@ -63,9 +63,23 @@ async def _run(proc_coro: Any, timeout_s: float) -> str:
     return _format_output(stdout, stderr, proc.returncode)
 
 
+def _missing_cwd(cwd: str | None) -> dict[str, Any] | None:
+    """A clear error for a working directory that does not exist (2026-10-23). The bare
+    FileNotFoundError that subprocess raised read like a problem in the script -- on the sw test
+    box a correct run_python was retried as if its code were wrong, because the model had passed
+    a cwd of its own invention."""
+    if cwd and not Path(cwd).is_dir():
+        return {"text": f"The working directory {cwd!r} does not exist -- leave cwd out, or give one that does. "
+                        "Nothing was run.", "is_error": True}
+    return None
+
+
 async def run_command(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     command = args["command"]
     cwd = args.get("cwd") or None
+    missing = _missing_cwd(cwd)
+    if missing:
+        return missing
     timeout_s = args.get("timeout_s") or DEFAULT_TIMEOUT_S
     proc_coro = asyncio.create_subprocess_shell(
         command, cwd=cwd,
@@ -79,6 +93,9 @@ async def run_command(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 async def run_python(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     code = args["code"]
     cwd = args.get("cwd") or None
+    missing = _missing_cwd(cwd)
+    if missing:
+        return missing
     timeout_s = args.get("timeout_s") or DEFAULT_TIMEOUT_S
     # Written to a temp file rather than passed via `python -c` -- multi-line
     # scripts with embedded quotes are common (e.g. python-pptx edits) and
@@ -147,11 +164,13 @@ PLUGIN = Plugin(
         ),
         PluginTool(
             "run_python",
-            "Run a Python script (arbitrary multi-line code, using this machine's own Python environment -- "
-            "including packages like python-pptx, python-docx, etc.) and return its exit code, stdout, and "
-            "stderr. Use this for anything that needs real logic rather than a one-line shell command -- editing "
-            f"an Office document, processing data, and so on. Defaults to a {DEFAULT_TIMEOUT_S}s timeout "
-            "(override with timeout_s).",
+            "Run a Python script (arbitrary multi-line code, using this machine's own Python environment) and "
+            "return its exit code, stdout, and stderr. Use this for anything that needs real logic rather than "
+            "a one-line shell command -- processing data, building or editing documents, and so on. Documents "
+            "are made with the installed libraries, never by assembling a file format's XML or bytes by hand "
+            "(that breaks): Word (.docx) with python-docx, Excel (.xlsx) with openpyxl or XlsxWriter, "
+            "PowerPoint (.pptx) with python-pptx, PDF with reportlab. Write the file to the exact path the task "
+            f"gives, not a temporary one. Defaults to a {DEFAULT_TIMEOUT_S}s timeout (override with timeout_s).",
             {"code": str, "cwd": str | None, "timeout_s": int | None}, run_python,
         ),
     ],

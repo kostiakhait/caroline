@@ -49,12 +49,70 @@ async def open_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f"Opened {path} in its default application."}
 
 
+def _office_as_text(p: Path) -> str | None:
+    """A Word / Excel / PowerPoint file as readable text, in document order, or None for
+    any other file. Until 2026-10-23 read_file returned such a file's zip bytes decoded as
+    text -- unreadable, so a model could not check a document it had just made (seen on
+    the sw test box: the verifier asked for a read-back that was impossible, and a retry
+    then appended a second total row and a second conclusion to a finished report)."""
+    suffix = p.suffix.lower()
+    lines: list[str] = []
+    if suffix == ".docx":
+        import docx
+
+        document = docx.Document(str(p))
+        tables = iter(document.tables)
+        paragraphs = iter(document.paragraphs)
+        for element in document.element.body.iterchildren():
+            kind = element.tag.rsplit("}", 1)[-1]
+            if kind == "p":
+                paragraph = next(paragraphs)
+                if paragraph.text.strip():
+                    style = paragraph.style.name if paragraph.style is not None else ""
+                    lines.append(f"[{style}] {paragraph.text}" if style and style != "Normal" else paragraph.text)
+            elif kind == "tbl":
+                lines.append("[table]")
+                for row in next(tables).rows:
+                    lines.append(" | ".join(cell.text for cell in row.cells))
+                lines.append("[/table]")
+    elif suffix == ".xlsx":
+        import openpyxl
+
+        workbook = openpyxl.load_workbook(str(p), data_only=False)
+        for sheet in workbook.worksheets:
+            lines.append(f"[sheet] {sheet.title}")
+            for row in sheet.iter_rows(values_only=True):
+                if any(cell is not None for cell in row):
+                    lines.append(" | ".join("" if cell is None else str(cell) for cell in row))
+    elif suffix == ".pptx":
+        import pptx
+
+        for number, slide in enumerate(pptx.Presentation(str(p)).slides, 1):
+            lines.append(f"[slide {number}]")
+            for shape in slide.shapes:
+                if shape.has_text_frame and shape.text_frame.text.strip():
+                    lines.append(shape.text_frame.text)
+                if getattr(shape, "has_table", False) and shape.has_table:
+                    for row in shape.table.rows:
+                        lines.append(" | ".join(cell.text for cell in row.cells))
+    else:
+        return None
+    return "\n".join(lines) if lines else "(the document has no text)"
+
+
 async def read_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     p = Path(args["path"])
     if not p.exists():
         raise FileNotFoundError(f"No such file: {p}")
     if not p.is_file():
         raise IsADirectoryError(f"Not a file: {p}")
+    try:
+        office_text = _office_as_text(p)
+    except Exception as exc:  # noqa: BLE001 -- a damaged or unreadable document is said so, not shown as bytes
+        return {"text": f"Could not read {p} as a document: {exc}", "is_error": True}
+    if office_text is not None:
+        truncated = len(office_text) > MAX_READ_BYTES
+        return {"text": office_text[:MAX_READ_BYTES] + (f"\n\n[... truncated, {len(office_text)} characters ...]" if truncated else "")}
     data = p.read_bytes()
     truncated = len(data) > MAX_READ_BYTES
     text = data[:MAX_READ_BYTES].decode("utf-8", errors="replace")

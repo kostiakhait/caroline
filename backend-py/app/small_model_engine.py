@@ -637,8 +637,10 @@ _ACT_DO_NOT_ASK_INSTRUCTION = (
     "ACT, DO NOT ASK. This is the most important rule you have. Do the task with your tools. Your first "
     "move is a tool call, never a question to the user.\n"
     "- Never ask the user for permission to read, search, open, look up or check anything.\n"
-    "- Never ask for something you can find yourself. Passwords, servers, ports, addresses, accounts, "
-    "earlier work, anything the user told you before: call request_info first -- that is your memory. "
+    "- Never ask for something you can find yourself. When something is MISSING -- a password, a server, a "
+    "port, an address, an account, earlier work, anything the user told you before: call request_info first -- "
+    "that is your memory. When the task already gives you everything it needs, do not search memory at all: "
+    "start the work. "
     "A mailbox the user has used before needs only its address: the email tools fill in its saved "
     "password and servers themselves, so just call them with the address. Files and folders: look at them.\n"
     "- Never hand the user a list of options instead of doing the work; when one way fails, try another.\n"
@@ -1584,6 +1586,19 @@ def _make_executor_fn(
                     f"NOT DONE: {name} is not part of the user's task ({why}). Do only what the task asks; "
                     "do not create, move, delete, rename or change anything else."
                 )
+            grounded, invented = _content_grounded(task_text, name, args, list(tracker.recent_calls), tab_id)
+            if not grounded:
+                return (
+                    f"NOT DONE: the content of this {name} call states things the task and your results do not "
+                    f"support: {invented}. Remove them -- write only what the task gave you and what your tool "
+                    "results showed (totals and comparisons of the given numbers are fine) -- and call again."
+                )
+
+        # The checks above take seconds, and the turn can be cancelled meanwhile (Stop, a
+        # closed session, a given-up attempt): a call is never made after that (2026-10-23;
+        # seen on the test box: a stopped turn's run_python still ran 5 s after the stop --
+        # for a send it would have been a letter nobody wanted any more).
+        _abandon_if_cancelled(tracker, parent_cancels)
 
         async def _run() -> dict[str, Any]:
             session_context.set_tab_id(tab_id)
@@ -1670,7 +1685,7 @@ def _make_executor_fn(
 
 def _build_verification_prompt(
     tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
-    can_deescalate: bool = False, can_retry: bool = False,
+    can_deescalate: bool = False, can_retry: bool = False, evidence: str = "",
 ) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
     any work. It checks the candidate against the mechanical facts below.
@@ -1728,6 +1743,11 @@ def _build_verification_prompt(
         parts.append(
             "Parallel-stage branches, each with its own real tool calls and results (ground truth, same rule):\n"
             + "\n".join(tracker.branch_trace[-40:])
+        )
+    if evidence:
+        parts.append(
+            "The files this task was to make, READ BY THE SYSTEM ITSELF just now -- what is in them at this "
+            "moment (ground truth; the system read them, so nobody has to read them back):\n" + evidence
         )
     if not tier_trace and not tracker.branch_trace:
         # Said on every pass, not only the last one (2026-10-22): its absence read as
@@ -2136,6 +2156,90 @@ def _action_in_scope(task: str, tool_name: str, args: dict[str, Any], calls: lis
     return output["in_scope"], str(output.get("why") or "")
 
 
+def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: list[str], tab_id: str | None) -> tuple[bool, str]:
+    """The content-grounding check, run synchronously on the tool-call worker thread for the
+    changing call just checked by sw.action.scope: sw.content.extract takes the statements
+    of fact out of what the call writes or sends, sw.content.grounding judges that list.
+    Fail-open (logged)."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents import sw_content_extract, sw_content_grounding
+
+    shown = {k: v for k, v in (args or {}).items() if k not in ("password", "imapHost", "imapPort", "smtpHost", "smtpPort")}
+    started = time.monotonic()
+
+    def run(module: Any, name: str, agent_input: dict[str, Any]) -> dict[str, Any] | None:
+        runtime = build_local_runtime()
+        if runtime is None:
+            return None
+        for agent in module.llm_agents():
+            try:
+                runtime.register(agent)
+            except ValueError:
+                pass
+        result = runtime.run(name, agent_input, runtime.new_context(budget=new_budget()))
+        if (result or {}).get("status") != "ok":
+            log_event("engine", "sw_content_grounding_failed", tab_id=tab_id, tool=tool_name, agent=name, error=(result or {}).get("error"))
+            return None
+        return (result or {}).get("output") or {}
+
+    try:
+        extracted = run(sw_content_extract, sw_content_extract.CONTENT_EXTRACT, {
+            "tool": tool_name, "args": json.dumps(shown, ensure_ascii=False, default=str)[:6000],
+        })
+        facts = [str(f) for f in (extracted or {}).get("facts") or []]
+        if not facts:
+            log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=True, facts=0,
+                      ms=int((time.monotonic() - started) * 1000))
+            return True, ""
+        judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": calls[-15:]})
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        log_event("engine", "sw_content_grounding_failed", tab_id=tab_id, tool=tool_name, error=str(exc)[:200])
+        return True, ""
+    if judged is None or not isinstance(judged.get("grounded"), bool):
+        return True, ""
+    log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=judged["grounded"], facts=len(facts),
+              checked=facts[:6], invented=str(judged.get("invented"))[:400], ms=int((time.monotonic() - started) * 1000))
+    return judged["grounded"], str(judged.get("invented") or "")
+
+
+async def _result_evidence(task: str, calls: list[str], memo: dict[str, str], tab_id: str | None) -> str:
+    """What is in the files the task was to make, read by the system for the verifier
+    (2026-10-23): sw.result.evidence names the files, this code reads them with read_file
+    (Word / Excel / PowerPoint as text). Only a path that occurs in the task or in the calls
+    is read -- a guessed one never is. Read once per state of the calls (memo); "" when there
+    are no files or nothing could be read."""
+    from app.microagents.sw_result_complete import RESULT_COMPLETE
+    from app.microagents.sw_result_evidence import MAX_FILES, RESULT_EVIDENCE
+    from app.plugins import files_plugin
+
+    key = json.dumps(calls[-30:], ensure_ascii=False, default=str)
+    if key in memo:
+        return memo[key]
+    output = await _local_agent(RESULT_EVIDENCE, "app.microagents.sw_result_evidence", {"task": task, "calls": calls[-30:]}, tab_id)
+    haystack = task + "\n" + "\n".join(calls)
+    shown: list[str] = []
+    for path in [str(p).strip() for p in (output or {}).get("files") or []][:MAX_FILES]:
+        if path not in haystack:
+            log_event("engine", "sw_result_evidence_path_dropped", tab_id=tab_id, path=path)
+            continue
+        try:
+            text = (await files_plugin.read_file({"path": path}, None))["text"]
+        except Exception as exc:  # noqa: BLE001 -- a file that is not there is itself the evidence
+            text = f"(cannot be read: {exc})"
+        if text and not text.startswith("(cannot be read"):
+            complete = await _local_agent(RESULT_COMPLETE, "app.microagents.sw_result_complete",
+                                          {"task": task, "content": text[:6000]}, tab_id)
+            problems = [str(x) for x in (complete or {}).get("problems") or []]
+            if problems:
+                log_event("engine", "sw_result_incomplete", tab_id=tab_id, path=path, problems=problems[:6])
+                text = text[:6000] + "\n\nCHECKED AGAINST THE TASK, THE FILE HAS THESE PROBLEMS:\n" + "\n".join("- " + x for x in problems)
+        shown.append(f"--- {path} ---\n{text[:6000]}")
+    memo[key] = "\n\n".join(shown)
+    if shown:
+        log_event("engine", "sw_result_evidence", tab_id=tab_id, files=len(shown), chars=len(memo[key]))
+    return memo[key]
+
+
 async def _local_agent(agent_name: str, module: str, agent_input: dict[str, Any], tab_id: str | None) -> dict[str, Any] | None:
     """One local microagent call (the ladder) -> its output, or None on any failure (logged)."""
     from app.plugins.voice_api import _run_local_microagent
@@ -2281,10 +2385,11 @@ _REQUEST_VALUES_RULE = (
 # finally was, and the reply described it as asked.
 _RESULT_READ_BACK_RULE = (
     "When the request was to create or change a file or document, the task is finished only if the facts "
-    "above (from this attempt or an earlier one) show its FINAL content read back after the last change to "
-    "it, and that content is exactly what was asked -- everything asked for, nothing duplicated or left "
-    "over from an earlier attempt. Without such a read-back, or when it differs, the task is NOT finished: "
-    "say that the final file has to be read back and corrected."
+    "above show the file's FINAL content -- the system's own reading of the files above, or a read-back by the "
+    "assistant after its last change -- and that content is exactly what was asked: everything asked for, "
+    "nothing duplicated or left over from an earlier attempt. When the content differs, say precisely what is "
+    "wrong or missing in it. When there is no content to compare with, say that the final file still has to be "
+    "read back -- never that the file was not made or saved unless the facts above show it."
 )
 
 
@@ -2877,13 +2982,16 @@ async def run_small_model_turn(
     # доделана, то нужна эскалация"): finding the task genuinely unfinished is
     # itself an escalation trigger while a later tier still exists -- verification
     # is no longer only a final polish pass tacked on after the loop.
+    evidence_memo: dict[str, str] = {}
+
     async def run_verifier(
         candidate_text: str, can_escalate: bool, can_deescalate: bool, trace: list[str],
         not_a_form: str | None = None, first_model: str | None = None, can_retry: bool = False,
     ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
-        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate, can_retry)})
+        evidence = await _result_evidence(request_spec or user_text, list(tier_history) + list(trace), evidence_memo, tab_id)
+        verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate, can_retry, evidence)})
         if not_a_form is not None:
             verification_messages.append({"role": "assistant", "content": not_a_form})
             verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text), can_retry)})
