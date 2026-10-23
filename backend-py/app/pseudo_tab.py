@@ -74,6 +74,23 @@ def real_tab_id_from_pseudo(pseudo_id: str) -> str:
     return pseudo_id[:idx] if idx != -1 else pseudo_id
 
 
+def activity_id_from_pseudo(pseudo_id: str) -> str:
+    idx = pseudo_id.find(_PSEUDO_MARKER)
+    return pseudo_id[idx + len(_PSEUDO_MARKER):] if idx != -1 else pseudo_id
+
+
+def _mark_awaiting_retry(pseudo_id: str, waiting: bool) -> None:
+    """Mirrors the waiting state into the reminder's own record (a reminder's
+    activity_id is its id) so that it survives a restart -- see
+    scheduler_plugin.set_reminder_awaiting_retry. Never raises: the chore's
+    own reply must not be lost to a failed bookkeeping write."""
+    from app.plugins.scheduler_plugin import set_reminder_awaiting_retry  # local: keeps this module's imports light
+    try:
+        set_reminder_awaiting_retry(activity_id_from_pseudo(pseudo_id), waiting)
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "reminder_awaiting_retry_set_failed", pseudo_id=pseudo_id, waiting=waiting, error=str(exc))
+
+
 def is_pseudo_tab_id(tab_id: str) -> bool:
     return _PSEUDO_MARKER in tab_id
 
@@ -147,6 +164,25 @@ def _make_pseudo_session_send(real_tab_id: str, pseudo_id: str, get_target_sessi
             if text:
                 _pseudo_turn_last_visible_text[pseudo_id] = text
         elif message.get("type") == "result":
+            # A turn that ended on the usage cap (or another failure the
+            # session retries on its own) is not the chore's end: the session
+            # has a flat 90s retry armed, and disposing it here cancelled that
+            # retry -- confirmed live 2026-10-23, the 10:00 and 12:00 mailbox
+            # checks were both lost this way and never ran after the cap
+            # reset. The session stays until a real reply gets through; its
+            # last "visible text" was the cap report, not the chore's answer,
+            # so nothing is relayed.
+            session = _pseudo_sessions.get(pseudo_id)
+            if session is not None and _retry_pending(session):
+                _pseudo_turn_last_visible_text.pop(pseudo_id, None)
+                log_event(
+                    "engine", "pseudo_session_kept_for_retry", pseudo_id=pseudo_id,
+                    api_retry=session.api_retry_timer is not None,
+                    followup=session.one_shot_followup_timer is not None,
+                )
+                _mark_awaiting_retry(pseudo_id, True)
+                return
+            _mark_awaiting_retry(pseudo_id, False)
             text = _pseudo_turn_last_visible_text.pop(pseudo_id, None)
             task = pop_pseudo_turn_task(pseudo_id)
             _dispose_pseudo_session(pseudo_id)
@@ -159,6 +195,22 @@ def _make_pseudo_session_send(real_tab_id: str, pseudo_id: str, get_target_sessi
             asyncio.create_task(target.deliver_relayed_reply(text, task=task, is_voice=bool(event.get("isVoice"))))
 
     return _send
+
+
+def _retry_pending(session: "ChatSession") -> bool:
+    """The session has its own retry armed (_schedule_api_retry or
+    _schedule_one_shot_followup_check, both flat 90s): its turn is not over."""
+    return session.api_retry_timer is not None or session.one_shot_followup_timer is not None
+
+
+def is_waiting_on_retry(real_tab_id: str, activity_id: str) -> bool:
+    """This activity's pseudo-session is alive and waiting on its own retry
+    (see the "result" branch of _make_pseudo_session_send). A recurring
+    reminder firing again meanwhile must not stack another copy of the same
+    chore into it: the waiting turn runs once the cap lifts, and that one
+    run stands for every firing missed in between."""
+    session = _pseudo_sessions.get(pseudo_tab_id(real_tab_id, activity_id))
+    return session is not None and not session.ended and _retry_pending(session)
 
 
 def _dispose_pseudo_session(pseudo_id: str) -> None:

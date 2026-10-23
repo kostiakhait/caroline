@@ -293,6 +293,13 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     owner = sessions.get(real_tab_id)
     if reminder.get("priority") == "background" and owner is not None and owner.has_live_dialog():
         return False
+    # The previous firing of this same reminder is still waiting out a usage
+    # cap in its own session (pseudo_tab.is_waiting_on_retry): that turn
+    # runs when the cap lifts, once, for all the firings missed meanwhile.
+    # Counted as delivered so the schedule moves on to the next time.
+    if pseudo_tab.is_waiting_on_retry(real_tab_id, reminder["id"]):
+        log_event("engine", "reminder_coalesced_into_waiting_turn", reminder_id=reminder.get("id"), due_at=reminder.get("dueAtIso"))
+        return True
     # activity_id = this reminder's own id (2026-10-19, per-activity pseudo-
     # sessions): a recurring reminder reuses its own id every firing, so
     # each firing's pseudo-session is a fresh instance of "this reminder's
@@ -341,8 +348,15 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # So check_background_relay_worth (deliver_relayed_reply) can judge the
     # eventual result against what was actually asked, not in isolation.
     pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, reminder.get("note"))
+    # A firing resumed after a restart (scheduler_plugin.set_reminder_awaiting_retry):
+    # its dueAtIso has already moved on to the next time, so it is named by
+    # when the usage cap interrupted it instead.
+    when = (
+        f"a firing interrupted by the usage cap at {reminder['awaitingRetry']}, resumed now"
+        if reminder.get("awaitingRetry") else f"you scheduled this for {reminder.get('dueAtIso')}"
+    )
     delivered = pseudo.inject_proactive(
-        f"⏰ Reminder due (you scheduled this for {reminder.get('dueAtIso')}): {reminder.get('note')}\n\n{instruction}",
+        f"⏰ Reminder due ({when}): {reminder.get('note')}\n\n{instruction}",
         suppress_narration=True,
     )
     if delivered:

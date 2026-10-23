@@ -244,22 +244,58 @@ async def cancel_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f"Cancelled {args['id']}." if removed else f"No pending reminder with id {args['id']}."}
 
 
+# Reminders already resumed in this process (see set_reminder_awaiting_retry).
+_resumed_this_process: set[str] = set()
+
+
+def set_reminder_awaiting_retry(reminder_id: str, waiting: bool) -> None:
+    """Marks a reminder whose turn is waiting out a usage cap in its own
+    session (app/pseudo_tab.py keeps that session alive and lets its 90s
+    retry run), and unmarks it once a real reply got through. The mark is in
+    schedule.json so that it survives a restart: the waiting session does
+    not, and without the mark the firing would be lost -- its time has
+    already moved on. After a restart the due-check loop fires a marked
+    reminder once more. An activity that is not a reminder (a sub-agent's
+    own pseudo-session) has no record here and is left alone."""
+    reminders = _load_reminders()
+    for r in reminders:
+        if r.get("id") != reminder_id:
+            continue
+        if bool(r.get("awaitingRetry")) == waiting:
+            return
+        if waiting:
+            r["awaitingRetry"] = datetime.now().astimezone().isoformat()
+        else:
+            r.pop("awaitingRetry", None)
+        _save_reminders(reminders)
+        log_event("engine", "reminder_awaiting_retry_set", reminder_id=reminder_id, waiting=waiting)
+        return
+
+
 def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: float = 20.0) -> asyncio.Task[None]:
     """Polls workspace/schedule.json and delivers every pending reminder whose
     time has passed. on_due returns whether it was actually delivered; an
-    undelivered reminder stays pending and is retried on the next check."""
+    undelivered reminder stays pending and is retried on the next check.
+
+    A reminder marked awaitingRetry (see set_reminder_awaiting_retry) is
+    delivered once more, whatever its time, the first time this process sees
+    it: after a restart its waiting session is gone. In a process where that
+    session is still alive the delivery coalesces into it (main.py's
+    _on_reminder_due) and nothing new runs."""
 
     def _check() -> None:
         reminders = _load_reminders()
         changed = _migrate_legacy_recurrence(reminders)
         now = datetime.now().astimezone()
         for r in reminders:
-            if r.get("fired"):
+            resume = bool(r.get("awaitingRetry")) and r.get("id") not in _resumed_this_process
+            if r.get("fired") and not resume:
                 continue
             due = datetime.fromisoformat(r["dueAtIso"])
             if due.tzinfo is None:
                 due = due.astimezone()
-            if due > now:
+            due_by_time = due <= now and not r.get("fired")
+            if not due_by_time and not resume:
                 continue
             try:
                 delivered = on_due(r)
@@ -267,6 +303,11 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
                 log_event("engine", "due_check_on_due_failed", reminder_id=r.get("id"), error=str(exc))
                 delivered = False
             if not delivered:
+                continue
+            if resume:
+                _resumed_this_process.add(r["id"])
+                log_event("engine", "reminder_resumed_awaiting_retry", reminder_id=r.get("id"), awaiting_since=r.get("awaitingRetry"))
+            if not due_by_time:
                 continue
             changed = True
             if r.get("cron"):
