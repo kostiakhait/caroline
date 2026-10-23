@@ -7,7 +7,9 @@ report was made exactly as asked, and the answer the user got was the
 model's own read-back of the file, "TABLE 0 / ROW 0 ['Месяц', 'Выручка'] ...".
 
 Runs after the verifier and before reply.review / translation, for sw turns
-only, on Haiku (explicit choice). Most answers are already fine: the model
+only, on codex-mini (explicit choice; first tried on Haiku, which on the test box
+turned a found-and-drafted email answer into "I can't access the mailbox without
+your permission" and a verifier's complaint into a claim of success). Most answers are already fine: the model
 then says OK and the answer goes out as it is. Any failure leaves the answer
 as it was -- this pass must never cost the user the answer.
 """
@@ -18,7 +20,8 @@ import time
 
 from app.logging_setup import log_event
 
-RESULT_WRITER_MODEL = "anthropic/claude-haiku-4.5"
+RESULT_WRITER_MODEL = "openai/gpt-5.1-codex-mini"
+RESULT_WRITER_REASONING = {"effort": "low"}
 _UNCHANGED = "OK"
 
 _PROMPT = (
@@ -39,7 +42,7 @@ _PROMPT = (
 )
 
 
-async def write_result(request: str, answer: str) -> str:
+async def write_result(request: str, answer: str, tab_id: str | None = None) -> str:
     """The answer the user reads: `answer` itself, or its human rewrite."""
     from app.small_model_engine import resolve_narration_prompt
 
@@ -48,14 +51,14 @@ async def write_result(request: str, answer: str) -> str:
     started = time.monotonic()
     try:
         raw = (await resolve_narration_prompt(_PROMPT.format(ok=_UNCHANGED, request=request, answer=answer),
-                                              model=RESULT_WRITER_MODEL) or "").strip()
+                                              model=RESULT_WRITER_MODEL, reasoning=RESULT_WRITER_REASONING) or "").strip()
     except Exception as exc:  # noqa: BLE001 -- the answer as it was, never none
-        log_event("engine", "sw_result_writer_failed", error=str(exc)[:200], error_type=type(exc).__name__,
+        log_event("engine", "sw_result_writer_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__,
                   ms=int((time.monotonic() - started) * 1000))
         return answer
     ms = int((time.monotonic() - started) * 1000)
     if not raw or raw.strip(" .\"'«»").upper() == _UNCHANGED:
-        log_event("engine", "sw_result_writer", changed=False, ms=ms)
+        log_event("engine", "sw_result_writer", tab_id=tab_id, changed=False, ms=ms)
         return answer
-    log_event("engine", "sw_result_writer", changed=True, ms=ms, before=answer[:400], after=raw[:400])
+    log_event("engine", "sw_result_writer", tab_id=tab_id, changed=True, ms=ms, before=answer[:400], after=raw[:400])
     return raw

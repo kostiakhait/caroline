@@ -246,6 +246,14 @@ class PermissionGuardMixin:
             return
         if result is None:
             return
+        # Every verdict, set or cleared (2026-10-22, explicit instruction): a block
+        # used to be armed with no trace at all, and only the stop it caused later
+        # showed up in the log.
+        log_event(
+            "engine", "permission_guard_checked", tab_id=self.tab_id, needs_approval=bool(result["needs_approval"]),
+            reason=result.get("reason") or None, same_action_as_before=bool(result.get("same_action_as_before")),
+            was_pending=self.pending_unapproved_action, event_note=(extra_context or "")[:300] or None, action_id=action_id,
+        )
         if result["needs_approval"]:
             self.pending_unapproved_action = result["reason"]
             if not result["same_action_as_before"]:

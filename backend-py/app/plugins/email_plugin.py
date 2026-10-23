@@ -310,6 +310,24 @@ def _validate_header_value(value: Any, field_name: str) -> None:
         raise ValueError(f'"{field_name}" contains an HTML entity ({entity.group(0)!r}) -- an email header is not HTML-escaped content: {value!r}')
 
 
+def _address_strings(value: Any) -> Any:
+    """to/cc/bcc as the plain address strings email:send takes. A model also
+    passes them as {"email": ..., "name": ...} objects (seen on the sw test box,
+    2026-10-22: two sends failed on the server with "sequence item 0: expected
+    str instance, dict found") -- turned into "Name <email>" here."""
+    if value is None:
+        return None
+    out = []
+    for one in (value if isinstance(value, list) else [value]):
+        if isinstance(one, dict):
+            addr = str(one.get("email") or one.get("address") or "").strip()
+            name = str(one.get("name") or "").strip()
+            one = f"{name} <{addr}>" if name and addr else addr
+        if isinstance(one, str) and one.strip():
+            out.append(one.strip())
+    return out
+
+
 def _validate_addresses(value: Any, field_name: str) -> None:
     """`value` is either one address/display-name string or a list of them
     -- validates every string it actually contains."""
@@ -321,6 +339,7 @@ def _validate_addresses(value: Any, field_name: str) -> None:
 
 @_with_saved_credentials
 async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    args = {**args, **{k: _address_strings(args.get(k)) for k in ("to", "cc", "bcc") if args.get(k) is not None}}
     _validate_addresses(args.get("from"), "from")
     _validate_addresses(args.get("to"), "to")
     _validate_addresses(args.get("cc"), "cc")

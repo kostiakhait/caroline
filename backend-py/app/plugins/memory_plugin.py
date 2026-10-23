@@ -617,7 +617,7 @@ async def request_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return await _run_memory_query(query, args.get("history"))
 
 
-async def _run_memory_query(query: str, history: int | None = None) -> dict[str, Any]:
+async def _run_memory_query(query: str, history: int | None = None, expand: bool = True) -> dict[str, Any]:
     """memory:requestStart + soft-timeout polling + late-background
     continuation -- exactly what request_info(query=...) always did,
     factored out (2026-10-13) so it's shared with the topic(=id) cold
@@ -665,7 +665,8 @@ async def _run_memory_query(query: str, history: int | None = None) -> dict[str,
                 "is_error": True}
     if not results:
         return {"text": f'Memory holds nothing relevant to "{query}".'}
-    await _expand_notes_candidates(results)
+    if expand:
+        await _expand_notes_candidates(results)
     # Bug fix (2026-10-16, full-plugin context-overflow audit): merges every "facts"/
     # "documents" part across possibly many sources/pages with no total-char budget --
     # same shape as the email-batch incident (many full results, one call).
@@ -836,7 +837,12 @@ async def _expand_notes_candidates(results: list[dict[str, Any]]) -> None:
                 pending.append(candidate)
     if not pending:
         return
-    replies = await asyncio.gather(*(_run_memory_query(candidate["title"]) for candidate in pending), return_exceptions=True)
+    # expand=False (2026-10-22): each follow-up used to expand ITS OWN second
+    # candidate in turn, a chain of queries one after another -- on the sw test box
+    # 34 memory queries in 5 minutes for 4 request_info calls, none of which ever
+    # returned. One extra round trip, as described above, not a chain.
+    log_event("plugin:memory", "notes_candidates_expanding", count=len(pending), titles=[c.get("title") for c in pending])
+    replies = await asyncio.gather(*(_run_memory_query(candidate["title"], expand=False) for candidate in pending), return_exceptions=True)
     for candidate, reply in zip(pending, replies):
         if isinstance(reply, BaseException) or not isinstance(reply, dict):
             continue

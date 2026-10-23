@@ -236,13 +236,6 @@ MAX_DEESCALATIONS = 2
 # what actually points the verifier at this diagnosis.
 RETRY_SENTINEL = "[[RETRY_SAME_TIER]]"
 
-# Scoped per TURN, not per tier (so it can't be bypassed by escalating once
-# and retrying again at the next tier) -- same anti-bounce shape as
-# MAX_DEESCALATIONS, deliberately small: a retry that still doesn't cover
-# what's missing is far more likely a genuine capability gap than a model
-# that just needs one more nudge, so the verifier is told explicitly once
-# this is exhausted and naturally pushed to escalate instead.
-MAX_SAME_TIER_RETRY = 1
 
 # Per explicit instruction (2026-09-12): NOT a task-complexity budget --
 # resolve_agentic()'s own doc comment documents this same thing. Set high
@@ -462,6 +455,22 @@ def _attempt_cancelled() -> bool:
     return flag is not None and flag.is_set()
 
 
+class _AttemptAbandoned(BaseException):
+    """Ends the worker thread of an attempt nobody waits for anymore (2026-10-22).
+    resolve_agentic() catches every Exception from its tools and callbacks and goes
+    on to the next model call, so a refusal alone kept an abandoned attempt calling
+    the model -- seen on the test box: after nano and codex-mini were given up as
+    stalled, both went on calling their models (~29,500 prompt tokens a call) until
+    the backend was restarted. A BaseException is not caught there: raised from a
+    tool call or a callback, it ends the loop, and at most the model call already
+    under way is paid for."""
+
+
+def _abandon_if_cancelled(tracker: "_TurnTracker", parent_cancels: tuple[threading.Event, ...] = ()) -> None:
+    if tracker.cancelled.is_set() or _attempt_cancelled() or any(flag.is_set() for flag in parent_cancels):
+        raise _AttemptAbandoned()
+
+
 async def _resolve_agentic_with_watchdog(
     ai: Any, tracker: _TurnTracker, *, parent_cancels: tuple[threading.Event, ...] = (), **resolve_kwargs: Any,
 ) -> str:
@@ -491,6 +500,9 @@ async def _resolve_agentic_with_watchdog(
         _attempt_local.cancel = attempt_cancel
         try:
             return ai.resolve_agentic(**resolve_kwargs)
+        except _AttemptAbandoned:
+            log_event("engine", "small_model_attempt_thread_ended", model=resolve_kwargs.get("model"))
+            return ""
         finally:
             _attempt_local.cancel = None
 
@@ -524,6 +536,12 @@ async def _resolve_agentic_with_watchdog(
             if any(flag.is_set() for flag in parent_cancels):
                 attempt_cancel.set()
                 raise _TurnStalled(now - started, "parent")
+            # A tool call still waiting for its result is not a stall (2026-10-22, explicit
+            # instruction): a memory lookup that took minutes had every tier given up on
+            # in turn while it waited, nano to codex-mini to Sonnet, none of them stalled.
+            # Such a call is bounded by its own timeout and ABSOLUTE_TURN_TIMEOUT_S.
+            if tracker.tools_in_flight > 0:
+                tracker.touch_progress()
             stalled_for = now - tracker.last_progress_at
             if stalled_for > STALL_TIMEOUT_S:
                 attempt_cancel.set()
@@ -609,6 +627,21 @@ def _shared_policy_text(workspace_dir: str, tab_id: str) -> str:
     dialogue_path = str(_recent_24h_dialogue_path(workspace_dir, tab_id))
     parts.append(recent_dialogue_history_instruction(dialogue_path))
     return "\n\n".join(p for p in parts if p)
+
+
+# Per explicit instruction (2026-10-22: "Действие. Вопросы разрешены только при полной
+# невозможности действий"). Seen the same day: asked to find a letter in a mailbox whose
+# credentials were saved, nano asked for the credentials and codex-mini asked to confirm
+# using the account -- neither called a tool, and the task climbed to the top tier.
+_ACT_DO_NOT_ASK_INSTRUCTION = (
+    "ACT, DO NOT ASK. Do the task with your tools. Never ask the user for permission to read, search, "
+    "open, look up or check anything, and never ask for something you can find yourself -- saved "
+    "credentials, a file, a mailbox, what is in memory: look for it first. Never hand the user a list of "
+    "options instead of doing the work; when one way fails, try another. Ask the user only when the action "
+    "is genuinely impossible without them -- a fact only they know, after you have looked everywhere you "
+    "can. (Whether a message or payment on the user's behalf needs their approval first is checked "
+    "separately when you send it; when you are told it does, ask for exactly that.)"
+)
 
 
 def _engine_instructions(language: str) -> str:
@@ -1171,6 +1204,9 @@ class _TurnTracker:
     current_attempt_cancel: threading.Event | None = None
     # Plugins whose usage instructions this turn already got (see executor_fn).
     instructed_plugins: set[str] = field(default_factory=set)
+    # Tool calls of this turn now running (2026-10-22): a call still waiting for its
+    # result is not a stall -- see _resolve_agentic_with_watchdog.
+    tools_in_flight: int = 0
 
     def touch_progress(self) -> None:
         self.last_progress_at = time.monotonic()
@@ -1452,16 +1488,22 @@ def _make_executor_fn(
         # The turn, this attempt, or -- for a parallel-stage branch -- whatever
         # started it (parent_cancels, 2026-10-22: an abandoned branch used to keep
         # acting after its turn ended, e.g. a save_info after the reply went out).
-        if tracker.cancelled.is_set() or _attempt_cancelled() or any(flag.is_set() for flag in parent_cancels):
-            # This turn's own watchdog already gave up waiting on us (a
-            # genuine stall, see STALL_TIMEOUT_S) and reported that to our
-            # caller -- nobody is listening for this call's real result
-            # anymore. Refuse instantly rather than actually dispatching
-            # (a real email send, an IMAP login with a real password,
-            # etc.) unsupervised after the fact; see _TurnTracker.cancelled
-            # own doc comment for the incident this fixes.
-            return "ERROR: this turn was already abandoned (stalled/timed out) -- stop, do not attempt further tool calls."
+        # This turn's own watchdog already gave up waiting on us (a genuine stall,
+        # see STALL_TIMEOUT_S) and reported that to our caller -- nobody is listening
+        # for this call's real result anymore. Never dispatch (a real email send, an
+        # IMAP login with a real password, etc.) unsupervised after the fact, and end
+        # the thread itself (_AttemptAbandoned) -- a refusal alone kept it calling the
+        # model.
+        _abandon_if_cancelled(tracker, parent_cancels)
         tracker.touch_progress()
+        tracker.tools_in_flight += 1
+        try:
+            return _execute(name, args)
+        finally:
+            tracker.tools_in_flight -= 1
+            tracker.touch_progress()
+
+    def _execute(name: str, args: dict[str, Any]) -> str:
         if parent_tracker is not None:
             # A branch's work is progress of the tier that is waiting on the stage
             # (2026-10-22: the waiting tier was declared stalled at 120s while its
@@ -1631,8 +1673,9 @@ def _build_verification_prompt(
     what was just tried; sometimes a stronger tier already did the hard part and
     what's left is mechanical.
 
-    `can_retry` (2026-10-15, RETRY_SENTINEL's own real incident): True while
-    MAX_SAME_TIER_RETRY hasn't been used yet THIS TURN. Distinct from escalating
+    `can_retry` (2026-10-15, RETRY_SENTINEL's own real incident): True for a tier's
+    first attempt and after every attempt that made progress (since 2026-10-22,
+    see the tier loop). Distinct from escalating
     up: the verifier picks this when the gap looks like the SAME tier simply
     stopped short (it used tools fine for part of the work, then quit before
     covering the rest of what was named) rather than being unable to reason
@@ -1718,6 +1761,7 @@ def _build_verification_prompt(
             "promises the work (\"подключаю\", \"сейчас проверю\", \"I'll send it\") when the request was to do it "
             "and the facts above show no tool call that did it -- that task is NOT finished. "
             + _RESULT_READ_BACK_RULE
+            + _REQUEST_VALUES_RULE
             + (
                 " Never OK a reply that asks the user something -- which option to take, what to do next, a "
                 "detail, a confirmation -- or hands them a choice instead of finishing the task: escalate it, so a "
@@ -1971,6 +2015,31 @@ def _trace_text(lines: list[str], limit: int) -> str:
     return "\n".join(reversed(kept))
 
 
+async def _attempt_progressed(task: str, earlier: list[str], latest: list[str], tab_id: str | None) -> tuple[bool, str]:
+    """(did the latest attempt move the task forward, why) -- the sw.attempt.progress
+    microagent, on the local microagent ladder. Any failure counts as no progress:
+    the task then goes up instead of paying for another attempt that may add nothing."""
+    from app.microagents.sw_attempt_progress import ATTEMPT_PROGRESS
+    from app.plugins.voice_api import _run_local_microagent
+
+    started = time.monotonic()
+    try:
+        result = await _run_local_microagent(
+            ATTEMPT_PROGRESS, "app.microagents.sw_attempt_progress",
+            {"task": task, "earlier": earlier[-30:], "latest": latest[-30:]},
+        )
+    except Exception as exc:  # noqa: BLE001 -- escalate rather than guess
+        log_event("engine", "sw_attempt_progress_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+        return False, "progress check failed"
+    ms = int((time.monotonic() - started) * 1000)
+    if not result or result.get("status") != "ok":
+        log_event("engine", "sw_attempt_progress_failed", tab_id=tab_id, ms=ms, error=(result or {}).get("error"))
+        return False, "progress check failed"
+    output = result.get("output") or {}
+    log_event("engine", "sw_attempt_progress", tab_id=tab_id, ms=ms, progress=bool(output.get("progress")), new=str(output.get("new"))[:300])
+    return bool(output.get("progress")), str(output.get("new") or "")
+
+
 def _continuation_note(tier_trace: list[str]) -> str:
     return (
         "[Internal: a previous attempt at this same request already ran these tool calls, with their real "
@@ -1990,6 +2059,19 @@ _CHECK_EARLIER_RESULT = (
     "wrong values. First look at its real current state (open the file again, re-read what was changed), "
     "then make it exactly what was asked: fix or remove what is wrong, never add a second copy of something "
     "already there. Read the final result back before you reply."
+)
+
+# Per explicit instruction (2026-10-22): the verifier checks the reply against the data of
+# the request. Seen the same day: told to answer that an invoice "will be paid by Friday",
+# the reply drafted "we plan to pay on [date]" and was approved.
+_REQUEST_VALUES_RULE = (
+    " Check the reply against the task as the user gave it (the formalized task above, when there is one): "
+    "every action done, and every value the user gave -- names, amounts, dates, wording -- used exactly as "
+    "given. A reply that leaves one of them out, or puts a placeholder (\"[date]\", \"[дата]\", \"TBD\") or "
+    "a question where the user already gave the value, is NOT finished. A message sent to someone else "
+    "carries only what is meant for that recipient: the user's summary or report never goes into it (seen "
+    "2026-10-22: a reply to a sender opened with \"Краткий пересказ письма: ...\", the summary meant for "
+    "the user)."
 )
 
 # The verifier's rule for work that leaves a result behind (2026-10-22, same incident): the
@@ -2394,6 +2476,7 @@ async def run_small_model_turn(
     history_messages: list[dict[str, Any]] | None = None,
     history_summary: str | None = None,
     recorder: Any = None,
+    formalize_request: bool = True,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -2433,6 +2516,13 @@ async def run_small_model_turn(
     if camerlengo_ai is None:
         log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
         return _answer(_UNAVAILABLE_ANSWER)
+    # The formalized task (app/sw_request_spec.py), drafted while the rest is set up --
+    # for a real user's request only: an internal note (a permission-guard stop, a
+    # finished background operation) was "formalized" into a task of its own on the
+    # test box, 2026-10-22, and the turn ended asking the user to confirm a send.
+    from app.sw_request_spec import formalize
+
+    request_spec_task = asyncio.ensure_future(formalize(user_text, recent_dialogue_lines, tab_id)) if formalize_request else None
 
     # Explicit adapter -- never rely on camerlengo_ai.AI()'s own default
     # (Config.OPENROUTER_KEY, server-only) from this process. Which adapter, and
@@ -2454,6 +2544,7 @@ async def run_small_model_turn(
         working_memory_system_prompt_clause(load_working_memory(workspace_dir)),
         memory_topics_system_prompt_clause(workspace_dir, tab_id),
         _engine_instructions(language),
+        _ACT_DO_NOT_ASK_INSTRUCTION,
         _shared_policy_text(workspace_dir, tab_id),
     ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else [])
       + ([history_summary] if history_summary else []))
@@ -2471,7 +2562,15 @@ async def run_small_model_turn(
     from app.chat_session import _format_timestamp_for_model
     from datetime import datetime, timezone
     sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}]"
-    messages.append({"role": "user", "content": f"{sent_line}\n{user_text}"})
+    request_spec = await request_spec_task if request_spec_task is not None else None
+    if request_spec:
+        messages.append({"role": "user", "content": (
+            f"{sent_line}\n[The task, formalized from the user's request -- this is the work to do. Every value "
+            f"in it (names, amounts, dates, wording) is the user's own and is used exactly as given:]\n{request_spec}\n\n"
+            f"[The user's own words, for clarification:]\n{user_text}"
+        )})
+    else:
+        messages.append({"role": "user", "content": f"{sent_line}\n{user_text}"})
 
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
@@ -2522,6 +2621,9 @@ async def run_small_model_turn(
         executor_fn = recorder.wrap(executor_fn, skip=_PLAN_TOOL_NAMES)
 
     def on_progress(evt: dict[str, Any]) -> None:
+        # An abandoned attempt's thread must not touch the live attempt's progress
+        # clock or trace -- it ends here instead (see _AttemptAbandoned).
+        _abandon_if_cancelled(tracker)
         tracker.touch_progress()
         log_event(
             "engine", "small_model_progress", tab_id=tab_id, event_type=evt.get("type"),
@@ -2539,6 +2641,9 @@ async def run_small_model_turn(
                 on_live_dialogue_update(list(live_dialogue))
 
     def get_new_messages() -> list[dict[str, Any]] | None:
+        # Polled before every model call of the attempt: an abandoned one ends here,
+        # before paying for another call.
+        _abandon_if_cancelled(tracker)
         if not get_new_user_comments:
             return None
         comments = get_new_user_comments()
@@ -2694,9 +2799,22 @@ async def run_small_model_turn(
     final_text = ""
     index = start_index
     deescalations_used = 0
-    same_tier_retries_used = 0
+    # Per explicit instruction (2026-10-22): a tier is retried before the task goes up
+    # ("сначала retry, потом вверх, обязательно"), and goes up only once it has run out
+    # of what it can do -- "пока есть прогресс": retried while each attempt moves the
+    # task forward, escalated after one that did not. Until then one retry per turn was
+    # the limit, and a tier that answered with a question went straight up -- an email
+    # task reached the top tier at $1.8 with the lower tiers never having tried a tool.
+    # Whether an attempt moved the task forward is a separate microagent's call
+    # (_attempt_progressed): counting "a call not made before" let nano search folders
+    # that do not exist, one empty search after another, without ever going up.
+    attempt_tier: int | None = None
+    tier_attempts = 0
+    tier_history: list[str] = []
     while index < len(tiers):
         model = tiers[index]
+        if index != attempt_tier:
+            attempt_tier, tier_attempts, tier_history = index, 0, []
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
         emit(f"Tier {index + 1} ({model}) is working.")
         current_model["name"] = model
@@ -2750,15 +2868,39 @@ async def run_small_model_turn(
                     pass
             can_escalate = index < len(tiers) - 1
             can_deescalate = index > 0 and deescalations_used < MAX_DEESCALATIONS
-            can_retry = same_tier_retries_used < MAX_SAME_TIER_RETRY
             try:
-                verified_text, action = await verify_candidate(candidate, can_escalate, can_deescalate, tier_trace, can_retry)
+                verified_text, action = await verify_candidate(candidate, can_escalate, can_deescalate, tier_trace, True)
             except _FundsExhaustedGivingUp as exc:
                 log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
                 return _answer(_funds_exhausted_final_answer(exc.reason))
             if action == "done":
                 final_text = verified_text
                 break
+            attempt_lines = list(tier_trace)
+            if action in ("up", "retry"):
+                # Unfinished: the tier's first attempt is always retried; after that it
+                # stays only while the progress microagent sees the latest attempt get
+                # something new (app/microagents/sw_attempt_progress.py).
+                if tier_attempts == 0:
+                    stay, why = True, "first attempt on this tier"
+                else:
+                    stay, why = await _attempt_progressed(request_spec or user_text, tier_history, attempt_lines, tab_id)
+                log_event("engine", "small_model_retry_decision", tab_id=tab_id, tier=index, model=model,
+                          attempt=tier_attempts + 1, stay=stay, why=why, verifier_said=action)
+                if stay and action == "up":
+                    verified_text, action = verified_text.replace(ESCALATION_SENTINEL, RETRY_SENTINEL), "retry"
+                elif not stay and action == "retry":
+                    if not can_escalate:
+                        # The last tier, and its latest attempt got nothing new: the answer as it stands.
+                        try:
+                            verified_text, _ = await verify_candidate(candidate, False, False, attempt_lines, False)
+                        except _FundsExhaustedGivingUp as exc:
+                            log_event("engine", "small_model_funds_exhausted_giving_up", tab_id=tab_id, tier=index, model=model, reason=exc.reason)
+                            return _answer(_funds_exhausted_final_answer(exc.reason))
+                        final_text = verified_text
+                        break
+                    verified_text, action = verified_text.replace(RETRY_SENTINEL, ESCALATION_SENTINEL), "up"
+            tier_history.extend(attempt_lines)
             if tier_trace:
                 messages.append({"role": "user", "content": _continuation_note(tier_trace)})
                 tier_trace.clear()
@@ -2772,7 +2914,7 @@ async def run_small_model_turn(
                 # redid work already done -- a second, English copy of the report's
                 # table -- and stalled. There the nudge just says what is missing.
                 # Same index (not +1): same model, same tier, continuing.
-                same_tier_retries_used += 1
+                tier_attempts += 1
                 missing = verified_text.replace(RETRY_SENTINEL, "").strip()
                 if tracker.looks_multi_target:
                     emit(f"The check found this tier's work incomplete but likely fixable by splitting it up; retrying tier {index + 1} with what's missing.")

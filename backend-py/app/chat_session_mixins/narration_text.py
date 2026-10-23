@@ -370,10 +370,11 @@ class TextNarrationMixin:
         if stale:
             log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, stage="pre_send")
             return
-        # Per explicit instruction (2026-10-11): re-evaluate the permission
-        # guard on every outbound message -- see _check_permission_guard's
-        # own docstring for why this runs here too, not just in submit().
-        await self._check_permission_guard()
+        # No permission-guard re-check here (2026-10-22, explicit instruction): a
+        # progress remark asks nothing and seeks no approval, and a check run at
+        # one armed a block on the sw test box -- "a new recipient needs approval",
+        # in the middle of a send the user had ordered -- that stopped the turn at
+        # its next send. Real answers and the user's own messages still re-check.
         await self._send_narration_remark(comment)
     async def _send_narration_remark(self, comment: str, audio_base64: str | None = None) -> None:
         """Shows one narration remark -- shared by the 60s path above and the voice
