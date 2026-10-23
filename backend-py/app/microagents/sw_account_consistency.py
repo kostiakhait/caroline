@@ -71,10 +71,14 @@ def verify_account_consistency(input: Any, output: Any) -> Optional[str]:
     return None
 
 
-def switched(output: dict[str, Any]) -> bool:
-    """True when both identities are stated and they differ."""
+def switched(output: dict[str, Any], args: str = "") -> bool:
+    """True when both identities are stated and they differ. The new call's identity must
+    literally occur in the call's arguments: on the W1 test the agent answered with the tool
+    name ("run_python") for a call that names no identity, and a correct call was refused."""
     earlier = str(output["earlier_identity"]).strip().lower()
     this = str(output["this_identity"]).strip().lower()
+    if this not in str(args).lower():
+        return False
     return NOT_STATED not in (earlier, this) and earlier != this
 
 

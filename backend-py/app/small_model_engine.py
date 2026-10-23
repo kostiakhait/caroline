@@ -2199,7 +2199,7 @@ def _account_consistent(task: str, tool_name: str, args: dict[str, Any], calls: 
         use = str(output["earlier_identity"]).strip()
         why = f"the earlier calls acted as {output['earlier_identity']}, this one as {output['this_identity']}"
         consistent, in_users_name = True, None
-        if sw_account_consistency.switched(output):
+        if sw_account_consistency.switched(output, json.dumps(shown, ensure_ascii=False, default=str)):
             # A switch is right only if the task itself says to act in the user's own name.
             asked = run(sw_task_on_behalf, sw_task_on_behalf.TASK_ON_BEHALF, {"task": task})
             in_users_name = bool((asked or {}).get("in_users_name"))

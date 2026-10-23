@@ -42,6 +42,9 @@ _PROMPT = (
     "confirm\", \"let me know\"), every invitation, offer, or promise to do something. Go through the text "
     "sentence by sentence and put each such sentence here; write it as \"asks the reader to ...\", \"asks "
     "...?\", \"promises to ...\".\n"
+    "A request, question or promise that the text only REPORTS or quotes -- a summary saying that someone "
+    "else asked something, or what a letter or chat said -- is a fact about that conversation: put it in "
+    "facts, not in requests. requests holds only what the text itself, in its own voice, asks of its reader.\n"
     "Do NOT list: anything about the program (library calls and their parameters, heading levels, styles, "
     "variable names, file paths and where the file is saved); text the program only prints to the console as a "
     "status message; plain labels (column headers, \"Итого\", \"Отчёт за 3 квартал\" as a title); greetings and "
@@ -66,7 +69,7 @@ def verify_content_extract(input: Any, output: Any) -> Optional[str]:
 def llm_agents() -> List["M.Agent"]:
     return [
         M.Agent(
-            CONTENT_EXTRACT, "2",
+            CONTENT_EXTRACT, "3",
             "Lists the statements of fact, and separately the requests (questions, asks, offers, promises), in the "
             "text a reader will read in what a tool call writes or sends, ignoring code mechanics, console output "
             "and file paths.",
