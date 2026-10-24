@@ -385,7 +385,7 @@ class TextNarrationMixin:
         if filler:
             # A filler (app/filler_phrases.py) is only sound: no chat bubble (isFiller), not in "already
             # said" and not an interim note -- Caroline said nothing the conversation should remember.
-            await self.send({"type": "sdk_message", "isVoice": True, "isNarration": True, "isFiller": True, "audioBase64": audio_base64,
+            await self.send({"type": "sdk_message", "isVoice": True, "isNarration": True, "isFiller": True, "isContinuous": True, "audioBase64": audio_base64,
                              "message": {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": comment}],
                                                                            "model": None, "stop_reason": None},
                                          "session_id": None, "parent_tool_use_id": None}})
@@ -418,4 +418,7 @@ class TextNarrationMixin:
         envelope: dict[str, Any] = {"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice, "isNarration": True}
         if audio_base64:
             envelope["audioBase64"] = audio_base64
+        if self._voice_narration_applies():
+            # Continuous narration (the voice loop): chat.js tells the animation window to stay up for good.
+            envelope["isContinuous"] = True
         await self.send(envelope)

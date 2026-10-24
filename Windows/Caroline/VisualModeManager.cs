@@ -43,6 +43,13 @@ public sealed class VisualModeManager
     private const int MaxRendersAhead = 2;
 
     private readonly string _tempDir;
+
+    /// <summary>Rendered clips, by the hash of their audio (and of the model): a clip that comes
+    /// again -- a filler remark, see backend-py/app/filler_phrases.py -- is copied from here, not
+    /// rendered again (2026-10-24). Lives next to the temp files; the same idea as the Linux
+    /// bridge's cache (vendor/XcfaRenderer/Bridge).</summary>
+    private readonly string _clipCacheDir;
+    private string _modelKey = "";
     private XcfaRenderer.Renderer.PreparedModel? _prepared;
     private byte[]? _staticPng;
     private readonly object _prepGate = new();
@@ -60,6 +67,14 @@ public sealed class VisualModeManager
     /// standing between two remarks of a dialogue (StayForNextClip).</summary>
     private VisualModeWindow? _lingeringWindow;
     private int _postRollGeneration;
+
+    /// <summary>Continuous narration (2026-10-24, explicit instruction: "один раз открыть и не закрывать
+    /// никогда"): chat.js says its clips are those of the continuous loop. From then on the window is
+    /// opened once and never closed by this class -- not after a clip, not by Stop (which only stops the
+    /// clip and leaves the model in her rest pose), not by the chat's Stop. Only the user closing the
+    /// window himself (its X) ends it, and the next clip opens one again. An ordinary spoken dialogue
+    /// (not continuous) works exactly as before.</summary>
+    private bool _persistent;
 
     /// <summary>Best-effort delete of a per-request temp file (audio/rendered video) --
     /// failure just leaves one stray file behind in _tempDir, never fatal to the caller,
@@ -98,6 +113,8 @@ public sealed class VisualModeManager
     {
         _tempDir = Path.Combine(Path.GetTempPath(), "CarolineVisualMode");
         Directory.CreateDirectory(_tempDir);
+        _clipCacheDir = Path.Combine(Path.GetTempPath(), "CarolineVisualModeClips");
+        Directory.CreateDirectory(_clipCacheDir);
         // ffmpeg now runs with CreateNoWindow=true (see XcfaRenderer.Encoder.Open) -- without
         // this hook, its stderr (encoder errors, codec issues, etc.) would just vanish
         // instead of showing in an unwanted console window. Set once for the process's
@@ -126,6 +143,7 @@ public sealed class VisualModeManager
         try
         {
             Logger.Log($"VisualModeManager: warming model {modelPath} ...");
+            _modelKey = $"{modelPath}|{new FileInfo(modelPath).Length}";
             var sw = Stopwatch.StartNew();
             // Height=480: small enough to render quickly, plenty for a corner-of-screen
             // window. RemoveBg=true is required for the transparent background this whole
@@ -166,6 +184,15 @@ public sealed class VisualModeManager
     /// order they were asked for, so the clip about to play never waits behind the one
     /// being prepared for after it.
     /// </summary>
+    private string ClipKey(byte[] audio)
+    {
+        using var sha = System.Security.Cryptography.SHA1.Create();
+        sha.TransformBlock(audio, 0, audio.Length, null, 0);
+        var tag = System.Text.Encoding.UTF8.GetBytes($"{_modelKey}|480");
+        sha.TransformFinalBlock(tag, 0, tag.Length);
+        return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
+    }
+
     private RenderJob StartRender(string requestId, byte[] audioBytes, XcfaRenderer.Renderer.PreparedModel prepared, string caller)
     {
         var audioPath = Path.Combine(_tempDir, $"{requestId}.mp3");
@@ -177,11 +204,25 @@ public sealed class VisualModeManager
             try
             {
                 await File.WriteAllBytesAsync(audioPath, audioBytes);
+                var cached = Path.Combine(_clipCacheDir, ClipKey(audioBytes) + ".webm");
+                if (File.Exists(cached))
+                {
+                    File.Copy(cached, outputPath, overwrite: true);
+                    Logger.Log($"VisualModeManager: {caller} requestId={requestId} clip taken from the cache");
+                    return true;
+                }
                 Logger.Log($"VisualModeManager: {caller} requestId={requestId} render starting");
                 var renderSw = Stopwatch.StartNew();
                 prepared.Render(audioPath, outputPath,
                     new XcfaRenderer.RenderOptions { RemoveBg = true, Height = 480, Ffmpeg = FfmpegPath });
                 Logger.Log($"VisualModeManager: {caller} requestId={requestId} render finished in {renderSw.Elapsed.TotalSeconds:F1}s");
+                try
+                {
+                    var partial = cached + ".tmp";
+                    File.Copy(outputPath, partial, overwrite: true);
+                    File.Move(partial, cached, overwrite: true);
+                }
+                catch (Exception ex) { Logger.Log($"VisualModeManager: clip not cached: {ex.Message}"); }
                 return true;
             }
             catch (Exception ex)
@@ -249,8 +290,9 @@ public sealed class VisualModeManager
     /// reply comes in, and this used to just close the window with nothing audible at
     /// all -- worse than not having Visual Mode.
     /// </summary>
-    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes, bool moreToCome = false, bool dialogue = false)
+    public async Task<VisualPlaybackResult> HandleAudioAsync(string requestId, byte[] audioBytes, bool moreToCome = false, bool dialogue = false, bool persistent = false)
     {
+        if (persistent) _persistent = true;
         Logger.Log($"VisualModeManager: HandleAudioAsync requestId={requestId} bytes={audioBytes.Length}");
         var ahead = TakeRenderAhead(requestId);
         // Request ids are per chat tab ("tts-N"), and tabs share this one manager: a render
@@ -323,8 +365,15 @@ public sealed class VisualModeManager
             // Stop pressed while nothing is playing: the model standing between two
             // remarks is sent away.
             var created = window;
+            created.Closed += (_, _) =>
+            {
+                // The user closed it himself: the next clip opens a new one.
+                if (_lingeringWindow == created) _lingeringWindow = null;
+                if (_activeWindow == created) _activeWindow = null;
+            };
             created.DismissRequested += () =>
             {
+                if (_persistent) return; // Stop on an idle window does nothing in continuous narration
                 if (_lingeringWindow != created) return;
                 Logger.Log("VisualModeManager: the idle window was dismissed with its Stop button.");
                 CloseWindow(created);
@@ -367,7 +416,7 @@ public sealed class VisualModeManager
             window.MoreToCome = moreToCome || dialogue;
             // Once a dialogue's window, it stays one: a speaker button clicked in between
             // must not put it back on the one-second timer.
-            if (dialogue) window.StaysUp = true;
+            if (dialogue || _persistent) window.StaysUp = true;
             await window.PlayVideoAsync(outputPath);
             await playbackEnded.Task;
             played = true;
@@ -389,7 +438,8 @@ public sealed class VisualModeManager
         if (_activeWindow == window)
         {
             // A window that failed to play is not handed on to the next clip.
-            if (!played) CloseWindow(window);
+            if (!played && !_persistent) CloseWindow(window);
+            else if (_persistent) StayForNextClip(window);
             // Stopped by its own button, the window goes after the usual second even in a
             // dialogue: that is the user closing it.
             else if (window.StaysUp && !window.StoppedByUser) StayForNextClip(window);
@@ -520,6 +570,13 @@ public sealed class VisualModeManager
         if (window == null)
         {
             Logger.Log("VisualModeManager: CloseWindow -- no window, nothing to do.");
+            return;
+        }
+        if (_persistent)
+        {
+            // Continuous narration: never closed. Whatever is playing stops, the window stays.
+            Logger.Log("VisualModeManager: CloseWindow -- continuous narration, the window stays; the clip is stopped.");
+            window.StopPlaybackKeepWindow();
             return;
         }
         if (_activeWindow == window) _activeWindow = null;

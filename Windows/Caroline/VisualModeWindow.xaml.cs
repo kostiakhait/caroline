@@ -348,6 +348,21 @@ public partial class VisualModeWindow : Window
     /// paused the video first (OnStopClick); every other way of closing it now does the
     /// same, and mutes the WebView2 too, which takes effect without waiting for script.
     /// </summary>
+    /// <summary>Stops the clip playing in the window and leaves the window up (continuous narration,
+    /// see VisualModeManager._persistent). Unlike SilenceNow the WebView stays unmuted for the next clip.</summary>
+    public void StopPlaybackKeepWindow()
+    {
+        try
+        {
+            _ = _webView?.CoreWebView2?.ExecuteScriptAsync(
+                "(function(){var v=document.getElementById('vid'); v.pause(); v.removeAttribute('src'); v.load();})()");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"VisualModeWindow: StopPlaybackKeepWindow failed: {ex.Message}");
+        }
+    }
+
     public void SilenceNow()
     {
         try

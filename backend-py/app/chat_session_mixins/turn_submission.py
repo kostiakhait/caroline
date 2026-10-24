@@ -272,10 +272,16 @@ class TurnSubmissionMixin:
         is held for USER_MESSAGE_MERGE_WINDOW_S; each further one within
         that time joins it and restarts the wait; then they are submitted
         together. Internal turns and replays call submit() directly and are
-        never held."""
+        never held.
+
+        Continuous dialogue (see app/continuous_dialogue.py): while that setting is on, what the user
+        sends is a voice turn whatever way it was sent."""
         if not is_real_user:
             self.submit(text, attachments, is_real_user, is_voice)
             return
+        from app.continuous_dialogue import is_enabled as continuous_dialogue_enabled
+
+        is_voice = is_voice or continuous_dialogue_enabled(self.workspace_dir)
         self._held_user_messages.append((text, list(attachments or []), is_voice))
         if self._held_user_flush is not None:
             self._held_user_flush.cancel()

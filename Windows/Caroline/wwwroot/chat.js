@@ -173,6 +173,10 @@
     if (window.chrome?.webview) window.chrome.webview.postMessage({ type: "set_always_on_top", value: alwaysOnTop.checked });
   });
   const voiceAutoSend = document.getElementById("voiceAutoSend");
+  const continuousDialogueEnabled = document.getElementById("continuousDialogueEnabled");
+  continuousDialogueEnabled.addEventListener("change", () => {
+    sendControl("continuous_dialogue_set", { enabled: continuousDialogueEnabled.checked });
+  });
   const visualModeEnabled = document.getElementById("visualModeEnabled");
   const visualModeUnavailableHint = document.getElementById("visualModeUnavailableHint");
   visualModeEnabled.addEventListener("change", () => {
@@ -1360,6 +1364,9 @@
   // waits for "visual_speech_done" (see the message listener below) the same
   // way playAudioBase64 waits for the <audio> element's "ended" event.
   let pendingVisualDone = new Map(); // requestId -> { base64, entry, onDone }
+  // Continuous narration (backend isContinuous): once a remark of it has arrived, the animation window is
+  // opened once and never closed by anything but the user's own closing of it (native side: "persistent").
+  let continuousNarration = false;
   function playAudioViaVisualMode(base64, entry, onDone) {
     if (entry.aborted) { onDone?.(); return; }
     pendingVisualDone.set(entry.requestId, { base64, entry, onDone });
@@ -1370,6 +1377,7 @@
     // thing said instead of closing after every clip.
     window.chrome.webview.postMessage({
       type: "visual_speech_audio", requestId: entry.requestId, audioBase64: base64, more: speechQueue.length > 0, dialogue: !entry.btn,
+      persistent: continuousNarration,
     });
     entry.audioSent = true;
     prepareNextVisual();
@@ -1572,6 +1580,7 @@
         });
       }
       sendControl("visual_mode_get");
+      sendControl("continuous_dialogue_get");
       // Bug fix (2026-09-22), confirmed live: chat_mode_get used to only be
       // requested when Settings was open (it used to feed nothing else) --
       // now the native tab-header menu mirrors its `available`/`mode`
@@ -1795,6 +1804,7 @@
           // check let those variants leak through as a real chat bubble.
           if (block.text.includes("[[NO_UPDATE]]")) continue;
           if (hasToolUse) continue;
+          if (evt.isContinuous) continuousNarration = true;
           // A filler remark (backend filler_phrases.py) is only sound: no bubble, not part of the turn's text.
           if (evt.isFiller) { if (evt.isVoice) speak(block.text, null, { narration: true, audioBase64: evt.audioBase64 }); continue; }
           addBubble("assistant", block.text);
@@ -2091,6 +2101,10 @@
     } else if (evt.op === "persona_reset") {
       if (!evt.ok) addBanner(`Could not reset profile: ${evt.stderr || "unknown error"}`);
       else sendControl("persona_get");
+    } else if (evt.op === "continuous_dialogue_get" || evt.op === "continuous_dialogue_set") {
+      try {
+        continuousDialogueEnabled.checked = !!JSON.parse(evt.stdout || "{}").enabled;
+      } catch { /* leave as-is */ }
     } else if (evt.op === "visual_mode_get") {
       try {
         const v = JSON.parse(evt.stdout || "{}");
@@ -2183,6 +2197,7 @@
     sendControl("mcp_list");
     sendControl("persona_get");
     sendControl("visual_mode_get");
+      sendControl("continuous_dialogue_get");
     sendControl("local_stt_get");
     sendControl("mode_get");
     sendControl("sw_status");

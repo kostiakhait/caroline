@@ -1049,9 +1049,11 @@ public partial class MainWindow : Window
                 // "dialogue": spoken on its own as part of a voice conversation, not by a click
                 // on a message's speaker button -- the window then stays (VisualModeManager.StayForNextClip).
                 var dialogue = root.TryGetProperty("dialogue", out var dialogueProp) && dialogueProp.ValueKind == JsonValueKind.True;
+                // "persistent": continuous narration -- the window is opened once and never closed (VisualModeManager._persistent).
+                var persistent = root.TryGetProperty("persistent", out var persistentProp) && persistentProp.ValueKind == JsonValueKind.True;
                 _ = RunVisualModeAsync(async () =>
                 {
-                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes, moreToCome, dialogue);
+                    var result = await _visualMode.HandleAudioAsync(visReqId, audioBytes, moreToCome, dialogue, persistent);
                     // playOneSpeech (chat.js) awaits this to advance the speech queue.
                     // played=false tells it to fall back to plain audio playback instead
                     // of silently moving on with nothing having been heard (see

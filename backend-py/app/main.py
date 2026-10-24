@@ -836,6 +836,23 @@ class ModeBody(BaseModel):
     mode: str
 
 
+@app.get("/api/continuous-dialogue")
+async def get_continuous_dialogue() -> JSONResponse:
+    """{ok, enabled}: the continuous-dialogue switch (app/continuous_dialogue.py)."""
+    return await _control_json("continuous_dialogue_get", PRIMARY_TAB_ID)
+
+
+class ContinuousDialogueBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/continuous-dialogue")
+async def post_continuous_dialogue(body: ContinuousDialogueBody) -> JSONResponse:
+    """Turns continuous dialogue on or off: while on, every message the user sends, typed or
+    spoken, is a voice turn (spoken or animated answer plus the continuous narration)."""
+    return await _control_json("continuous_dialogue_set", PRIMARY_TAB_ID, {"enabled": body.enabled})
+
+
 @app.post("/api/mode")
 async def post_mode(body: ModeBody, tab: str = PRIMARY_TAB_ID) -> JSONResponse:
     """Switches a tab to "claude", "sw" or "openai". A Claude<->OpenAI change
@@ -1623,6 +1640,17 @@ async def handle_control_request(
         log_event("engine", "persona_reset", profile_key=profile_key)
         reset_profile(WORKSPACE_DIR, profile_key)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "continuous_dialogue_get":
+        from app.continuous_dialogue import is_enabled as continuous_dialogue_enabled
+
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps({"enabled": continuous_dialogue_enabled(WORKSPACE_DIR)}), "requestId": request_id}
+    if op == "continuous_dialogue_set":
+        if not isinstance(parsed.get("enabled"), bool):
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "continuous_dialogue_set requires a boolean 'enabled'", "requestId": request_id}
+        from app.continuous_dialogue import set_enabled as set_continuous_dialogue
+
+        set_continuous_dialogue(WORKSPACE_DIR, parsed["enabled"])
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps({"enabled": parsed["enabled"]}), "requestId": request_id}
     if op == "visual_mode_get":
         model = resolve_visual_model(WORKSPACE_DIR)
         stdout = json.dumps({
