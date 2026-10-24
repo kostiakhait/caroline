@@ -146,7 +146,7 @@ $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	# subtrees/stamps the other targets below own (backend/, backend-py/,
 	# whatsapp-sidecar/, every *.stamp file) -- same "narrower cleanup, same
 	# effect, scoped" principle already applied to those, just missed here.
-	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend ! -name backend-py ! -name whatsapp-sidecar ! -name messenger-sidecar ! -name "*.stamp" -exec rm -rf {} +
+	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend ! -name backend-py ! -name whatsapp-sidecar ! -name messenger-sidecar ! -name browsers ! -name "*.stamp" -exec rm -rf {} +
 	( rc=0; dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.caroline-exe.rc" ) & \
 	( echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"; \
 	  rc=0; dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.nativehost.rc" ) & \
@@ -232,7 +232,22 @@ $(OUT)/.messenger-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/messenger-sidecar/
 	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT)/messenger-sidecar/fca-config.json"
 	touch -m "$@"
 
-$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
+# Caroline's own web-search browser (app/web_browser.py, decided 2026-10-23: "вшить
+# Chromium в установщик"): the FULL Chromium of the revision the bundled Playwright
+# expects (run in its "new" headless mode -- the separate headless shell is turned away by
+# search engines, seen live 2026-10-24), installed into dist/browsers -- shipped inside Caroline.zip and launched by its
+# explicit path, so nothing depends on the user's own Playwright caches. Redone only when
+# the Playwright version (its browsers.json) changes.
+PLAYWRIGHT_BROWSERS_JSON := $(BACKEND_PY_DIR)/python-runtime/Lib/site-packages/playwright/driver/package/browsers.json
+$(OUT)/.browsers.stamp: $(PLAYWRIGHT_BROWSERS_JSON)
+	@echo "--- browsers (headless Chromium for web search -- see app/web_browser.py) ---"
+	rm -rf "$(OUT)/browsers"
+	mkdir -p "$(OUT)/browsers"
+	PLAYWRIGHT_BROWSERS_PATH="$(OUT)/browsers" "$(BACKEND_PY_DIR)/python-runtime/python.exe" -m playwright install --no-shell chromium
+	ls "$(OUT)"/browsers/chromium-*/chrome-win64/chrome.exe
+	touch -m "$@"
+
+$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/.browsers.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
 	@touch -m "$@"
 

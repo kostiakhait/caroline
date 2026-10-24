@@ -74,6 +74,13 @@ echo "--- installing backend-py dependencies ---"
 echo "--- fetching playwright's own Chromium build (app_browser_cdp.py / _linux_app_browser.py) ---"
 "$RUNTIME_DIR/bin/python3" -m playwright install chromium
 
+# Caroline's own web-search browser (app/web_browser.py, 2026-10-23): the full Chromium of
+# the revision this Playwright expects (its "new" headless mode -- the separate headless shell
+# is turned away by search engines, seen live 2026-10-24), bundled INSIDE the install (not the
+# user's cache), launched by its explicit path from $INSTALL_ROOT/browsers.
+echo "--- bundling the Chromium of Caroline's own web search (app/web_browser.py) ---"
+PLAYWRIGHT_BROWSERS_PATH="$INSTALL_ROOT/browsers" "$RUNTIME_DIR/bin/python3" -m playwright install --no-shell chromium
+
 echo "--- verifying import ---"
 ( cd "$INSTALL_ROOT/backend-py" && CAROLINE_APP_ROOT="$INSTALL_ROOT" "$RUNTIME_DIR/bin/python3" -c 'from app.main import PORT, app; print("ok, PORT =", PORT)' )
 

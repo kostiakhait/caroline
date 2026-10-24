@@ -67,7 +67,10 @@ internal static class PythonInstaller
          // CDP endpoint (AppBrowserWindow's own WebView2 instance) via
          // connect_over_cdp(), never launches a local browser itself. The
          // pip package alone ships the driver that requires.
-         "playwright",
+         // Pinned (2026-10-23): app/web_browser.py launches the headless
+         // Chromium bundled in Caroline.zip (dist/browsers, see the Makefile),
+         // built for exactly the revision this Playwright version expects.
+         "playwright==1.62.0",
          // app/pdf_pages.py's per-page PDF text extraction (2026-09-15,
          // "никогда документ целиком" -- multi-page documents must be
          // parsed page-by-page, text only, never handed to the model as
