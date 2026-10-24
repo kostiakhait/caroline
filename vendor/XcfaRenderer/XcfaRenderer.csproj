@@ -1,7 +1,8 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- net8.0-windows: the WPF shell (Windows/Caroline). net8.0: the headless bridge (Bridge/) the Linux shell runs. -->
+    <TargetFrameworks>net8.0-windows;net8.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -11,6 +12,7 @@
     <!-- Default SDK glob would otherwise also pick up XcfaRenderer.Tests/*.cs and Demo/*.cs as part of THIS project. -->
     <Compile Remove="XcfaRenderer.Tests\**\*.cs" />
     <Compile Remove="Demo\**\*.cs" />
+    <Compile Remove="Bridge\**\*.cs" />
     <Compile Remove="obj\**\*.cs" />
   </ItemGroup>
 
@@ -21,8 +23,10 @@
   <ItemGroup>
     <PackageReference Include="MessagePack" Version="3.1.8" />
     <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260627" />
-    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.13.0.20260627" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.13.0.20260627" Condition="$(TargetFramework.EndsWith('-windows'))" />
+    <PackageReference Include="OpenCvSharp4.official.runtime.linux-x64" Version="4.13.0.20260627" Condition="!$(TargetFramework.EndsWith('-windows'))" />
     <PackageReference Include="SkiaSharp" Version="4.151.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="4.151.1" Condition="!$(TargetFramework.EndsWith('-windows'))" />
   </ItemGroup>
 
 </Project>

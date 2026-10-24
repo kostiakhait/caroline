@@ -50,6 +50,7 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, WebKit2  # noqa: E402
 from hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, GlobalHotkeyListener  # noqa: E402
 from settings_service import AppSettings, SettingsService  # noqa: E402
 from update_checker import UpdateChecker  # noqa: E402
+import visual_bridge  # noqa: E402
 from viewer_window import ViewerResult, ViewerWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -565,6 +566,7 @@ class Shell:
         self.supervisor = supervisor
         self.settings = settings
         self.settings_service = settings_service
+        self.visual_bridge: visual_bridge.VisualBridge | None = None
         self.tabs: list[ChatTab] = []
         self.active_tab: ChatTab | None = None
         self.viewer_windows: dict[str, ViewerWindow] = {}
@@ -977,21 +979,37 @@ class Shell:
             self._open_login_viewer(tab, msg)
         elif kind == "open_payment":
             self._open_payment_viewer(tab, msg)
+        elif kind in ("visual_mode_config", "visual_speech_prepare", "visual_speech_audio", "visual_speech_cancel")                 and visual_bridge.enabled():
+            self._on_visual_message(tab, kind, msg)
         elif kind == "visual_speech_audio":
-            # Visual Mode (XcfaRenderer-based talking-head rendering) isn't
-            # ported -- that library is a vendored C# ProjectReference with
-            # no bridge from this Python shell, a separate, large undertaking
-            # (see docs/LINUX_PORT_PLAN.md's Phase 4 section). chat.js
-            # already treats played=false as "fall back to plain audio" for
-            # the exact same reason on Windows (a not-yet-warmed model) --
-            # replying with it immediately here keeps every voice reply
-            # audible instead of chat.js waiting forever for a
-            # visual_speech_done that would otherwise never arrive.
+            # Visual Mode (XcfaRenderer-based talking-head rendering) is not on unless
+            # CAROLINE_VISUAL_BRIDGE=1 (see visual_bridge.py). chat.js treats played=false
+            # as "fall back to plain audio" (the same signal Windows gives for a
+            # not-yet-warmed model) -- replying with it immediately keeps every voice
+            # reply audible instead of chat.js waiting forever for a visual_speech_done.
             self._dispatch(tab, {"type": "visual_speech_done", "requestId": msg.get("requestId"), "played": False})
-        elif kind in ("visual_mode_config", "visual_speech_start", "visual_speech_stop", "visual_speech_cancel"):
+        elif kind in ("visual_mode_config", "visual_speech_start", "visual_speech_stop", "visual_speech_cancel", "visual_speech_prepare"):
             pass  # no native reply expected for these on Windows either
         else:
             log(f"[page:{tab.id}] unhandled message type={kind!r} (not implemented in the Linux shell yet)")
+
+    def _on_visual_message(self, tab: ChatTab, kind: str, msg: dict) -> None:
+        """Visual Mode through the headless XcfaBridge (visual_bridge.py)."""
+        if self.visual_bridge is None:
+            self.visual_bridge = visual_bridge.VisualBridge(log, GLib.idle_add)
+        bridge = self.visual_bridge
+        request_id = msg.get("requestId")
+        if kind == "visual_mode_config":
+            bridge.configure(msg.get("modelPath") if msg.get("enabled", True) else None)
+        elif kind == "visual_speech_prepare":
+            bridge.prepare(request_id, msg.get("audioBase64") or "")
+        elif kind == "visual_speech_cancel":
+            bridge.cancel(request_id)
+        elif kind == "visual_speech_audio":
+            bridge.play(
+                request_id, msg.get("audioBase64") or "",
+                lambda played: self._dispatch(tab, {"type": "visual_speech_done", "requestId": request_id, "played": played}),
+            )
 
     def _on_editor_message(self, tab: ChatTab, msg: dict) -> None:
         path = msg.get("path", "")

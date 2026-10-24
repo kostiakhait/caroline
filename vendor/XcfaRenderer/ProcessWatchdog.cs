@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace XcfaRenderer;
@@ -89,6 +89,12 @@ public static class ProcessWatchdog
 
     private static bool IsProcessAlive(int pid)
     {
+        // The kernel32 calls exist only on Windows; elsewhere (the Linux bridge) ask the runtime.
+        if (!OperatingSystem.IsWindows())
+        {
+            try { using var p = Process.GetProcessById(pid); return !p.HasExited; }
+            catch { return false; }
+        }
         var handle = OpenProcess(Synchronize, false, pid);
         if (handle == IntPtr.Zero) return false;
         CloseHandle(handle);

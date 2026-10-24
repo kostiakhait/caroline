@@ -3,7 +3,7 @@
 # `pip freeze` after iteratively resolving every ModuleNotFoundError hit by
 # `from app.main import PORT, app` on a clean python-build-standalone
 # CPython 3.12.15 interpreter -- NOT the full backend-py dependency set for
-# every platform. pywin32/edge-tts/edge-playback (genuinely Windows-only
+# every platform. pywin32/edge-playback (genuinely Windows-only
 # automation extras) are intentionally absent; those plugins fail to import
 # on Linux and are skipped, same as already verified in earlier Linux-port
 # phases.
@@ -21,6 +21,11 @@
 # Also added: qrcode, Pillow -- needed by whatsapp_channel.py's and
 # signal_channel.py's QR-login image generation, same gap, same cause
 # (never added when those channels landed).
+#
+# Added 2026-10-24 (continuous-narration testing): edge-tts (+ tabulate, which it needs). It was listed as
+# Windows-only above, but it is plain Python on aiohttp; without it every voice synthesis on Linux fell
+# back to Camerlengo's ai:tts (9.3s for a 64-character sentence, measured), and a voice remark every few
+# seconds could not keep up. local_edge_tts.py is the only importer.
 #
 # Added 2026-10-22 (sw-mode testing, documents category): python-docx,
 # openpyxl, python-pptx, reportlab, lxml, XlsxWriter, et_xmlfile -- the
@@ -64,6 +69,7 @@ click==8.5.0
 cryptography==50.0.2
 discord==2.3.2
 discord.py==2.7.1
+edge-tts==7.2.8
 et_xmlfile==2.0.0
 fastapi==0.142.2
 frozenlist==1.8.0
@@ -109,6 +115,7 @@ slack_sdk==3.45.0
 sniffio==1.3.1
 sse-starlette==3.5.0
 starlette==1.7.0
+tabulate==0.10.0
 Telethon==1.45.0
 truststore==0.10.4
 typing-inspection==0.4.4

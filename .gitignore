@@ -26,6 +26,8 @@ Windows/CarolineInstaller/bin/
 Windows/CarolineInstaller/obj/
 vendor/XcfaRenderer/bin/
 vendor/XcfaRenderer/obj/
+vendor/XcfaRenderer/Bridge/bin/
+vendor/XcfaRenderer/Bridge/obj/
 vendor/XcfaRenderer/Demo/bin/
 vendor/XcfaRenderer/Demo/obj/
 vendor/XcfaRenderer/XcfaRenderer.Tests/bin/
