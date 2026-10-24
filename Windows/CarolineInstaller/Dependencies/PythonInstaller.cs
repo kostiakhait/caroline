@@ -71,6 +71,9 @@ internal static class PythonInstaller
          // Chromium bundled in Caroline.zip (dist/browsers, see the Makefile),
          // built for exactly the revision this Playwright version expects.
          "playwright==1.62.0",
+         // CalDAV calendars (app/plugins/calendar_plugin.py, 2026-10-24); pip pulls in its
+         // own dependencies (icalendar, niquests, recurring-ical-events, ...).
+         "caldav==3.5.0",
          // app/pdf_pages.py's per-page PDF text extraction (2026-09-15,
          // "никогда документ целиком" -- multi-page documents must be
          // parsed page-by-page, text only, never handed to the model as
