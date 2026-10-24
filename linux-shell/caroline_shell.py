@@ -979,7 +979,8 @@ class Shell:
             self._open_login_viewer(tab, msg)
         elif kind == "open_payment":
             self._open_payment_viewer(tab, msg)
-        elif kind in ("visual_mode_config", "visual_speech_prepare", "visual_speech_audio", "visual_speech_cancel")                 and visual_bridge.enabled():
+        elif kind in ("visual_mode_config", "visual_speech_prepare", "visual_speech_audio", "visual_speech_cancel",
+                      "visual_speech_stop") and visual_bridge.enabled():
             self._on_visual_message(tab, kind, msg)
         elif kind == "visual_speech_audio":
             # Visual Mode (XcfaRenderer-based talking-head rendering) is not on unless
@@ -993,10 +994,16 @@ class Shell:
         else:
             log(f"[page:{tab.id}] unhandled message type={kind!r} (not implemented in the Linux shell yet)")
 
+    def _chat_window_rect(self) -> tuple[int, int, int, int]:
+        """Where the chat window is on the screen, for placing the animation window beside it."""
+        x, y = self.window.get_position()
+        w, h = self.window.get_size()
+        return int(x), int(y), int(w), int(h)
+
     def _on_visual_message(self, tab: ChatTab, kind: str, msg: dict) -> None:
         """Visual Mode through the headless XcfaBridge (visual_bridge.py)."""
         if self.visual_bridge is None:
-            self.visual_bridge = visual_bridge.VisualBridge(log, GLib.idle_add)
+            self.visual_bridge = visual_bridge.VisualBridge(log, GLib.idle_add, self._chat_window_rect)
         bridge = self.visual_bridge
         request_id = msg.get("requestId")
         if kind == "visual_mode_config":
@@ -1007,9 +1014,12 @@ class Shell:
             bridge.cancel(request_id)
         elif kind == "visual_speech_audio":
             bridge.play(
-                request_id, msg.get("audioBase64") or "",
-                lambda played: self._dispatch(tab, {"type": "visual_speech_done", "requestId": request_id, "played": played}),
+                request_id, msg.get("audioBase64") or "", bool(msg.get("dialogue")), bool(msg.get("persistent")),
+                lambda played, stopped: self._dispatch(
+                    tab, {"type": "visual_speech_done", "requestId": request_id, "played": played, "stopped": stopped}),
             )
+        elif kind == "visual_speech_stop":
+            bridge.stop()
 
     def _on_editor_message(self, tab: ChatTab, msg: dict) -> None:
         path = msg.get("path", "")

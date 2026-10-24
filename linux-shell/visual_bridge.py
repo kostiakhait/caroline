@@ -7,13 +7,13 @@ sequence for the Python shell: warm the model once (configure), render each clip
 (visual_speech_prepare renders it ahead, visual_speech_audio plays it), cancel clips
 nobody will play. Clips render one at a time in the order they arrive.
 
-State of the port: the clips are RENDERED for real (the render time, the cost of
-each remark in animated mode, is what narration timing depends on) and visual_speech_done
-is reported when the clip's duration has passed, so the page's speech queue runs at
-the pace of real playback. Showing the video in a window is not done yet, and nothing
-is heard from a clip rendered here, so the bridge is off unless CAROLINE_VISUAL_BRIDGE=1
-is set -- without it the shell keeps answering `played: false` and chat.js plays plain
-audio, as before."""
+Playback (2026-10-24): the rendered clip is shown and heard in visual_window.VisualWindow --
+borderless, transparent, above the other windows; for a dialogue it stays up between the
+remarks, for a clip played from a message's speaker button it closes a second after the clip,
+and the user's Stop closes it. visual_speech_done is reported when the clip really ended (or
+was stopped); when a clip cannot be rendered or played, played=False and chat.js plays plain
+audio. Off unless CAROLINE_VISUAL_BRIDGE=1 is set -- without it the shell keeps answering
+`played: false`, as before."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import os
 import subprocess
 import tempfile
 import threading
+from typing import Any
 import time
 from pathlib import Path
 from typing import Callable
@@ -46,21 +47,29 @@ class _Clip:
         self.ok = False
         self.duration_s = 0.0
         self.render_ms = 0
-        self.waiting: list[Callable[[bool], None]] = []  # visual_speech_audio callers
+        self.waiting: list[Callable[[bool, bool], None]] = []  # visual_speech_audio callers
+        self.dialogue = False
 
 
 class VisualBridge:
-    def __init__(self, log: Callable[[str], None], run_on_main: Callable[[Callable[[], None]], None]) -> None:
+    def __init__(self, log: Callable[[str], None], run_on_main: Callable[[Callable[[], None]], None],
+                 chat_rect: Callable[[], tuple[int, int, int, int] | None] | None = None) -> None:
         """log: the shell's logger. run_on_main: schedules a callable on the GTK main loop
         (the page can only be spoken to from there)."""
         self._log = log
         self._run_on_main = run_on_main
+        self._chat_rect = chat_rect  # where the chat window is, so the animation window goes beside it
         self._proc: subprocess.Popen[str] | None = None
         self._ready = threading.Event()
         self._clips: dict[str, _Clip] = {}
         self._lock = threading.Lock()
         self._dir = Path(tempfile.gettempdir()) / "CarolineVisualMode"
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._window: Any = None
+        self._rest: str | None = None  # the model's rest pose (PNG), from the renderer's "ready" event
+        self._hide_generation = 0
+        self._persistent = False
+        self._playing: Callable[[bool, bool], None] | None = None
 
     # -- process -----------------------------------------------------------------
 
@@ -116,18 +125,36 @@ class VisualBridge:
         self._send({"cmd": "render", "id": request_id, "audio": str(audio_path), "out": str(clip.out_path)})
         return clip
 
-    def play(self, request_id: str, audio_b64: str, on_done: Callable[[bool], None]) -> None:
-        """visual_speech_audio: on_done(played) once the clip has been rendered and its
-        duration has passed; on_done(False) at once when nothing could be rendered (the page
-        then plays plain audio)."""
+    def play(self, request_id: str, audio_b64: str, dialogue: bool, persistent: bool, on_done: Callable[[bool, bool], None]) -> None:
+        """visual_speech_audio: on_done(played, stopped) when the clip has been rendered and shown
+        to its end (or stopped by the user); on_done(False, False) at once when nothing could be
+        rendered or shown (the page then plays plain audio). `dialogue`: the window stays up
+        afterwards (a voice reply or a narration remark), else it closes a second later.
+        `persistent`: continuous narration -- the window is never closed by this code, whatever
+        happens (2026-10-24, explicit instruction: opened once, never closed); Stop only stops
+        the clip. Ordinary playback is as before."""
+        if persistent:
+            self._persistent = True
         clip = self.prepare(request_id, audio_b64)
         if clip is None:
-            on_done(False)
+            on_done(False, False)
             return
+        clip.dialogue = dialogue
         if clip.done.is_set():
             self._finish(clip, on_done)
         else:
             clip.waiting.append(on_done)
+
+    def stop(self) -> None:
+        """visual_speech_stop: the user pressed Stop in the chat window."""
+        if self._window is not None and self._window.is_visible():
+            if self._persistent:
+                self._window.stop_playback()  # the window stays
+            else:
+                self._window.hide()
+            done, self._playing = self._playing, None
+            if done is not None:
+                done(True, True)
 
     def cancel(self, request_id: str) -> None:
         clip = self._clips.pop(request_id, None)
@@ -145,6 +172,7 @@ class VisualBridge:
                 continue
             kind = event.get("event")
             if kind == "ready":
+                self._rest = event.get("rest")
                 self._ready.set()
                 self._log(f"visual bridge: model warm in {event.get('prepMs')} ms")
             elif kind == "rendered":
@@ -166,18 +194,54 @@ class VisualBridge:
             elif kind in ("cancelled", "error"):
                 self._log(f"visual bridge: {line.strip()}")
 
-    def _finish(self, clip: _Clip, on_done: Callable[[bool], None]) -> None:
-        """The clip is rendered: report it played after its own duration (see the module docstring)."""
+    def _finish(self, clip: _Clip, on_done: Callable[[bool, bool], None]) -> None:
+        """The clip is rendered: show it (on the GTK main thread) and report when it has played."""
         if not clip.ok:
             self._discard(clip)
-            on_done(False)
+            on_done(False, False)
             return
+        try:
+            if self._window is None:
+                import visual_window
 
-        def done() -> None:
+                self._window = visual_window.VisualWindow(self._log)
+                if self._rest:
+                    self._window.set_rest(self._rest)
+        except Exception as exc:  # noqa: BLE001 -- no display, no WebKit: plain audio instead
+            self._log(f"visual bridge: window could not be made: {exc}")
             self._discard(clip)
-            on_done(True)
+            on_done(False, False)
+            return
+        self._hide_generation += 1
 
-        threading.Timer(clip.duration_s, lambda: self._run_on_main(done)).start()
+        def finished(played: bool, stopped: bool) -> None:
+            self._playing = None
+            self._discard(clip)
+            if not self._persistent and (stopped or not clip.dialogue):
+                generation = self._hide_generation
+
+                def maybe_hide() -> bool:
+                    if generation == self._hide_generation and self._window is not None:
+                        self._window.hide()
+                    return False
+
+                from gi.repository import GLib
+
+                GLib.timeout_add(0 if stopped else 1000, maybe_hide)
+            on_done(played, stopped)
+
+        def on_event(kind: str, payload: dict) -> None:
+            callback, self._playing = self._playing, None
+            if callback is None:
+                return
+            callback(kind != "error", kind == "stopped")
+
+        self._playing = finished
+        try:
+            rect = self._chat_rect() if self._chat_rect else None
+        except Exception:  # noqa: BLE001
+            rect = None
+        self._window.play(str(clip.out_path), on_event, rect)
 
     def _discard(self, clip: _Clip) -> None:
         self._clips.pop(clip.request_id, None)

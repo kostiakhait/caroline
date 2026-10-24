@@ -130,6 +130,34 @@ Decisions:
 6. Repeats: the narrator is told each new remark must state a different fact (what is done, what is being done now,
    what is expected, how long it has taken); fillers are not shown as chat bubbles and are not part of "already said".
 
+## 7c. Next steps (decisions 2026-10-24, to be done later -- written down, not started)
+
+State: the Linux animation window exists and plays the rendered clips with sound; in continuous narration it is
+opened once and never closed by the program; rendered clips are cached by the hash of their audio. Recordings made
+on a virtual display without a GPU were not trustworthy (sound ahead of picture by ~0.8 s, duplicated frames); a
+recording on the GPU box (ffmpeg + NVENC, two recorders, aligned with a clapperboard) is. Only what a person can
+see and hear counts as a result, not timings from logs.
+
+To do:
+1. **Window transparency** (Linux). The window must be see-through around the figure, as on Windows. On the GPU test
+   box the picture came out on a grey background: the alpha channel of the VP9 clip is not honoured by the window
+   (WebKit compositing / the compositor). To be fixed and then checked by eye on a recording from the GPU box.
+2. **Language of the first remarks.** The tab's language is used for the first remark of a tab, as agreed (no change
+   to the rule). The recorded run had an English first remark because the tab's stored language was English
+   (nothing had been resolved for a fresh tab); that is a question of what the tab's language is, not of the rule.
+   To look at when the tab language of a new voice tab is set.
+3. **Window position** stays as it is for now (decision: do not touch). On the test box the window manager ignored
+   the requested corner and placed it in the middle.
+4. **Filler remarks** stay as they are until asked (some of them sound as if work was being done, e.g. "Проверяю ещё
+   одну вещь"; noted, not changed).
+5. Lip movement vs. the voice inside the clip itself was not measured; to be judged by eye on a trustworthy recording.
+6. Commit and push the work done so far (Linux window, the persistent window in continuous narration on Windows and
+   Linux, the clip cache) -- when asked.
+
+Test machine: the AWS image `ami-08cd334e960c547f8` (NVIDIA GRID driver, Xorg on the GPU, ffmpeg with NVENC, dotnet,
+the built bridge, the model, the test scripts) is kept so work can restart from the same point; a new machine is
+started from it only on request and is TERMINATED (not stopped) afterwards. See Notes: vault:aws:caroline-animation-gpu-test.
+
 ## 8. Decisions
 
 Made (2026-10-23):
