@@ -28,11 +28,17 @@ from __future__ import annotations
 # localhost, or the real frontend breaks along with any actual attacker.
 CAROLINE_FRONTEND_ORIGIN = "https://caroline.local"
 
+# The Linux shell (linux-shell/caroline_shell.py) has no virtual host: it serves wwwroot from its
+# own loopback HTTP server (PAGE_PORT there) and loads the chat page from it, so the page's origin
+# is this one. Without it the whole Linux chat was refused (seen 2026-10-24 on a test box, after the
+# WebSocket check was added: "rejected ... cross-origin (http://127.0.0.1:48767)").
+LINUX_SHELL_FRONTEND_ORIGIN = "http://127.0.0.1:48767"
+
 
 def is_cross_origin_browser_request(origin_header: str | None, port: int) -> bool:
     if not origin_header:
         return False
-    allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", CAROLINE_FRONTEND_ORIGIN}
+    allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", CAROLINE_FRONTEND_ORIGIN, LINUX_SHELL_FRONTEND_ORIGIN}
     return origin_header not in allowed
 
 
