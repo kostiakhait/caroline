@@ -409,6 +409,7 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     from app.evolution_client import run_reply_agent
     from app.microagents.reply_review import REVIEW
 
+    started = time.monotonic()
     # `timeout` is honored again (2026-10-22): since the review moved to the client
     # (20739d0) it was accepted and never used, and the voice narrator's
     # VOICE_NARRATION_REVIEW_TIMEOUT_S (6s, "a review that has not answered in this time
@@ -433,7 +434,49 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     if not isinstance(output, dict) or not isinstance(output.get("text"), str) or not output["text"].strip():
         log_event("plugin:voice", "review_reply_failed", reason="empty")
         return None
-    return output["text"]
+    revised = output["text"]
+    # The reviewer's own sanitizer (2026-10-24): a revision that says something the
+    # original did not is thrown away -- the user sees Caroline's own text instead of
+    # words the reviewer made up. Nothing to check when the text is unchanged or the
+    # reviewer dropped it whole ([[NO_UPDATE]]).
+    if revised.strip() != text.strip() and revised.strip() != "[[NO_UPDATE]]":
+        if await _review_invented(text, revised, timeout - (time.monotonic() - started)):
+            return text
+    return revised
+
+
+async def _review_invented(original: str, revised: str, time_left_s: float) -> bool:
+    """reply.review.check on the local microagent ladder (not an evolvable role):
+    True when the revision adds something the original does not say. Fail-open --
+    an error, a timeout or no time left keeps the revision as before (logged)."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents import reply_review_check
+
+    if time_left_s <= 0:
+        log_event("plugin:voice", "review_check_skipped", reason="no_time_left")
+        return False
+    runtime = build_local_runtime()
+    if runtime is None:
+        log_event("plugin:voice", "review_check_skipped", reason="no_runtime")
+        return False
+    for agent in reply_review_check.llm_agents():
+        runtime.register(agent)
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(
+            runtime.run, reply_review_check.REVIEW_CHECK, {"original": original, "revised": revised},
+            runtime.new_context(budget=new_budget())), time_left_s)
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        log_event("plugin:voice", "review_check_failed", error=f"{type(exc).__name__}: {exc}"[:300],
+                  ms=int((time.monotonic() - started) * 1000))
+        return False
+    output = (result or {}).get("output") or {}
+    if (result or {}).get("status") != "ok" or reply_review_check.verify_review_check({}, output) is not None:
+        log_event("plugin:voice", "review_check_failed", error=(result or {}).get("error"), ms=int((time.monotonic() - started) * 1000))
+        return False
+    log_event("plugin:voice", "review_check_done", invented=output["invented"], what=str(output.get("what") or "")[:300],
+              ms=int((time.monotonic() - started) * 1000))
+    return bool(output["invented"])
 
 
 async def check_permission_guard(

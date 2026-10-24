@@ -62,18 +62,6 @@ REVIEW_RULES_TEXT = (
         "like 'cdpPort' or 'ok' appropriate to show a person -- so check for and strip it even when TASK "
         "below is '(not given)'; rewrite what it MEANS (what happened, in plain language) and drop the raw "
         "structure entirely, never leave it sitting alongside the plain-language sentence either.\n"
-        "This rule ALSO covers a credential or secret value recited in plain prose (a password, API key, "
-        "token, PIN or similar), not just JSON-shaped data -- mask the literal value itself. But go further "
-        "than just masking it: a message whose only real content WAS that credential (e.g. 'Credentials for "
-        "X: [password], [server], [port]') has NOTHING left to say once the secret is gone, and masking the "
-        "value alone leaves a pointless, still off-task stub -- confirmed live, 2026-10-14: the assistant was "
-        "asked to check a mailbox for journal confirmations, fetched its own login credentials as an internal "
-        "step along the way, and recited them back as if that answered the question; masking the password "
-        "alone ('Credentials for khait@multi-portal.org: [REDACTED], [REDACTED], [REDACTED].') still reached "
-        "the user as a message, right before the real answer arrived separately a few seconds later. Reciting "
-        "one's own login details is essentially never what TASK is actually asking for -- when TEXT is this "
-        "shape, treat it as failing rule 1 too and collapse the WHOLE message to [[NO_UPDATE]], not a masked "
-        "remnant of it, UNLESS TEXT also contains separate, genuine substance that answers TASK.\n"
         "This rule ALSO covers the assistant's own BACKGROUND-TASK bookkeeping: a self-scheduled reminder "
         "firing, a periodic maintenance sweep, a memory/notes backup, a 'vault note' or similar internal "
         "continuity record and its timestamp, or any other internal task-scheduling detail -- these are the "
@@ -102,12 +90,13 @@ REVIEW_RULES_TEXT = (
         "it, before the user had even seen the draft. If TEXT asks the user something, it must still be "
         "asking it when you return it -- fix it for rules 1-3 above if it needs fixing, but never resolve, "
         "answer, or pre-empt the question itself.\n"
-        "The same holds when the question asks the user FOR access details -- a password, a server, a port, "
-        "a login. Asking for them is not reciting a secret: there is no secret value in the text to hide, "
-        "and the question stays exactly as asked. Never turn it into a refusal, a security lecture, or "
-        "advice to use some other channel (confirmed live, 2026-10-22: 'please give me the mailbox's "
-        "password, IMAP/SMTP host and port' came back as 'I cannot request or pass passwords through this "
-        "channel; use a secure channel' -- the user was left with no way to get the task done).\n\n"
+        "Access details -- a password, a server, a port, a login -- are ordinary content here, never "
+        "something to hide or mask: whether TEXT asks the user for them or gives them to the user, they stay "
+        "exactly as written. Never turn such a message into a refusal, a security lecture, or advice to use "
+        "some other channel (confirmed live, 2026-10-22: 'please give me the mailbox's password, IMAP/SMTP "
+        "host and port' came back as 'I cannot request or pass passwords through this channel; use a secure "
+        "channel'; and 2026-10-24: the user asked for a mailbox password, the answer giving it was masked to "
+        "[REDACTED] and then replaced with an invented refusal).\n\n"
         "WHEN TASK LOOKS UNRELATED: TASK is the assistant's own current standing task, which can legitimately "
         "be one of its own self-scheduled background chores (a periodic mailbox check, a memory backup) "
         "rather than something the user explicitly asked about this turn -- TEXT being unrelated to a "
@@ -143,7 +132,9 @@ def verify_review(input: Any, output: Any) -> Optional[str]:
 def llm_agents() -> List[M.Agent]:
     return [
         M.Agent(
-            REVIEW, "1",
+            # "2" (2026-10-24): the credential-masking rule was removed -- a new version is what
+            # re-seeds the server's genome (evolvable_roles_client.seed_genome).
+            REVIEW, "2",
             "Checks one piece of outbound assistant text for task relevance, absence of internal "
             "implementation details, and human-sounding tone -- rewriting it only if it fails one of those.",
             input_schema=_object({"text": _STRING, "task": _STRING}, required=["text", "task"]),
