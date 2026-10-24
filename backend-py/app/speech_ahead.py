@@ -71,18 +71,18 @@ def pieces_for(text: str) -> list[str]:
     return seen
 
 
-async def synthesize_piece(text: str, gender: str | None, language_iso: str | None) -> str:
+async def synthesize_piece(text: str, gender: str | None, tab_id: str | None, tab_language: str | None) -> str:
     """What the "tts" control op does for one piece (main.py), base64 audio."""
     from app.login_api import get_cached_v2_session
     from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, voice_for_gender
 
     session = await get_cached_v2_session() if speech_needs_cleanup(text) else None
     cleaned = await clean_text_for_speech(text, session)
-    return await synthesize_speech(cleaned, voice_for_gender(gender), session, language=language_iso,
-                                   session_provider=get_cached_v2_session)
+    return await synthesize_speech(cleaned, voice_for_gender(gender), session,
+                                   session_provider=get_cached_v2_session, tab_id=tab_id, tab_language=tab_language)
 
 
-def prepare(text: str, gender: str | None, language_iso: str | None) -> None:
+def prepare(text: str, gender: str | None, tab_id: str | None, tab_language: str | None) -> None:
     """Starts synthesis of the first pieces of a reply that will most likely be read out."""
     now = time.monotonic()
     for key in [k for k, (at, task) in _ahead.items() if now - at > AHEAD_TTL_S]:
@@ -90,7 +90,7 @@ def prepare(text: str, gender: str | None, language_iso: str | None) -> None:
     for piece in pieces_for(text.strip()):
         if piece in _ahead or len(_ahead) >= AHEAD_MAX:
             continue
-        task = asyncio.create_task(synthesize_piece(piece, gender, language_iso))
+        task = asyncio.create_task(synthesize_piece(piece, gender, tab_id, tab_language))
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)  # never "never retrieved"
         _ahead[piece] = (now, task)
     log_event("engine", "speech_ahead_started", pieces=len(pieces_for(text.strip())), text_len=len(text))

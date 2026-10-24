@@ -530,6 +530,8 @@ class ChatSession(
         # remarks have gone out in a row (see VOICE_NARRATION_STALE_STEP_S).
         self._prepared_narration_stale = False
         self._stale_remarks_in_row = 0
+        # Fillers (app/filler_phrases.py) said since the last real remark.
+        self._fillers_in_row = 0
         # Lines of activity since a tier's answer went to the verifier; None when no answer
         # is being checked (see _answer_being_checked).
         self._lines_since_answer_candidate: int | None = None
@@ -541,6 +543,8 @@ class ChatSession(
         self._client_speaking: bool | None = None
         self._client_quiet_since: float | None = None
         self._client_speech_reported_at: float | None = None
+        # True while _client_speaking is only our own assumption after a send, not chat.js's report.
+        self._speaking_assumed = False
         self._last_narration_est_speech_s = 0.0
 
         # restart budget

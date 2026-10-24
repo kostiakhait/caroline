@@ -356,9 +356,10 @@ class TurnSubmissionMixin:
         if not answer_is_in_language(text, language):
             return
         from app import speech_ahead
+        from app.plugins.voice_api import language_code_for_name
 
         try:
-            speech_ahead.prepare(text, get_persona_gender(self.workspace_dir), {"Russian": "ru", "English": "en"}.get(language))
+            speech_ahead.prepare(text, get_persona_gender(self.workspace_dir), self.tab_id, language_code_for_name(language))
         except Exception as exc:  # noqa: BLE001 -- a head start must never cost the turn
             log_event("engine", "speech_ahead_failed", tab_id=self.tab_id, error=str(exc)[:200])
     async def _reviewed(self, text: str, task: str) -> str | None:

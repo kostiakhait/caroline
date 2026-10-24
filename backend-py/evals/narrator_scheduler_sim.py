@@ -33,7 +33,7 @@ WANTED = {"_voice_narration_applies", "_reset_voice_narration", "on_client_speec
           "_voice_narration_loop", "_step_voice_narration", "_draft_voice_narration", "_send_narration_remark",
           "_narration_task", "_narration_action_facts", "_synthesize_narration_audio", "_draft_voice_narration_body",
           "_say_first_voice_remark", "_review_and_synthesize", "_stale_interval", "_stale_lead", "_note_answer_candidate",
-          "_answer_being_checked"}
+          "_answer_being_checked", "_filler_due", "_play_filler"}
 # Module-level helpers (now in chat_session_shared.py) the copied methods call.
 HELPERS = {"_spoken_duration"}
 helpers = [n for n in shared_tree.body if isinstance(n, ast.FunctionDef) and n.name in HELPERS]
@@ -68,7 +68,7 @@ async def generate_progress_comment(dialogue, language, **kw):
 
 voice_api = types.ModuleType("app.plugins.voice_api"); voice_api.generate_progress_comment = generate_progress_comment
 async def clean_text_for_speech(t): return t
-async def synthesize_speech(t, voice, language=None):
+async def synthesize_speech(t, voice, language=None, **kw):
     state["live"] = state.get("live", 0)
     state["tts"] = state.get("tts", 0) + 1
     state["live"] += 1; state["max_live"] = max(state.get("max_live", 0), state["live"])
@@ -82,8 +82,26 @@ voice_api.voice_for_gender = lambda g: "Nova"
 REVIEW_S = float(os.environ.get("REVIEW_S", "0"))
 async def review_reply(text, task, **kw):
     await asyncio.sleep(REVIEW_S * SCALE)
-    return text
+    return "[[NO_UPDATE]]" if state.get("review_no_update") else text
 voice_api.review_reply = review_reply
+voice_api._last_speech_language = {}
+voice_api.language_code_for_name = lambda name: "ru"
+# Fillers (app/filler_phrases.py): the real set lives on disk; here pick_filler hands out numbered ones.
+filler_phrases = types.ModuleType("app.filler_phrases")
+def pick_filler(language, gender, cache_root):
+    state["fillers"] = state.get("fillers", 0) + 1
+    return f"FILL {state['fillers']}", "AUDIO"
+filler_phrases.pick_filler = pick_filler
+filler_phrases.ensure_set = lambda *a, **k: None
+sys.modules["app.filler_phrases"] = filler_phrases
+login_api = types.ModuleType("app.login_api")
+async def get_cached_v2_session(): return None
+login_api.get_cached_v2_session = get_cached_v2_session
+sys.modules["app.login_api"] = login_api
+engine = types.ModuleType("app.small_model_engine")
+async def resolve_narration_prompt(prompt, model=None, reasoning=None): return "[]"
+engine.resolve_narration_prompt = resolve_narration_prompt
+sys.modules["app.small_model_engine"] = engine
 async def generate_progress_comment_direct(task, activity, already_said, language, resolve, **kw):
     return await generate_progress_comment('', language, activity=activity, task=task, already_said=already_said)
 voice_api.generate_progress_comment_direct = generate_progress_comment_direct
@@ -94,7 +112,8 @@ sys.modules["app.plugins.voice_api"] = voice_api
 
 ns = {"asyncio": asyncio, "time": time, "log_event": log_event,
       "current_language_name": lambda tab: "Russian", "get_persona_gender": lambda d: "female",
-      "get_owner_profile": lambda d: types.SimpleNamespace(gender=None), "Any": object, "draft_narration_remark": draft_narration_remark, **consts}
+      "get_owner_profile": lambda d: types.SimpleNamespace(gender=None), "Any": object,
+      "_NO_UPDATE_SENTINEL": "[[NO_UPDATE]]", "_is_silent_reply_paraphrase": lambda t: False, "draft_narration_remark": draft_narration_remark, **consts}
 for k, v in list(consts.items()):  # scale every time constant
     if k == "VOICE_NARRATION_EST_CHARS_PER_S":
         ns[k] = v / SCALE  # a rate, not a duration
@@ -105,26 +124,28 @@ code = compile(ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(name="S",
 exec(code, ns)
 exec(compile(ast.fix_missing_locations(ast.Module(body=helpers, type_ignores=[])), SRC, "exec"), ns)
 S = ns["S"]
+FILLER_AFTER_S = ns["VOICE_NARRATION_FILLER_AFTER_S"]
 
 class Client:
     """chat.js's queue: plays remarks one at a time, reporting speech_state."""
     def __init__(self, sess, reports=True, speak_s_per_char=1 / 14):
         self.sess, self.reports, self.rate = sess, reports, speak_s_per_char
         self.queue, self.running, self.spoken = [], False, []
-    async def receive(self, text, narration):
+    async def receive(self, text, narration, filler=False):
         if not narration:
             self.queue = [q for q in self.queue if not q[1]]
-        self.queue.append((text, narration))
+        self.queue.append((text, narration, filler))
         if not self.running:
             asyncio.create_task(self.run())
     async def run(self):
         self.running = True
         if self.reports: self.sess.on_client_speech_state(True)
         while self.queue:
-            text, narration = self.queue.pop(0)
+            text, narration, filler = self.queue.pop(0)
             start = now_s()
-            await asyncio.sleep((0.8 + len(text) * self.rate) * SCALE)  # 0.8s synthesis + speaking
-            self.spoken.append((start, now_s(), text, narration))
+            await asyncio.sleep(((0.0 if filler else 0.8) + len(text) * self.rate) * SCALE)  # 0.8s synthesis + speaking; a filler arrives with its audio
+            # the 4th field stays "a real remark" for the older checks; fillers are told apart by the 5th
+            self.spoken.append((start, now_s(), text, narration and not filler, filler))
         self.running = False
         if self.reports: self.sess.on_client_speech_state(False)
 
@@ -144,20 +165,23 @@ def make_session(voice=True, reports=True):
     s._client_speaking = None; s._client_quiet_since = None; s._client_speech_reported_at = None
     s._last_narration_est_speech_s = 0.0
     s._first_voice_remark_task = None
+    s._fillers_in_row = 0; s._speaking_assumed = False
     s._reset_voice_narration()
     s._narration_turn_started_at = time.monotonic()
     s.client = Client(s, reports)
     async def send(env):
         text = env["message"]["message"]["content"][0]["text"]
         if env.get("isNarration"): state.setdefault("with_audio", []).append(bool(env.get("audioBase64")))
-        await s.client.receive(text, env.get("isNarration", False))
+        await s.client.receive(text, env.get("isNarration", False), env.get("isFiller", False))
     s.send = send
     return s
 
 async def scenario(name, *, turn_s, fact_every=None, voice=True, reports=True, model_delay=3.0, empty=False, first_remark_at=None,
-                   candidate_at=None, repeats_unless_told=False):
+                   candidate_at=None, repeats_unless_told=False, fillers=False, review_no_update=False):
     events.clear(); state.update(model_delay=model_delay, empty=empty, calls=0, with_audio=[], live=0, max_live=0,
-                                 repeats_unless_told=repeats_unless_told)
+                                 repeats_unless_told=repeats_unless_told, fillers=0, review_no_update=review_no_update)
+    # The older scenarios test the real remarks' scheduling alone: fillers off (never due).
+    ns["VOICE_NARRATION_FILLER_AFTER_S"] = FILLER_AFTER_S if fillers else 1e9
     global T0; T0 = time.monotonic()
     s = make_session(voice, reports)
     loop = asyncio.create_task(s._voice_narration_loop())
@@ -202,8 +226,8 @@ async def scenario(name, *, turn_s, fact_every=None, voice=True, reports=True, m
 def report(name, s, answer_at, checks):
     spoken = s.client.spoken
     print(f"\n=== {name} ===")
-    for a, b, text, narr in spoken:
-        print(f"  {a:6.1f}-{b:6.1f}s  {'NARR ' if narr else 'REAL '} {text}")
+    for a, b, text, narr, *filler in spoken:
+        print(f"  {a:6.1f}-{b:6.1f}s  {'FILL ' if filler and filler[0] else ('NARR ' if narr else 'REAL ')} {text}")
     sent = [e for e in events if e[1] == "voice_narration_sent"]
     print(f"  remarks sent: {len(sent)}, model calls: {state['calls']}, final answer at {answer_at:.1f}s")
     ok = True
@@ -352,6 +376,51 @@ async def main():
             ("no two lines ever overlap", no_overlap(sp)),
         ]
     all_ok &= report("M", s, ans, cm)
+
+    def continuous(sp):
+        """Every silence between two lines of the whole stream, from the first sound to the end."""
+        return [sp[i + 1][0] - sp[i][1] for i in range(len(sp) - 1)]
+
+    s, ans = await scenario("N: continuous -- nothing new for a minute, the narrator has nothing to say", turn_s=60, fact_every=None,
+                            empty=True, fillers=True)
+    def cn(sp, sent, ans):
+        g = continuous(sp); fill = [x for x in sp if x[4]]
+        return [
+            (f"fillers fill the pauses ({len(fill)} said)", len(fill) >= 10),
+            (f"no silence over 3s anywhere (max {max(g, default=0):.1f}s)", all(x <= 3.0 for x in g)),
+            ("no two lines ever overlap", no_overlap(sp)),
+            ("first sound by 8s", bool(sp) and sp[0][0] <= 8),
+        ]
+    all_ok &= report("N", s, ans, cn)
+
+    s, ans = await scenario("O: continuous -- a new fact every 4s, a remark takes 3s to prepare", turn_s=60, fact_every=4, fillers=True)
+    def co(sp, sent, ans):
+        g = continuous(sp)
+        return [
+            (f"no silence over 3s anywhere (max {max(g, default=0):.1f}s)", all(x <= 3.0 for x in g)),
+            ("real remarks are still said", len([x for x in sp if x[3]]) >= 5),
+            ("no two lines ever overlap", no_overlap(sp)),
+        ]
+    all_ok &= report("O", s, ans, co)
+
+    s, ans = await scenario("P: continuous -- the review turns every remark into [[NO_UPDATE]]", turn_s=60, fact_every=4, fillers=True,
+                            review_no_update=True)
+    def cp(sp, sent, ans):
+        g = continuous(sp)
+        return [
+            ("no remark text [[NO_UPDATE]] is sent", not any("NO_UPDATE" in x[2] for x in sp)),
+            (f"no silence over 3s anywhere (max {max(g, default=0):.1f}s)", all(x <= 3.0 for x in g)),
+        ]
+    all_ok &= report("P", s, ans, cp)
+
+    s, ans = await scenario("Q: continuous -- the answer is checked for 4s after a busy turn", turn_s=24, fact_every=3, candidate_at=20, fillers=True)
+    def cq(sp, sent, ans):
+        g = continuous(sp); real = [x for x in sp if not x[3] and not x[4]]
+        return [
+            (f"no silence over 3.5s anywhere (max {max(g, default=0):.1f}s)", all(x <= 3.5 for x in g)),
+            (f"the answer is not kept waiting (starts {real[0][0] - ans if real else -1:.1f}s after it is ready)", bool(real) and real[0][0] - ans <= 1.5),
+        ]
+    all_ok &= report("Q", s, ans, cq)
 
     print("\nALL OK" if all_ok else "\nSOME CHECKS FAILED")
 

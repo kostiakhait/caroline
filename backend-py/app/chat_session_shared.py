@@ -356,6 +356,17 @@ VOICE_NARRATION_TICK_S = 1.0
 # before the answer. Saying again, in other words, that the work goes on -- after half a
 # minute -- is what a person would do; silence on a call sounds like a hang.
 VOICE_NARRATION_STALE_REPEAT_WINDOW = 2
+# Filler remarks (2026-10-24, explicit instruction; app/filler_phrases.py): a pause nothing real can fill is
+# filled with a short pre-coded phrase ("Одну секунду"). One goes out when the client has been quiet this long
+# and no remark is ready; after this many in a row a real remark is forced (the narrator is asked even when
+# nothing is new), so the user does not hear only fillers.
+VOICE_NARRATION_FILLER_AFTER_S = 1.5
+VOICE_NARRATION_MAX_FILLERS_IN_ROW = 4
+# After the backend sends a remark it assumes the client is speaking it until chat.js says so (speech_state).
+# A client that never reports (it dropped the remark, e.g. a [[NO_UPDATE]] text; an older chat.js) must not
+# keep that assumption for the VOICE_NARRATION_CLIENT_SPEAKING_STALE_S of a dropped connection: measured
+# 2026-10-24, a 70 s silence after a review turned a remark into [[NO_UPDATE]].
+VOICE_NARRATION_ASSUMED_SPEAKING_S = 4.0
 # Per explicit instruction (2026-10-11, and again 2026-10-12 when its cost for the voice
 # loop was put to him: "он необходим для предотвращения ошибок модели, оставляем"): every
 # outbound text goes through the server's reply.review, a narration remark first of all.
@@ -1803,6 +1814,9 @@ __all__ = [
     'NARRATION_FAILURE_RETRY_S',
     'VOICE_NARRATION_TICK_S',
     'VOICE_NARRATION_STALE_REPEAT_WINDOW',
+    'VOICE_NARRATION_FILLER_AFTER_S',
+    'VOICE_NARRATION_MAX_FILLERS_IN_ROW',
+    'VOICE_NARRATION_ASSUMED_SPEAKING_S',
     'VOICE_NARRATION_REVIEW',
     'VOICE_NARRATION_REVIEW_TIMEOUT_S',
     'VOICE_NARRATION_FIRST_S',

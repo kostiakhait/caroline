@@ -67,6 +67,22 @@ def _edge_tts_voice_for(camero_voice: str, language: str | None) -> str:
     return table["male"] if camero_voice == "Onyx" else table["female"]
 
 
+async def _edge_voice_for_language(camero_voice: str, language: str | None) -> str | None:
+    """The edge-tts voice for a language: the built-in table (ru, en) at once, any other
+    language from the service's voice list, fetched on first use (local_edge_tts.voices_for_language).
+    None when there is none or the language is not known."""
+    if not language:
+        return None
+    if language in _EDGE_TTS_VOICES:
+        return _edge_tts_voice_for(camero_voice, language)
+    from app.local_edge_tts import voices_for_language
+
+    table = await voices_for_language(language)
+    if not table:
+        return None
+    return table["male"] if camero_voice == "Onyx" else table["female"]
+
+
 async def detect_language(text: str) -> str | None:
     """Real LLM-backed language detection (Camerlengo's ai:detectLanguage)
     -- deliberately NOT a Cyrillic/Latin heuristic. Returns a lowercase
@@ -1637,7 +1653,7 @@ def _progress_comment_prompt(
     confirmed -- and that rule is the one here now, in main's words."""
     return (
         "CRITICAL: a program parses your reply, not a person. Reply with ONLY a <narration> tag around ONE "
-        "short sentence, no JSON, no markdown, no preamble.\n\n"
+        "short sentence, followed by a <language> tag (described at the end), no JSON, no markdown, no preamble.\n\n"
         "You speak to the user about where their request stands right now: how far along the work is, or that "
         "it's finished. Use first person, plain everyday words, present tense.\n"
         "Never mention tools, functions, commands, systems, files, processes, session mechanics or any internal "
@@ -1667,6 +1683,10 @@ def _progress_comment_prompt(
         "nothing for a while. When that line is there and nothing else is new, do not stay silent -- on a live "
         "call silence sounds like a hang: say in one short sentence, in words different from anything already "
         "said, that the work on their request is still going on. Never guess how long is left.\n"
+        "Every remark must state something DIFFERENT from everything in ALREADY SAID -- not the same fact in "
+        "other words (\"waiting for the result\" said twice is a repeat). Choose a new angle each time: what has "
+        "been done so far, what is being done right now, what is being waited for, how long it has taken. If there "
+        "is no new angle, say nothing.\n"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n\n"
         f"{_draft_language_line(draft_language)}{(' ' + gender_clause) if gender_clause else ''}\n\n"
@@ -1708,7 +1728,9 @@ def _progress_comment_prompt(
         f"TASK (the user's request):\n---\n{task}\n---\n\n"
         f"STATUS (what is happening):\n---\n{activity}\n---\n\n"
         f"{_already_said_block(already_said)}"
-        "Reply now, wrapped in the tag."
+        "Reply now, wrapped in the tag. After the <narration> tag add <language>xx</language>: the ISO 639-1 "
+        "code (ru, en, uk, de, fr ...) of the language the sentence is written in -- the remark is read "
+        "aloud, and the voice is chosen by this code. No <language> tag when the narration is empty."
     )
 
 
@@ -2014,6 +2036,15 @@ async def generate_progress_comment(
     return final_text
 
 
+class SpokenText(str):
+    """A remark that knows the language its writer says it is in (ISO 639-1, or None when the
+    writer did not say). The voice reading it aloud follows that (2026-10-24, explicit
+    instruction: the language is named by whoever writes the text). It is an ordinary str to
+    everything else; a text rewritten by anything else is a plain str and carries no language."""
+
+    language: str | None = None
+
+
 async def generate_progress_comment_direct(
     task: str, activity: str, already_said: list[str], language: str,
     resolve: Callable[[str], Awaitable[str]], gender: str | None = None, addressee_gender: str | None = None,
@@ -2086,11 +2117,14 @@ async def generate_progress_comment_direct(
             task, activity, already_said, language, resolve, gender=gender, addressee_gender=addressee_gender,
             repeat_window=repeat_window, max_chars=max_chars, too_long=text,
         )
-    log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True)
-    return text
+    named = _extract_tagged_text(raw, "language").strip().lower() if re.search(r"<language>", raw, re.IGNORECASE) else ""
+    spoken = SpokenText(text)
+    spoken.language = named if re.fullmatch(r"[a-z]{2,3}", named) else None
+    log_event("plugin:voice", "generate_progress_comment_ok", text=text, direct=True, language=spoken.language)
+    return spoken
 
 
-async def _synthesize_speech_locally(text: str, voice: str) -> str:
+async def _synthesize_speech_locally(text: str, voice: str, retries: int | None = None) -> str:
     # Bug fix (2026-09-27), per explicit instruction: used to POST to a separate
     # local_tts_server.py subprocess over HTTP (port 9414) -- ported as-is from the old
     # Node.js backend, where that indirection was the only way to reach a Python TTS
@@ -2104,7 +2138,8 @@ async def _synthesize_speech_locally(text: str, voice: str) -> str:
     # instead, 20-97s even for a few words).
     from app.local_edge_tts import EdgeTtsOptions, synthesize_sentences_in_parallel
 
-    audio = await synthesize_sentences_in_parallel(text, EdgeTtsOptions(voice=voice))
+    options = EdgeTtsOptions(voice=voice) if retries is None else EdgeTtsOptions(voice=voice, max_retries=retries)
+    audio = await synthesize_sentences_in_parallel(text, options)
     if not audio:
         raise VoiceApiError("local edge-tts returned no audio")
     return base64.b64encode(audio).decode("ascii")
@@ -2124,31 +2159,83 @@ async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str 
     return data["result"]  # base64 MP3
 
 
+# The language the voice of each tab last spoke in (2026-10-24, explicit instruction): the next
+# message is tried in it first, and ai:detectLanguage is asked only when the voice did not
+# manage. The first time a tab speaks, its tab language is the guess.
+_last_speech_language: dict[str, str] = {}
+
+# The names the tab's language is kept under (chat_session_shared.current_language_name: one
+# English word, "Russian", "Ukrainian") and their ISO 639-1 codes, for the first guess of a tab.
+_LANGUAGE_CODES = {
+    "russian": "ru", "english": "en", "ukrainian": "uk", "german": "de", "french": "fr", "spanish": "es",
+    "italian": "it", "portuguese": "pt", "polish": "pl", "turkish": "tr", "dutch": "nl", "czech": "cs",
+    "chinese": "zh", "japanese": "ja", "korean": "ko", "arabic": "ar", "hebrew": "he", "hindi": "hi",
+    "swedish": "sv", "norwegian": "nb", "danish": "da", "finnish": "fi", "greek": "el", "romanian": "ro",
+    "hungarian": "hu", "bulgarian": "bg", "serbian": "sr", "croatian": "hr", "slovak": "sk", "lithuanian": "lt",
+    "latvian": "lv", "estonian": "et", "vietnamese": "vi", "thai": "th", "indonesian": "id",
+}
+
+
+def language_code_for_name(name: str | None) -> str | None:
+    """ISO 639-1 code of a language name as the tab keeps it, None when it is not a known one."""
+    return _LANGUAGE_CODES.get((name or "").strip().lower())
+
+
 async def synthesize_speech(
     text: str, voice: str = "Nova", session: str | None = None, language: str | None = None,
     session_provider: Callable[[], Awaitable[str | None]] | None = None,
+    tab_id: str | None = None, tab_language: str | None = None,
 ) -> str:
     """Prefers the local edge-tts server over Camerlengo's ai:tts -- purely
     a latency optimization (no Camerlengo round trip), tried FIRST
     regardless of session, falling back to Camerlengo whenever the local
-    attempt fails for any reason (never a hard new dependency)."""
-    # `language` (ISO 639-1, 2026-10-10): a caller that already knows it skips the
-    # ai:detectLanguage round trip -- voice narration does, since every remark is
-    # already translated into the tab's own language.
-    if language is None:
-        language = await detect_language(text)
-    edge_voice = _edge_tts_voice_for(voice, language)
-    try:
-        audio = await _synthesize_speech_locally(text, edge_voice)
-        log_event("plugin:voice", "tts_local_ok", edge_voice=edge_voice, text_len=len(text))
-        return audio
-    except Exception as exc:
-        log_event("plugin:voice", "tts_local_failed_falling_back", edge_voice=edge_voice, error=str(exc))
-        # `session_provider` (2026-10-11): the session only matters here, on the fallback,
-        # so a caller can hand over how to get one instead of minting it for every request.
-        if session is None and session_provider is not None:
-            session = await session_provider()
-        return await _synthesize_speech_via_camerlengo(text, voice, session)
+    attempt fails for any reason (never a hard new dependency).
+
+    Which voice (2026-10-24, explicit instruction): the voice follows the language of the
+    MESSAGE, not of the tab (the tab's language is what things are translated into for the
+    user; a message need not be in it). `language` (ISO 639-1) is a caller that knows it for
+    certain. Otherwise the guess is the language this tab's voice spoke last time, and for a
+    tab that has not spoken yet `tab_language` (ISO code of the tab's language, if it has one
+    in the voice table). The guess is tried at once, without retries; only when that voice
+    fails is ai:detectLanguage asked about the text, and the voice of the language it names
+    tried. A language with no local voice, or a failure that is not about the voice, goes to
+    Camerlengo's multilingual voices."""
+    from app.local_edge_tts import EdgeTtsRefused
+
+    guess = language or (_last_speech_language.get(tab_id) if tab_id else None) or tab_language
+    detected = language is not None  # a language the caller is sure of is as good as a detected one
+    if not guess:
+        guess = await detect_language(text)
+        detected = True
+    while True:
+        edge_voice = await _edge_voice_for_language(voice, guess)
+        if edge_voice is None:
+            log_event("plugin:voice", "tts_no_local_voice", language=guess, text_len=len(text))
+            break
+        try:
+            audio = await _synthesize_speech_locally(text, edge_voice, retries=None if detected else 0)
+            log_event("plugin:voice", "tts_local_ok", edge_voice=edge_voice, text_len=len(text), guessed=not detected)
+            if tab_id and guess:
+                _last_speech_language[tab_id] = guess
+            return audio
+        except EdgeTtsRefused as exc:
+            log_event("plugin:voice", "tts_local_failed_falling_back", edge_voice=edge_voice, error=str(exc))
+            break
+        except Exception as exc:
+            log_event("plugin:voice", "tts_local_failed_falling_back", edge_voice=edge_voice, error=str(exc), guessed=not detected)
+            if detected:
+                break
+            detected = True
+            named = await detect_language(text)
+            log_event("plugin:voice", "tts_language_detected_after_failure", guess=guess, detected=named)
+            if not named:
+                break
+            guess = named  # the same language again means the failure was not the voice: tried once more, with retries
+    # `session_provider` (2026-10-11): the session only matters here, on the fallback,
+    # so a caller can hand over how to get one instead of minting it for every request.
+    if session is None and session_provider is not None:
+        session = await session_provider()
+    return await _synthesize_speech_via_camerlengo(text, voice, session)
 
 
 # Skip the LLM cleanup call entirely when the text plainly has nothing for

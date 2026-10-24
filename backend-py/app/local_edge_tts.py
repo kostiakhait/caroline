@@ -112,6 +112,62 @@ async def synthesize_sentences_in_parallel(text: str, options: EdgeTtsOptions | 
     return b"".join(await asyncio.gather(*(one(part) for part in parts)))
 
 
+LIST_VOICES_TIMEOUT_S = 8.0
+LIST_VOICES_RETRY_AFTER_S = 60.0
+_voices_by_language: dict[str, dict[str, str]] | None = None
+_voices_failed_at = 0.0
+_voices_gate = asyncio.Lock()
+
+
+async def voices_for_language(language: str) -> dict[str, str] | None:
+    """{"female": ShortName, "male": ShortName} for an ISO 639-1 language, from the service's own
+    voice list -- None when the service has no voice for it or the list could not be fetched.
+
+    Fetched lazily, on the first request for a language the built-in table does not know
+    (2026-10-24, explicit instruction), and kept for the life of the process: the service has
+    voices for 75 languages (322 voices, measured), and a table of them to maintain is not
+    needed. A failed fetch is not cached for good, only for LIST_VOICES_RETRY_AFTER_S, so a
+    caller is not made to wait on it again at once. Of a language's voices, the one of its
+    main locale (de-DE, fr-FR) without "Multilingual" in the name is preferred."""
+    import time
+
+    global _voices_by_language, _voices_failed_at
+    if _voices_by_language is None:
+        async with _voices_gate:
+            if _voices_by_language is None:
+                if time.monotonic() - _voices_failed_at < LIST_VOICES_RETRY_AFTER_S:
+                    return None
+                try:
+                    import edge_tts
+
+                    from app.edge_tts_token_patch import apply as _apply_edge_tts_token_patch
+
+                    _apply_edge_tts_token_patch()
+                    voices = await asyncio.wait_for(edge_tts.list_voices(), timeout=LIST_VOICES_TIMEOUT_S)
+                except Exception as exc:  # noqa: BLE001 -- the caller falls back to the server's voice
+                    _voices_failed_at = time.monotonic()
+                    log.warning("local_edge_tts: voice list not fetched: %s", exc)
+                    return None
+                table: dict[str, dict[str, str]] = {}
+                by_language: dict[str, list[dict]] = {}
+                for voice in voices:
+                    by_language.setdefault(str(voice.get("Locale", "")).split("-")[0].lower(), []).append(voice)
+                for code, candidates in by_language.items():
+                    main_locale = f"{code}-{code.upper()}"
+                    candidates.sort(key=lambda v: (v.get("Locale") != main_locale, "Multilingual" in v.get("ShortName", ""), v.get("ShortName", "")))
+                    picked: dict[str, str] = {}
+                    for gender in ("Female", "Male"):
+                        found = next((v["ShortName"] for v in candidates if v.get("Gender") == gender), None)
+                        if found:
+                            picked[gender.lower()] = found
+                    if picked:
+                        picked.setdefault("female", picked.get("male", ""))
+                        picked.setdefault("male", picked["female"])
+                        table[code] = picked
+                _voices_by_language = table
+    return (_voices_by_language or {}).get(language)
+
+
 class EdgeTtsRefused(RuntimeError):
     """The service refused the connection itself (HTTP 403 on the handshake)."""
 

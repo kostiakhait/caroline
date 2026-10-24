@@ -376,11 +376,21 @@ class TextNarrationMixin:
         # in the middle of a send the user had ordered -- that stopped the turn at
         # its next send. Real answers and the user's own messages still re-check.
         await self._send_narration_remark(comment)
-    async def _send_narration_remark(self, comment: str, audio_base64: str | None = None) -> None:
+    async def _send_narration_remark(self, comment: str, audio_base64: str | None = None, filler: bool = False) -> None:
         """Shows one narration remark -- shared by the 60s path above and the voice
         loop. isNarration (2026-10-09) lets chat.js drop a remark still waiting in its
         speech queue once the real answer arrives, instead of reading it out after."""
         self.last_visible_output_at = time.monotonic()
+        self._last_narration_est_speech_s = len(comment) / VOICE_NARRATION_EST_CHARS_PER_S
+        if filler:
+            # A filler (app/filler_phrases.py) is only sound: no chat bubble (isFiller), not in "already
+            # said" and not an interim note -- Caroline said nothing the conversation should remember.
+            await self.send({"type": "sdk_message", "isVoice": True, "isNarration": True, "isFiller": True, "audioBase64": audio_base64,
+                             "message": {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": comment}],
+                                                                           "model": None, "stop_reason": None},
+                                         "session_id": None, "parent_tool_use_id": None}})
+            log_event("engine", "voice_narration_filler_sent", tab_id=self.tab_id, comment=comment)
+            return
         # Kept so the NEXT draft in this same episode sees its own earlier remarks.
         self.turn_narration_remarks.append(comment)
         del self.turn_narration_remarks[:-20]

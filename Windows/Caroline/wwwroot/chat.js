@@ -1795,6 +1795,8 @@
           // check let those variants leak through as a real chat bubble.
           if (block.text.includes("[[NO_UPDATE]]")) continue;
           if (hasToolUse) continue;
+          // A filler remark (backend filler_phrases.py) is only sound: no bubble, not part of the turn's text.
+          if (evt.isFiller) { if (evt.isVoice) speak(block.text, null, { narration: true, audioBase64: evt.audioBase64 }); continue; }
           addBubble("assistant", block.text);
           if (turn) turn.assistantText += (turn.assistantText ? "\n\n" : "") + block.text;
           // Bug fix (2026-09-13), confirmed live: a voice-originated turn that

@@ -12,12 +12,20 @@ class VoiceNarrationMixin:
         (its prompt says so); the digits left are names from the request ("iPhone 17"),
         which the speech service reads as they are. Live 2026-10-17 that call cost a
         remark 9s of silence on a busy server."""
-        from app.plugins.voice_api import strip_markup_for_speech, synthesize_speech, voice_for_gender
+        from app.plugins.voice_api import language_code_for_name, strip_markup_for_speech, synthesize_speech, voice_for_gender
 
         try:
             cleaned = strip_markup_for_speech(comment)
-            iso = {"Russian": "ru", "English": "en"}.get(current_language_name(self.tab_id))
-            return await synthesize_speech(cleaned, voice_for_gender(get_persona_gender(self.workspace_dir)), language=iso)
+            # The voice follows the language of this remark (2026-10-24, explicit instruction):
+            # the language the narrator said it wrote in (a SpokenText from the draft; a remark
+            # the review rewrote is a plain str and has none). Without one, the tab's last
+            # spoken language is tried, the tab's own language for its first remark, and the
+            # text is language-detected only if that voice fails.
+            return await synthesize_speech(
+                cleaned, voice_for_gender(get_persona_gender(self.workspace_dir)),
+                language=getattr(comment, "language", None),
+                tab_id=self.tab_id, tab_language=language_code_for_name(current_language_name(self.tab_id)),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -76,6 +84,7 @@ class VoiceNarrationMixin:
         self._prepared_narration_is_first = False
         self._prepared_narration_stale = False
         self._stale_remarks_in_row = 0
+        self._fillers_in_row = 0
         self._lines_since_answer_candidate = None
         self._held_for_answer = None
         self._narration_facts_at_last_draft = None
@@ -97,6 +106,7 @@ class VoiceNarrationMixin:
         line by VOICE_NARRATION_AFTER_SPEECH_GAP_S, not by up to a whole tick more."""
         was = self._client_speaking
         self._client_speaking = speaking
+        self._speaking_assumed = False
         self._client_speech_reported_at = time.monotonic()
         if not speaking and was is not False:
             self._client_quiet_since = time.monotonic()
@@ -108,6 +118,8 @@ class VoiceNarrationMixin:
         if self._client_speaking is not None:
             if self._client_speaking:
                 reported = self._client_speech_reported_at
+                if self._speaking_assumed and reported is not None and now - reported > VOICE_NARRATION_ASSUMED_SPEAKING_S:
+                    return now - reported - VOICE_NARRATION_ASSUMED_SPEAKING_S  # chat.js never confirmed: nothing was spoken
                 if reported is not None and now - reported > VOICE_NARRATION_CLIENT_SPEAKING_STALE_S:
                     return now - reported - VOICE_NARRATION_CLIENT_SPEAKING_STALE_S
                 return 0.0
@@ -166,12 +178,16 @@ class VoiceNarrationMixin:
                 if self._held_for_answer != comment:
                     self._held_for_answer = comment
                     log_event("engine", "voice_narration_held_for_answer", tab_id=self.tab_id, comment=comment)
+                # Held back, but the user must not sit in silence meanwhile.
+                if self._filler_due(now, started):
+                    await self._play_filler()
                 return
             elif (
                 (self._prepared_narration_is_first or now - started >= VOICE_NARRATION_FIRST_S)
                 and self._client_quiet_for(now) >= VOICE_NARRATION_AFTER_SPEECH_GAP_S
             ):
                 self._stale_remarks_in_row = self._stale_remarks_in_row + 1 if self._prepared_narration_stale else 0
+                self._fillers_in_row = 0
                 self._prepared_narration = None
                 self._prepared_narration_is_first = False
                 self._prepared_narration_stale = False
@@ -181,10 +197,16 @@ class VoiceNarrationMixin:
                 # must not look quiet, or the next remark could be shown on top of it.
                 if self._client_speaking is not None:
                     self._client_speaking = True
+                    self._speaking_assumed = True
                     self._client_speech_reported_at = time.monotonic()
                 return
             else:
                 return
+
+        # 1b. Nothing is ready and the user has heard nothing for a moment: a pre-coded filler
+        # (app/filler_phrases.py) rather than silence.
+        if self._filler_due(now, started) and await self._play_filler():
+            return
 
         # 2. Otherwise draft the next one ahead of time -- while the previous one is
         # still being spoken, so it is ready the moment the client goes quiet.
@@ -209,7 +231,7 @@ class VoiceNarrationMixin:
         nothing_new = facts == self._narration_facts_at_last_draft
         seen = set((self._narration_facts_at_last_draft or "").splitlines())
         new_lines = [line for line in facts.splitlines() if line not in seen]
-        if nothing_new:
+        if nothing_new and self._fillers_in_row < VOICE_NARRATION_MAX_FILLERS_IN_ROW:
             # Nothing new happened: at most one remark per VOICE_NARRATION_STALE_S,
             # counted from the later of the last draft and the end of the last speech.
             last = self._narration_last_draft_at or started
@@ -245,6 +267,47 @@ class VoiceNarrationMixin:
             self._draft_voice_narration(self._narration_turn_seq, facts_for_model, self._narration_task(), already_said,
                                         stale=nothing_new)
         )
+    def _filler_due(self, now: float, started: float) -> bool:
+        """Whether the user has been without sound long enough for a filler (app/filler_phrases.py).
+        With an answer being checked a filler goes out a second later than usual (it is short, and
+        the answer is seconds away). There is no cap here: past VOICE_NARRATION_MAX_FILLERS_IN_ROW step 2
+        forces a real remark to be asked for, and the fillers go on meanwhile -- its preparation takes
+        seconds, and those must not be silence."""
+        return (
+            now - started >= VOICE_NARRATION_FIRST_S
+            and self._client_quiet_for(now) >= VOICE_NARRATION_FILLER_AFTER_S + (1.0 if self._answer_being_checked() else 0.0)
+        )
+    async def _play_filler(self) -> bool:
+        """Says one filler remark in the language the voice last spoke (the tab's language for the first),
+        in the persona's gender. False when this language's set is not ready yet -- it is then built in
+        the background (translated and synthesized at the first use, see filler_phrases.ensure_set) and
+        nothing is played in the meantime."""
+        from pathlib import Path
+
+        from app import filler_phrases
+        from app.login_api import get_cached_v2_session
+        from app.plugins.voice_api import _last_speech_language, language_code_for_name, synthesize_speech, voice_for_gender
+        from app.small_model_engine import resolve_narration_prompt
+
+        voice = voice_for_gender(get_persona_gender(self.workspace_dir))
+        gender = "male" if voice == "Onyx" else "female"
+        language = _last_speech_language.get(self.tab_id) or language_code_for_name(current_language_name(self.tab_id)) or "en"
+        cache_root = Path(self.workspace_dir) / "filler-cache"
+        picked = filler_phrases.pick_filler(language, gender, cache_root)
+        if picked is None:
+            async def synthesize(text: str, lang: str) -> str:
+                return await synthesize_speech(text, voice, language=lang, session_provider=get_cached_v2_session)
+
+            filler_phrases.ensure_set(language, gender, cache_root, synthesize, resolve_narration_prompt)
+            return False
+        text, audio = picked
+        self._fillers_in_row += 1
+        await self._send_narration_remark(text, audio, filler=True)
+        if self._client_speaking is not None:
+            self._client_speaking = True
+            self._speaking_assumed = True
+            self._client_speech_reported_at = time.monotonic()
+        return True
     async def _say_first_voice_remark(self, turn_seq: int, remark: str, audio_task: asyncio.Task[str | None] | None) -> None:
         """The remark the fast lane's decline came with (2026-10-11, see try_fast_answer):
         the model that read the request has already put into one sentence what the work
@@ -340,6 +403,11 @@ class VoiceNarrationMixin:
         # live, synthesis took 4-7s per remark -- every one of them dead air when the
         # client only asked for the audio once the remark had arrived.
         comment, audio = await self._review_and_synthesize(comment, task)
+        if _NO_UPDATE_SENTINEL in comment or _is_silent_reply_paraphrase(comment):
+            # The review judged the remark to be internal machinery or off-task and reduced it to the
+            # "say nothing" marker (as narration_text's 60 s path already honours): not a remark to send.
+            log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=comment, voice=True)
+            return
         if turn_seq != self._narration_turn_seq:
             log_event("engine", "voice_narration_draft_discarded", tab_id=self.tab_id, had_comment=True)
             return
