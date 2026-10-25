@@ -674,6 +674,58 @@ class Shell:
         self.window.show_all()
         if self.settings.window_left is not None and self.settings.window_top is not None:
             self.window.move(int(self.settings.window_left), int(self.settings.window_top))
+            return
+        # No saved position (first run, or a fresh hosted desktop): sit against the right edge of the desktop, and stay
+        # there while the desktop's size changes (a hosted session is resized to the user's browser window after
+        # Caroline has started) -- until the user moves the window himself.
+        self._docked = True
+        self._dock_expected: tuple[int, int] | None = None
+        screen = self.window.get_screen()
+        screen.connect("size-changed", lambda _s: GLib.idle_add(self._dock_right))
+        screen.connect("monitors-changed", lambda _s: GLib.idle_add(self._dock_right))
+        self.window.connect("configure-event", self._on_window_configure)
+        GLib.timeout_add(300, self._dock_right)
+
+    def _dock_right(self) -> bool:
+        """Put the window's outer frame against the right edge of the primary monitor's work area, at its top."""
+        if not getattr(self, "_docked", False):
+            return False
+        gdk_window = self.window.get_window()
+        if gdk_window is None:
+            return False
+        display = self.window.get_display()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        area = monitor.get_workarea()
+        frame = gdk_window.get_frame_extents()
+        x = area.x + area.width - frame.width
+        y = area.y
+        left, top = self.window.get_position()
+        # get_position is the client origin; the frame starts left/up of it by the decoration
+        x += left - frame.x
+        y += top - frame.y
+        self._dock_expected = (x, y)
+        if (left, top) != (x, y):
+            self.window.move(x, y)
+        return False
+
+    def _on_window_configure(self, _window, _event) -> bool:
+        expected = getattr(self, "_dock_expected", None)
+        if expected is None or not getattr(self, "_docked", False):
+            return False
+        left, top = self.window.get_position()
+        if abs(left - expected[0]) > 12 or abs(top - expected[1]) > 12:
+            # moved by the user (or by a size change we have not answered yet); a real drag ends the docking
+            GLib.timeout_add(700, self._check_undocked)
+        return False
+
+    def _check_undocked(self) -> bool:
+        expected = getattr(self, "_dock_expected", None)
+        if expected is None:
+            return False
+        left, top = self.window.get_position()
+        if abs(left - expected[0]) > 12 or abs(top - expected[1]) > 12:
+            self._docked = False
+        return False
 
     def toggle_visibility(self) -> None:
         """Port of ToggleVisibility: hide if shown, show+raise+focus if
