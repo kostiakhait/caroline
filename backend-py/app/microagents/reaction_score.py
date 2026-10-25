@@ -1,4 +1,4 @@
-"""turn.reaction.score -- Agent 1 of the evolution-feedback loop (per
+"""turn.reaction.score -- the user's reaction for the evolution (per
 explicit special order, 2026-10-19): from one real user message, scores
 the user's emotional reaction to something Caroline did on a continuous
 scale from -1 (complete disapproval) to +1 (complete approval), and tries
@@ -22,8 +22,9 @@ compliment/complaint about the current track). Every run is logged by the
 caller, including the no-op case, per explicit instruction ("Логировать
 все это надо").
 
-A non-trivial, attributed score hands off to evolution.backprop (Agent 2,
-see evolution_backprop.py) -- never this agent's own concern."""
+The score goes to the evolution as the user's reaction to the previous turn
+(2026-10-24, permission_guard.py's _check_reaction_score; the attribution
+fields are logged, not used there) -- never this agent's own concern."""
 
 from __future__ import annotations
 

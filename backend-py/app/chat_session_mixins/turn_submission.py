@@ -212,15 +212,13 @@ class TurnSubmissionMixin:
             # _check_action_sanction's own early return) whenever nothing is
             # open.
             asyncio.ensure_future(self._check_action_sanction(text))
-            # Per explicit special order (2026-10-19), the evolution-
-            # feedback loop's own Agent 1: every real user message is also
-            # scored for an emotional reaction to something Caroline did,
-            # and attributed to an open action/track -- same fire-and-
-            # forget shape as the two checks just above. Never skipped
-            # (unlike _check_action_sanction, which early-returns when no
-            # action is open): a reaction can be about the current track
-            # alone, with no open action at all.
-            asyncio.ensure_future(self._check_reaction_score(text))
+            # Per explicit special order (2026-10-19; reworked 2026-10-24): every
+            # real user message is also scored for an emotional reaction, and the
+            # score goes to the evolution as the reaction to the previous turn --
+            # same fire-and-forget shape as the two checks just above. The
+            # previous turn's id is taken here, while it is still the one this
+            # message's turn replaced.
+            asyncio.ensure_future(self._check_reaction_score(text, memory_turns.previous_turn_id(self.tab_id)))
             # Bug fix (2026-09-11), per explicit instruction: language must
             # be tracked CONTINUOUSLY, not resolved once and left alone --
             # confirmed live a tab can legitimately switch languages

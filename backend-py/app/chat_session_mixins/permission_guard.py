@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
 
-# Per explicit special order (2026-10-19), the evolution-feedback loop: a
-# reaction score below this magnitude is treated as "no real reaction" and
-# never reaches evolution.backprop at all -- most real messages score very
-# close to 0.0, and backprop is meaningless noise at that point. A tunable
-# constant, not user-configurable for v1.
-REACTION_SCORE_BACKPROP_THRESHOLD = 0.2
+# Per explicit special order (2026-10-19): a reaction score below this magnitude
+# is treated as "no real reaction" -- most real messages score very close to 0.0.
+# Such a turn still goes to the evolution, with score 0 (2026-10-24): the server
+# then just drops the turn's record.
+REACTION_SCORE_THRESHOLD = 0.2
 
 # Never repeated to the model in the note below: the blocked call's credentials.
 _NOTE_HIDDEN_ARGS = frozenset({"password", "imapHost", "imapPort", "smtpHost", "smtpPort", "key", "token", "session"})
@@ -237,29 +236,13 @@ class PermissionGuardMixin:
         straight through, so this method's own call to voice_api.
         check_permission_guard never repeats that same local model call a
         second time. None (every other call site) means check_
-        permission_guard runs identify itself, same as always.
-
-        `action_id` (2026-10-19, the evolution-feedback loop): passed
-        straight through to check_permission_guard so a tournament round
-        actually resolved by THIS call gets journaled against this same
-        action (see app/evolution_journal.py) -- only _check_action_before_
-        send supplies this (it already has the resolved action in hand);
-        every other call site omits it and that round simply never
-        attributes to an action (it may still attribute to the tab's
-        current track, which is resolved here either way)."""
+        permission_guard runs identify itself, same as always."""
         from app.plugins.voice_api import check_permission_guard
 
         dialogue = self._dialogue_with_note(extra_context)
-        if action_id is not None:
-            action = self.action_registry.get(action_id)
-            track_id = action.track_hint if action else None
-        else:
-            from app.memory_topics import get_current_topic
-            track_id = get_current_topic(self.workspace_dir, self.tab_id)
         try:
             result = await check_permission_guard(
                 self._narration_task(), dialogue, previous_block_reason=self.permission_guard_last_reason, facts=facts,
-                workspace_dir=self.workspace_dir, action_id=action_id, track_id=track_id,
             )
         except Exception as exc:
             log_event("engine", "check_permission_guard_failed", tab_id=self.tab_id, error=str(exc))
@@ -543,27 +526,26 @@ class PermissionGuardMixin:
         self._persist_action_state()
         log_event("engine", "action_closed", tab_id=self.tab_id, action_id=action_id)
 
-    async def _check_reaction_score(self, message: str) -> None:
-        """Agent 1 of the evolution-feedback loop (per explicit special
-        order, 2026-10-19): after every real user message, scores the
-        user's emotional reaction to something Caroline did on a -1
-        (complete disapproval) to +1 (complete approval) scale, and tries
-        to attribute it to a specific open action or this tab's current
-        track (app/microagents/reaction_score.py). Called from submit()'s
-        own real-user-message path, same fire-and-forget cadence as
-        _check_action_sanction -- never skipped (unlike that one), since a
-        reaction can be about something with no open action at all.
+    async def _check_reaction_score(self, message: str, previous_turn_id: str | None) -> None:
+        """The user's reaction (2026-10-19, explicit special order; reworked
+        2026-10-24): after every real user message, turn.reaction.score scores
+        the user's emotional reaction on a -1 (complete disapproval) to +1
+        (complete approval) scale (app/microagents/reaction_score.py), and the
+        score goes to the evolution as the reaction to the PREVIOUS turn (the
+        user's choice: "Только предыдущий"). The server applies it to every
+        evolvable role that ran in that turn -- points to the tournament, or a
+        higher chance of one (app/evolution_client.send_reaction; reforce
+        Api2Evolution.apply_reaction). Independent of the tournaments' own judge.
 
-        Every run is logged, including the overwhelmingly common no-op case
-        (no real reaction found), per explicit instruction ("Логировать
-        все это надо"). A non-trivial, attributed score hands off to
-        evolution.backprop (Agent 2, _run_evolution_backprop) as its own
-        fire-and-forget background call -- never on this turn's own
-        critical path."""
-        from app.evolution_journal import recent_rounds_for
+        Every run is logged, including the overwhelmingly common no-reaction
+        case, per explicit instruction ("Логировать все это надо")."""
+        from app.evolution_client import send_reaction
         from app.memory_topics import get_current_topic
         from app.plugins.voice_api import score_reaction
 
+        if not previous_turn_id:
+            log_event("engine", "reaction_skipped", tab_id=self.tab_id, reason="no previous turn")
+            return
         open_actions_wire = [{"id": a.id, "summary": a.summary} for a in self.action_registry.open_actions()]
         track_id = get_current_topic(self.workspace_dir, self.tab_id)
         candidate_track_ids = [track_id] if track_id else []
@@ -576,83 +558,13 @@ class PermissionGuardMixin:
         if result is None:
             return
 
-        score = float(result.get("reaction_score") or 0.0)
-        target_action_id = result.get("target_action_id")
-        target_track_id = result.get("target_track_id")
+        score = max(-1.0, min(1.0, float(result.get("reaction_score") or 0.0)))
+        sent_score = score if abs(score) >= REACTION_SCORE_THRESHOLD else 0.0
         log_event(
-            "engine", "reaction_scored", tab_id=self.tab_id, reaction_score=score,
-            target_action_id=target_action_id, target_track_id=target_track_id,
-            dialogue_window_len=len(message),
+            "engine", "reaction_scored", tab_id=self.tab_id, reaction_score=score, sent_score=sent_score,
+            turn_id=previous_turn_id, target_action_id=result.get("target_action_id"),
+            target_track_id=result.get("target_track_id"), dialogue_window_len=len(message),
         )
-        if abs(score) < REACTION_SCORE_BACKPROP_THRESHOLD or not (target_action_id or target_track_id):
-            return
-
-        target_summary = "(unknown)"
-        if target_action_id:
-            action = self.action_registry.get(target_action_id)
-            if action:
-                target_summary = action.summary
-        elif target_track_id:
-            target_summary = target_track_id
-
-        action_ids = [target_action_id] if target_action_id else None
-        rounds = recent_rounds_for(self.workspace_dir, action_ids=action_ids, track_id=target_track_id, limit=5)
-        asyncio.ensure_future(self._run_evolution_backprop(score, target_action_id, target_track_id, target_summary, rounds))
-
-    async def _run_evolution_backprop(
-        self, reaction_score: float, target_action_id: str | None, target_track_id: str | None,
-        target_summary: str, rounds: list[dict[str, Any]],
-    ) -> None:
-        """Agent 2 of the evolution-feedback loop (per explicit special
-        order, 2026-10-19): given Agent 1's attributed score and the recent
-        tournament rounds journaled (app/evolution_journal.py) for the same
-        action/track, proposes a bounded weight_selector adjustment for
-        each round genuinely implicated (app/microagents/
-        evolution_backprop.py) -- applied deterministically via
-        app/evolution_client.py's get_role_settings/
-        apply_weight_selector_delta, never by the model itself.
-
-        Every run is logged, including the empty-adjustments case; a
-        separate "backprop_applied" log line per adjustment actually
-        written, so a proposed-but-skipped adjustment (a failed apply) is
-        distinguishable from one that never applied in the first place --
-        per explicit instruction ("Логировать все это надо"). The caller
-        (_check_reaction_score) already confirmed rounds is non-empty
-        before scheduling this."""
-        from app.evolution_client import apply_weight_selector_delta
-        from app.plugins.voice_api import run_evolution_backprop
-
-        if not rounds:
-            log_event(
-                "engine", "backprop_evaluated", tab_id=self.tab_id, target_action_id=target_action_id,
-                target_track_id=target_track_id, reaction_score=reaction_score, rounds_considered=[], adjustments=[],
-            )
-            return
-        rounds_wire = [
-            {"role": r["role"], "tournament_id": r["tournament_id"], "verdict_reason": r.get("verdict_reason")}
-            for r in rounds
-        ]
-        try:
-            result = await run_evolution_backprop(target_summary, reaction_score, rounds_wire)
-        except Exception as exc:
-            log_event("engine", "evolution_backprop_failed", tab_id=self.tab_id, error=str(exc))
-            return
-        adjustments = (result or {}).get("adjustments") or []
-        log_event(
-            "engine", "backprop_evaluated", tab_id=self.tab_id, target_action_id=target_action_id,
-            target_track_id=target_track_id, reaction_score=reaction_score,
-            rounds_considered=[{"role": r["role"], "tournament_id": r["tournament_id"]} for r in rounds_wire],
-            adjustments=adjustments,
-        )
-        for adjustment in adjustments:
-            role, delta = adjustment.get("role"), adjustment.get("weight_delta")
-            if not role or delta is None:
-                continue
-            applied = await apply_weight_selector_delta(role, float(delta))
-            if applied is None:
-                continue
-            before, after = applied
-            log_event(
-                "engine", "backprop_applied", tab_id=self.tab_id, role=role,
-                weight_selector_before=before, weight_selector_after=after,
-            )
+        applied = await send_reaction(previous_turn_id, sent_score)
+        log_event("engine", "reaction_applied", tab_id=self.tab_id, turn_id=previous_turn_id, score=sent_score,
+                  applied=applied, failed=applied is None)
