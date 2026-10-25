@@ -144,6 +144,7 @@ public partial class App : System.Windows.Application
         _mainWindow.Show();
         Logger.Log($"[DIAG] main window Show() done, IsVisible={_mainWindow.IsVisible}");
         _ = _mainWindow.StartTabsAsync();
+        _ = OpenWizardIfNeededAsync();
 
         _mainWindow.Activate();
         // Activate() alone can silently no-op here: Windows' foreground-lock
@@ -220,6 +221,35 @@ public partial class App : System.Windows.Application
 
             await Task.WhenAny(Task.Delay(BackendPollInterval), dismissedEarly);
         }
+    }
+
+    private WizardWindow? _wizardWindow;
+
+    /// <summary>
+    /// Opens the start-up wizard (WizardWindow) when the backend says it is needed: nothing is signed in yet (Caroline
+    /// cannot work without it), or a wizard started earlier was not finished. A backend that does not answer simply means
+    /// no wizard this time -- never a broken start.
+    /// </summary>
+    private async Task OpenWizardIfNeededAsync()
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            var json = await http.GetStringAsync($"http://127.0.0.1:{BackendProcess.Port}/api/wizard/state");
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("needed", out var needed) || needed.ValueKind != JsonValueKind.True) return;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"wizard: state check failed: {ex.Message}");
+            return;
+        }
+
+        if (_wizardWindow != null) return;
+        _wizardWindow = new WizardWindow(BackendProcess.Port);
+        _wizardWindow.Closed += (_, _) => _wizardWindow = null;
+        _wizardWindow.Show();
+        _wizardWindow.Activate();
     }
 
     /// <summary>

@@ -1,0 +1,13 @@
+<Window x:Class="Caroline.WizardWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Caroline"
+        Icon="pack://application:,,,/Resources/app.ico"
+        Width="560" Height="740"
+        MinWidth="420" MinHeight="520"
+        Topmost="True"
+        Background="White"
+        WindowStartupLocation="CenterScreen">
+    <!-- The WebView2 control is added here in code-behind (InitAsync), like DocumentViewerWindow does for its pages. -->
+    <Grid x:Name="Host" Background="White" />
+</Window>

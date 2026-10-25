@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caroline</title>
+<style>
+  :root { --brand:#5066C9; --brand-hover:#6578D6; --ink:#1F2440; --muted:#6B7194; --line:#C9CDE8; --soft:#EEF0FB; --bad:#C0392B; --ok:#2E9D5B; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:#FFFFFF; color:var(--ink); font:14px/1.45 "Segoe UI", "DejaVu Sans", system-ui, sans-serif; }
+  main { max-width:520px; margin:0 auto; padding:20px 24px 28px; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  h2 { font-size:15px; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 14px; }
+  .dots { display:flex; gap:8px; margin:6px 0 14px; }
+  .dots span { flex:1; height:4px; border-radius:2px; background:var(--line); }
+  .dots span.on { background:var(--brand); }
+  label { display:block; font-size:12px; color:#3B4160; margin:10px 0 3px; }
+  input, select { width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); font:inherit; }
+  input:focus, select:focus { outline:none; border-color:var(--brand); }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  button { padding:8px 14px; border:none; border-radius:6px; background:var(--brand); color:#fff; font:inherit; cursor:pointer; }
+  button:hover { background:var(--brand-hover); }
+  button:disabled { opacity:.55; cursor:default; }
+  button.secondary { background:#fff; color:var(--brand); border:1px solid var(--brand); }
+  button.secondary:hover { background:var(--soft); }
+  button.link { background:none; color:var(--brand); padding:4px 0; text-decoration:underline; }
+  .actions { display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap; }
+  .err { color:var(--bad); font-size:12px; margin-top:8px; white-space:pre-wrap; }
+  .note { color:var(--muted); font-size:12px; margin-top:8px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:10px 0; }
+  .card.done { background:var(--soft); }
+  .badge { float:right; font-size:12px; color:var(--muted); }
+  .badge.ok { color:var(--ok); }
+  .hidden { display:none; }
+  a { color:var(--brand); word-break:break-all; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Caroline</h1>
+  <p class="sub" id="subtitle"></p>
+  <div class="dots" id="dots"><span></span><span></span><span></span></div>
+  <section id="view"></section>
+</main>
+<script>
+"use strict";
+const T = {
+  en: {
+    welcome:"Welcome to Caroline", welcomeSub:"Sign in to continue, or create an account.",
+    login:"Login (e-mail)", password:"Password", signIn:"Sign in", register:"Register", toRegister:"I don't have an account — register", toLogin:"I already have an account",
+    bad_input:"Enter a valid e-mail and a password.", failed:"That did not work", restored:"Found your earlier settings and restored them: ",
+    subsTitle:"Your own subscriptions", subsSub:"Caroline can also work through your own Claude or OpenAI (Codex) subscription. Both are optional.",
+    claude:"Claude subscription", openai:"OpenAI (Codex) subscription", connected:"connected", notConnected:"not connected", connect:"Connect", waiting:"Waiting for sign-in…", openLink:"Open this page to sign in:", code:"Code:",
+    next:"Next", back:"Back", later:"Finish later", noSub:"I do not have one",
+    accTitle:"Mailboxes and messengers", accSub:"Add what Caroline should know. Skip what you do not have.",
+    caroline_mail:"Caroline's mailbox", owner_mail:"Your mailbox", caroline_messengers:"Caroline's messengers", owner_messengers:"Your messengers",
+    thisIsMine:"This is", assign:"Save", addr:"Address", imapHost:"IMAP server", imapPort:"IMAP port", smtpHost:"SMTP server", smtpPort:"SMTP port", checkSave:"Check and save",
+    telegram:"Telegram (username or phone)", whatsapp:"WhatsApp (phone)", signal:"Signal (phone)", save:"Save", none:"There is none", done:"done", skip:"Skip",
+    finish:"Finish", finished:"All set. Caroline is ready.", close:"Close", checking:"Checking…", mbfail:"The mailbox did not answer", asCaroline:"Caroline's", asOwner:"mine",
+    connectLater:"Connect Telegram, WhatsApp and Signal in Settings once you are in the chat.",
+    sure:"Sure? Remove", addMailbox:"Add a mailbox", addMailboxSub:"The mailbox is checked before it is saved.", mailOf_caroline:"Caroline's mailbox", mailOf_owner:"My mailbox", whose:"Whose mailbox is it",
+    cancel:"Cancel", messengerSub:"Caroline will know this account.", telegramHint:"@username or +phone", whatsappHint:"+phone", signalHint:"+phone",
+    telegramLabel:"Telegram account", whatsappLabel:"WhatsApp number", signalLabel:"Signal number", name_telegram:"Telegram", name_whatsapp:"WhatsApp", name_signal:"Signal", roleName_caroline:"Caroline", roleName_owner:"owner",
+    remove:"Remove", fromNotes:"kept in your notes", foundInNotes:"Found in your notes — whose is it?", mailboxes:"Mailboxes", messengers:"Messengers", notAdded:"not added", edit:"Edit", add:"Add"
+  },
+  ru: {
+    welcome:"Добро пожаловать в Caroline", welcomeSub:"Войдите, чтобы продолжить, или зарегистрируйтесь.",
+    login:"Логин (e-mail)", password:"Пароль", signIn:"Войти", register:"Зарегистрироваться", toRegister:"У меня нет аккаунта — зарегистрироваться", toLogin:"У меня уже есть аккаунт",
+    bad_input:"Введите корректный e-mail и пароль.", failed:"Не получилось", restored:"Найдены ваши прежние настройки, они восстановлены: ",
+    subsTitle:"Ваши собственные подписки", subsSub:"Caroline может работать и через вашу подписку Claude или OpenAI (Codex). Обе необязательны.",
+    claude:"Подписка Claude", openai:"Подписка OpenAI (Codex)", connected:"подключена", notConnected:"не подключена", connect:"Подключить", waiting:"Ждём завершения входа…", openLink:"Откройте страницу для входа:", code:"Код:",
+    next:"Далее", back:"Назад", later:"Закончить позже", noSub:"У меня нет такой подписки",
+    accTitle:"Почта и мессенджеры", accSub:"Добавьте то, что Caroline должна знать. Чего нет — пропустите.",
+    caroline_mail:"Почта Caroline", owner_mail:"Ваша почта", caroline_messengers:"Мессенджеры Caroline", owner_messengers:"Ваши мессенджеры",
+    thisIsMine:"Это", assign:"Сохранить", addr:"Адрес", imapHost:"Сервер IMAP", imapPort:"Порт IMAP", smtpHost:"Сервер SMTP", smtpPort:"Порт SMTP", checkSave:"Проверить и сохранить",
+    telegram:"Telegram (имя или телефон)", whatsapp:"WhatsApp (телефон)", signal:"Signal (телефон)", save:"Сохранить", none:"Такого нет", done:"готово", skip:"Пропустить",
+    finish:"Готово", finished:"Всё настроено. Caroline готова к работе.", close:"Закрыть", checking:"Проверяем…", mbfail:"Почтовый ящик не ответил", asCaroline:"почта Caroline", asOwner:"моя почта",
+    connectLater:"Подключить Telegram, WhatsApp и Signal можно в настройках, когда откроется чат.",
+    sure:"Точно удалить?", addMailbox:"Добавить мейлбокс", addMailboxSub:"Ящик проверяется перед сохранением.", mailOf_caroline:"Почта Caroline", mailOf_owner:"Моя почта", whose:"Чей это ящик",
+    cancel:"Отмена", messengerSub:"Caroline будет знать этот аккаунт.", telegramHint:"@имя или +телефон", whatsappHint:"+телефон", signalHint:"+телефон",
+    telegramLabel:"Аккаунт Telegram", whatsappLabel:"Номер WhatsApp", signalLabel:"Номер Signal", name_telegram:"Telegram", name_whatsapp:"WhatsApp", name_signal:"Signal", roleName_caroline:"Caroline", roleName_owner:"владелец",
+    remove:"Удалить", fromNotes:"хранится в ваших заметках", foundInNotes:"Найден в ваших заметках — чей он?", mailboxes:"Мейлбоксы", messengers:"Мессенджеры", notAdded:"не добавлен", edit:"Изменить", add:"Добавить"
+  }
+};
+const lang = (navigator.language || "en").toLowerCase().startsWith("ru") ? "ru" : "en";
+const t = k => (T[lang][k] ?? T.en[k] ?? k);
+document.documentElement.lang = lang;
+
+const view = document.getElementById("view");
+let state = null, step = "account", registerMode = false, restoredNote = "", polling = null;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return r.json();
+}
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+function field(label, input) { return [el("label", {}, label), input]; }
+function setTitle(title, sub) { document.getElementById("title").textContent = title; document.getElementById("subtitle").textContent = sub || ""; }
+function dots() { const i = ["account", "subscriptions", "accounts"].indexOf(step); [...document.getElementById("dots").children].forEach((d, n) => d.classList.toggle("on", n <= i)); }
+function signal(name) { document.title = name; }   // the shell closes its window on these titles
+
+async function refresh() { state = await api("/api/wizard/state"); return state; }
+
+function firstOpenStep() {
+  if (!state.loggedIn) return "account";
+  const s = Object.fromEntries(state.steps.map(x => [x.id, x.status]));
+  if (s.subscriptions !== "done") return "subscriptions";
+  if (s.accounts !== "done") return "accounts";
+  return "finish";
+}
+
+function renderAccount() {
+  setTitle(t("welcome"), t("welcomeSub"));
+  const email = el("input", { type: "email", autocomplete: "username", id: "email" });
+  const pass = el("input", { type: "password", autocomplete: registerMode ? "new-password" : "current-password", id: "pass" });
+  const err = el("div", { class: "err" });
+  const go = el("button", {}, registerMode ? t("register") : t("signIn"));
+  const submit = async () => {
+    err.textContent = ""; go.disabled = true;
+    try {
+      const r = await api("/api/wizard/login", { email: email.value, password: pass.value, isRegister: registerMode });
+      if (!r.ok) { err.textContent = r.error === "invalid_input" ? t("bad_input") : (t("failed") + ": " + (r.error || "")); return; }
+      state = r.state;
+      restoredNote = r.restored && r.restored.length ? t("restored") + r.restored.length : "";
+      step = firstOpenStep(); render();
+    } catch (e) { err.textContent = t("failed") + ": " + e; } finally { go.disabled = false; }
+  };
+  go.addEventListener("click", submit);
+  pass.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  view.replaceChildren(
+    ...field(t("login"), email), ...field(t("password"), pass), err,
+    el("div", { class: "actions" }, go, el("button", { class: "link", onclick: () => { registerMode = !registerMode; render(); } }, registerMode ? t("toLogin") : t("toRegister")))
+  );
+  email.focus();
+}
+
+function subCard(title, signedIn, pending, onConnect, extra) {
+  return el("div", { class: "card" + (signedIn ? " done" : "") },
+    el("span", { class: "badge" + (signedIn ? " ok" : "") }, signedIn ? "✓ " + t("connected") : t("notConnected")),
+    el("h2", {}, title),
+    signedIn ? null : el("div", { class: "actions" }, el("button", { class: "secondary", onclick: onConnect }, pending ? t("waiting") : t("connect"))),
+    extra);
+}
+
+let openaiInfo = null;
+function renderSubscriptions() {
+  setTitle(t("subsTitle"), t("subsSub"));
+  const openaiExtra = openaiInfo && openaiInfo.url ? el("div", { class: "note" }, t("openLink"), " ", el("a", { href: openaiInfo.url, target: "_blank", rel: "noopener" }, openaiInfo.url), openaiInfo.userCode ? el("div", {}, t("code") + " " + openaiInfo.userCode) : null) : null;
+  view.replaceChildren(...[
+    restoredNote ? el("div", { class: "note" }, restoredNote) : null,
+    subCard(t("claude"), state.claude.signedIn, state.claude.pending, async () => { await api("/api/wizard/claude-login", {}); startPolling(); }),
+    subCard(t("openai"), state.openai.signedIn, !!openaiInfo, async () => {
+      const r = await api("/api/wizard/openai-login", {});
+      try { openaiInfo = JSON.parse(r.stdout || "{}"); } catch { openaiInfo = null; }
+      startPolling(); render();
+    }, openaiExtra),
+    el("div", { class: "actions" },
+      el("button", { onclick: async () => { await api("/api/wizard/answer", { field: "subscriptionsAnswered", value: true }); await refresh(); step = firstOpenStep() === "subscriptions" ? "accounts" : firstOpenStep(); render(); } },
+        (state.claude.signedIn || state.openai.signedIn) ? t("next") : t("noSub") + " →"))
+  ].filter(Boolean));
+}
+
+// --- step 3: a list page; every mailbox and messenger account is a page of its own ---------------------------------
+const MESSENGERS = ["telegram", "whatsapp", "signal"];
+const ROLES = ["caroline", "owner"];
+let sub = null;                      // null = the list; {type:"mailbox"} | {type:"messenger", role, kind}
+
+function goSub(next) { sub = next; render(); }
+function removeButton(label, action) {
+  // two clicks: the first only asks, so a mailbox is not lost to a slip
+  const b = el("button", { class: "link" }, label);
+  b.addEventListener("click", async () => {
+    if (!b.dataset.armed) { b.dataset.armed = "1"; b.textContent = t("sure"); setTimeout(() => { delete b.dataset.armed; b.textContent = label; }, 4000); return; }
+    b.disabled = true; await action(); await refresh(); render();
+  });
+  return b;
+}
+
+function mailboxPage() {
+  setTitle(t("addMailbox"), t("addMailboxSub"));
+  const role = el("select", {}, ROLES.map(r => el("option", { value: r }, t("mailOf_" + r))));
+  const f = { address: el("input", { type: "email", placeholder: t("addr") }), password: el("input", { type: "password", autocomplete: "new-password" }),
+    imapHost: el("input", {}), imapPort: el("input", { value: "993", inputmode: "numeric" }), smtpHost: el("input", {}), smtpPort: el("input", { value: "465", inputmode: "numeric" }) };
+  f.address.addEventListener("blur", () => {
+    const d = (f.address.value.split("@")[1] || "").toLowerCase();
+    if (!d) return;
+    if (!f.imapHost.value) f.imapHost.value = d === "gmail.com" ? "imap.gmail.com" : "imap." + d;
+    if (!f.smtpHost.value) f.smtpHost.value = d === "gmail.com" ? "smtp.gmail.com" : "smtp." + d;
+  });
+  const err = el("div", { class: "err" });
+  const save = el("button", {}, t("checkSave"));
+  save.addEventListener("click", async () => {
+    err.textContent = ""; save.disabled = true; save.textContent = t("checking");
+    try {
+      const r = await api("/api/wizard/mailbox", { address: f.address.value, password: f.password.value, role: role.value, imapHost: f.imapHost.value, imapPort: +f.imapPort.value || 993, smtpHost: f.smtpHost.value, smtpPort: +f.smtpPort.value || 465 });
+      if (!r.ok) { err.textContent = r.error === "invalid_input" ? t("bad_input") : t("mbfail") + (r.detail ? ": " + r.detail : ""); return; }
+      await refresh(); goSub(null);
+    } catch (e) { err.textContent = t("mbfail") + ": " + e; } finally { save.disabled = false; save.textContent = t("checkSave"); }
+  });
+  view.replaceChildren(
+    ...field(t("whose"), role), ...field(t("addr"), f.address), ...field(t("password"), f.password),
+    el("div", { class: "row" }, el("div", {}, ...field(t("imapHost"), f.imapHost)), el("div", {}, ...field(t("imapPort"), f.imapPort))),
+    el("div", { class: "row" }, el("div", {}, ...field(t("smtpHost"), f.smtpHost)), el("div", {}, ...field(t("smtpPort"), f.smtpPort))),
+    err, el("div", { class: "actions" }, save, el("button", { class: "secondary", onclick: () => goSub(null) }, t("cancel"))));
+  f.address.focus();
+}
+
+function messengerPage(role, kind) {
+  const current = (state.contacts[role] || {})[kind] || "";
+  setTitle(t("name_" + kind) + " — " + t("roleName_" + role), t("messengerSub"));
+  const input = el("input", { value: current, placeholder: t(kind + "Hint") });
+  const save = el("button", {}, t("save"));
+  save.addEventListener("click", async () => {
+    if (!input.value.trim()) return;
+    await api("/api/wizard/answer", { field: "contact", value: { role, kind, handle: input.value } });
+    await refresh(); goSub(null);
+  });
+  input.addEventListener("keydown", e => { if (e.key === "Enter") save.click(); });
+  view.replaceChildren(...field(t(kind + "Label"), input), el("div", { class: "note" }, t("connectLater")),
+    el("div", { class: "actions" }, save, el("button", { class: "secondary", onclick: () => goSub(null) }, t("cancel")),
+      current ? removeButton(t("remove"), () => api("/api/wizard/answer", { field: "removeContact", value: { role, kind } })) : null));
+  input.focus();
+}
+
+function accountsList() {
+  setTitle(t("accTitle"), t("accSub"));
+  const parts = [];
+  // mailboxes
+  parts.push(el("h2", {}, t("mailboxes")));
+  const roles = state.mailboxes.roles, created = new Set(state.mailboxes.createdHere || []);
+  const rows = Object.entries(roles).map(([address, role]) => el("div", { class: "card" },
+    el("span", { class: "badge" }, t("mailOf_" + role)), el("h2", {}, address),
+    el("div", { class: "actions" }, removeButton(t("remove"), () => api("/api/wizard/mailbox/remove", { address })),
+      created.has(address) ? null : el("span", { class: "note" }, t("fromNotes")))));
+  parts.push(...rows);
+  for (const address of state.mailboxes.unassigned) {
+    parts.push(el("div", { class: "card" }, el("h2", {}, address), el("div", { class: "note" }, t("foundInNotes")),
+      el("div", { class: "actions" }, ...ROLES.map(role => el("button", { class: "secondary", onclick: async () => {
+        await api("/api/wizard/answer", { field: "emailRole", value: { address, role } }); await refresh(); render();
+      } }, t("mailOf_" + role))))));
+  }
+  parts.push(el("div", { class: "actions" }, el("button", { onclick: () => goSub({ type: "mailbox" }) }, "+ " + t("addMailbox"))));
+  // messengers
+  parts.push(el("h2", { style: "margin-top:18px" }, t("messengers")));
+  for (const kind of MESSENGERS) for (const role of ROLES) {
+    const handle = (state.contacts[role] || {})[kind] || "";
+    parts.push(el("div", { class: "card" + (handle ? " done" : "") },
+      el("span", { class: "badge" + (handle ? " ok" : "") }, handle ? "✓ " + handle : t("notAdded")),
+      el("h2", {}, t("name_" + kind) + " — " + t("roleName_" + role)),
+      el("div", { class: "actions" }, el("button", { class: "secondary", onclick: () => goSub({ type: "messenger", role, kind }) }, handle ? t("edit") : t("add")))));
+  }
+  const missing = Object.values(state.needs).some(Boolean);
+  parts.push(el("div", { class: "actions" },
+    el("button", { class: "secondary", onclick: () => { step = "subscriptions"; render(); } }, t("back")),
+    el("button", { onclick: async () => {
+      for (const [need, isMissing] of Object.entries(state.needs)) if (isMissing) await api("/api/wizard/answer", { field: "decline", value: need });
+      await refresh(); step = "finish"; render();
+    } }, missing ? t("skip") + " →" : t("next"))));
+  view.replaceChildren(...parts.filter(Boolean));
+}
+
+function renderAccounts() {
+  if (sub && sub.type === "mailbox") return mailboxPage();
+  if (sub && sub.type === "messenger") return messengerPage(sub.role, sub.kind);
+  accountsList();
+}
+
+function renderFinish() {
+  setTitle(t("finish"), t("finished"));
+  view.replaceChildren(el("div", { class: "actions" },
+    el("button", { onclick: async () => { await api("/api/wizard/answer", { field: "completed", value: true }); signal("caroline-wizard-done"); view.replaceChildren(el("p", {}, t("finished"))); } }, t("close"))));
+}
+
+function startPolling() {
+  if (polling) return;
+  polling = setInterval(async () => {
+    await refresh();
+    if (step === "subscriptions") {
+      if (state.claude.signedIn && state.openai.signedIn || (!state.claude.pending && !openaiInfo)) { clearInterval(polling); polling = null; }
+      render();
+    }
+  }, 2500);
+}
+
+function render() {
+  dots();
+  document.getElementById("later")?.remove();
+  if (state && state.loggedIn) document.querySelector("main").append(el("div", { class: "actions", id: "later" }, el("button", { class: "link", onclick: async () => { await api("/api/wizard/answer", { field: "dismissed", value: true }); signal("caroline-wizard-dismissed"); } }, t("later"))));
+  ({ account: renderAccount, subscriptions: renderSubscriptions, accounts: renderAccounts, finish: renderFinish })[step]();
+}
+
+(async function init() {
+  await refresh();
+  if (state.loggedIn && !state.needed) { signal("caroline-wizard-done"); }
+  step = firstOpenStep();
+  if (step === "subscriptions" || step === "accounts") restoredNote = "";
+  render();
+})();
+</script>
+</body>
+</html>

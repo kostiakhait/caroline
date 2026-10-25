@@ -33,6 +33,7 @@ from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcr
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history_for_session
+from app import settings_mirror, wizard
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
@@ -543,6 +544,8 @@ async def _start_ratatosk_background_loops() -> None:
     from app import http_tls
     asyncio.create_task(http_tls.warm_up())
     asyncio.create_task(_prune_redundant_archives_in_background())
+    # Settings kept in Notes (app/settings_mirror.py): restored once there is a login, pushed when they change.
+    asyncio.create_task(settings_mirror.run_forever(WORKSPACE_DIR))
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _inject_from_ratatosk_owner_account, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
@@ -892,6 +895,82 @@ async def post_openai_cancel() -> JSONResponse:
     return await _control_json("openai_cancel_login", PRIMARY_TAB_ID)
 
 
+# --- the start-up wizard (app/wizard.py; page app/assets/wizard.html) -----------
+# Served by the backend itself so the page and its API share one origin -- the shells only open
+# http://127.0.0.1:<port>/wizard in a window of their own.
+
+_WIZARD_PAGE = Path(__file__).parent / "assets" / "wizard.html"
+
+
+@app.get("/wizard")
+async def get_wizard_page() -> Response:
+    try:
+        html = _WIZARD_PAGE.read_text(encoding="utf-8")
+    except OSError:
+        return Response("wizard page missing", status_code=404, media_type="text/plain")
+    return Response(html, media_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/wizard/state")
+async def get_wizard_state() -> JSONResponse:
+    return JSONResponse(await wizard.get_state(WORKSPACE_DIR))
+
+
+class WizardLoginBody(BaseModel):
+    email: str
+    password: str
+    isRegister: bool = False
+
+
+@app.post("/api/wizard/login")
+async def post_wizard_login(body: WizardLoginBody) -> JSONResponse:
+    return JSONResponse(await wizard.login(WORKSPACE_DIR, body.email, body.password, body.isRegister))
+
+
+@app.post("/api/wizard/claude-login")
+async def post_wizard_claude_login() -> JSONResponse:
+    return JSONResponse(await wizard.start_claude_login(WORKSPACE_DIR))
+
+
+@app.post("/api/wizard/openai-login")
+async def post_wizard_openai_login() -> JSONResponse:
+    return await _control_json("openai_login", PRIMARY_TAB_ID, {"method": "chatgpt"})
+
+
+class WizardMailboxRemoveBody(BaseModel):
+    address: str
+
+
+@app.post("/api/wizard/mailbox/remove")
+async def post_wizard_mailbox_remove(body: WizardMailboxRemoveBody) -> JSONResponse:
+    return JSONResponse(await wizard.remove_mailbox(WORKSPACE_DIR, body.address))
+
+
+class WizardAnswerBody(BaseModel):
+    field: str
+    value: Any = None
+
+
+@app.post("/api/wizard/answer")
+async def post_wizard_answer(body: WizardAnswerBody) -> JSONResponse:
+    return JSONResponse(wizard.answer(WORKSPACE_DIR, body.field, body.value))
+
+
+class WizardMailboxBody(BaseModel):
+    address: str
+    password: str
+    role: str
+    imapHost: str
+    imapPort: int | None = None
+    smtpHost: str | None = None
+    smtpPort: int | None = None
+
+
+@app.post("/api/wizard/mailbox")
+async def post_wizard_mailbox(body: WizardMailboxBody) -> JSONResponse:
+    return JSONResponse(await wizard.save_mailbox(WORKSPACE_DIR, body.model_dump()))
+
+
 class ControlBody(BaseModel):
     op: str | None = None
     requestId: str | None = None
@@ -1107,7 +1186,27 @@ def _ratatosk_stop_session() -> bool:
     asyncio.create_task(_do())
 
 
+# Control ops that change a setting kept in the workspace: after one of them succeeds the settings mirror
+# (settings_mirror.py) writes the change to Notes, so a reinstall picks it up.
+_SETTINGS_OPS = frozenset({
+    "persona_set", "persona_reset", "continuous_dialogue_set", "visual_mode_set", "local_stt_set",
+    "chat_mode_set", "model_override_set", "openai_key_set", "own_anthropic_key_set",
+    "ratatosk_own_account_register", "openai_login", "auth_login",
+})
+
+
 async def handle_control_request(
+    parsed: dict[str, Any],
+    send: Any = None,
+    session: ChatSession | None = None,
+) -> dict[str, Any]:
+    response = await _handle_control_request_inner(parsed, send, session)
+    if parsed.get("op") in _SETTINGS_OPS and response.get("ok"):
+        settings_mirror.schedule_push(WORKSPACE_DIR)
+    return response
+
+
+async def _handle_control_request_inner(
     parsed: dict[str, Any],
     send: Any = None,
     session: ChatSession | None = None,
@@ -1422,6 +1521,7 @@ async def handle_control_request(
         result = await (register_and_save_login(email, password) if is_register else verify_and_save_login(email, password))
         log_event("engine", "login_submit_result", is_register=is_register, email=email, ok=result.ok)
         if result.ok:
+            settings_mirror.schedule_sync(WORKSPACE_DIR)  # a fresh install gets its settings back from Notes
             if session is not None:
                 kind = "registration" if is_register else "login"
                 session.inject_proactive(

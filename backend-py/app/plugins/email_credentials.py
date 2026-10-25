@@ -92,6 +92,31 @@ async def _find_vault_note(address: str) -> tuple[str | None, dict[str, Any] | N
     return None, None
 
 
+async def forget(address: str) -> dict[str, bool]:
+    """Drops what is kept for a mailbox: the local encrypted copy, and the vault note (Notes' own soft delete, so it
+    can still be recovered there). Memory keeps its line: nothing here can take a fact back out of it. Used for a
+    mailbox added by mistake (the start-up wizard's "remove")."""
+    from app.plugins import notes_plugin
+
+    local = False
+    try:
+        path = _local_path(address)
+        local = path.exists()
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log_event("plugin:email", "credentials_forget_local_failed", address=address, error=str(exc)[:200])
+    note = False
+    try:
+        note_id, _creds = await _find_vault_note(address)
+        if note_id:
+            await notes_plugin.notes_delete({"id": note_id}, None)
+            note = True
+    except Exception as exc:  # noqa: BLE001 -- the local copy is gone either way
+        log_event("plugin:email", "credentials_forget_note_failed", address=address, error=str(exc)[:200])
+    log_event("plugin:email", "credentials_forgotten", address=address, local=local, note=note)
+    return {"local": local, "note": note}
+
+
 async def fill(args: dict[str, Any]) -> dict[str, Any]:
     """`args` with the mailbox's kept credentials filled in where the call left
     them out. Only for a call that names an address; one that gives everything

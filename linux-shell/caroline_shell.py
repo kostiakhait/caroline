@@ -670,8 +670,69 @@ class Shell:
             return False
         return True
 
+    # --- the start-up wizard (backend app/wizard.py, page app/assets/wizard.html) -----------------------------
+    WIZARD_DONE_TITLES = ("caroline-wizard-done", "caroline-wizard-dismissed")
+
+    def maybe_open_wizard(self) -> None:
+        """Opens the wizard when the backend says it is needed: no login yet (Caroline can't work without one), or a
+        wizard started earlier and not finished. Asked once, off the GTK thread."""
+        def check() -> None:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{BACKEND_PORT}/api/wizard/state", timeout=20) as r:
+                    needed = bool(json.loads(r.read().decode("utf-8")).get("needed"))
+            except Exception as exc:  # noqa: BLE001 -- no wizard rather than a broken start
+                log(f"wizard: state check failed: {exc}")
+                return
+            if needed:
+                GLib.idle_add(self.open_wizard)
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def open_wizard(self) -> bool:
+        existing = getattr(self, "wizard_window", None)
+        if existing is not None:
+            existing.present()
+            return False
+        win = Gtk.Window(title="Caroline")
+        win.set_default_size(560, 720)
+        win.set_position(Gtk.WindowPosition.CENTER)
+        win.set_keep_above(True)                       # on top of the chat window and everything else
+        win.set_transient_for(self.window)
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        webview = WebKit2.WebView()
+        webview.set_background_color(Gdk.RGBA(1, 1, 1, 1))
+        wizard_origin = f"http://127.0.0.1:{BACKEND_PORT}/"
+
+        def on_title(wv, _pspec) -> None:
+            if (wv.get_title() or "") in self.WIZARD_DONE_TITLES:
+                win.destroy()
+
+        def on_policy(_wv, decision, decision_type) -> bool:
+            # The page stays on its own origin; a link the page opens elsewhere (an OpenAI sign-in page) goes to the
+            # system browser.
+            if decision_type in (WebKit2.PolicyDecisionType.NAVIGATION_ACTION, WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION):
+                uri = decision.get_navigation_action().get_request().get_uri()
+                if not uri.startswith(wizard_origin):
+                    decision.ignore()
+                    try:
+                        Gtk.show_uri_on_window(None, uri, Gdk.CURRENT_TIME)
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"wizard: could not open {uri}: {exc}")
+                    return True
+            return False
+
+        webview.connect("notify::title", on_title)
+        webview.connect("decide-policy", on_policy)
+        win.connect("destroy", lambda _w: setattr(self, "wizard_window", None))
+        win.add(webview)
+        self.wizard_window = win
+        webview.load_uri(f"{wizard_origin}wizard")
+        win.show_all()
+        return False
+
     def reveal(self) -> None:
         self.window.show_all()
+        self.maybe_open_wizard()
         if self.settings.window_left is not None and self.settings.window_top is not None:
             self.window.move(int(self.settings.window_left), int(self.settings.window_top))
             return

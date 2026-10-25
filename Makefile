@@ -56,7 +56,7 @@ INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
 # once too many separate $(shell) subprocess spawns land in the same
 # Makefile parse pass. Four total here stays well clear of that.
 SKILLS_SRC := $(shell find "$(BACKEND_PY_DIR)/skills-src" -type f 2>/dev/null)
-BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py
+BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(shell find "$(BACKEND_PY_DIR)/app/assets" -type f -name '*.html' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py
 CAROLINE_SRC := $(shell find "$(CAROLINE_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' -o -path '*/wwwroot/*' \) 2>/dev/null)
 NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' \) 2>/dev/null)
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
