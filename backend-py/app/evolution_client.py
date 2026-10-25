@@ -259,6 +259,13 @@ async def run_reply_agent(
         "candidate_a_output": _safe_json(candidate_a.get("output")),
         "candidate_b_output": _safe_json(candidate_b.get("output")),
     }
+    # The judge's context (2026-10-24, explicit order): the champion's full rules, the
+    # user's request and the last lines of the dialogue -- app/evolution_request.py.
+    from app.evolution_request import current_request_context
+    request = current_request_context()
+    judge_context = {"role_rules": champion_g.get("rulesText"), "user_request": request.get("userRequest"),
+                     "recent_dialogue": "\n".join(request.get("recentDialogue") or [])}
+    select_input.update({key: value for key, value in judge_context.items() if value})
     select_result = await asyncio.to_thread(_run_sync, selector.llm_agents()[0], select_input)
     if select_result.get("status") != "ok":
         # Fail-open: an unjudgeable round still answers with SOMETHING -- the

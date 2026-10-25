@@ -167,6 +167,11 @@ async def _memory(command: str, **params: Any) -> dict[str, Any]:
     turn_id = memory_turns.current_turn_id(get_tab_id())
     if turn_id:
         params.setdefault("turnId", turn_id)
+    # The evolution judge's context for this request (app/evolution_request.py): the
+    # server hands it to evolution.selector when a memory role is in a tournament.
+    from app.evolution_request import current_request_context
+    for key, value in current_request_context().items():
+        params.setdefault(key, value)
     return await _sessions.with_session(
         lambda session: _post({"command": command, "key": CAROLINE_SW_KEY, "session": session, **params})
     )

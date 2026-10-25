@@ -35,12 +35,31 @@ def _object(properties: dict, required: Optional[List[str]] = None) -> dict:
     return {"type": "object", "properties": properties, "required": list(properties) if required is None else required}
 
 
+def _context_block(input: Any) -> str:
+    """What the judge knows beyond the two answers (2026-10-24, explicit order: "Нам надо
+    дать судье контекст запроса"): the role's full rules, the user's request this call was
+    serving, and the last lines of the dialogue. Each part only when the caller has it."""
+    parts = []
+    if input.get("role_rules"):
+        parts.append("THE ROLE'S RULES -- what a good answer of this role must do (the version currently in "
+                     f"use; placeholders like {{{{DATA_BLOCK}}}} stand for the task data shown below):\n"
+                     f"<<<\n{input['role_rules']}\n>>>")
+    if input.get("user_request"):
+        parts.append(f"WHAT THE USER ASKED -- the request this call was made to serve:\n<<<\n{input['user_request']}\n>>>")
+    if input.get("recent_dialogue"):
+        parts.append(f"THE LAST LINES OF THE DIALOGUE, oldest first:\n<<<\n{input['recent_dialogue']}\n>>>")
+    return "\n\n".join(parts) + "\n\n" if parts else ""
+
+
 def prompt_select(input: Any, context: Any) -> str:
     return (
         "You are comparing two real candidate results produced for the exact same task, by two versions of "
-        "the same AI agent. Judge ONLY by how well each result serves the role's own stated purpose below -- "
-        "never by length, confidence, tone, or anything else unrelated to actually doing the job.\n\n"
-        f"PURPOSE this role exists for (judge by this, nothing else): {input['role_purpose']}\n\n"
+        "the same AI agent. Judge ONLY by how well each result serves the role's purpose and rules below, "
+        "for what the user actually wanted -- never by length, confidence, tone, or anything else unrelated "
+        "to actually doing the job. Use the user's request and the dialogue to see what the right answer "
+        "for THIS task is: a result that follows the rules but misses what the user needed is the worse one.\n\n"
+        f"PURPOSE this role exists for: {input['role_purpose']}\n\n"
+        + _context_block(input) +
         f"THE TASK both candidates were given:\n{input['task_input_summary']}\n\n"
         f"CANDIDATE A:\n{input['candidate_a_output']}\n\n"
         f"CANDIDATE B:\n{input['candidate_b_output']}\n\n"
@@ -60,12 +79,14 @@ def verify_select(input: Any, output: Any) -> Optional[str]:
 def llm_agents() -> List[M.Agent]:
     return [
         M.Agent(
-            SELECT, "1",
+            # "2" (2026-10-24): the judge also gets the role's rules, the user's request and the dialogue.
+            SELECT, "2",
             "Picks the better of two real results for the same task and role, by that role's own stated "
-            "purpose, or says they're indistinguishable.",
+            "purpose and rules and what the user asked, or says they're indistinguishable.",
             input_schema=_object(
                 {"role_purpose": _STRING, "task_input_summary": _STRING, "candidate_a_output": _STRING,
-                 "candidate_b_output": _STRING},
+                 "candidate_b_output": _STRING, "role_rules": _STRING, "user_request": _STRING,
+                 "recent_dialogue": _STRING},
                 required=["role_purpose", "task_input_summary", "candidate_a_output", "candidate_b_output"],
             ),
             output_schema=_object({"winner": _WINNER_ENUM, "reason": _STRING}, required=["winner", "reason"]),

@@ -320,6 +320,31 @@ class PermissionGuardMixin:
             if bridge:
                 return f"{bridge}\n{own}" if own else bridge
         return own
+    def evolution_request_context(self, lines: int) -> dict[str, Any]:
+        """What the evolution judge is told about the request (2026-10-24, explicit
+        order: "Нам надо дать судье контекст запроса"; app/evolution_request.py): the
+        user's request this turn is serving and the last `lines` lines of the dialogue.
+        The request is the real user's message of this turn; a background session's own
+        task stands in for it (a reminder, a sub-agent's job)."""
+        request = self.pending_user_text if self.pending_is_real_user else None
+        if not request:
+            from app import pseudo_tab   # late: pseudo_tab imports chat_session lazily too
+            request = pseudo_tab._pseudo_turn_task.get(self.tab_id)
+        if self.small_model_active and self.small_model_live_dialogue:
+            recent = list(self.small_model_live_dialogue[-lines:])
+        else:
+            deduped: list[str] = []
+            for line in _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, lines):
+                if not deduped or deduped[-1] != line:
+                    deduped.append(line)
+            recent = deduped[-lines:]
+        context: dict[str, Any] = {}
+        if request and str(request).strip():
+            context["userRequest"] = str(request).strip()
+        if recent:
+            context["recentDialogue"] = recent
+        return context
+
     async def _check_action_before_send(self, tool_name: str, args: dict[str, Any]) -> str | None:
         """Registered with session_context's register_send_action_guard;
         awaited by app/operations.py's dispatch() right before a send-type
