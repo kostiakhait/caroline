@@ -1293,7 +1293,8 @@ public partial class MainWindow : Window
 
         if (_viewerWindows.TryGetValue(LoginWindowKey, out var existing)) existing.Close();
 
-        var viewer = new DocumentViewerWindow(error, noAiAtAll, (email, password, cancelled, isRegister, openSettingsInstead) =>
+        DocumentViewerWindow? viewer = null;
+        viewer = new DocumentViewerWindow(error, noAiAtAll, (email, password, cancelled, isRegister, openSettingsInstead) =>
         {
             Dispatcher.Invoke(() =>
             {
@@ -1303,11 +1304,13 @@ public partial class MainWindow : Window
                 webView.CoreWebView2.PostWebMessageAsJson(payload);
                 if (openSettingsInstead)
                 {
-                    _ = _activeTab?.WebView?.CoreWebView2?.ExecuteScriptAsync("window.carolineOpenSettings && window.carolineOpenSettings();");
+                    var section = JsonSerializer.Serialize(viewer!.SettingsSection);
+                    _ = _activeTab?.WebView?.CoreWebView2?.ExecuteScriptAsync($"window.carolineOpenSettings && window.carolineOpenSettings({section});");
                 }
             });
         });
         _viewerWindows[LoginWindowKey] = viewer;
+        viewer.Owner = this;
         viewer.Show();
     }
 

@@ -6,6 +6,35 @@
         Width="900" Height="700"
         WindowStartupLocation="CenterScreen"
         Closing="OnClosing">
+    <Window.Resources>
+        <Style x:Key="BrandButton" TargetType="Button">
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="Background" Value="#5066C9" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="BorderBrush" Value="#5066C9" />
+            <Setter Property="Padding" Value="12,6" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.88" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="BrandOutlineButton" TargetType="Button" BasedOn="{StaticResource BrandButton}">
+            <Setter Property="Foreground" Value="#5066C9" />
+            <Setter Property="Background" Value="White" />
+        </Style>
+    </Window.Resources>
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -19,11 +48,6 @@
             <StackPanel x:Name="ViewButtons" Orientation="Horizontal" DockPanel.Dock="Right" Margin="0,0,8,0" Visibility="Collapsed">
                 <Button x:Name="CloseViewButton" Content="Close" Margin="4,6" Padding="12,4" Click="OnCloseViewClicked" />
             </StackPanel>
-            <StackPanel x:Name="LoginButtons" Orientation="Horizontal" DockPanel.Dock="Right" Margin="0,0,8,0" Visibility="Collapsed">
-                <Button x:Name="LoginOpenSettingsButton" Content="I have my own Claude account" Margin="4,6" Padding="12,4" Click="OnLoginOpenSettingsClicked" Visibility="Collapsed" />
-                <Button x:Name="LoginButton" Content="Log In" Margin="4,6" Padding="12,4" Click="OnLoginClicked" IsDefault="True" />
-                <Button x:Name="LoginCancelButton" Content="Cancel" Margin="4,6" Padding="12,4" Click="OnLoginCancelClicked" />
-            </StackPanel>
             <TextBlock x:Name="TitleText" Foreground="White" VerticalAlignment="Center" Margin="12,0" FontSize="14" />
         </DockPanel>
 
@@ -33,16 +57,27 @@
             <!-- OnlyOffice's WebView2 editor control is added here in code-behind, see ShowOffice(). -->
             <Grid x:Name="OfficeHost" Visibility="Collapsed" />
             <TextBlock x:Name="StatusText" Foreground="#CCC" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="16" Visibility="Collapsed" />
-            <StackPanel x:Name="LoginPanel" Visibility="Collapsed" HorizontalAlignment="Center" VerticalAlignment="Center" Width="320">
-                <TextBlock x:Name="LoginTitleText" Text="Log in to SquirrelWisdom" Foreground="White" FontSize="18" Margin="0,0,0,4" HorizontalAlignment="Center" />
-                <TextBlock x:Name="LoginSubtitleText" Text="Needed for Notes and other features that use your SquirrelWisdom account." Foreground="#AAA" TextWrapping="Wrap" TextAlignment="Center" Margin="0,0,0,16" />
-                <TextBlock Text="Email" Foreground="#CCC" Margin="0,0,0,2" />
-                <TextBox x:Name="LoginEmailBox" Padding="6,4" Margin="0,0,0,10" />
-                <TextBlock Text="Password" Foreground="#CCC" Margin="0,0,0,2" />
-                <PasswordBox x:Name="LoginPasswordBox" Padding="6,4" Margin="0,0,0,10" />
-                <CheckBox x:Name="RegisterToggle" Content="I don't have an account -- register instead" Foreground="#CCC"
-                          Margin="0,0,0,10" Checked="OnRegisterToggleChanged" Unchecked="OnRegisterToggleChanged" />
-                <TextBlock x:Name="LoginErrorText" Foreground="#FF8080" TextWrapping="Wrap" Margin="0,0,0,10" Visibility="Collapsed" />
+            <StackPanel x:Name="LoginPanel" Visibility="Collapsed" HorizontalAlignment="Stretch" VerticalAlignment="Top" Margin="20,16,20,16" Background="White">
+                <TextBlock x:Name="LoginTitleText" Text="Log in to SquirrelWisdom" Foreground="#1F2440" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <TextBlock x:Name="LoginSubtitleText" Text="Needed for Notes and other features that use your SquirrelWisdom account." Foreground="#6B7194" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,8" />
+                <TextBlock Text="Email" Foreground="#3B4160" FontSize="12" Margin="0,0,0,2" />
+                <TextBox x:Name="LoginEmailBox" Padding="6,4" Margin="0,0,0,6" BorderBrush="#C9CDE8" />
+                <TextBlock Text="Password" Foreground="#3B4160" FontSize="12" Margin="0,0,0,2" />
+                <PasswordBox x:Name="LoginPasswordBox" Padding="6,4" Margin="0,0,0,6" BorderBrush="#C9CDE8" />
+                <CheckBox x:Name="RegisterToggle" Content="I don't have an account -- register instead" Foreground="#3B4160" FontSize="12"
+                          Margin="0,0,0,6" Checked="OnRegisterToggleChanged" Unchecked="OnRegisterToggleChanged" />
+                <TextBlock x:Name="LoginErrorText" Foreground="#C0392B" FontSize="12" TextWrapping="Wrap" Margin="0,0,0,6" Visibility="Collapsed" />
+                <UniformGrid Columns="2" Margin="0,2,0,0">
+                    <Button x:Name="LoginButton" Content="Log In" Style="{StaticResource BrandButton}" Margin="0,0,4,0" Click="OnLoginClicked" IsDefault="True" />
+                    <Button x:Name="LoginCancelButton" Content="Cancel" Style="{StaticResource BrandOutlineButton}" Margin="4,0,0,0" Click="OnLoginCancelClicked" />
+                </UniformGrid>
+                <StackPanel x:Name="LoginOwnAccountPanel" Visibility="Collapsed" Margin="0,10,0,0">
+                    <TextBlock Text="Or use your own account" Foreground="#6B7194" FontSize="12" Margin="0,0,0,4" />
+                    <UniformGrid Columns="2">
+                        <Button x:Name="LoginClaudeButton" Content="Claude" Style="{StaticResource BrandOutlineButton}" Margin="0,0,4,0" Click="OnLoginClaudeClicked" />
+                        <Button x:Name="LoginOpenAiButton" Content="OpenAI" Style="{StaticResource BrandOutlineButton}" Margin="4,0,0,0" Click="OnLoginOpenAiClicked" />
+                    </UniformGrid>
+                </StackPanel>
             </StackPanel>
         </Grid>
     </Grid>

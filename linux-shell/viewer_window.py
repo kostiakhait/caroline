@@ -31,8 +31,9 @@ from typing import Callable
 import gi
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import Gtk, WebKit2  # noqa: E402
+from gi.repository import Gdk, Gtk, WebKit2  # noqa: E402
 
 HEADER_CSS = b"""
 #viewer-header { background-color: #3A3F8F; }
@@ -40,9 +41,23 @@ HEADER_CSS = b"""
 #viewer-header button { background: #4169E1; color: white; border: none; border-radius: 0; box-shadow: none; }
 #viewer-header button:hover { background: #5A7FEA; }
 #viewer-content { background-color: #222222; }
-#login-label, #login-check label { color: #CCCCCC; }
-#login-subtitle { color: #AAAAAA; }
-#login-error { color: #FF8080; }
+"""
+
+# The sign-in modal looks like the chat window around it: white page, brand-blue buttons (chat.css --brand), not
+# the dark viewer chrome the media and code viewers use. Scoped by name so those viewers keep their look.
+LOGIN_CSS = b"""
+#login-window, #login-root { background-color: #FFFFFF; }
+#login-title { color: #1F2440; font-size: 16px; font-weight: bold; }
+#login-label, #login-check label { color: #3B4160; font-size: 12px; }
+#login-subtitle, #login-or { color: #6B7194; font-size: 12px; }
+#login-error { color: #C0392B; font-size: 12px; }
+#login-root entry { background: #FFFFFF; color: #1F2440; border: 1px solid #C9CDE8; border-radius: 6px; padding: 4px 8px; min-height: 0; box-shadow: none; }
+#login-root entry:focus { border-color: #5066C9; }
+#login-root button { background: #5066C9; background-image: none; color: #FFFFFF; border: none; border-radius: 6px; padding: 5px 12px; min-height: 0; box-shadow: none; text-shadow: none; }
+#login-root button:hover { background: #6578D6; background-image: none; }
+#login-root button.secondary { background: #FFFFFF; background-image: none; color: #5066C9; border: 1px solid #5066C9; }
+#login-root button.secondary:hover { background: #EEF0FB; background-image: none; }
+#login-root separator { background: #E1E4F2; }
 """
 
 
@@ -60,7 +75,10 @@ class ViewerWindow:
         font_css: str,
         on_done: Callable[[ViewerResult], None] | None = None,
         on_login_done: Callable[[str | None, str | None, bool, bool, bool], None] | None = None,
+        parent: Gtk.Window | None = None,
     ) -> None:
+        self._parent = parent
+        self.settings_section: str | None = None
         self._page_port = page_port
         self._shim_js = shim_js
         self._font_css = font_css
@@ -77,7 +95,7 @@ class ViewerWindow:
         self.window.connect("delete-event", self._on_close_request)
 
         css = Gtk.CssProvider()
-        css.load_from_data(HEADER_CSS)
+        css.load_from_data(HEADER_CSS + LOGIN_CSS)
         Gtk.StyleContext.add_provider_for_screen(
             self.window.get_screen(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
@@ -162,19 +180,40 @@ class ViewerWindow:
 
     def show_login(self, error: str | None, no_ai_at_all: bool) -> None:
         self._kind = "login"
-        self.title_label.set_label("Log in to SquirrelWisdom")
+        # A compact modal on top of the chat window it belongs to, sized by its content -- not the 900x700 viewer
+        # that media and code use.
+        self.window.set_title("Log in to SquirrelWisdom")
+        self.window.set_name("login-window")
+        self.window.set_resizable(False)
+        self.window.set_default_size(380, -1)
+        if self._parent is not None:
+            self.window.set_transient_for(self._parent)
+            self.window.set_modal(True)
+            self.window.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+            self.window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.window.set_keep_above(True)
+        for child in list(self.window.get_children()):
+            self.window.remove(child)
 
-        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        form.set_halign(Gtk.Align.CENTER)
-        form.set_valign(Gtk.Align.CENTER)
-        form.set_size_request(320, -1)
+        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        form.set_name("login-root")
+        form.set_margin_start(20)
+        form.set_margin_end(20)
+        form.set_margin_top(16)
+        form.set_margin_bottom(16)
+
+        title = Gtk.Label(label="Log in to SquirrelWisdom", halign=Gtk.Align.START)
+        title.set_name("login-title")
+        form.pack_start(title, False, False, 0)
 
         if no_ai_at_all:
             subtitle = Gtk.Label(
-                label="Caroline can't talk to you right now -- log in or register with "
-                      "SquirrelWisdom below, or use your own Claude account instead.",
+                label="Caroline can't talk to you right now. Log in or register, or connect your own Claude or OpenAI account.",
+                halign=Gtk.Align.START,
             )
             subtitle.set_line_wrap(True)
+            subtitle.set_max_width_chars(38)
+            subtitle.set_xalign(0)
             subtitle.set_name("login-subtitle")
             form.pack_start(subtitle, False, False, 0)
 
@@ -192,7 +231,7 @@ class ViewerWindow:
         register_check.set_name("login-check")
         form.pack_start(register_check, False, False, 0)
 
-        error_label = Gtk.Label(label=error or "")
+        error_label = Gtk.Label(label=error or "", halign=Gtk.Align.START)
         error_label.set_line_wrap(True)
         error_label.set_name("login-error")
         if error:
@@ -200,15 +239,23 @@ class ViewerWindow:
 
         login_button = Gtk.Button(label="Log In")
         cancel_button = Gtk.Button(label="Cancel")
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cancel_button.get_style_context().add_class("secondary")
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_row.pack_start(login_button, True, True, 0)
         btn_row.pack_start(cancel_button, True, True, 0)
-        form.pack_start(btn_row, False, False, 0)
+        form.pack_start(btn_row, False, False, 2)
 
         if no_ai_at_all:
-            settings_button = Gtk.Button(label="I have my own Claude account")
-            form.pack_start(settings_button, False, False, 0)
-            settings_button.connect("clicked", lambda _b: self._finish_login(None, None, True, False, True))
+            or_label = Gtk.Label(label="Or use your own account", halign=Gtk.Align.START)
+            or_label.set_name("login-or")
+            form.pack_start(or_label, False, False, 0)
+            own_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            for text, section in (("Claude", "claude"), ("OpenAI", "openai")):
+                own = Gtk.Button(label=text)
+                own.get_style_context().add_class("secondary")
+                own.connect("clicked", lambda _b, sec=section: self._own_account(sec))
+                own_row.pack_start(own, True, True, 0)
+            form.pack_start(own_row, False, False, 0)
 
         def do_login(_b):
             email, password = email_entry.get_text().strip(), password_entry.get_text()
@@ -221,13 +268,20 @@ class ViewerWindow:
             self._finish_login(email, password, False, register_check.get_active(), False)
 
         login_button.connect("clicked", do_login)
+        password_entry.connect("activate", do_login)
         register_check.connect("toggled", lambda cb: login_button.set_label(
             "Register" if cb.get_active() else "Log In",
         ))
         cancel_button.connect("clicked", lambda _b: self._finish_login(None, None, True, False, False))
 
-        self.content.pack_start(form, True, True, 0)
+        self.window.add(form)
         form.show_all()
+        email_entry.grab_focus()
+
+    def _own_account(self, section: str) -> None:
+        """The "own Claude / OpenAI account" buttons: close the modal and open Settings at that provider."""
+        self.settings_section = section
+        self._finish_login(None, None, True, False, True)
 
     # -- shared plumbing --
 

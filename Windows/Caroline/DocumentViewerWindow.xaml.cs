@@ -179,6 +179,10 @@ public partial class DocumentViewerWindow : Window
     /// which would be redundant/confusing to show when Claude obviously already
     /// works (that's the only way this window opens for anything else).
     /// </summary>
+    /// <summary>Which provider's Settings block the "own account" buttons asked for ("claude" or "openai"); read by the caller
+    /// when openSettingsInstead is true.</summary>
+    public string? SettingsSection { get; private set; }
+
     public DocumentViewerWindow(string? loginError, bool noAiAtAll, Action<string?, string?, bool, bool, bool> onLoginDone)
     {
         InitializeComponent();
@@ -186,18 +190,22 @@ public partial class DocumentViewerWindow : Window
         _kind = "login";
         _onLoginDone = onLoginDone;
         TitleText.Text = "Log in to SquirrelWisdom";
+        // A compact modal sized by its content, white like the chat window it sits on top of -- not the 900x700 viewer.
+        Width = 380;
+        SizeToContent = SizeToContent.Height;
+        ResizeMode = ResizeMode.NoResize;
+        WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        ContentHost.Background = System.Windows.Media.Brushes.White;
         ShowLogin(loginError, noAiAtAll);
     }
 
     private void ShowLogin(string? error, bool noAiAtAll)
     {
-        LoginButtons.Visibility = Visibility.Visible;
         LoginPanel.Visibility = Visibility.Visible;
         if (noAiAtAll)
         {
-            LoginSubtitleText.Text = "Caroline can't talk to you right now -- log in or register with SquirrelWisdom " +
-                "below, or use your own Claude account instead.";
-            LoginOpenSettingsButton.Visibility = Visibility.Visible;
+            LoginSubtitleText.Text = "Caroline can't talk to you right now. Log in or register, or connect your own Claude or OpenAI account.";
+            LoginOwnAccountPanel.Visibility = Visibility.Visible;
         }
         if (!string.IsNullOrEmpty(error))
         {
@@ -228,8 +236,13 @@ public partial class DocumentViewerWindow : Window
         Close();
     }
 
-    private void OnLoginOpenSettingsClicked(object sender, RoutedEventArgs e)
+    private void OnLoginClaudeClicked(object sender, RoutedEventArgs e) => OpenSettingsFor("claude");
+
+    private void OnLoginOpenAiClicked(object sender, RoutedEventArgs e) => OpenSettingsFor("openai");
+
+    private void OpenSettingsFor(string section)
     {
+        SettingsSection = section;
         _resultReported = true;
         _onLoginDone!(null, null, true, false, true);
         Close();

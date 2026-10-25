@@ -1095,11 +1095,12 @@ class Shell:
             }
             self._dispatch(tab, payload)
             if open_settings_instead and self.active_tab and self.active_tab.webview:
+                section = json.dumps(getattr(viewer, "settings_section", None))
                 self.active_tab.webview.run_javascript(
-                    "window.carolineOpenSettings && window.carolineOpenSettings();", None, None, None,
+                    f"window.carolineOpenSettings && window.carolineOpenSettings({section});", None, None, None,
                 )
 
-        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, PAGE_CSS, on_login_done=on_login_done)
+        viewer = ViewerWindow(PAGE_PORT, SHIM_JS, PAGE_CSS, on_login_done=on_login_done, parent=self.window)
         viewer.show_login(msg.get("error"), bool(msg.get("noAiAtAll")))
         self.viewer_windows[self.LOGIN_WINDOW_KEY] = viewer
         viewer.show()
