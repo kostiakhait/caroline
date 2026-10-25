@@ -143,7 +143,8 @@ public sealed class VisualModeManager
         try
         {
             Logger.Log($"VisualModeManager: warming model {modelPath} ...");
-            _modelKey = $"{modelPath}|{new FileInfo(modelPath).Length}";
+            // The model's name and size, not its path: a clip pack rendered elsewhere and downloaded must hit the same keys.
+            _modelKey = $"{Path.GetFileName(modelPath)}|{new FileInfo(modelPath).Length}";
             var sw = Stopwatch.StartNew();
             // Height=480: small enough to render quickly, plenty for a corner-of-screen
             // window. RemoveBg=true is required for the transparent background this whole

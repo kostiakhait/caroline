@@ -158,6 +158,20 @@ Test machine: the AWS image `ami-08cd334e960c547f8` (NVIDIA GRID driver, Xorg on
 the built bridge, the model, the test scripts) is kept so work can restart from the same point; a new machine is
 started from it only on request and is TERMINATED (not stopped) afterwards. See Notes: vault:aws:caroline-animation-gpu-test.
 
+## 7d. Filler clips are rendered once per model and downloaded (decision 2026-10-24)
+
+The filler remarks have fixed audio (app/assets/fillers), so their talking-head clips are always the same for a given animation
+model. They are NOT rendered on the user's machine: each of the four models (CarolineA, CarolineB, PeterA, PeterB) is rendered
+once, the clips are packed (`backend-py/tools/build_filler_clips.py` -> `<Model>-clips.tar`, ~25 MB per model: 256 clips of
+2-3 s) and put on the download server next to the models; the app unpacks the pack for the model it uses into the clip cache.
+- The clip cache key is the SHA-1 of the audio plus the model's NAME and size plus the picture height -- never a path (changed
+  2026-10-24 in XcfaBridge and VisualModeManager), so a clip rendered anywhere is found everywhere. The rest-pose PNG is in the pack.
+- A filler is then a cache hit with no rendering at all on every machine, which also removes the rendering from the session
+  CPU budget of the hosted desktops (docs in Xopek_Deskops/docs/SELKIES_AND_CAROLINE_PLAN.md).
+- Real remarks (new text each time) are still rendered on the machine; only the fillers are shared.
+- Not done yet: rendering the four packs (needs the three other models, ~12-14 GB each, on one machine), uploading them, and the
+  installer / first-use download of the pack. If the filler texts change (they are to be made neutral), the packs are rebuilt.
+
 ## 8. Decisions
 
 Made (2026-10-23):

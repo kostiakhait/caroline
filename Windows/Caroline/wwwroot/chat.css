@@ -247,7 +247,10 @@ a.attachment-chip {
 
 .lamp-green-blink {
   background: #3fb95a;
-  animation: lamp-blink 1s ease-in-out infinite;
+  /* steps(1, end): the lamp still blinks once a second, but as two discrete states. Smoothly fading opacity made WebKit repaint
+     every frame, and with software rendering (a hosted Linux session has no GPU) that alone took a whole CPU core while Caroline
+     was working (measured 2026-10-24: 109 % of a core for a 9 px lamp). */
+  animation: lamp-blink 1s steps(1, end) infinite;
 }
 
 @keyframes lamp-blink {
@@ -374,7 +377,7 @@ a.attachment-chip {
 .composer #micBtn.recording {
   color: #d92c2c;
   background: #ffe9e9;
-  animation: mic-pulse 1s infinite;
+  animation: mic-pulse 1s steps(1, end) infinite;
 }
 
 .composer #micBtn.transcribing {
@@ -393,7 +396,7 @@ a.attachment-chip {
 }
 
 .bubble .speak-btn.speaking {
-  animation: mic-pulse 1s infinite;
+  animation: mic-pulse 1s steps(1, end) infinite;
 }
 
 .bubble .speak-btn {

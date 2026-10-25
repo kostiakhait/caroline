@@ -129,7 +129,9 @@ while ((line = Console.In.ReadLine()) != null)
                 var modelPath = root.GetProperty("modelPath").GetString()!;
                 var height = root.TryGetProperty("height", out var h) ? h.GetInt32() : 480;
                 outHeight = height;
-                modelKey = modelPath + "|" + new FileInfo(modelPath).Length;
+                // The model's NAME and size, never its path: the same clip rendered on another machine (a pack downloaded from
+                // the server, see backend-py/tools/build_filler_clips.py) must be found under the same key.
+                modelKey = Path.GetFileName(modelPath) + "|" + new FileInfo(modelPath).Length;
                 var warm = Stopwatch.StartNew();
                 prepared = Renderer.Prepare(modelPath, "preview.webm", new RenderOptions { RemoveBg = true, Height = height, Ffmpeg = ffmpeg });
                 var restPath = Path.Combine(clipCache, "rest-" + Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(modelKey + "|" + height))).ToLowerInvariant() + ".png");
