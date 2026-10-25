@@ -105,11 +105,11 @@ def scroll_mouse(amount: int, horizontal: bool = False) -> None:
 
 
 # --- key-name -> X11 keysym table -------------------------------------------
-# Mirrors native_exe.py's _NAMED_KEYS table key-for-key (same names Caroline
+# Mirrors _win32.py's _NAMED_KEYS table key-for-key (same names Caroline
 # already uses in tool calls) so chain/keyboard/window-keyboard steps work
 # unmodified across both platforms -- only the resolved value's TYPE differs
 # (an X11 keysym here, a Win32 virtual-key code there); each plugin's Linux
-# branch calls resolve_keysym instead of native_exe.resolve_vk.
+# branch calls resolve_keysym instead of _win32.resolve_vk.
 _NAMED_KEYS: dict[str, int] = {
     "enter": Xlib.XK.XK_Return, "return": Xlib.XK.XK_Return,
     "escape": Xlib.XK.XK_Escape, "esc": Xlib.XK.XK_Escape, "tab": Xlib.XK.XK_Tab,

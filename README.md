@@ -53,12 +53,11 @@ left for the target machine to already have.
   is the per-tab core; `app/plugins/` is the tool roster, auto-wired to the
   model as MCP servers; `app/*_channel.py` own the always-running messenger
   connections. See `PROJECT.md`.
-- `backend/` -- the original Node/TypeScript sidecar. No longer the live
-  engine, but its `mcp-servers`/`mcp-servers-src` (the default MCP tool
-  binaries) and `skills-src` are still built and bundled into every install.
-  Registered once, on first run, at **user scope** (`claude mcp add
-  --scope user`) under `caroline-`-prefixed names so they can never collide
-  with any other MCP server config already on the machine.
+- `backend-py/skills-src/` -- the default skills, seeded into the workspace
+  on every start. Every tool lives in `backend-py` (desktop automation:
+  `app/plugins/_win32*.py` on Windows, `_x11_*.py`/`_linux_chain.py` on
+  Linux); the old Node/TypeScript backend, its MCP servers and native helper
+  exes were removed on 2026-10-24.
 - Adding/removing MCP servers or skills after install is just the normal
   Claude Code mechanism (`claude mcp add/remove`, editing
   `%LOCALAPPDATA%\Caroline\workspace\Skills\`) -- exposed through Caroline's

@@ -34,22 +34,14 @@ from pathlib import Path
 
 from app.logging_setup import log_event
 
-# Mirrors local_tts_launcher.py's own shipped-vs-dev-tree resolution: the
-# Makefile copies backend/skills-src/ into backend-py/skills-src/ at
-# packaging time (single source of truth for skill CONTENT stays under
-# backend/skills-src/ -- these are plain markdown files, nothing
-# Node-specific about them, no reason to fork them in the repo); a dev
-# tree running straight from the repo without a full `make build` yet
-# falls back to the sibling backend/skills-src/ directly.
-_SHIPPED_SKILLS_SRC = Path(__file__).resolve().parent.parent / "skills-src"
-_DEV_TREE_SKILLS_SRC = Path(__file__).resolve().parent.parent.parent / "backend" / "skills-src"
+# backend-py/skills-src/ (2026-10-24: moved here from the removed Node
+# backend/): the same folder in a repo checkout and in an install, which the
+# Makefile ships next to app/.
+_SKILLS_SRC = Path(__file__).resolve().parent.parent / "skills-src"
 
 
 def _resolve_skills_src() -> Path | None:
-    for candidate in (_SHIPPED_SKILLS_SRC, _DEV_TREE_SKILLS_SRC):
-        if candidate.is_dir():
-            return candidate
-    return None
+    return _SKILLS_SRC if _SKILLS_SRC.is_dir() else None
 
 
 def seed_skills(workspace_dir: str) -> None:

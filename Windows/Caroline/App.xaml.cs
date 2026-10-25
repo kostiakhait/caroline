@@ -171,13 +171,15 @@ public partial class App : System.Windows.Application
     /// Keeps the splash up (and, per OnStartup's Hide()/Show() dance, the main
     /// window invisible) until the backend actually answers GET /api/status
     /// (started by MainWindow.OnLoaded, already running by the time this is
-    /// called) AND no tab in that response's own tabs[] array reports
-    /// forcedCompactionPending -- see ChatSession.status()'s own doc comment
-    /// (backend-py/app/chat_session.py) for the startup forced-compaction
-    /// this is specifically waiting out. Per explicit instruction
-    /// (2026-09-13): confirmed live that dismissing on /api/status alone
-    /// let the user see a broken-looking, half-populated tab strip while a
-    /// large tab's session was still being compacted in the background.
+    /// called).
+    ///
+    /// Issue #12 (2026-10-24, the user's choice: "Только бэкенд"): this also
+    /// used to wait for no tab in tabs[] reporting forcedCompactionPending --
+    /// a check that could never fire: the tabs (and their sessions, whose
+    /// startup compaction it meant) are created only AFTER this returns
+    /// (StartTabsAsync, below the Show()), so tabs[] here is always empty.
+    /// Removed rather than kept as a false promise; a tab's startup
+    /// compaction runs with the window visible, as it always actually did.
     /// Honors SplashMinDuration as a floor (so a warm start still gets a
     /// brief, deliberate branding beat instead of flashing by instantly) and
     /// SplashMaxWait as a ceiling (so a genuinely broken backend doesn't
@@ -190,7 +192,6 @@ public partial class App : System.Windows.Application
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
         var deadline = DateTime.UtcNow + SplashMaxWait;
         var minDeadline = DateTime.UtcNow + SplashMinDuration;
-        var loggedCompactionWait = false;
 
         while (DateTime.UtcNow < deadline)
         {
@@ -200,33 +201,7 @@ public partial class App : System.Windows.Application
             try
             {
                 using var resp = await http.GetAsync($"http://127.0.0.1:{BackendProcess.Port}/api/status");
-                if (!resp.IsSuccessStatusCode)
-                {
-                    healthy = false;
-                }
-                else
-                {
-                    var body = await resp.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(body);
-                    var compacting = false;
-                    if (doc.RootElement.TryGetProperty("tabs", out var tabs) && tabs.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var t in tabs.EnumerateArray())
-                        {
-                            if (t.TryGetProperty("forcedCompactionPending", out var p) && p.ValueKind == JsonValueKind.True)
-                            {
-                                compacting = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (compacting && !loggedCompactionWait)
-                    {
-                        loggedCompactionWait = true;
-                        Logger.Log("App.WaitForSplashDismissAsync: holding splash -- a tab is still running its startup forced compaction");
-                    }
-                    healthy = !compacting;
-                }
+                healthy = resp.IsSuccessStatusCode;
             }
             catch
             {

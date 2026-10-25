@@ -601,6 +601,35 @@
     return div.innerHTML;
   }
 
+  // Issue #2 (2026-10-24): escapeHtml leaves quotes as they are, and
+  // decodeURIComponent brings back raw quotes and tags -- either one put into an
+  // attribute could close it and add a handler. Every value renderMarkdown puts
+  // into an attribute goes through attrValue: the text it stands for (the
+  // escaped markdown source, entities undone) escaped for an attribute.
+  function unescapeHtml(text) {
+    const area = document.createElement("textarea");
+    area.innerHTML = text;
+    return area.value;
+  }
+
+  function attrEscape(raw) {
+    return String(raw).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function attrValue(text) {
+    return attrEscape(unescapeHtml(text));
+  }
+
+  // A malformed %-escape stays as it was written instead of throwing.
+  function safeDecodeURIComponent(text) {
+    try {
+      return decodeURIComponent(text);
+    } catch (e) {
+      return text;
+    }
+  }
+
   // Minimal markdown -> HTML: bold, italic, inline code, links, headings,
   // and "- "/"* " bullet lines. Not a full parser -- covers what Claude's
   // replies actually use. Escapes HTML first so nothing in the model's
@@ -656,20 +685,20 @@
       // whatever it starts with -- always route those through the local-
       // file endpoint instead, same as any other real local path.
       if (!src.startsWith("assets/") || src.includes("..")) {
-        const localPath = src.startsWith("file:///") ? decodeURIComponent(src.slice(8)) : src;
+        const localPath = src.startsWith("file:///") ? safeDecodeURIComponent(unescapeHtml(src.slice(8))) : unescapeHtml(src);
         src = `http://127.0.0.1:${port}/api/local-file?path=${encodeURIComponent(localPath)}`;
       }
-      return stash(`<img class="chat-photo" alt="${alt}" title="${alt}" src="${src}" />`);
+      return stash(`<img class="chat-photo" alt="${attrValue(alt)}" title="${attrValue(alt)}" src="${src === rawSrc ? attrValue(src) : attrEscape(src)}" />`);
     });
 
     // A local document link -- clicking it asks the backend to open it in
     // the OS default app (see the "open_file" control op) rather than
     // trying to navigate the page itself to a file:// URL.
     html = html.replace(/\[([^\]]+)\]\(file:\/\/\/([^\s)"']+)\)/g,
-      (_, label, path) => stash(`<a href="#" class="doc-link" data-path="${decodeURIComponent(path)}">📄 ${label}</a>`));
+      (_, label, path) => stash(`<a href="#" class="doc-link" data-path="${attrEscape(safeDecodeURIComponent(unescapeHtml(path)))}">📄 ${label}</a>`));
 
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-      (_, label, url) => stash(`<a href="${url}" target="_blank" rel="noopener">${label}</a>`));
+      (_, label, url) => stash(`<a href="${attrValue(url)}" target="_blank" rel="noopener">${label}</a>`));
     // Bare URLs not already wrapped in an <a> tag from the rule above.
     // Bug fix (2026-09-11): confirmed live -- "*"/"_" weren't excluded, so
     // a bare URL wrapped in **bold** or _italic_ (no [text](url) syntax,
@@ -682,7 +711,7 @@
     // normally, so the bold/italic rules below still see a real matched
     // pair (the placeholder token itself is markdown-special-character-free).
     html = html.replace(/(^|[^"'>])(https?:\/\/[^\s<*_]+)/g,
-      (_, pre, url) => pre + stash(`<a href="${url}" target="_blank" rel="noopener">${url}</a>`));
+      (_, pre, url) => pre + stash(`<a href="${attrValue(url)}" target="_blank" rel="noopener">${url}</a>`));
 
     html = html.replace(/^###\s+(.+)$/gm, "<h4>$1</h4>");
     html = html.replace(/^##\s+(.+)$/gm, "<h3>$1</h3>");
@@ -2273,7 +2302,7 @@
     sendControl("openai_key_set", { apiKey: null });
   });
 
-  function openSettings() {
+  function openSettings(section) {
     settingsOverlay.classList.add("open");
     sendControl("openai_status");
     sendControl("openai_key_get");
@@ -2281,6 +2310,13 @@
     authLoginOutput.textContent = "";
     authLoginOutput.style.display = "none";
     refreshSettingsPanel();
+    // "I have my own Claude / OpenAI account" in the sign-in modal lands on that provider's block.
+    if (typeof section === "string" && section) {
+      const want = section.toLowerCase();
+      const heading = Array.from(settingsOverlay.querySelectorAll("h4"))
+        .find((h) => h.textContent.trim().toLowerCase().startsWith(want));
+      if (heading) heading.scrollIntoView({ block: "start" });
+    }
   }
 
   ratatoskRegisterBtn.addEventListener("click", () => {

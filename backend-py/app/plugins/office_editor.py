@@ -83,47 +83,64 @@ _FORCE_SAVE_POLL_INTERVAL_S = 1.0
 _FORCE_SAVE_MAX_ATTEMPTS = 8
 
 
-async def finish_office_edit_session(remote_path: str, local_path: str, key: str | None = None) -> None:
+async def finish_office_edit_session(remote_path: str, local_path: str, key: str | None = None) -> str | None:
     """`key` is only passed for an editABLE session (see viewer_plugin.py's
     own open_viewer, which withholds it for a view-only document, e.g. a
     PDF) -- a view-only document was never editable in the first place, so
     there is nothing to force-save or wait on; this keeps that case to its
     original single immediate read, not a pointless multi-second wait for
-    a change that can never arrive."""
-    log_event("plugin:office-editor", "finish_edit_session_start", remote_path=remote_path, local_path=local_path)
-    if not key:
-        try:
-            read_res = await reforce_call("file:read", {"path": remote_path})
-            data = base64.b64decode(read_res.get("content", ""))
-            Path(local_path).write_bytes(data)
-            log_event("plugin:office-editor", "synced_back", local_path=local_path, bytes=len(data))
-        except ReforceError as exc:
-            log_event("plugin:office-editor", "read_back_failed", remote_path=remote_path, error=str(exc))
-        await _delete_temp_copy(remote_path)
-        return
+    a change that can never arrive.
 
-    original_sha = hashlib.sha256(Path(local_path).read_bytes()).hexdigest() if Path(local_path).exists() else None
+    Issue #6 (2026-10-24): returns None once the document is safely back in
+    `local_path`, else what went wrong. The server copy -- the only one with
+    the user's edits until then -- is deleted only after the local file is
+    written; on any failure (an error answer, no or undecodable content, a
+    failed local write) it is kept, and the caller says so."""
+    log_event("plugin:office-editor", "finish_edit_session_start", remote_path=remote_path, local_path=local_path)
     try:
-        await reforce_call("document:forceSave", {"key": key})
-        log_event("plugin:office-editor", "force_save_requested", remote_path=remote_path, key=key)
-    except ReforceError as exc:
-        log_event("plugin:office-editor", "force_save_failed", remote_path=remote_path, key=key, error=str(exc))
-    try:
-        data: bytes | None = None
-        attempt = 0
-        for attempt in range(1, _FORCE_SAVE_MAX_ATTEMPTS + 1):
-            read_res = await reforce_call("file:read", {"path": remote_path})
-            data = base64.b64decode(read_res.get("content", ""))
-            changed = original_sha is None or hashlib.sha256(data).hexdigest() != original_sha
-            if changed or attempt == _FORCE_SAVE_MAX_ATTEMPTS:
-                break
-            await asyncio.sleep(_FORCE_SAVE_POLL_INTERVAL_S)
-        if data is not None:
-            Path(local_path).write_bytes(data)
-            log_event("plugin:office-editor", "synced_back", local_path=local_path, bytes=len(data), attempts=attempt)
-    except ReforceError as exc:
-        log_event("plugin:office-editor", "read_back_failed", remote_path=remote_path, error=str(exc))
+        if not key:
+            data = await _read_remote(remote_path)
+            attempt = 1
+        else:
+            original_sha = hashlib.sha256(Path(local_path).read_bytes()).hexdigest() if Path(local_path).exists() else None
+            try:
+                await reforce_call("document:forceSave", {"key": key})
+                log_event("plugin:office-editor", "force_save_requested", remote_path=remote_path, key=key)
+            except ReforceError as exc:
+                log_event("plugin:office-editor", "force_save_failed", remote_path=remote_path, key=key, error=str(exc))
+            data = b""
+            attempt = 0
+            for attempt in range(1, _FORCE_SAVE_MAX_ATTEMPTS + 1):
+                data = await _read_remote(remote_path)
+                changed = original_sha is None or hashlib.sha256(data).hexdigest() != original_sha
+                if changed or attempt == _FORCE_SAVE_MAX_ATTEMPTS:
+                    break
+                await asyncio.sleep(_FORCE_SAVE_POLL_INTERVAL_S)
+        _write_atomically(Path(local_path), data)
+        log_event("plugin:office-editor", "synced_back", local_path=local_path, bytes=len(data), attempts=attempt)
+    except Exception as exc:  # noqa: BLE001 -- reported to the caller; the server copy stays
+        error = f"{type(exc).__name__}: {exc}"
+        log_event("plugin:office-editor", "read_back_failed", remote_path=remote_path, local_path=local_path,
+                  error=error, remote_copy_kept=True)
+        return error
     await _delete_temp_copy(remote_path)
+    return None
+
+
+async def _read_remote(remote_path: str) -> bytes:
+    """The server copy's bytes; raises on an error answer or missing/undecodable content."""
+    read_res = await reforce_call("file:read", {"path": remote_path})
+    content = read_res.get("content") if isinstance(read_res, dict) else None
+    if not isinstance(content, str):
+        raise ReforceError(f"file:read returned no content for {remote_path}")
+    return base64.b64decode(content, validate=True)
+
+
+def _write_atomically(path: Path, data: bytes) -> None:
+    """A failed write leaves the old local file as it was."""
+    tmp = path.with_name(path.name + ".caroline-sync")
+    tmp.write_bytes(data)
+    tmp.replace(path)
 
 
 async def _delete_temp_copy(remote_path: str) -> None:

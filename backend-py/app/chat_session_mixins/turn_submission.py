@@ -248,7 +248,15 @@ class TurnSubmissionMixin:
         # pending_text: what a restart should resume FROM -- the user's own words, not this
         # call's (possibly wrapped) wire text. See durability.unwrap_resume_note for the
         # nested-wrapper incident this prevents.
-        save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments)
+        #
+        # Issue #3 (2026-10-24): a nudge nobody typed (the startup greeting, a
+        # reminder, a background note) never replaces a pending turn already on
+        # disk -- that record may be the user's only copy of unfinished work, and a
+        # crash would then resume the nudge instead of it.
+        if is_real_user or peek_pending_turn(self.workspace_dir, self.tab_id) is None:
+            save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments)
+        else:
+            log_event("engine", "pending_turn_kept_for_real_user_work", tab_id=self.tab_id, is_real_user=is_real_user)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
         # last_real_user_question/the saved pending-turn file above -- those
         # all need to stay the real, clean text for their own consumers,

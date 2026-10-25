@@ -186,9 +186,9 @@ def _migrate_legacy_recurrence(reminders: list[dict[str, Any]]) -> bool:
 async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     reminders = _load_reminders()
     cron_text = args.get("cron")
-    if not cron_text and (args.get("recurring") or args.get("recurring_every_minutes")):
-        cron_text = _cron_for_legacy(args.get("due_at_iso") or datetime.now().astimezone().isoformat(), args.get("recurring"), args.get("recurring_every_minutes"))
     try:
+        if not cron_text and (args.get("recurring") or args.get("recurring_every_minutes")):
+            cron_text = _cron_for_legacy(args.get("due_at_iso") or datetime.now().astimezone().isoformat(), args.get("recurring"), args.get("recurring_every_minutes"))
         if cron_text:
             cron = _Cron(cron_text)
             due = args.get("due_at_iso")
@@ -200,8 +200,10 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             due_iso = first.isoformat()
         else:
             cron = None
-            due_iso = args["due_at_iso"]
-    except ValueError as exc:
+            # Issue #5 (2026-10-24): checked before it is saved -- an unparseable
+            # date used to be stored as given and then broke every due check.
+            due_iso = datetime.fromisoformat(str(args["due_at_iso"])).isoformat()
+    except (ValueError, TypeError) as exc:
         return {"text": f"Invalid schedule: {exc}", "is_error": True}
     event_type = args.get("event_type") or "user"
     if event_type not in EVENT_TYPES:
@@ -291,9 +293,19 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
             resume = bool(r.get("awaitingRetry")) and r.get("id") not in _resumed_this_process
             if r.get("fired") and not resume:
                 continue
-            due = datetime.fromisoformat(r["dueAtIso"])
-            if due.tzinfo is None:
-                due = due.astimezone()
+            try:
+                due = datetime.fromisoformat(str(r["dueAtIso"]))
+                if due.tzinfo is None:
+                    due = due.astimezone()
+            except (KeyError, ValueError, TypeError, OverflowError) as exc:
+                # Issue #5 (2026-10-24): one broken entry (an old one, saved before
+                # dates were checked) is set aside and the others still fire --
+                # it used to abort the whole check, every tick, forever.
+                if not r.get("invalidDue"):
+                    r["invalidDue"] = f"{type(exc).__name__}: {exc}"
+                    changed = True
+                    log_event("engine", "reminder_due_unparseable", reminder_id=r.get("id"), due=r.get("dueAtIso"), error=r["invalidDue"])
+                continue
             due_by_time = due <= now and not r.get("fired")
             if not due_by_time and not resume:
                 continue
@@ -311,7 +323,14 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
                 continue
             changed = True
             if r.get("cron"):
-                r["dueAtIso"] = _Cron(r["cron"]).next_after(now).isoformat()
+                try:
+                    r["dueAtIso"] = _Cron(r["cron"]).next_after(now).isoformat()
+                except (ValueError, TypeError, OverflowError) as exc:
+                    # Delivered already; a broken cron must not lose that (the save
+                    # below) nor deliver it again every tick.
+                    r["fired"] = True
+                    r["invalidDue"] = f"{type(exc).__name__}: {exc}"
+                    log_event("engine", "reminder_cron_unusable", reminder_id=r.get("id"), cron=r.get("cron"), error=r["invalidDue"])
             else:
                 r["fired"] = True
         if changed:

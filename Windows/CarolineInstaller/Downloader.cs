@@ -69,6 +69,24 @@ internal sealed class Downloader
         if (resumeFrom > 0) request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(resumeFrom, null);
 
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (resumeFrom > 0 && response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            // Issue #9 (2026-10-24): 416 = the partial file already has every byte
+            // (or more) -- e.g. a complete download whose verification failed, or
+            // one interrupted between the last byte and the move below. It used to
+            // throw here on every retry and on every later installer run, forever.
+            // Now: a partial that is the whole file (and passes the hash) is used;
+            // anything else is removed, and the next attempt starts from byte 0.
+            var serverLength = response.Content.Headers.ContentRange?.Length;
+            if (serverLength == resumeFrom && (expectedSha256Hex is null || await HashMatchesAsync(tempPath, expectedSha256Hex, ct)))
+            {
+                Logger.Log($"Downloader: {url} already complete in the partial file ({resumeFrom} bytes) -- using it");
+                File.Move(tempPath, destPath, overwrite: true);
+                return;
+            }
+            File.Delete(tempPath);
+            throw new IOException($"Server answered 416 to a resume from byte {resumeFrom} (server length {serverLength?.ToString() ?? "unknown"}) -- partial file removed, starting over");
+        }
         var resumed = resumeFrom > 0 && response.StatusCode == System.Net.HttpStatusCode.PartialContent;
         if (resumeFrom > 0 && !resumed)
         {
@@ -124,9 +142,11 @@ internal sealed class Downloader
         // file, so the next outer-loop attempt naturally starts clean.
         if (expectedSha256Hex is not null)
         {
-            using var sha256 = SHA256.Create();
-            await using var verifyStream = File.OpenRead(tempPath);
-            var actualHash = Convert.ToHexString(await sha256.ComputeHashAsync(verifyStream, ct)).ToLowerInvariant();
+            // Issue #9 (2026-10-24): the hash is computed (and its file stream
+            // closed) BEFORE the delete -- deleting a file still open for reading
+            // fails on Windows, which used to leave the bad file in place and
+            // turn every retry into a resume of it (and then a 416).
+            var actualHash = await HashAsync(tempPath, ct);
             if (!string.Equals(actualHash, expectedSha256Hex, StringComparison.OrdinalIgnoreCase))
             {
                 File.Delete(tempPath);
@@ -136,4 +156,14 @@ internal sealed class Downloader
 
         File.Move(tempPath, destPath, overwrite: true);
     }
+
+    private static async Task<string> HashAsync(string path, CancellationToken ct)
+    {
+        using var sha256 = SHA256.Create();
+        await using var stream = File.OpenRead(path);
+        return Convert.ToHexString(await sha256.ComputeHashAsync(stream, ct)).ToLowerInvariant();
+    }
+
+    private static async Task<bool> HashMatchesAsync(string path, string expectedSha256Hex, CancellationToken ct) =>
+        string.Equals(await HashAsync(path, ct), expectedSha256Hex, StringComparison.OrdinalIgnoreCase);
 }

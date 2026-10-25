@@ -1,5 +1,5 @@
-"""windows-keyboard -- ports mcp-servers-src/keyboard/src/index.ts's real
-SendInput keyboard control (keyboard.exe), unchanged native binary.
+"""windows-keyboard -- real SendInput keyboard control. Windows: in-process
+via app.plugins._win32 (2026-10-24; was keyboard.exe).
 
 Linux port (2026-10-04): in-process XTest calls via app.plugins._x11_input
 instead of a native exe -- see that module's docstring for the keysym/
@@ -18,9 +18,7 @@ from app.plugins.loader import Plugin, PluginTool
 from app.policies import prefer_window_targeted_input_instruction
 
 if sys.platform == "win32":
-    from app.plugins.native_exe import exe_path, resolve_vk, run_exe
-
-    EXE = exe_path("keyboard", "keyboard.exe")
+    from app.plugins import _win32 as win
 else:
     from app.plugins import _x11_input as x11
 
@@ -31,7 +29,7 @@ async def type_text(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         await asyncio.to_thread(x11.type_text, text)
         return {"text": f"Typed {len(text)} character(s)"}
     delay_ms = args.get("delayMs")
-    await run_exe(EXE, ["--action", "Type", "--text", text, "--delayms", str(delay_ms if delay_ms is not None else 10)])
+    await asyncio.to_thread(win.type_text, text, delay_ms if delay_ms is not None else 10)
     return {"text": f"Typed {len(text)} character(s)"}
 
 
@@ -42,9 +40,9 @@ async def press_key(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if sys.platform != "win32":
         await asyncio.to_thread(x11.press_key, key, modifiers)
         return {"text": f"Pressed {combo}"}
-    vk = resolve_vk(key)
-    mod_vks = [resolve_vk(m) for m in modifiers]
-    await run_exe(EXE, ["--action", "Press", "--vk", str(vk), "--modifiers", ",".join(map(str, mod_vks))])
+    vk = win.resolve_vk(key)
+    mod_vks = [win.resolve_vk(m) for m in modifiers]
+    await asyncio.to_thread(win.press_combo, mod_vks, vk)
     return {"text": f"Pressed {combo}"}
 
 
@@ -53,7 +51,7 @@ async def key_down(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if sys.platform != "win32":
         await asyncio.to_thread(x11.key_down, key)
         return {"text": f"Holding {key} down"}
-    await run_exe(EXE, ["--action", "Down", "--vk", str(resolve_vk(key))])
+    await asyncio.to_thread(win.key_down, win.resolve_vk(key))
     return {"text": f"Holding {key} down"}
 
 
@@ -62,7 +60,7 @@ async def key_up(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if sys.platform != "win32":
         await asyncio.to_thread(x11.key_up, key)
         return {"text": f"Released {key}"}
-    await run_exe(EXE, ["--action", "Up", "--vk", str(resolve_vk(key))])
+    await asyncio.to_thread(win.key_up, win.resolve_vk(key))
     return {"text": f"Released {key}"}
 
 

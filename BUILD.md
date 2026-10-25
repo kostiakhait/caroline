@@ -63,28 +63,15 @@ only redoes the steps whose actual inputs changed since last time.
 
 ## Why this matters (don't hand-run the steps)
 
-The Makefile's own build recipe copies the backend's `node_modules`,
-`dist/`, `mcp-servers/`, and `skills-src/` into the packaged app in
-**parallel background jobs**, then `wait`s for them:
-
-```make
-cp -r "$(BACKEND_DIR)/dist" "$(OUT)/backend/dist" & \
-cp -r "$(BACKEND_DIR)/node_modules" "$(OUT)/backend/node_modules" & \
-cp -r "$(BACKEND_DIR)/mcp-servers" "$(OUT)/backend/mcp-servers" & \
-cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend/skills-src" & \
-wait
-```
-
-Confirmed live (2026-09-04): running this by hand through a tool that can
-silently time out and "move a command to the background" produced a
-`dist/backend/node_modules` that looked like it copied successfully (the
-overall command reported exit code 0) but was actually **missing packages**
-(`ws`, at minimum) -- because the copy of that one directory got interrupted
-partway, and a bare `wait` only reflects the last-checked job, not all four.
-The resulting zip got built, hashed, and deployed anyway, and the installed
-app's backend then crashed on every single startup with
-`ERR_MODULE_NOT_FOUND: Cannot find package 'ws'`, hanging the whole app on
-"Connecting..." forever with no error surfaced anywhere obvious.
+Confirmed live (2026-09-04): running a copy step of the recipe by hand,
+through a tool that can silently time out and "move a command to the
+background", produced a packaged folder that looked like it copied
+successfully (the overall command reported exit code 0) but was actually
+**missing files** -- the copy had been interrupted partway. The resulting zip
+got built, hashed, and deployed anyway, and the installed app then crashed on
+every single startup, hanging on "Connecting..." forever with no error
+surfaced anywhere obvious. (That was the old Node backend's node_modules,
+removed since; the lesson stands for every step.)
 
 Running the real `make deploy` doesn't fix that specific race by itself, but
 it does mean you're running the pipeline the way it's actually tested and
@@ -94,7 +81,7 @@ ask -- don't hand-replicate the recipe.**
 
 ## Where things end up
 
-- `dist/` -- unpacked app (WPF shell + `backend/` sidecar), portable, no
+- `dist/` -- unpacked app (WPF shell + `backend-py/`), portable, no
   reference back to this repo at runtime.
 - `dist_installer/` -- `Caroline.zip` (+ `.sha256`/`.version`) and
   `CarolineInstaller.exe` (+ `.sha256`), the four/five files `make deploy`

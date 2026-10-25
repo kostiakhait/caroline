@@ -34,9 +34,6 @@ and independently buildable. Each remains licensed under the terms of this
 repository (Apache License 2.0) as vendored, unless a more specific notice
 is present within that directory:
 
-  - backend/mcp-servers-src/*  -- MCP server implementations Caroline's
-    backend spawns/bundles at build time (see backend/scripts/
-    bundle-mcp-servers.mjs).
   - vendor/XcfaRenderer/       -- the Visual Mode playback/rendering engine
     (renders and plays back pre-built .xcfa talking-head model files). The
     separate, private pipeline that CREATES .xcfa model files is not part

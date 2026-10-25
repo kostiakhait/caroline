@@ -284,10 +284,10 @@ internal static class Program
             await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, info.Sha256Hex, ct));
         }
 
-        // Step 3: Chromium, now that the app's own copy of playwright-core exists on disk.
-        window.SetStatus("Setting up browser automation…");
-        await WithStepAsync(ErrorCodes.PlaywrightInstall, "Setting up browser automation",
-            () => PlaywrightInstaller.InstallAsync(s => window.SetStatus(s), ct));
+        // Step 3 used to install Chromium through the Node browser MCP server's
+        // playwright-core. Gone (2026-10-24): that server no longer exists, and the
+        // Chromium Caroline uses ships inside Caroline.zip (dist/browsers, see the
+        // Makefile's .browsers.stamp and backend-py/app/web_browser.py).
 
         // Step 4 used to fetch Visual Mode's talking-head models here,
         // unconditionally, on every install -- tens of GB, ~90% of a fresh

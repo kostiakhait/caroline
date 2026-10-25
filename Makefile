@@ -26,7 +26,6 @@ SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -ec
 
 SCRIPT_DIR := $(CURDIR)
-BACKEND_DIR := $(SCRIPT_DIR)/backend
 BACKEND_PY_DIR := $(SCRIPT_DIR)/backend-py
 
 # Any local clone of the `reforce` repo that has the `caroline` branch reachable
@@ -56,7 +55,7 @@ INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
 # fail intermittently ("process_begin: CreateProcess(NULL, "", ...) failed")
 # once too many separate $(shell) subprocess spawns land in the same
 # Makefile parse pass. Four total here stays well clear of that.
-BACKEND_SRC := $(shell find "$(BACKEND_DIR)/src" -type f 2>/dev/null)
+SKILLS_SRC := $(shell find "$(BACKEND_PY_DIR)/skills-src" -type f 2>/dev/null)
 BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py
 CAROLINE_SRC := $(shell find "$(CAROLINE_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' -o -path '*/wwwroot/*' \) 2>/dev/null)
 NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' \) 2>/dev/null)
@@ -74,27 +73,16 @@ help:
 	@echo "Targets: build, installer, clean, dist-linux, appimage-linux"
 	@echo "(deploy, deploy-models: available only when deploy.mk is present -- see its header comment)"
 
-# --- 1. Backend: npm install only when package.json/lockfile change --------
-$(BACKEND_DIR)/node_modules/.stamp: $(BACKEND_DIR)/package.json $(BACKEND_DIR)/package-lock.json
-	cd "$(BACKEND_DIR)" && npm install
-	touch "$@"
-
-# --- 2. Backend: recompile only when its own source or deps changed --------
-$(BACKEND_DIR)/dist/.stamp: $(BACKEND_DIR)/node_modules/.stamp $(BACKEND_SRC) $(BACKEND_DIR)/tsconfig.json
-	cd "$(BACKEND_DIR)" && npm run build
-	touch "$@"
-
-# --- 3. MCP server bundling -- rebundle only when the compiled backend changed --
-$(BACKEND_DIR)/mcp-servers/.stamp: $(BACKEND_DIR)/dist/.stamp
-	cd "$(BACKEND_DIR)" && node scripts/bundle-mcp-servers.mjs
-	touch "$@"
+# --- 1-3. (gone, 2026-10-24) The old Node/TypeScript backend (backend/: its
+# npm install, tsc build, node_modules and MCP server bundle) is no longer built
+# or shipped -- backend-py is the only backend, and every tool, desktop automation
+# included (app/plugins/_win32*.py, _x11_*.py, _linux_chain.py), lives in it. The
+# skills it used to carry are backend-py/skills-src now.
 
 # --- 4. WPF shell publish + backend sidecar copy (was build.bat) -----------
 #
 # Produces a self-contained, portable install folder under dist/ -- entirely
-# from this repo's own sources (backend/mcp-servers-src/ for the bundled MCP
-# servers, vendor/XcfaRenderer for Visual Mode), no reference to any other
-# repo at runtime.
+# from this repo's own sources, no reference to any other repo at runtime.
 #
 # Split into independent stamp targets (2026-10-12, per explicit instruction),
 # replacing one monolithic $(OUT)/Caroline.exe recipe that rebuilt EVERYTHING
@@ -146,7 +134,7 @@ $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	# subtrees/stamps the other targets below own (backend/, backend-py/,
 	# whatsapp-sidecar/, every *.stamp file) -- same "narrower cleanup, same
 	# effect, scoped" principle already applied to those, just missed here.
-	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend ! -name backend-py ! -name whatsapp-sidecar ! -name messenger-sidecar ! -name browsers ! -name "*.stamp" -exec rm -rf {} +
+	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend-py ! -name whatsapp-sidecar ! -name messenger-sidecar ! -name browsers ! -name "*.stamp" -exec rm -rf {} +
 	( rc=0; dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.caroline-exe.rc" ) & \
 	( echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"; \
 	  rc=0; dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.nativehost.rc" ) & \
@@ -178,43 +166,18 @@ $(OUT)/backend-py/camerlengo/.stamp: $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLEN
 	cp $^ "$(OUT)/backend-py/camerlengo/"
 	@touch "$@"
 
-# Split out of .backend-node.stamp (2026-10-12, confirmed live): node_modules
-# is 6415 files / ~285 MB -- `cp -r` through Git Bash on that many small files
-# is the single slowest step in the whole build (antivirus scans each file),
-# and the OLD combined stamp re-paid that cost on every npm/TS source change
-# via its mcp-servers/.stamp -> dist/.stamp -> BACKEND_SRC chain, even though
-# node_modules itself depends on nothing but package.json/package-lock.json
-# and almost never actually changes. Its own stamp, its own real dependency.
-$(OUT)/.backend-node-modules.stamp: $(BACKEND_DIR)/node_modules/.stamp
-	mkdir -p "$(OUT)/backend"
-	rm -rf "$(OUT)/backend/node_modules"
-	cp -r "$(BACKEND_DIR)/node_modules" "$(OUT)/backend/node_modules"
-	touch -m "$@"
-
-$(OUT)/.backend-node.stamp: $(BACKEND_DIR)/mcp-servers/.stamp
-	mkdir -p "$(OUT)/backend"
-	rm -rf "$(OUT)/backend/dist" "$(OUT)/backend/mcp-servers" "$(OUT)/backend/skills-src" "$(OUT)/backend/python-scripts"
-	cp -r "$(BACKEND_DIR)/dist" "$(OUT)/backend/dist" & \
-	cp -r "$(BACKEND_DIR)/mcp-servers" "$(OUT)/backend/mcp-servers" & \
-	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend/skills-src" & \
-	cp -r "$(BACKEND_DIR)/python-scripts" "$(OUT)/backend/python-scripts" & \
-	wait
-	cp "$(BACKEND_DIR)/package.json" "$(OUT)/backend/package.json"
-	touch -m "$@"
-
 # --- backend-py (the live backend -- see Native/SupervisorClient.cs) -------
-$(OUT)/.backend-py.stamp: $(BACKEND_PY_SRC)
+$(OUT)/.backend-py.stamp: $(BACKEND_PY_SRC) $(SKILLS_SRC)
 	@echo "--- backend-py (the live backend -- see Native/SupervisorClient.cs) ---"
+	rm -rf "$(OUT)/backend" "$(OUT)/backend-py/python-scripts"
 	rm -rf "$(OUT)/backend-py/app"
 	mkdir -p "$(OUT)/backend-py"
 	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT)/backend-py/app"
 	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT)/backend-py/run_server.py"
 	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT)/backend-py/supervisor.py"
 	find "$(OUT)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	mkdir -p "$(OUT)/backend-py/python-scripts"
-	cp "$(BACKEND_DIR)/python-scripts/local_tts_server.py" "$(OUT)/backend-py/python-scripts/local_tts_server.py"
 	rm -rf "$(OUT)/backend-py/skills-src"
-	cp -r "$(BACKEND_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
+	cp -r "$(BACKEND_PY_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
 	touch -m "$@"
 
 $(OUT)/.whatsapp-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js
@@ -247,7 +210,7 @@ $(OUT)/.browsers.stamp: $(PLAYWRIGHT_BROWSERS_JSON)
 	ls "$(OUT)"/browsers/chromium-*/chrome-win64/chrome.exe
 	touch -m "$@"
 
-$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/.browsers.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-node-modules.stamp $(OUT)/.backend-node.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
+$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/.browsers.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
 	@touch -m "$@"
 
@@ -264,7 +227,7 @@ build: $(OUT)/Caroline.exe
 # itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
 # back into Windows/Caroline/), matching caroline_shell.py's own
 # _default_wwwroot() packaged-install lookup.
-$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(SKILLS_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
 	@echo "=== Caroline Linux shell package ==="
 	rm -rf "$(OUT_LINUX)"
 	mkdir -p "$(OUT_LINUX)/linux-shell"
@@ -280,6 +243,7 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT_LINUX)/backend-py/run_server.py"
 	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT_LINUX)/backend-py/supervisor.py"
 	cp "$(BACKEND_PY_DIR)/requirements-linux.txt" "$(OUT_LINUX)/backend-py/requirements-linux.txt"
+	cp -r "$(BACKEND_PY_DIR)/skills-src" "$(OUT_LINUX)/backend-py/skills-src"
 	find "$(OUT_LINUX)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find "$(OUT_LINUX)/linux-shell" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@echo "--- camerlengo (small-model primary path, vendored once -- see the Windows build's own stamp rule for why) ---"

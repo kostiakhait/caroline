@@ -1,6 +1,6 @@
-"""windows-window-keyboard -- ports mcp-servers-src/window-keyboard/src/
-index.ts's posted-message (non-focus-stealing) window keyboard input
-(windowkeyboard.exe), unchanged native binary.
+"""windows-window-keyboard -- posted-message (non-focus-stealing) window
+keyboard input. Windows: in-process via app.plugins._win32 (2026-10-24; was
+windowkeyboard.exe).
 
 Linux port (2026-10-04): XSendEvent via app.plugins._x11_input's
 send_window_text/send_window_combo instead of a native exe -- same
@@ -15,9 +15,7 @@ from app.plugins.loader import Plugin, PluginTool
 from app.policies import prefer_window_targeted_input_instruction
 
 if sys.platform == "win32":
-    from app.plugins.native_exe import exe_path, resolve_vk, run_exe
-
-    EXE = exe_path("window-keyboard", "windowkeyboard.exe")
+    from app.plugins import _win32 as win
 else:
     from app.plugins import _x11_input as x11
     from app.plugins import _x11_window as x11win
@@ -31,10 +29,10 @@ async def type_window(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         window = await asyncio.to_thread(x11win.window_for, hwnd)
         await asyncio.to_thread(x11.send_window_text, window, text)
         return {"text": f"Typed {len(text)} character(s) into window {hwnd}."}
-    cli = ["--action", "text", "--hwnd", hwnd, "--text", text]
-    if args.get("delayMs") is not None:
-        cli += ["--delayms", str(args["delayMs"])]
-    await run_exe(EXE, cli)
+    import asyncio
+
+    delay_ms = args.get("delayMs")
+    await asyncio.to_thread(win.post_text, win.parse_hwnd(hwnd), text, 10 if delay_ms is None else int(delay_ms))
     return {"text": f"Typed {len(text)} character(s) into window {hwnd}."}
 
 
@@ -48,12 +46,11 @@ async def press_window_key(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         window = await asyncio.to_thread(x11win.window_for, hwnd)
         await asyncio.to_thread(x11.send_window_combo, window, key, modifiers)
         return {"text": f"Pressed {combo} in window {hwnd}."}
-    vk = resolve_vk(key)
-    mod_vks = [resolve_vk(m) for m in modifiers]
-    cli = ["--action", "key", "--hwnd", hwnd, "--vk", str(vk)]
-    if mod_vks:
-        cli += ["--modifiers", ",".join(map(str, mod_vks))]
-    await run_exe(EXE, cli)
+    import asyncio
+
+    vk = win.resolve_vk(key)
+    mod_vks = [win.resolve_vk(m) for m in modifiers]
+    await asyncio.to_thread(win.post_combo, win.parse_hwnd(hwnd), mod_vks, vk)
     return {"text": f"Pressed {combo} in window {hwnd}."}
 
 

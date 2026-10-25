@@ -1,6 +1,5 @@
-"""windows-window-mouse -- ports mcp-servers-src/window-mouse/src/index.ts's
-posted-message (non-focus-stealing) window click (windowmouse.exe),
-unchanged native binary.
+"""windows-window-mouse -- posted-message (non-focus-stealing) window click.
+Windows: in-process via app.plugins._win32 (2026-10-24; was windowmouse.exe).
 
 Linux port (2026-10-04): XSendEvent via app.plugins._x11_input's
 send_window_click instead of a native exe -- see that module's own
@@ -16,9 +15,7 @@ from app.plugins.loader import Plugin, PluginTool
 from app.policies import prefer_window_targeted_input_instruction
 
 if sys.platform == "win32":
-    from app.plugins.native_exe import exe_path, run_exe
-
-    EXE = exe_path("window-mouse", "windowmouse.exe")
+    from app.plugins import _win32 as win
 else:
     from app.plugins import _x11_input as x11
     from app.plugins import _x11_window as x11win
@@ -37,10 +34,9 @@ async def click_window(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             x11.send_window_click, window, x, y, rect["x"] + x, rect["y"] + y, args.get("button"),
         )
         return {"text": f"Clicked ({x}, {y}) in window {hwnd}."}
-    cli = ["--hwnd", hwnd, "--x", str(x), "--y", str(y)]
-    if args.get("button"):
-        cli += ["--button", args["button"]]
-    await run_exe(EXE, cli)
+    import asyncio
+
+    await asyncio.to_thread(win.post_click, win.parse_hwnd(hwnd), x, y, args.get("button") or "Left")
     return {"text": f"Clicked ({x}, {y}) in window {hwnd}."}
 
 

@@ -1,7 +1,6 @@
-"""windows-inspect -- ports mcp-servers-src/inspect/src/index.ts's Windows
-UI Automation window enumeration (inspect.exe), unchanged native binary.
-Returns raw JSON text from the exe (stdout is already a JSON array/object),
-matching the current TS wrapper's own jsonResult() passthrough.
+"""windows-inspect -- window enumeration (EnumWindows/EnumChildWindows).
+Windows: in-process via app.plugins._win32 (2026-10-24; was inspect.exe),
+same records and JSON.
 
 Linux port (2026-10-04): in-process recursive XQueryTree via
 app.plugins._x11_window instead of a native exe -- see that module's own
@@ -16,27 +15,22 @@ from typing import Any
 
 from app.plugins.loader import Plugin, PluginTool
 
+import asyncio
+
 if sys.platform == "win32":
-    from app.plugins.native_exe import exe_path, run_exe
-
-    EXE = exe_path("inspect", "inspect.exe")
+    from app.context_cap import truncate
+    from app.plugins import _win32 as win
 else:
-    import asyncio
-
     from app.plugins import _x11_window as x11win
 
 
-def _filter_args(args: dict[str, Any]) -> list[str]:
-    cli: list[str] = []
-    if args.get("titleFilter") is not None:
-        cli += ["--titleFilter", args["titleFilter"]]
-    if args.get("classNameFilter") is not None:
-        cli += ["--classNameFilter", args["classNameFilter"]]
-    if args.get("pid") is not None:
-        cli += ["--pid", str(args["pid"])]
-    if args.get("includeInvisible") is not None:
-        cli += ["--includeInvisible", str(args["includeInvisible"])]
-    return cli
+def _win_json(value: Any) -> str:
+    """The records as JSON, capped like every tool result (a busy desktop's
+    whole window tree has no natural size ceiling)."""
+    text, note = truncate(json.dumps(value))
+    if note is None:
+        return text
+    return text + "\n\n[... output truncated: too large to return in full; narrow what you're asking for (a specific window/control instead of the whole desktop) ...]"
 
 
 async def window_list(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -47,8 +41,11 @@ async def window_list(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             bool(args.get("includeInvisible")),
         )
         return {"text": json.dumps(records)}
-    out = await run_exe(EXE, ["--action", "list", *_filter_args(args)])
-    return {"text": out}
+    records = await asyncio.to_thread(
+        win.list_windows, args.get("titleFilter"), args.get("classNameFilter"), args.get("pid"),
+        bool(args.get("includeInvisible")),
+    )
+    return {"text": _win_json(records)}
 
 
 async def window_children(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -59,16 +56,19 @@ async def window_children(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
             bool(args.get("includeInvisible")),
         )
         return {"text": json.dumps(records)}
-    out = await run_exe(EXE, ["--action", "children", "--hwnd", args["hwnd"], *_filter_args(args)])
-    return {"text": out}
+    records = await asyncio.to_thread(
+        win.window_children, win.parse_hwnd(args["hwnd"]), args.get("titleFilter"), args.get("classNameFilter"),
+        args.get("pid"), bool(args.get("includeInvisible")),
+    )
+    return {"text": _win_json(records)}
 
 
 async def window_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if sys.platform != "win32":
         record = await asyncio.to_thread(x11win.window_info, args["hwnd"])
         return {"text": json.dumps(record)}
-    out = await run_exe(EXE, ["--action", "info", "--hwnd", args["hwnd"]])
-    return {"text": out}
+    record = await asyncio.to_thread(win.window_info, win.parse_hwnd(args["hwnd"]))
+    return {"text": _win_json(record)}
 
 
 _FILTER_SCHEMA = {

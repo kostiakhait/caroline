@@ -32,7 +32,7 @@ from app.stt_adaptation import apply_adaptation, observe_user_message
 from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcript
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
-from app.history import read_archived_entries, read_recent_history, read_recent_history_for_session
+from app.history import read_archived_entries, read_recent_history_for_session
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
@@ -1259,20 +1259,28 @@ async def handle_control_request(
         # window_registry entry is guaranteed to get cleaned up either way.
         unregister_window(f"viewer:{path}")
         req = take_viewer_request(request_id)
+        sync_error = None
         if req and req.get("remotePath") and outcome != "error":
             # A document opened via the OnlyOffice flow -- pull back whatever
             # got saved server-side and clean up the temp copy, before telling
-            # Caroline anything. Best-effort: a sync failure here shouldn't
-            # also swallow the close notification.
+            # Caroline anything. A sync failure doesn't swallow the close
+            # notification -- and is no longer reported as "saved" (issue #6).
             try:
-                await finish_office_edit_session(req["remotePath"], path, req.get("key"))
+                sync_error = await finish_office_edit_session(req["remotePath"], path, req.get("key"))
             except Exception as exc:
-                log_event("engine", "editor_result_sync_failed", path=path, error=str(exc))
+                sync_error = f"{type(exc).__name__}: {exc}"
+            if sync_error:
+                log_event("engine", "editor_result_sync_failed", path=path, remote_path=req["remotePath"], error=sync_error)
         outcome_text = {
             "saved": f"saved ({path})",
             "cancelled": f"cancelled -- no changes saved ({path})",
             "closed": f"closed (view-only, {path})",
         }.get(outcome, f"failed to open -- {parsed.get('message') or 'unknown error'} ({path})")
+        if sync_error:
+            outcome_text = (
+                f"NOT saved: the edited document could not be copied back to {path} ({sync_error}). The local file "
+                f"is unchanged; the edited copy is kept on the server at {req['remotePath']}. Tell the user"
+            )
         if session is not None:
             session.inject_proactive(
                 f"The viewer window you opened for {path} just closed: {outcome_text}. Nobody prompted you for "
@@ -1735,8 +1743,14 @@ async def handle_control_request(
             )
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "get_history":
-        entries = read_recent_history(WORKSPACE_DIR)
-        log_event("engine", "get_history", entries=len(entries))
+        # Issue #4 (2026-10-24): the requesting tab's own transcript -- this used to
+        # read the newest session file of the whole workspace, so a tab with an
+        # empty local cache got (and kept) whichever other tab had spoken last. A
+        # tab with no session of its own yet gets an empty history.
+        history_tab = (session.tab_id if session is not None else None) or parsed.get("tabId") or PRIMARY_TAB_ID
+        history_session_id = (session.last_saved_session_id if session is not None else None) or load_tab_session_id(WORKSPACE_DIR, history_tab)
+        entries = read_recent_history_for_session(WORKSPACE_DIR, history_session_id) if history_session_id else []
+        log_event("engine", "get_history", tab_id=history_tab, session_id=history_session_id, entries=len(entries))
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(entries), "requestId": request_id}
     if op == "expand_dehydrated_ref":
         import os as _os

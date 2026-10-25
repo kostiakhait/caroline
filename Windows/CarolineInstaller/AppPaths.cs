@@ -58,7 +58,6 @@ internal static class AppPaths
     // from before this scheme existed.
     public static string AppDir => Path.Combine(Root, InstallStateStore.Load().ActiveAppDir);
     public static string ClientExe => Path.Combine(AppDir, "Caroline.exe");
-    public static string BackendDir => Path.Combine(AppDir, "backend");
     public static string DownloadZipPath => Path.Combine(Root, "Caroline-download.zip");
 
     /// <summary>

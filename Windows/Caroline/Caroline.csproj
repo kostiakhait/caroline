@@ -56,37 +56,12 @@
     </None>
   </ItemGroup>
 
-  <!-- Dev-time convenience: BackendProcess.cs spawns node against
-       <output>/backend/dist/server.js, a copy independent of
-       ../../backend/dist (node_modules and mcp-servers live only in that
-       copy; see build.bat for the full release packaging). Without this
-       target, editing backend/src and running `npx tsc` there updates the
-       source tree's dist/ but not this copy, so the running app keeps
-       executing stale backend code with no error whatsoever; this is
-       exactly what happened once during development, where persona fields
-       silently came back empty because the running backend didn't have
-       the persona_get op yet. This only copies the small compiled .js
-       files, not node_modules/mcp-servers (those need build.bat's full
-       copy if they ever change). Kept even though BackendProcess.cs no
-       longer launches Node: the Node backend still ships in the packaged
-       output as a rollback (see BackendProcess.cs's own doc comment), and
-       this keeps that copy from silently going stale during the
-       transition period the same way it always did for active dev work. -->
-  <Target Name="SyncBackendDist" AfterTargets="Build">
-    <ItemGroup>
-      <BackendDistFiles Include="..\..\backend\dist\**\*.js" />
-    </ItemGroup>
-    <Copy SourceFiles="@(BackendDistFiles)"
-          DestinationFolder="$(OutDir)backend\dist\%(RecursiveDir)"
-          SkipUnchangedFiles="true" />
-  </Target>
-
-  <!-- Same dev-time convenience, now for the ACTUAL live backend
+  <!-- Dev-time convenience for the live backend
        (backend-py, see Native/SupervisorClient.cs). Without this, editing
        backend-py/app/*.py updates only the source tree, not this build
        output's own copy, so `dotnet build` + relaunch keeps running stale
-       Python code with no error: the exact same silent-staleness trap
-       SyncBackendDist exists to prevent for the Node copy above. -->
+       Python code with no error (the same silent-staleness trap the
+       removed Node backend's copy step once hit). -->
   <Target Name="SyncBackendPy" AfterTargets="Build">
     <ItemGroup>
       <BackendPyFiles Include="..\..\backend-py\app\**\*.py" Exclude="..\..\backend-py\app\**\__pycache__\**" />

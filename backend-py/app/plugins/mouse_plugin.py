@@ -1,13 +1,12 @@
-"""windows-mouse -- ports mcp-servers-src/mouse/src/index.ts's real
-SendInput/SetCursorPos mouse control (mouse.exe), unchanged native binary.
+"""windows-mouse -- real SetCursorPos/mouse_event mouse control. Windows:
+in-process via app.plugins._win32 (2026-10-24; was mouse.exe).
 
 Linux port (2026-10-04): no native exe on this platform at all -- in-process
 XTest calls via app.plugins._x11_input instead (see that module's own
 docstring for how it was verified against a real X server). Each X11 call
 is synchronous (python-xlib, no asyncio of its own), so it's run via
 asyncio.to_thread to avoid blocking the event loop during its XTest round
-trip -- same non-blocking contract run_exe's subprocess await already gave
-every caller on Windows."""
+trip -- the Windows branch (_win32) runs the same way."""
 
 from __future__ import annotations
 
@@ -19,9 +18,7 @@ from app.plugins.loader import Plugin, PluginTool
 from app.policies import prefer_window_targeted_input_instruction
 
 if sys.platform == "win32":
-    from app.plugins.native_exe import exe_path, parse_position, run_exe
-
-    EXE = exe_path("mouse", "mouse.exe")
+    from app.plugins import _win32 as win
 else:
     from app.plugins import _x11_input as x11
 
@@ -30,8 +27,7 @@ async def get_mouse_position(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if sys.platform != "win32":
         pos = await asyncio.to_thread(x11.get_mouse_position)
         return {"text": f"{pos['x']},{pos['y']}"}
-    out = await run_exe(EXE, ["--action", "Position"])
-    pos = parse_position(out)
+    pos = await asyncio.to_thread(win.get_mouse_position)
     return {"text": f"{pos['x']},{pos['y']}"}
 
 
@@ -40,8 +36,7 @@ async def move_mouse(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if sys.platform != "win32":
         await asyncio.to_thread(x11.move_mouse, x, y)
         return {"text": f"Moved to {x},{y}"}
-    out = await run_exe(EXE, ["--action", "Move", "--x", str(x), "--y", str(y)])
-    pos = parse_position(out)
+    pos = await asyncio.to_thread(win.move_mouse, x, y)
     return {"text": f"Moved to {pos['x']},{pos['y']}"}
 
 
@@ -58,11 +53,7 @@ async def click_mouse(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
                 await asyncio.to_thread(x11.click_mouse, pos["x"], pos["y"], button)
         pos = await asyncio.to_thread(x11.get_mouse_position)
         return {"text": f"Clicked {button} at {pos['x']},{pos['y']}"}
-    cli = ["--action", "Click", "--button", button, "--clicks", str(clicks)]
-    if x is not None and y is not None:
-        cli += ["--x", str(x), "--y", str(y)]
-    out = await run_exe(EXE, cli)
-    pos = parse_position(out)
+    pos = await asyncio.to_thread(win.click_mouse, button, clicks, x, y)
     return {"text": f"Clicked {button} at {pos['x']},{pos['y']}"}
 
 
@@ -77,11 +68,7 @@ async def mouse_button(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         pos = await asyncio.to_thread(x11.get_mouse_position)
         verb = "Pressed" if action == "down" else "Released"
         return {"text": f"{verb} {button} at {pos['x']},{pos['y']}"}
-    cli = ["--action", "Down" if action == "down" else "Up", "--button", button]
-    if x is not None and y is not None:
-        cli += ["--x", str(x), "--y", str(y)]
-    out = await run_exe(EXE, cli)
-    pos = parse_position(out)
+    pos = await asyncio.to_thread(win.mouse_button, "down" if action == "down" else "up", button, x, y)
     verb = "Pressed" if action == "down" else "Released"
     return {"text": f"{verb} {button} at {pos['x']},{pos['y']}"}
 
@@ -92,8 +79,7 @@ async def scroll_mouse(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         await asyncio.to_thread(x11.scroll_mouse, delta)
         pos = await asyncio.to_thread(x11.get_mouse_position)
         return {"text": f"Scrolled {delta} notch(es) at {pos['x']},{pos['y']}"}
-    out = await run_exe(EXE, ["--action", "Scroll", "--delta", str(delta)])
-    pos = parse_position(out)
+    pos = await asyncio.to_thread(win.scroll_mouse, delta)
     return {"text": f"Scrolled {delta} notch(es) at {pos['x']},{pos['y']}"}
 
 

@@ -18,9 +18,10 @@ as-is.
 Known fidelity gaps vs the Windows native interpreter (documented, not
 silently glossed over -- same posture every other Linux-branch module in
 this port takes):
-- wait_pixel/wait_idle capture via mss (screen-crop) for window mode too,
-  NOT an occlusion-safe PrintWindow-equivalent -- same gap
-  window_screenshot_plugin.py's own Linux branch already documents.
+- wait_pixel/wait_idle/checkpoint in window mode (hwnd) read the window's
+  own content through the X Composite extension (_x11_capture, 2026-10-24),
+  covered parts included, like PrintWindow; only without that extension
+  do they fall back to a screen crop of the window's area.
 - drag/move/click/mouse_down/mouse_up/key/type/scroll's window-scoped
   (hwnd) mode use the same XSendEvent posted-input mechanism as
   window_mouse_plugin.py/window_keyboard_plugin.py -- same toolkit-trust
@@ -39,6 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from app.plugins import _x11_capture as x11cap
 from app.plugins import _x11_input as x11
 from app.plugins import _x11_window as x11win
 
@@ -213,6 +215,18 @@ def _execute_wait_window(step: dict[str, Any]) -> None:
         time.sleep(0.1)
 
 
+def _window_image(hwnd: str, step: dict[str, Any]) -> Any | None:
+    """The window's own content (Pillow image, covered parts included), or None
+    when the X server has no Composite extension (callers then screen-crop).
+    The step's settlePollMs/settleMaxMs set the first-capture wait."""
+    try:
+        return x11cap.capture_window(hwnd, step.get("settlePollMs"), step.get("settleMaxMs"))
+    except x11cap.CompositeUnavailable:
+        return None
+    except RuntimeError as exc:
+        raise ChainStepError(str(exc)) from exc
+
+
 def _capture_region_rgb(x: int, y: int, width: int, height: int) -> bytes:
     import mss
 
@@ -232,6 +246,22 @@ def _execute_wait_pixel(step: dict[str, Any]) -> None:
     deadline = time.monotonic() + timeout_s
     last: tuple[int, int, int] = (0, 0, 0)
     base_x, base_y = 0, 0
+    if step.get("hwnd") is not None and x11cap.available():
+        hwnd = _resolve_hwnd(step["hwnd"])
+        x, y = int(step["x"]), int(step["y"])
+        while True:
+            image = _window_image(hwnd, step)
+            if image is not None and 0 <= x < image.width and 0 <= y < image.height:
+                last = image.getpixel((x, y))[:3]
+                if matches(last):
+                    return
+            if time.monotonic() >= deadline:
+                raise ChainStepError(
+                    f"wait_pixel timed out after {step['timeoutMs']}ms at window-relative ({x},{y}), "
+                    f"last saw #{last[0]:02X}{last[1]:02X}{last[2]:02X}, "
+                    f"wanted #{target[0]:02X}{target[1]:02X}{target[2]:02X} +/-{tolerance}"
+                )
+            time.sleep(0.1)
     if step.get("hwnd") is not None:
         hwnd = _resolve_hwnd(step["hwnd"])
         rect = x11win.get_window_rect(hwnd)
@@ -260,7 +290,15 @@ def _hash_rgb(data: bytes) -> str:
 
 
 def _execute_wait_idle(step: dict[str, Any]) -> None:
-    if step.get("hwnd") is not None:
+    if step.get("hwnd") is not None and x11cap.available():
+        hwnd = _resolve_hwnd(step["hwnd"])
+
+        def capture() -> bytes:
+            image = _window_image(hwnd, step)
+            if image is None:
+                raise ChainStepError("The Composite extension went away mid-step.")
+            return image.tobytes()
+    elif step.get("hwnd") is not None:
         hwnd = _resolve_hwnd(step["hwnd"])
 
         def capture() -> bytes:
@@ -334,6 +372,10 @@ def _execute_checkpoint(step: dict[str, Any], out_file: str | None) -> str | Non
 
     if step.get("hwnd") is not None:
         hwnd = _resolve_hwnd(step["hwnd"])
+        image = _window_image(hwnd, step)
+        if image is not None:
+            image.save(out_file, format="PNG")
+            return out_file
         rect = x11win.get_window_rect(hwnd)
         if rect["x"] is None:
             return None

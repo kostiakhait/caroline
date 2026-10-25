@@ -11,8 +11,9 @@ set.
 This file is the detailed, code-derived companion to `README.md` (portability/build basics). It
 describes what's actually implemented, not the roadmap — rewritten 2026-10-11 to describe the
 current Python backend (`backend-py/`), which replaced the original Node/TypeScript backend
-(`backend/`) as the live engine; the Node tree survives only as a source of bundled MCP-server
-binaries and skills content copied into every build, not as a running process.
+(`backend/`) as the live engine. That Node tree was removed on 2026-10-24: its skills moved to
+`backend-py/skills-src/`, and its MCP servers and native helper exes were replaced by Python
+plugins.
 
 ## Four layers
 
@@ -24,10 +25,10 @@ binaries and skills content copied into every build, not as a running process.
 - **`backend-py/`** — the live Python backend (FastAPI). `app/chat_session.py`'s `ChatSession` is
   the per-tab core; `app/plugins/` is the tool roster; `app/*_channel.py` own the always-running
   messenger connections. See "Chat session core" and "Plugins & tools" below.
-- **`backend/`** — the original Node/TypeScript sidecar, not run anymore as the live engine. Its
-  `mcp-servers`/`mcp-servers-src` (default MCP tool binaries) and `skills-src` are still built and
-  copied into every install by the root `Makefile`, which explicitly labels `backend-py` as "the
-  live backend" in its own build-step comments.
+- **`backend-py/skills-src/`** — the default skills, seeded into the workspace on every start
+  (`app/skills_seed.py`). Every tool, desktop automation included (`app/plugins/_win32*.py` on
+  Windows, `_x11_*.py`/`_linux_chain.py` on Linux), lives in `backend-py`; there is no Node backend,
+  MCP server bundle or native helper exe any more (removed 2026-10-24).
 - **The backing SquirrelWisdom/Camerlengo service** (a separate repository, `reforce`) — every
   SW-gated feature (Notes/memory, email, consult, voice, pay-as-you-go chat billing) and the
   cross-product **microagent layer** (memory/documents/contacts/search — see "Memory and
