@@ -328,7 +328,13 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # runs when the cap lifts, once, for all the firings missed meanwhile.
     # Counted as delivered so the schedule moves on to the next time.
     if pseudo_tab.is_waiting_on_retry(real_tab_id, reminder["id"]):
-        log_event("engine", "reminder_coalesced_into_waiting_turn", reminder_id=reminder.get("id"), due_at=reminder.get("dueAtIso"))
+        noted = pseudo_tab.note_missed_firing_on_waiting_session(
+            real_tab_id, reminder["id"],
+            f"⏰ This reminder came due again ({reminder.get('dueAtIso')}) while you were waiting out the usage cap: "
+            f"{reminder.get('note')}\n\nWhen you resume, do the check fresh as of now -- don't just finish the older "
+            "one -- and report the current state.",
+        )
+        log_event("engine", "reminder_coalesced_into_waiting_turn", reminder_id=reminder.get("id"), due_at=reminder.get("dueAtIso"), waiting_session_noted=noted)
         return True
     # activity_id = this reminder's own id (2026-10-19, per-activity pseudo-
     # sessions): a recurring reminder reuses its own id every firing, so

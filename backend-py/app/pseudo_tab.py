@@ -213,6 +213,24 @@ def is_waiting_on_retry(real_tab_id: str, activity_id: str) -> bool:
     return session is not None and not session.ended and _retry_pending(session)
 
 
+def note_missed_firing_on_waiting_session(real_tab_id: str, activity_id: str, text: str) -> bool:
+    """Bug fix (2026-10-25), confirmed live (tab 1's 2-hourly mail report
+    silently skipped 04:00 and 10:00 on 2026-10-25, both inside a usage-cap
+    window): is_waiting_on_retry's "that one run stands for every firing
+    missed in between" was only true in the narrow sense that ONE report
+    eventually comes out -- the waiting turn resumes its OWN, older task
+    from its own context and never learns a later firing was also due, so
+    nothing tells it to check fresh. Hand the waiting session a one-line
+    note about the missed firing, once per waiting stretch (the flag resets
+    when the session is disposed with its turn), so the resumed turn
+    reports on current state without stacking a copy per missed slot."""
+    session = _pseudo_sessions.get(pseudo_tab_id(real_tab_id, activity_id))
+    if session is None or session.ended or getattr(session, "_missed_firing_noted", False):
+        return False
+    session._missed_firing_noted = True
+    return bool(session.inject_proactive(text, suppress_narration=True))
+
+
 def _dispose_pseudo_session(pseudo_id: str) -> None:
     """A per-activity session's own one turn is over -- tear it down now
     rather than leaving it idle forever (today's `inject_proactive` on an
