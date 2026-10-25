@@ -513,6 +513,26 @@ class EngineLifecycleMixin:
                 # real user submit() or an actual assistant reply, or it can
                 # fire almost immediately with stale/pre-restart context.
                 self.last_visible_output_at = time.monotonic()
+                # Bug fix (2026-10-25), confirmed live (tab 2, real incident: a
+                # ~15min hang/escalation/restart cycle repeating forever, no
+                # narrator, no visible output, turn_pending never clearing):
+                # hang_interrupt_result_pending is set True by the soft
+                # interrupt (_check_hang) to swallow the CLI's own courtesy
+                # ResultMessage for the turn it just aborted -- but it's only
+                # ever cleared when that ResultMessage actually arrives and is
+                # consumed (see the ResultMessage handler below). Escalation's
+                # hard client.disconnect() (as opposed to the gentler
+                # interrupt()) does not reliably deliver that courtesy result,
+                # so the flag survived into this fresh session and silently
+                # discarded the NEW session's own first real result as fake,
+                # forever, every cycle -- the turn never actually completed,
+                # it just sat idle until the next absolute-ceiling timeout 900s
+                # later force-closed an already-dead connection and repeated
+                # the same trap. A fresh session has nothing left to wait for
+                # from the old one -- same "fresh attempt, fresh clock"
+                # reasoning as last_activity/last_visible_output_at just above.
+                self.hang_interrupt_result_pending = False
+                self.ignore_next_result_recovery = False
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
                 self.engine_kind = (

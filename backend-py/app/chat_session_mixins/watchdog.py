@@ -336,9 +336,18 @@ class WatchdogMixin:
             time.monotonic() - self.connecting_since
             if (self.connecting_since is not None and not self.has_seen_init) else 0.0
         )
+        # Bug fix (2026-10-25), per explicit instruction -- see
+        # EMPTY_TURN_CEILING_MS's own comment: a turn that has produced
+        # neither a tool call nor visible text since it started gets the
+        # shorter ceiling, not the full 900s one.
+        turn_is_empty = (
+            self.turn_pending and not tool_in_flight and not self.turn_saw_any_visible_text
+            and not self.turn_tool_outcomes and self.turn_pending_since is not None
+        )
         past_absolute_ceiling = (
             turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
             or connecting_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
+            or (turn_is_empty and turn_elapsed_s >= EMPTY_TURN_CEILING_MS / 1000)
         )
         log_event(
             "engine", "check_hang_tick", tab_id=self.tab_id, turn_pending=self.turn_pending,
@@ -347,7 +356,7 @@ class WatchdogMixin:
             effective_timeout_s=effective_timeout_s, signal_source=signal_source,
             tool_in_flight=tool_in_flight, tool_in_flight_name=self.last_tool_use_name if tool_in_flight else None,
             turn_elapsed_s=round(turn_elapsed_s, 1), connecting_elapsed_s=round(connecting_elapsed_s, 1),
-            past_absolute_ceiling=past_absolute_ceiling,
+            past_absolute_ceiling=past_absolute_ceiling, turn_is_empty=turn_is_empty,
             # Bug fix (2026-09-16): raw numbers behind the activity
             # boolean, not just the final verdict -- see ProcessActivity
             # Monitor's own comment for the incident this closes (no way
@@ -398,7 +407,7 @@ class WatchdogMixin:
         if past_absolute_ceiling and elapsed < effective_timeout_s:
             log_event(
                 "engine", "hang_absolute_ceiling_override", tab_id=self.tab_id,
-                turn_elapsed_s=round(turn_elapsed_s, 1), signal_source=signal_source,
+                turn_elapsed_s=round(turn_elapsed_s, 1), signal_source=signal_source, turn_is_empty=turn_is_empty,
             )
 
         self.hang_count += 1

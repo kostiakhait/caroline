@@ -203,6 +203,22 @@ HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS = 15 * 60_000
 # turn_pending_since (when the CURRENT turn actually started), completely
 # independent of whatever the activity monitor says.
 HANG_ABSOLUTE_CEILING_MS = 15 * 60_000
+# Bug fix (2026-10-25), per explicit instruction ("Пустой turn должен
+# немедленно прерываться"): HANG_ABSOLUTE_CEILING_MS above exists because
+# the process-activity signal can be fooled by periodic real work -- but
+# the same periodic-blip pattern also comes from pure Python-backend
+# housekeeping (logging, the watchdog tick itself) even when the turn has
+# produced NOTHING (confirmed live, tab 2: a turn sat with zero tool calls
+# and zero visible text for the entire 900s ceiling, every cycle, because
+# small IO blips kept resetting the activity clock just under
+# HANG_TIMEOUT_MS on every 5s tick). A turn that's actually doing real
+# work always has something to show for itself (at minimum a tool call)
+# well inside the ordinary 90s -- so a turn that has shown NEITHER a tool
+# call nor visible text since it started is judged against this shorter
+# ceiling instead of the full absolute one, on turn_elapsed_s (immune to
+# the activity-clock reset, same clock HANG_ABSOLUTE_CEILING_MS itself
+# uses) rather than the resettable `elapsed`.
+EMPTY_TURN_CEILING_MS = HANG_TIMEOUT_MS
 # Bug fix (2026-09-14/15), per explicit instruction ("надежный рубильник",
 # then "Кнопка стоп это абсолютный рубильник... Сразу по нажатии"):
 # confirmed live, twice, that a user-initiated Stop could leave a turn
@@ -1796,6 +1812,7 @@ __all__ = [
     'HANG_ESCALATION_GRACE_MS',
     'HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS',
     'HANG_ABSOLUTE_CEILING_MS',
+    'EMPTY_TURN_CEILING_MS',
     'STOP_ESCALATION_DISCONNECT_TIMEOUT_S',
     'MAX_RESTARTS_PER_WINDOW',
     'RESTART_WINDOW_MS',
