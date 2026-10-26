@@ -191,6 +191,13 @@ class SmallModelTurnMixin:
             log_event("engine", "small_model_turn_unexpected_error", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
             result = {"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
+        if not is_real_user and STARTUP_GREETING_NUDGE_TEMPLATE[:60] in text:
+            from app.small_model_engine import _UNAVAILABLE_ANSWER
+
+            if result.get("text") == _UNAVAILABLE_ANSWER:
+                # The startup greeting is the first thing the user sees: when no model could write it, a plain
+                # welcome is a better start than "I can't answer this right now".
+                result["text"] = "Hello! I'm Caroline. I'm still getting ready -- give me a moment."
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         await self._finish_small_model_turn_answered(
             question_text, result["text"], is_voice, translate=translate_answer, write_result=from_cascade,

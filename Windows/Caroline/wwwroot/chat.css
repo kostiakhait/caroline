@@ -445,6 +445,10 @@ a.attachment-chip {
 .composer textarea {
   flex: 1;
   resize: none;
+  /* rows="1" alone leaves the empty field shorter than its own text (and than the send button) until the first
+     keystroke resizes it; at start the placeholder was clipped. As tall as the button, placeholder on one line. */
+  min-height: 40px;
+  box-sizing: border-box;
   max-height: 120px;
   padding: 9px 12px;
   border-radius: 10px;
@@ -452,6 +456,12 @@ a.attachment-chip {
   font-family: inherit;
   font-size: 14px;
   outline: none;
+}
+
+.composer textarea::placeholder {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .composer textarea:focus {

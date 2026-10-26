@@ -3,8 +3,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Caroline"
         Icon="pack://application:,,,/Resources/app.ico"
-        Width="560" Height="740"
-        MinWidth="420" MinHeight="520"
+        Width="560" Height="420"
+        MinWidth="420" MinHeight="300"
         Topmost="True"
         Background="White"
         WindowStartupLocation="CenterScreen">

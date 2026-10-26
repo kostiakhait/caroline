@@ -673,39 +673,36 @@ class Shell:
     # --- the start-up wizard (backend app/wizard.py, page app/assets/wizard.html) -----------------------------
     WIZARD_DONE_TITLES = ("caroline-wizard-done", "caroline-wizard-dismissed")
 
-    def maybe_open_wizard(self) -> None:
-        """Opens the wizard when the backend says it is needed: no login yet (Caroline can't work without one), or a
-        wizard started earlier and not finished. Asked once, off the GTK thread."""
-        def check() -> None:
-            try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{BACKEND_PORT}/api/wizard/state", timeout=20) as r:
-                    needed = bool(json.loads(r.read().decode("utf-8")).get("needed"))
-            except Exception as exc:  # noqa: BLE001 -- no wizard rather than a broken start
-                log(f"wizard: state check failed: {exc}")
-                return
-            if needed:
-                GLib.idle_add(self.open_wizard)
+    WIZARD_HEIGHT_PREFIX = "caroline-wizard-height:"
 
-        threading.Thread(target=check, daemon=True).start()
-
-    def open_wizard(self) -> bool:
+    def open_wizard(self, on_closed=None) -> bool:
+        """The wizard window. on_closed runs once it is gone, however it was closed."""
         existing = getattr(self, "wizard_window", None)
         if existing is not None:
             existing.present()
             return False
         win = Gtk.Window(title="Caroline")
-        win.set_default_size(560, 720)
+        win.set_default_size(560, 420)                 # the page asks for the height its content needs (on_title)
         win.set_position(Gtk.WindowPosition.CENTER)
-        win.set_keep_above(True)                       # on top of the chat window and everything else
-        win.set_transient_for(self.window)
+        win.set_keep_above(True)                       # on top of everything else
         win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
         webview = WebKit2.WebView()
         webview.set_background_color(Gdk.RGBA(1, 1, 1, 1))
         wizard_origin = f"http://127.0.0.1:{BACKEND_PORT}/"
 
         def on_title(wv, _pspec) -> None:
-            if (wv.get_title() or "") in self.WIZARD_DONE_TITLES:
+            title = wv.get_title() or ""
+            if title in self.WIZARD_DONE_TITLES:
                 win.destroy()
+            elif title.startswith(self.WIZARD_HEIGHT_PREFIX):
+                try:
+                    wanted = int(title[len(self.WIZARD_HEIGHT_PREFIX):])
+                except ValueError:
+                    return
+                display = win.get_display()
+                monitor = display.get_primary_monitor() or display.get_monitor(0)
+                limit = int(monitor.get_workarea().height * 0.92)
+                win.resize(560, max(300, min(wanted, limit)))
 
         def on_policy(_wv, decision, decision_type) -> bool:
             # The page stays on its own origin; a link the page opens elsewhere (an OpenAI sign-in page) goes to the
@@ -723,7 +720,12 @@ class Shell:
 
         webview.connect("notify::title", on_title)
         webview.connect("decide-policy", on_policy)
-        win.connect("destroy", lambda _w: setattr(self, "wizard_window", None))
+        def on_destroy(_w) -> None:
+            self.wizard_window = None
+            if on_closed is not None:
+                on_closed()
+
+        win.connect("destroy", on_destroy)
         win.add(webview)
         self.wizard_window = win
         webview.load_uri(f"{wizard_origin}wizard")
@@ -731,8 +733,24 @@ class Shell:
         return False
 
     def reveal(self) -> None:
+        """The chat window comes after the wizard: when the backend says the wizard is needed (no login yet, or one
+        started earlier and not finished) it is shown first, and the chat window only once it is closed. A backend
+        that does not answer means no wizard -- never a broken start. Asked off the GTK thread."""
+        if getattr(self, "_reveal_started", False):
+            return
+        self._reveal_started = True
+
+        def check() -> None:
+            needed = self._wizard_needed()
+            if needed:
+                GLib.idle_add(lambda: self.open_wizard(on_closed=self._reveal_now) and False)
+            else:
+                GLib.idle_add(self._reveal_now)
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _reveal_now(self) -> bool:
         self.window.show_all()
-        self.maybe_open_wizard()
         if self.settings.window_left is not None and self.settings.window_top is not None:
             self.window.move(int(self.settings.window_left), int(self.settings.window_top))
             return
@@ -796,16 +814,50 @@ class Shell:
         if self.window.get_visible():
             self.window.hide()
         else:
-            self.window.present()
+            self._wizard_first(self.window.present)
 
     def show_and_activate(self) -> None:
         """Port of MainWindow's ShowAndActivate -- the tray's "Open
         Caroline" item and its default (left-)click both use this rather
         than toggle_visibility, matching Windows: always brings the window
         to front, never hides an already-visible one."""
-        self.window.show_all()
-        self.window.deiconify()
-        self.window.present()
+        def show_chat() -> None:
+            self.window.show_all()
+            self.window.deiconify()
+            self.window.present()
+
+        self._wizard_first(show_chat)
+
+    def _wizard_needed(self) -> bool:
+        """Whether the backend says the start-up wizard is needed (no login yet, or one started earlier and not
+        finished). Blocks on the network: call it off the GTK thread. A backend that does not answer means no wizard."""
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{BACKEND_PORT}/api/wizard/state", timeout=20) as r:
+                return bool(json.loads(r.read().decode("utf-8")).get("needed"))
+        except Exception as exc:  # noqa: BLE001
+            log(f"wizard: state check failed: {exc}")
+            return False
+
+    def _wizard_first(self, then) -> None:
+        """While the wizard is not finished it is what coming back from the tray (or the hotkey) shows -- not the
+        chat window. `then` shows the chat window when no wizard is needed."""
+        if getattr(self, "wizard_window", None) is not None:
+            self.wizard_window.present()
+            return
+
+        def check() -> None:
+            needed = self._wizard_needed()
+
+            def on_gtk_thread() -> bool:
+                if needed:
+                    self.open_wizard()
+                else:
+                    then()
+                return False
+
+            GLib.idle_add(on_gtk_thread)
+
+        threading.Thread(target=check, daemon=True).start()
 
     def _on_delete_event(self, _widget, _event) -> bool:
         """Port of MainWindow's OnClosing: closing via the window's own X

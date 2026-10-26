@@ -75,13 +75,13 @@ async def _vault_mailboxes() -> list[str]:
     return sorted(set(out))
 
 
-async def _claude_signed_in() -> bool:
+async def _claude_signed_in(wait_s: float = 8.0) -> bool:
     try:
         from app.subscription_mode import get_claude_auth_status
 
         # The status comes from the shared cache (a wedged CLI is killed after 45 s there); the wizard does not
         # wait that long -- shield keeps a timeout here from cancelling the refresh others are waiting on.
-        r = await asyncio.wait_for(asyncio.shield(get_claude_auth_status()), timeout=8.0)
+        r = await asyncio.wait_for(asyncio.shield(get_claude_auth_status()), timeout=wait_s)
         return bool(json.loads(r.get("stdout") or "{}").get("loggedIn"))
     except Exception:  # noqa: BLE001 -- unknown counts as not signed in
         return False
@@ -110,10 +110,12 @@ def _needs(data: dict[str, Any], vault_addresses: list[str]) -> dict[str, bool]:
     return missing
 
 
-async def get_state(workspace_dir: str) -> dict[str, Any]:
+async def get_state(workspace_dir: str, quick: bool = False) -> dict[str, Any]:
+    """quick: right after the login the answer must not wait for the Claude CLI's status (a first start can take a
+    minute); the page asks again a moment later and fills it in."""
     data = load(workspace_dir)
     logged_in = is_logged_in()
-    claude = await _claude_signed_in() if logged_in else False
+    claude = await _claude_signed_in(0.3 if quick else 8.0) if logged_in else False
     openai = _openai_signed_in(workspace_dir)
     vault = await _vault_mailboxes() if logged_in else []
     roles = data.get("emailRoles") or {}
@@ -123,7 +125,8 @@ async def get_state(workspace_dir: str) -> dict[str, Any]:
     steps = [
         {"id": "account", "status": "done" if logged_in else "todo"},
         {"id": "subscriptions", "status": "done" if subscriptions_done else "todo"},
-        {"id": "accounts", "status": "done" if not any(needs.values()) else "todo"},
+        {"id": "mailboxes", "status": "done" if not (needs["caroline_mail"] or needs["owner_mail"]) else "todo"},
+        {"id": "messengers", "status": "done" if not (needs["caroline_messengers"] or needs["owner_messengers"]) else "todo"},
     ]
     return {
         "loggedIn": logged_in,
@@ -150,7 +153,7 @@ async def login(workspace_dir: str, email: str, password: str, register: bool) -
     if not result.ok:
         return {"ok": False, "error": str(result.error or "failed")[:300]}
     sync = await settings_mirror.sync_now(workspace_dir)
-    return {"ok": True, "restored": sync.get("restored", []), "state": await get_state(workspace_dir)}
+    return {"ok": True, "restored": sync.get("restored", []), "state": await get_state(workspace_dir, quick=True)}
 
 
 async def start_claude_login(workspace_dir: str) -> dict[str, Any]:

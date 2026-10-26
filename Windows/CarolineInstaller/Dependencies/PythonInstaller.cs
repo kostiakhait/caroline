@@ -110,6 +110,10 @@ internal static class PythonInstaller
          // app/slack_channel.py's Socket Mode connection (slack_sdk.socket_mode) --
          // first of the messenger integrations plan's channels. slack_sdk alone
          // covers Socket Mode without the heavier slack-bolt framework.
+         // The SW engine (backend-py/camerlengo-vendor-stubs/AI.py) imports it; without it the engine fails to load and
+         // Caroline answers "I can't answer this right now" to everything, including her first greeting (2026-10-25).
+         // Same pin as requirements-linux.txt.
+         "openai==3.24.0",
          "slack_sdk",
          // app/telegram_channel.py's Telethon (MTProto Client API) connection --
          // second messenger. Confirmed live: telethon's own dependency (pyaes)

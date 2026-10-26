@@ -19,7 +19,7 @@ def env(monkeypatch):
     async def vault():
         return list(state["vault"])
 
-    async def claude():
+    async def claude(wait_s=8.0):
         return state["claude"]
 
     monkeypatch.setattr(wizard, "_vault_mailboxes", vault)
@@ -40,7 +40,8 @@ def test_without_a_login_only_the_account_step_is_open_and_the_wizard_is_needed(
 
 def test_a_fresh_login_asks_for_everything_still_missing(tmp_path, env):
     s = run(wizard.get_state(str(tmp_path)))
-    assert [x["status"] for x in s["steps"]] == ["done", "todo", "todo"]
+    assert [x["id"] for x in s["steps"]] == ["account", "subscriptions", "mailboxes", "messengers"]
+    assert [x["status"] for x in s["steps"]] == ["done", "todo", "todo", "todo"]
     assert s["needs"] == {"caroline_mail": True, "owner_mail": True, "caroline_messengers": True, "owner_messengers": True}
     assert s["needed"] is True
 
@@ -65,7 +66,7 @@ def test_everything_answered_means_all_steps_done_and_completed_ends_the_wizard(
     for need in wizard.NEEDS:
         assert wizard.answer(ws, "decline", need)["ok"]
     s = run(wizard.get_state(ws))
-    assert [x["status"] for x in s["steps"]] == ["done", "done", "done"] and s["needed"] is True   # not finished until the user says so
+    assert [x["status"] for x in s["steps"]] == ["done", "done", "done", "done"] and s["needed"] is True   # not finished until the user says so
     wizard.answer(ws, "completed", True)
     assert run(wizard.get_state(ws))["needed"] is False
 
@@ -75,6 +76,27 @@ def test_finish_later_stops_the_nagging_but_not_before_a_login(tmp_path, env):
     assert run(wizard.get_state(str(tmp_path)))["needed"] is False
     env["logged_in"] = False
     assert run(wizard.get_state(str(tmp_path)))["needed"] is True
+
+
+def test_mailboxes_and_messengers_are_separate_steps(tmp_path, env):
+    ws = str(tmp_path)
+    wizard.answer(ws, "decline", "caroline_mail")
+    wizard.answer(ws, "decline", "owner_mail")
+    status = {x["id"]: x["status"] for x in run(wizard.get_state(ws))["steps"]}
+    assert status["mailboxes"] == "done" and status["messengers"] == "todo"
+
+
+def test_the_login_answer_does_not_wait_for_the_claude_status(tmp_path, env, monkeypatch):
+    seen = []
+
+    async def claude(wait_s=8.0):
+        seen.append(wait_s)
+        return False
+
+    monkeypatch.setattr(wizard, "_claude_signed_in", claude)
+    run(wizard.get_state(str(tmp_path), quick=True))
+    run(wizard.get_state(str(tmp_path)))
+    assert seen == [0.3, 8.0]
 
 
 def test_messenger_handles_are_kept_per_role(tmp_path, env):

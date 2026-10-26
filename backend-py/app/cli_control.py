@@ -50,24 +50,24 @@ async def _run(args: list[str], cwd: str, timeout_s: float | None = None) -> dic
     supposed to answer quickly (auth status) passes one, so a wedged CLI
     can't leave its caller -- and everything queued behind it -- waiting
     forever: the process is killed and asyncio.TimeoutError raised."""
-    proc = await asyncio.create_subprocess_exec(
-        resolve_claude_exe(), *args, cwd=cwd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        creationflags=_NO_WINDOW,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
+    # Run in a worker thread, not with asyncio.create_subprocess_exec: on Windows that call makes CreateProcess on the
+    # event loop's own thread, and the first launch of the 210 MB bundled claude.exe was seen (2026-10-25, a fresh
+    # install) to take 73 seconds in it -- the whole backend, its port included, stood still that long. A thread
+    # blocks only this call; subprocess.run kills the child itself when the timeout runs out.
+    def run_blocking() -> dict[str, object]:
         try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        raise
-    return {
-        "code": proc.returncode if proc.returncode is not None else -1,
-        "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace"),
-    }
+            done = subprocess.run(
+                [resolve_claude_exe(), *args], cwd=cwd, capture_output=True, timeout=timeout_s, creationflags=_NO_WINDOW,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise asyncio.TimeoutError() from exc
+        return {
+            "code": done.returncode,
+            "stdout": done.stdout.decode("utf-8", errors="replace"),
+            "stderr": done.stderr.decode("utf-8", errors="replace"),
+        }
+
+    return await asyncio.to_thread(run_blocking)
 
 
 async def auth_status(cwd: str, timeout_s: float | None = None) -> dict[str, object]:

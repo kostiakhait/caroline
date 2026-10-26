@@ -1337,8 +1337,11 @@ public partial class MainWindow : Window
         viewer.Show();
     }
 
-    private void ShowAndActivate()
+    // While the start-up wizard is not finished it is what the tray and the hotkey bring back, not the chat window
+    // (App.TryShowWizardAsync). async void: both callers are fire-and-forget UI events.
+    private async void ShowAndActivate()
     {
+        if (await ((App)System.Windows.Application.Current).TryShowWizardAsync()) return;
         Show();
         if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         Activate();

@@ -22,6 +22,7 @@ public partial class WizardWindow : Window
 {
     private const string DoneTitle = "caroline-wizard-done";
     private const string DismissedTitle = "caroline-wizard-dismissed";
+    private const string HeightPrefix = "caroline-wizard-height:";
 
     private readonly string _origin;
 
@@ -47,7 +48,18 @@ public partial class WizardWindow : Window
             var core = browser.CoreWebView2;
             core.DocumentTitleChanged += (_, _) =>
             {
-                if (core.DocumentTitle == DoneTitle || core.DocumentTitle == DismissedTitle) Close();
+                var title = core.DocumentTitle ?? "";
+                if (title == DoneTitle || title == DismissedTitle)
+                {
+                    Close();
+                    return;
+                }
+                // The page asks for the height its content needs (the login screen is short, the mailbox list is long).
+                if (title.StartsWith(HeightPrefix, StringComparison.Ordinal)
+                    && int.TryParse(title.AsSpan(HeightPrefix.Length), out var contentHeight))
+                {
+                    FitHeight(contentHeight);
+                }
             };
             core.NewWindowRequested += (_, e) =>
             {
@@ -69,6 +81,18 @@ public partial class WizardWindow : Window
             Logger.Log($"WizardWindow: could not open the wizard page: {ex.Message}");
             Close();
         }
+    }
+
+    /// <summary>Sizes the window to the page's content: the frame and title bar (what the window has beyond the web
+    /// view) plus the content, kept between MinHeight and 92% of the work area, and centred on it again.</summary>
+    private void FitHeight(int contentHeight)
+    {
+        var chrome = Math.Max(0, ActualHeight - Host.ActualHeight);
+        var workArea = SystemParameters.WorkArea;
+        var wanted = Math.Max(MinHeight, Math.Min(contentHeight + chrome, workArea.Height * 0.92));
+        if (Math.Abs(wanted - Height) < 2) return;
+        Height = wanted;
+        Top = workArea.Top + (workArea.Height - wanted) / 2;
     }
 
     private static void OpenExternal(string uri)

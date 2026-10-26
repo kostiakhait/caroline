@@ -141,10 +141,12 @@ public partial class App : System.Windows.Application
         await WaitForSplashDismissAsync(dismissedEarly.Task);
         Logger.Log($"[DIAG] after WaitForSplashDismissAsync, elapsed={diagSw.Elapsed.TotalSeconds:F1}s, dismissedEarly={dismissedEarly.Task.IsCompleted}, IsVisible={_mainWindow.IsVisible}, Opacity={_mainWindow.Opacity}");
         if (splash.IsLoaded) splash.Close();
+        // The start-up wizard comes first: the chat window is not shown until the wizard is done (or put off with
+        // "Finish later"). Nothing to wait for when the backend says no wizard is needed.
+        await RunWizardIfNeededAsync();
         _mainWindow.Show();
         Logger.Log($"[DIAG] main window Show() done, IsVisible={_mainWindow.IsVisible}");
         _ = _mainWindow.StartTabsAsync();
-        _ = OpenWizardIfNeededAsync();
 
         _mainWindow.Activate();
         // Activate() alone can silently no-op here: Windows' foreground-lock
@@ -224,32 +226,51 @@ public partial class App : System.Windows.Application
     }
 
     private WizardWindow? _wizardWindow;
+    private TaskCompletionSource _wizardClosed = new();
 
     /// <summary>
-    /// Opens the start-up wizard (WizardWindow) when the backend says it is needed: nothing is signed in yet (Caroline
-    /// cannot work without it), or a wizard started earlier was not finished. A backend that does not answer simply means
-    /// no wizard this time -- never a broken start.
+    /// The start-up wizard (WizardWindow) comes before the chat window, every time the chat window would be shown while
+    /// the wizard is not finished: at start, from the tray, from the hotkey. Returns true when the wizard is on screen
+    /// (opened now, or brought to the front) -- the caller then must NOT show the chat window; false when no wizard is
+    /// needed. A backend that does not answer means no wizard this time -- never a broken start.
     /// </summary>
-    private async Task OpenWizardIfNeededAsync()
+    public async Task<bool> TryShowWizardAsync()
     {
+        if (_wizardWindow != null)
+        {
+            _wizardWindow.Activate();
+            return true;
+        }
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
             var json = await http.GetStringAsync($"http://127.0.0.1:{BackendProcess.Port}/api/wizard/state");
             using var doc = JsonDocument.Parse(json);
-            if (!doc.RootElement.TryGetProperty("needed", out var needed) || needed.ValueKind != JsonValueKind.True) return;
+            if (!doc.RootElement.TryGetProperty("needed", out var needed) || needed.ValueKind != JsonValueKind.True) return false;
         }
         catch (Exception ex)
         {
             Logger.Log($"wizard: state check failed: {ex.Message}");
-            return;
+            return false;
         }
 
-        if (_wizardWindow != null) return;
+        if (_wizardWindow != null) return true;   // opened by another caller while the state was being read
+        _wizardClosed = new TaskCompletionSource();
         _wizardWindow = new WizardWindow(BackendProcess.Port);
-        _wizardWindow.Closed += (_, _) => _wizardWindow = null;
+        _wizardWindow.Closed += (_, _) =>
+        {
+            _wizardWindow = null;
+            _wizardClosed.TrySetResult();
+        };
         _wizardWindow.Show();
         _wizardWindow.Activate();
+        return true;
+    }
+
+    /// <summary>At start: shows the wizard when it is needed and returns once its window is closed.</summary>
+    private async Task RunWizardIfNeededAsync()
+    {
+        if (await TryShowWizardAsync()) await _wizardClosed.Task;
     }
 
     /// <summary>
