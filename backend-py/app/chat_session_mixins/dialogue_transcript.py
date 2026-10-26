@@ -273,6 +273,10 @@ class DialogueTranscriptMixin:
                 await self._check_delivery_completeness(text)
             if is_silent:
                 log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
+                if not self.headless:
+                    from app import dialogue_log
+
+                    dialogue_log.append(self.workspace_dir, self.tab_id, dialogue_log.ASSISTANT, original_text, dialogue_log.WITHHELD)
                 dropped.append(block)
             elif block["text"] != original_text:
                 transcript_patches.append((original_text, block["text"]))

@@ -289,6 +289,11 @@ class TurnSubmissionMixin:
 
         is_voice = is_voice or continuous_dialogue_enabled(self.workspace_dir)
         self._held_user_messages.append((text, list(attachments or []), is_voice))
+        if not self.headless:
+            from app import dialogue_log
+
+            dialogue_log.append(self.workspace_dir, self.tab_id, dialogue_log.USER,
+                                text + (f"\n[{len(attachments)} attachment(s)]" if attachments else ""), voice=is_voice)
         if self._held_user_flush is not None:
             self._held_user_flush.cancel()
         self._held_user_flush = asyncio.get_running_loop().call_later(USER_MESSAGE_MERGE_WINDOW_S, self._flush_held_user_messages)

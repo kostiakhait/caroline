@@ -21,11 +21,26 @@ class DeliveryReportMixin:
             try:
                 if self._dr is not None:
                     self._dr.note_sent(envelope)
+                self._dialogue_log_sent(envelope)
             except Exception:  # noqa: BLE001
                 pass
             return result
 
         return recording_send
+
+    def _dialogue_log_sent(self, envelope: Any) -> None:
+        """What reached the window goes to the exact dialogue record (app/dialogue_log.py)."""
+        if getattr(self, "headless", False):
+            return
+        text = delivery_report.delivered_text(envelope)
+        if not text:
+            return
+        from app import dialogue_log
+
+        kind = dialogue_log.REPORT if envelope.get("isDeliveryReport") else dialogue_log.SHOWN
+        if text.startswith("[progress note] "):
+            text, kind = text[len("[progress note] "):], dialogue_log.NOTE
+        dialogue_log.append(self.workspace_dir, self.tab_id, dialogue_log.ASSISTANT, text, kind)
 
     def _dr_reset(self) -> None:
         self._dr = None
@@ -68,6 +83,6 @@ class DeliveryReportMixin:
                 return
             log_event("engine", "delivery_report_sent", tab_id=self.tab_id, delivered=len(record.delivered), report=report[:300])
             wire = {"type": "assistant", "message": {"content": [{"type": "text", "text": report}]}}
-            await self.send({"type": "sdk_message", "message": wire, "isVoice": False})
+            await self.send({"type": "sdk_message", "message": wire, "isVoice": False, "isDeliveryReport": True})
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "delivery_report_failed", tab_id=self.tab_id, error=str(exc)[:200])
