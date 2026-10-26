@@ -76,6 +76,24 @@ class DeliveryReportMixin:
             return  # an error is handled by the retry machinery; with no work done there is nothing to report on
         asyncio.create_task(self._dr_check(record))
 
+    REPEAT_WINDOW_S = 180
+
+    def _recent_repeat_of(self, text: str) -> bool:
+        """True when `text` only repeats something the user was shown in the last REPEAT_WINDOW_S seconds (the same burst of
+        messages -- not a routine report that looks like the previous one an hour ago)."""
+        if getattr(self, "headless", False):
+            return False
+        try:
+            from app import dialogue_log
+
+            cutoff = (time.time() - self.REPEAT_WINDOW_S) * 1000
+            recent = [e["text"] for e in dialogue_log.read_entries(self.workspace_dir, self.tab_id)
+                      if e.get("role") == dialogue_log.ASSISTANT and e.get("kind") in (dialogue_log.SHOWN, dialogue_log.REPORT)
+                      and e.get("ms", 0) >= cutoff]
+            return bool(recent) and delivery_report.is_duplicate(text, recent[-6:])
+        except Exception:  # noqa: BLE001
+            return False
+
     def _dr_earlier_messages(self, record: delivery_report.TurnRecord) -> list[str]:
         """What the user has already been shown: this turn's messages and the recent ones from the exact dialogue record
         (reports included) -- a report must not say again what is there."""

@@ -219,11 +219,22 @@ def _notify_operation_completed(plugin_name: str, op: Operation) -> None:
         outcome = f"failed with an error: {op.error}"
     else:
         return
+    known = ""
+    try:
+        from app.background_context import context_block
+        from app.pseudo_tab import is_pseudo_tab_id, real_tab_id_from_pseudo
+        from app.session_context import get_sessions_getter
+
+        owner = real_tab_id_from_pseudo(op.tab_id) if op.tab_id and is_pseudo_tab_id(op.tab_id) else op.tab_id
+        known = context_block(WORKSPACE_DIR, owner, get_sessions_getter()) if owner else ""
+    except Exception:  # noqa: BLE001
+        pass
     inject(
         f"[Internal: a background operation you started earlier (tool: {op.tool_name}, "
         f"operation_id: {op.id}) just {outcome} You never checked back on this one directly -- "
-        "react to it now if it's relevant (e.g. tell the user what happened), rather than "
-        "leaving it unmentioned.]"
+        "react to it now ONLY if the user has not been told what it shows yet (see the record below, if there is one) and "
+        "it matters to them; if they have been told, or it changes nothing for them, reply exactly [[NO_UPDATE]]."
+        + (f"\n\n{known}" if known else "") + "]"
     )
     log_event(f"plugin:{plugin_name}", "operation_completion_notified", tool=op.tool_name, operation_id=op.id, status=op.status, error=op.error)
 

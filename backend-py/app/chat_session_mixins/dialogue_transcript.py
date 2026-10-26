@@ -222,6 +222,11 @@ class DialogueTranscriptMixin:
                 text = reviewed
                 block["text"] = text
             is_silent = _NO_UPDATE_SENTINEL in text or _is_silent_reply_paraphrase(text)
+            # A reply to an internal message (a finished background task, a check) that only repeats what the user was told
+            # a moment ago is not shown (2026-10-26: one finished job was reported three times in 40 seconds).
+            if not is_silent and not self.pending_is_real_user and self._recent_repeat_of(text):
+                log_event("engine", "repeat_reply_suppressed", tab_id=self.tab_id, text=text[:300])
+                is_silent = True
             # Per explicit instruction (2026-10-13): current_language_name(tab_id)
             # is only ever written by refresh_language_in_background, called only
             # from a REAL user's own submit() -- a headless session (see
@@ -485,6 +490,9 @@ class DialogueTranscriptMixin:
         suppressed message costs nothing further."""
         from app.plugins.voice_api import check_background_relay_worth, translate_text
 
+        if self._recent_repeat_of(text):
+            log_event("engine", "relayed_reply_suppressed_as_repeat", tab_id=self.tab_id, text=text[:300])
+            return
         verdict = await check_background_relay_worth(text, task=task)
         if verdict is not None and not verdict["worth_relaying"]:
             log_event(

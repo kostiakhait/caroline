@@ -35,6 +35,7 @@ class WatchdogMixin:
                     self._check_compaction_stuck()
                     self._check_deferred_engine_switch()
                     self._check_funds_exhaustion_status()
+                    self._publish_status_if_changed()      # a status that changed by itself (an in-flight message went stale)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 -- must log, never let this tick die silently
@@ -114,6 +115,12 @@ class WatchdogMixin:
                         "is needed, reply exactly [[NO_UPDATE]].]"
                     )
                     sessions_getter = get_sessions_getter()
+                    from app.background_context import context_block
+
+                    # The pseudo-session this goes to has none of the user's conversation: hand it over (2026-10-26).
+                    known = context_block(self.workspace_dir, real_tab_id, sessions_getter)
+                    if known:
+                        notification_text = notification_text[:-1] + "\n\n" + known + "]"
                     if sessions_getter is not None:
                         pseudo = await pseudo_tab.get_or_create_pseudo_session(real_tab_id, message.task_id, sessions_getter)
                         pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, description)

@@ -92,11 +92,61 @@ class StatusConnMixin:
         if self.forced_compaction_result_pending:
             queued_note = f" ({len(self.compaction_queued_turns)} message(s) queued)" if self.compaction_queued_turns else ""
             return "recovering", f"Compacting conversation, one moment…{queued_note}"
-        if self.turn_pending:
+        if self.turn_pending or self._inflight_active():
             return "working", ""
         return "ready", ""
+    # Messages handed to the CLI whose result has not come back (2026-10-26): turn_pending is cleared by the FIRST result, so a
+    # tab that still had queued internal messages (a finished background task, a check) was "ready" -- no Stop button, a tool
+    # label left in the status bar -- while the model went on working. The status is "working" while any is in flight, unless
+    # nothing has been heard from the CLI for INFLIGHT_STALE_S (a result that never comes must not leave it "working").
+    _inflight_messages: int = 0
+    _inflight_since: float = 0.0
+    _last_public_state: str | None = None
+    INFLIGHT_STALE_S = 45.0
+    INFLIGHT_SETTLE_S = 8.0
+
+    def _inflight_active(self) -> bool:
+        if self._inflight_messages <= 0:
+            return False
+        return time.monotonic() - max(self._inflight_since, getattr(self, "last_activity", 0.0) or 0.0) < self.INFLIGHT_STALE_S
+
+    def _inflight_begin(self) -> None:
+        self._inflight_messages += 1
+        self._inflight_since = time.monotonic()
+        self._publish_status_if_changed()
+
+    def _inflight_end(self) -> None:
+        self._inflight_messages = max(0, self._inflight_messages - 1)
+        self._publish_status_if_changed()
+        if self._inflight_messages > 0:
+            # The CLI starts the next message it holds within moments of a result. Merged messages leave no result of their
+            # own, so if nothing at all is heard for INFLIGHT_SETTLE_S, nothing is in flight any more.
+            marker = time.monotonic()
+            try:
+                asyncio.get_running_loop().call_later(self.INFLIGHT_SETTLE_S, self._inflight_settle, marker)
+            except RuntimeError:
+                pass
+
+    def _inflight_settle(self, marker: float) -> None:
+        if self._inflight_messages > 0 and (getattr(self, "last_activity", 0.0) or 0.0) - marker < 0.5:
+            self._inflight_messages = 0
+            self._publish_status_if_changed()
+
+    def _inflight_reset(self) -> None:
+        self._inflight_messages = 0
+
+    def _publish_status_if_changed(self) -> None:
+        try:
+            state, _reason = self._compute_public_status()
+            if state != self._last_public_state:
+                self._last_public_state = state          # at once: two calls in a row must not send the same state twice
+                asyncio.get_running_loop().create_task(self._publish_status())
+        except RuntimeError:
+            pass          # no running loop (a plain script or test): nothing to publish to
+
     async def _publish_status(self) -> None:
         state, reason = self._compute_public_status()
+        self._last_public_state = state
         # Per standing instruction ("логи повсеместно"): every status the
         # client is told about is logged here, in ONE place, regardless of
         # which of the several call sites (turn_pending's own setter,

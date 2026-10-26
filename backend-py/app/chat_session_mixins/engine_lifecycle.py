@@ -426,6 +426,7 @@ class EngineLifecycleMixin:
             self._glue_context_recovery(item)
             self._dr_begin(item)
             await self._ladder_before_yield(item)
+            self._inflight_begin()
             yield item["message"]
     async def _glue_memory_advice(self, item: dict[str, Any]) -> None:
         """The memory advisor (app/memory_advisor.py) for a real user message of the Claude/Codex engines: the
@@ -558,6 +559,7 @@ class EngineLifecycleMixin:
                 self.ignore_next_result_recovery = False
                 self._ladder_reset()
                 self._dr_reset()
+                self._inflight_reset()
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
                 self.engine_kind = (
@@ -1120,6 +1122,7 @@ class EngineLifecycleMixin:
                         # here would risk clobbering pending_user_text/
                         # pending_attachments for something ELSE that got
                         # queued in the meantime.
+                        self._inflight_end()
                         if await self._ladder_on_result(message):
                             continue  # the attempt was rejected: the next model has the turn, nothing of this one is shown
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending or self.clear_tab_result_pending

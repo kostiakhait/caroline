@@ -140,6 +140,7 @@ class StopControlMixin:
         engine. Otherwise the tab is simply idle."""
         self._ladder_reset()
         self._dr_reset()
+        self._inflight_reset()
         if self.queue:
             log_event("engine", "after_stop_keeping_new_user_input", tab_id=self.tab_id, count=len(self.queue))
             return
