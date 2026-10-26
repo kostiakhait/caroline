@@ -55,6 +55,9 @@ API_URL = "https://www.squirrelwisdom.com/"
 # Microagent.py instead of AI.py.
 _SHIPPED_CAMERLENGO_DIR = Path(__file__).resolve().parent.parent / "camerlengo"
 _DEV_TREE_CAMERLENGO_DIR = Path(__file__).resolve().parents[3] / "reforce"
+# In the reforce checkout itself Microagent.py lives here, not at its root next to AI.py (only the build vendors the two
+# side by side): without it a dev tree had no local runtime at all.
+_DEV_TREE_MICROAGENTS_DIR = _DEV_TREE_CAMERLENGO_DIR / "apps" / "microagents"
 
 
 def _resolve_camerlengo_dir() -> Path | None:
@@ -63,8 +66,9 @@ def _resolve_camerlengo_dir() -> Path | None:
         return Path(override)
     if (_SHIPPED_CAMERLENGO_DIR / "Microagent.py").is_file():
         return _SHIPPED_CAMERLENGO_DIR
-    if (_DEV_TREE_CAMERLENGO_DIR / "Microagent.py").is_file():
-        return _DEV_TREE_CAMERLENGO_DIR
+    for candidate in (_DEV_TREE_CAMERLENGO_DIR, _DEV_TREE_MICROAGENTS_DIR):
+        if (candidate / "Microagent.py").is_file():
+            return candidate
     return None
 
 
