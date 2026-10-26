@@ -265,7 +265,7 @@ class TurnSubmissionMixin:
         # a real one structurally, without guessing from its wording -- see
         # _SYNTHETIC_TURN_MARKER's own docstring.
         wire_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
-        self._push_message(wire_text, attachments, is_voice)
+        self._push_message(wire_text, attachments, is_voice, memory_advice_for=text if is_real_user else None)
     def submit_or_try_small_model(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, is_real_user: bool = True) -> None:
         """The entry point for what the USER sends (the chat window, the
         REST /api/message, the phone). In "sw" mode submit() itself routes

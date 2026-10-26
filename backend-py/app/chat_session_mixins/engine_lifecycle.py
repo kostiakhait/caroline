@@ -421,7 +421,23 @@ class EngineLifecycleMixin:
                 continue
             item = self.queue.pop(0)
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
+            if item.get("memory_advice_for"):
+                await self._glue_memory_advice(item)
             yield item["message"]
+    async def _glue_memory_advice(self, item: dict[str, Any]) -> None:
+        """The memory advisor (app/memory_advisor.py) for a real user message of the Claude/Codex engines: the
+        block goes in as one more text block of the message. Never raises -- the message goes on unchanged."""
+        try:
+            from app.memory_advisor import memory_block
+
+            dialogue = await asyncio.to_thread(
+                _read_recent_dialogue_lines, self.last_saved_session_id, self.tab_id, self.workspace_dir, 6,
+            )
+            block = await memory_block(item["memory_advice_for"], dialogue, self.tab_id)
+            if block:
+                item["message"]["message"]["content"].append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + block})
+        except Exception as exc:  # noqa: BLE001
+            log_event("engine", "memory_advisor_glue_failed", tab_id=self.tab_id, error=str(exc)[:200])
     async def _run_loop(self) -> None:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)

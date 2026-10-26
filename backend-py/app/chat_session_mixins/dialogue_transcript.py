@@ -503,7 +503,9 @@ class DialogueTranscriptMixin:
             "session_id": None, "parent_tool_use_id": None,
         }
         await self.send({"type": "sdk_message", "message": wire, "isVoice": is_voice})
-    def _push_message(self, text: str, attachments: list[Any], is_voice: bool) -> None:
+    def _push_message(self, text: str, attachments: list[Any], is_voice: bool, memory_advice_for: str | None = None) -> None:
+        """memory_advice_for: the user's own words, for a REAL user message -- _input_stream then glues the memory
+        advisor's block to the message (app/memory_advisor.py)."""
         sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}"
         if is_voice:
             sent_line += ", via voice input -- may contain transcription errors"
@@ -519,6 +521,7 @@ class DialogueTranscriptMixin:
         self.queue.append({
             "message": {"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": None},
             "is_voice": is_voice,
+            "memory_advice_for": memory_advice_for,
         })
         self._queue_event.set()
     def _schedule_recent_24h_dialogue_refresh(self) -> None:

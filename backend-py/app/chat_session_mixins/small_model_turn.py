@@ -144,7 +144,16 @@ class SmallModelTurnMixin:
         translate_answer = True
         from_cascade = False
         task_completed = False
+        review_text = text
         try:
+            if is_real_user:
+                # The memory advisor (app/memory_advisor.py): before ANY tier answers, including the fast lane that
+                # answers without tools, the code searches memory when the message implies it.
+                from app.memory_advisor import memory_block
+
+                block = await memory_block(text, recent_dialogue_lines[-6:], self.tab_id)
+                if block:
+                    text = f"{text}\n\n{block}"
             fast = None
             start_tier = None
             # Fast lane (2026-10-10 prototype, see small_model_engine.try_fast_answer):
@@ -175,7 +184,7 @@ class SmallModelTurnMixin:
                     # Review of a tier's answer runs alongside its verification (_review_ahead);
                     # the voice narrator holds back meanwhile (_answer_being_checked).
                     on_candidate=(
-                        (lambda candidate: (self._note_answer_candidate(), self._review_ahead(candidate, text),
+                        (lambda candidate: (self._note_answer_candidate(), self._review_ahead(candidate, review_text),
                                             is_voice and self._speech_ahead(candidate, language)))
                         if is_real_user else None
                     ),
@@ -203,7 +212,7 @@ class SmallModelTurnMixin:
                 # The startup greeting is the first thing the user sees: when no model could write it, a plain
                 # welcome is a better start than "I can't answer this right now".
                 result["text"] = "Hello! I'm Caroline. I'm still getting ready -- give me a moment."
-        question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
+        question_text = review_text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{review_text}"
         await self._finish_small_model_turn_answered(
             question_text, result["text"], is_voice, translate=translate_answer, write_result=from_cascade,
             task_completed=task_completed, language=user_language,
