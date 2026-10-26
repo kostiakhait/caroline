@@ -2254,7 +2254,11 @@ def read_claude_attempt_verdict(reply: str, can_escalate: bool) -> tuple[str, st
 DELIVERY_VERDICT_TIMEOUT_S = 60.0
 
 
-def _build_delivery_prompt(user_text: str, trace: list[str], delivered: str) -> str:
+def _build_delivery_prompt(user_text: str, trace: list[str], delivered: str, earlier: str = "") -> str:
+    already = (
+        f"ALREADY SHOWN TO THE PERSON EARLIER (recent messages from before this turn; they count as told):\n---\n{earlier}\n---\n\n"
+        if earlier else ""
+    )
     return (
         "A person asked an assistant for something, the assistant did work, and the person was shown the messages "
         "below. Decide whether the person now has enough information about the RESULT of that work.\n\n"
@@ -2262,20 +2266,24 @@ def _build_delivery_prompt(user_text: str, trace: list[str], delivered: str) -> 
         "THE WORK THE ASSISTANT DID -- real tool calls with their real results (ground truth for what happened):\n"
         f"{_trace_text(trace, 40)}\n\n"
         f"WHAT THE PERSON WAS ACTUALLY SHOWN, in order -- only this reached them:\n---\n{delivered}\n---\n\n"
+        f"{already}"
         "Enough information means the person can tell from what they were shown: what was done, how it ended "
         "(done, failed, or waiting for them), and anything they have to know or do next. Judge ONLY what they were "
         "shown; do not credit them with anything that is only in the work log. Progress notes (\"checking...\") are "
         "not a result. A message that asks them for a needed approval or answer is a sufficient ending when the "
         "question is clear and carries what they must decide on (for example the exact text to approve).\n\n"
+        "A report must add something the person has NOT been told. If what you would write is already said, in the "
+        "same or other words, in the messages shown in this turn or earlier, answer OK -- never restate or "
+        "paraphrase it, and never write a report only to add a detail of no consequence.\n\n"
         "Reply with exactly one of:\n"
-        '- "OK" -- they have enough.\n'
-        "- <final>the report</final> -- they do not. Write the report to them yourself: in the language of the "
-        "request, directly to the person, short and concrete, stating the outcome and what matters, using only "
-        "facts the work log supports. No promises of further work, no apologies, no mention of this check."
+        '- "OK" -- they have enough, or the report would only repeat what they were told.\n'
+        "- <final>the report</final> -- a material outcome is missing. Write the report to them yourself: in the "
+        "language of the request, directly to the person, short and concrete, stating the outcome and what matters, "
+        "using only facts the work log supports. No promises of further work, no apologies, no mention of this check."
     )
 
 
-async def verify_delivery(user_text: str, trace: list[str], delivered: str, tab_id: str) -> str | None:
+async def verify_delivery(user_text: str, trace: list[str], delivered: str, tab_id: str, earlier: str = "") -> str | None:
     """The end-of-turn check (app/delivery_report.py): None when the person was shown enough about the result, else
     the report to send them. Never raises: no key, no answer, an error or a timeout all mean None -- a missing
     check must not put anything in front of the user."""
@@ -2287,7 +2295,7 @@ async def verify_delivery(user_text: str, trace: list[str], delivered: str, tab_
         tracker = _TurnTracker()
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": "You check what a person was shown against what was done for them."},
-            {"role": "user", "content": _build_delivery_prompt(user_text, trace, delivered)},
+            {"role": "user", "content": _build_delivery_prompt(user_text, trace, delivered, earlier)},
         ]
 
         def executor_fn(name: str, args: dict[str, Any]) -> str:

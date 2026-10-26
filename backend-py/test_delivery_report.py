@@ -98,7 +98,7 @@ def test_insufficient_delivery_sends_the_report(monkeypatch):
     s = Session()
     calls = []
 
-    async def fake(user_text, trace, delivered, tab_id):
+    async def fake(user_text, trace, delivered, tab_id, earlier=""):
         calls.append((user_text, list(trace), delivered))
         return "The email to Oksana was sent."
 
@@ -178,3 +178,52 @@ def test_verifier_failure_changes_nothing(monkeypatch):
 
     run(go())
     assert s.sent == []
+
+
+SHOWN = "Понятно, письма от Anthropic в отчётах пропускаю. По Яндексу действительно ничего не сделать, так что эту тему оставляю как есть."
+REPEAT = "Письма от Anthropic в двухчасовых почтовых отчётах будут пропускаться — настройка сохранена как ваше предпочтение. По Яндексу изменений нет: эту тему оставляю без изменений."
+
+
+def test_a_reworded_repeat_is_a_duplicate_but_a_new_outcome_is_not():
+    """The real case of 2026-10-26: a report restated, in other words, the answer shown seconds before."""
+    assert dr.is_duplicate(REPEAT, [SHOWN])
+    assert dr.is_duplicate(REPEAT, ["unrelated chatter", SHOWN])
+    assert not dr.is_duplicate("Письмо Оксане отправлено на khait.oksan@gmail.com, копия сохранена в «Отправленных».", [SHOWN])
+    assert not dr.is_duplicate(REPEAT, [])
+    assert not dr.is_duplicate("", [SHOWN])
+    # the words may be spread over several recent messages
+    assert dr.is_duplicate("Письма Anthropic пропускаются, Яндекс без изменений.", ["Письма Anthropic пропускаю.", "Яндекс остаётся без изменений."])
+
+
+def test_the_prompt_carries_earlier_messages_and_forbids_restating():
+    plain = sme._build_delivery_prompt("do it", ["- t -> ok"], "Done.")
+    assert "ALREADY SHOWN" not in plain and "never restate" in plain
+    full = sme._build_delivery_prompt("do it", ["- t -> ok"], "Done.", "Earlier message")
+    assert "ALREADY SHOWN" in full and "Earlier message" in full
+
+
+def test_a_duplicate_report_is_not_sent(monkeypatch, tmp_path):
+    from app import dialogue_log as dl
+
+    s = Session()
+    s.workspace_dir = str(tmp_path)
+    got = {}
+
+    async def fake(user_text, trace, delivered, tab_id, earlier=""):
+        got["earlier"] = earlier
+        return REPEAT
+
+    monkeypatch.setattr(sme, "verify_delivery", fake)
+    dl.append(str(tmp_path), "t", dl.ASSISTANT, SHOWN, dl.SHOWN)
+
+    async def go():
+        s._dr_begin(item("skip the Anthropic letters"))
+        s._dr_observe(tool_use())
+        s._dr_observe(tool_result())
+        await s.send(sdk(assistant(SHOWN)))
+        s._dr_finish(SimpleNamespace(is_error=False))
+        await asyncio.sleep(0.05)
+
+    run(go())
+    assert SHOWN in got["earlier"]
+    assert len(s.sent) == 1           # only the answer; the repeating report was dropped

@@ -12,6 +12,7 @@ small_model_engine.verify_delivery, the wiring is chat_session_mixins/delivery_r
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,34 @@ class TurnRecord:
             return "(nothing was shown to the user in this turn)"
         text = "\n---\n".join(self.delivered)
         return text if len(text) <= MAX_DELIVERED_CHARS else "...\n" + text[-MAX_DELIVERED_CHARS:]
+
+
+DUPLICATE_SHARE = 0.5        # the share of the SHORTER text's words found in the other one that makes the two a repeat
+MIN_STEMS_FOR_COMPARISON = 4  # a shorter text than this ("Done.") proves nothing about being a repeat
+DUPLICATE_SHARE_ALL = 0.75   # ... or found across all of the recent messages together
+
+
+def _stems(text: str) -> set[str]:
+    """Word stems (the first five letters of each word of four or more), so that an inflected or reworded repeat
+    still matches: 'пропускаю' / 'пропускаться'."""
+    words = re.findall(r"[^\W\d_]{4,}", (text or "").lower())
+    return {w[:5] for w in words}
+
+
+def is_duplicate(report: str, earlier_messages: list[str]) -> bool:
+    """True when what the report says has already been said to the user: most of its words are in one earlier message,
+    or in the recent ones taken together (2026-10-26: a report restated the answer shown a few seconds before it)."""
+    wanted = _stems(report)
+    if not wanted:
+        return False
+    seen: set[str] = set()
+    for message in earlier_messages:
+        have = _stems(message)
+        smaller = min(len(wanted), len(have))
+        if smaller >= MIN_STEMS_FOR_COMPARISON and len(wanted & have) / smaller >= DUPLICATE_SHARE:
+            return True
+        seen |= have
+    return bool(seen) and len(wanted & seen) / len(wanted) >= DUPLICATE_SHARE_ALL
 
 
 def delivered_text(envelope: Any) -> str:

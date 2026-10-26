@@ -6,6 +6,8 @@ import os
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
 from app import delivery_report
 
+EARLIER_WINDOW_S = 30 * 60
+
 
 class DeliveryReportMixin:
     """The end-of-turn check of what the user actually got (app/delivery_report.py). Hooks: _dr_begin (_input_stream,
@@ -74,12 +76,33 @@ class DeliveryReportMixin:
             return  # an error is handled by the retry machinery; with no work done there is nothing to report on
         asyncio.create_task(self._dr_check(record))
 
+    def _dr_earlier_messages(self, record: delivery_report.TurnRecord) -> list[str]:
+        """What the user has already been shown: this turn's messages and the recent ones from the exact dialogue record
+        (reports included) -- a report must not say again what is there."""
+        from app import dialogue_log
+
+        texts = list(record.delivered)
+        try:
+            cutoff = (time.time() - EARLIER_WINDOW_S) * 1000
+            logged = [e["text"] for e in dialogue_log.read_entries(self.workspace_dir, self.tab_id)
+                      if e.get("role") == dialogue_log.ASSISTANT and e.get("kind") != dialogue_log.WITHHELD and e.get("ms", 0) >= cutoff]
+            texts = logged[-10:] + [t for t in texts if t not in logged]
+        except Exception:  # noqa: BLE001
+            pass
+        return texts
+
     async def _dr_check(self, record: delivery_report.TurnRecord) -> None:
         try:
             from app.small_model_engine import verify_delivery
 
-            report = await verify_delivery(record.user_text, list(record.work.trace), record.delivered_transcript(), self.tab_id)
+            earlier = self._dr_earlier_messages(record)
+            report = await verify_delivery(
+                record.user_text, list(record.work.trace), record.delivered_transcript(), self.tab_id, "\n---\n".join(earlier[-6:]),
+            )
             if not report:
+                return
+            if delivery_report.is_duplicate(report, earlier):
+                log_event("engine", "delivery_report_skipped_duplicate", tab_id=self.tab_id, report=report[:300])
                 return
             log_event("engine", "delivery_report_sent", tab_id=self.tab_id, delivered=len(record.delivered), report=report[:300])
             wire = {"type": "assistant", "message": {"content": [{"type": "text", "text": report}]}}
