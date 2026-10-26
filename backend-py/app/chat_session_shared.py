@@ -1488,7 +1488,22 @@ def current_language_name(tab_id: str) -> str:
     rather than porting that same bug first. Per-tab (2026-09-10 fix, see
     _last_language_path's own docstring) -- one tab's language never
     leaks into another's."""
-    return _load_persisted_language(tab_id) or "English"
+    return _load_persisted_language(tab_id) or _language_from_recent_user_messages(tab_id) or "English"
+
+
+def _language_from_recent_user_messages(tab_id: str) -> str | None:
+    """Until a language has been resolved for the tab (a model call, after its first turn), the letters of the user's last
+    LANGUAGE_DETECTION_USER_LINE_COUNT messages -- the exact dialogue record, which already holds the one being answered --
+    decide, as app/language_hint.py does for a single message. Without it a fresh tab answered a Russian user in English
+    (2026-10-26: the forced translation of the reply used the English default)."""
+    try:
+        from app import dialogue_log
+        from app.language_hint import guess_language_from_text
+
+        texts = [e["text"].split("\n[")[0] for e in dialogue_log.read_entries(WORKSPACE_DIR, tab_id) if e.get("role") == dialogue_log.USER]
+        return guess_language_from_text("\n".join(texts[-LANGUAGE_DETECTION_USER_LINE_COUNT:]))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def refresh_language_in_background(session_id: str | None, tab_id: str) -> None:

@@ -123,3 +123,85 @@ def test_language_is_read_from_the_last_five_user_messages_even_in_a_new_tab(tmp
     assert len(lines) == 5 and lines[-1] == "Открой свой браузер чтобы я залогинился в линкедин"
     assert lines[0] == "Сообщение номер 3"
     assert _read_recent_user_lines(None, "nope", ws, 5) == []
+
+
+@pytest.fixture
+def workspace(tmp_path, monkeypatch):
+    from app import chat_session_shared as shared
+
+    monkeypatch.setattr(shared, "WORKSPACE_DIR", str(tmp_path))
+    return shared, str(tmp_path)
+
+
+def test_a_new_tab_answers_in_the_language_the_user_writes_in(workspace):
+    """The exact incident: Tab 2, first message in Russian, no language resolved yet -> the reply was translated to English."""
+    shared, ws = workspace
+    assert shared.current_language_name("2") == "English"                      # nothing said yet
+    dl.append(ws, "2", dl.USER, "Открой свой браузер чтобы я залогинился в линкедин")
+    assert shared.current_language_name("2") == "Russian"
+    assert shared.current_language_name("3") == "English"                      # another tab is not affected
+
+
+def test_a_resolved_language_wins_over_the_guess(workspace):
+    shared, ws = workspace
+    dl.append(ws, "2", dl.USER, "Открой браузер")
+    shared._save_persisted_language("2", "Ukrainian")
+    assert shared.current_language_name("2") == "Ukrainian"
+
+
+def test_only_the_last_five_user_messages_decide(workspace):
+    shared, ws = workspace
+    for text in ["Привет", "Как дела", "Что нового", "Расскажи", "Покажи письма"]:
+        dl.append(ws, "2", dl.USER, text)
+    for text in ["Please open the browser", "Now check the mail", "Thanks a lot", "Show me the list", "Great, go on"]:
+        dl.append(ws, "2", dl.USER, text)
+    assert shared.current_language_name("2") == "English"                      # the Russian ones are older than five messages
+
+
+def test_the_background_resolution_is_fed_the_first_message_of_a_new_tab(workspace, monkeypatch):
+    shared, ws = workspace
+    seen = []
+
+    async def fake_resolve(text, session=None):
+        seen.append(text)
+        return "Russian"
+
+    monkeypatch.setattr("app.plugins.voice_api.resolve_user_language", fake_resolve)
+    dl.append(ws, "2", dl.USER, "Открой свой браузер чтобы я залогинился в линкедин")
+
+    async def go():
+        shared.refresh_language_in_background(None, "2")
+        await asyncio.sleep(0.1)
+
+    asyncio.run(go())
+    assert seen and "линкедин" in seen[0]
+    assert shared._load_persisted_language("2") == "Russian"
+
+
+def test_the_reply_of_a_new_tab_is_not_translated_into_english(workspace, monkeypatch):
+    """The failing path itself: ChatSession._translate_wire_visible_text asks translate_text for the tab's language."""
+    shared, ws = workspace
+    from app.chat_session import ChatSession
+
+    asked = []
+
+    async def fake_review(text, task=None):
+        return text
+
+    async def fake_translate(text, language, **kwargs):
+        asked.append(language)
+        return text
+
+    async def nothing(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr("app.plugins.voice_api.review_reply", fake_review)
+    monkeypatch.setattr("app.plugins.voice_api.translate_text", fake_translate)
+    session = ChatSession(tab_id="2", workspace_dir=ws, send=nothing)
+    for name in ("_check_permission_guard", "_check_question_already_answered", "_check_delivery_completeness"):
+        monkeypatch.setattr(session, name, nothing)
+    monkeypatch.setattr(session, "_narration_task", lambda: "task")
+    dl.append(ws, "2", dl.USER, "Открой свой браузер чтобы я залогинился в линкедин")
+    wire = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Открыла встроенный браузер на странице входа LinkedIn."}]}}
+    result = asyncio.run(session._translate_wire_visible_text(wire))
+    assert asked == ["Russian"] and result is wire
