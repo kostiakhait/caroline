@@ -92,7 +92,12 @@ class SmallModelTurnMixin:
         recent_dialogue_lines = _read_recent_dialogue_lines(
             self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW,
         )
-        language = current_language_name(self.tab_id)
+        # The language of this turn is the one the user wrote this message in; the tab's resolved language only
+        # backs it up (it does not exist yet on a tab's first turn, and "English" is then a wrong default).
+        from app.language_hint import guess_language_from_text
+
+        user_language = guess_language_from_text(text) if is_real_user else None
+        language = user_language or current_language_name(self.tab_id)
         history_messages, history_summary = await self._sw_history_context()
 
         def on_live_dialogue_update(lines: list[str]) -> None:
@@ -201,7 +206,7 @@ class SmallModelTurnMixin:
         question_text = text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}"
         await self._finish_small_model_turn_answered(
             question_text, result["text"], is_voice, translate=translate_answer, write_result=from_cascade,
-            task_completed=task_completed,
+            task_completed=task_completed, language=user_language,
         )
     async def _sw_history_context(self) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Phase 2b (2026-10-22, see app/sw_history.py): makes sure this turn's
@@ -229,9 +234,10 @@ class SmallModelTurnMixin:
         return sw_history.context_messages(turns), sw_history.summary_section(summary)
     async def _finish_small_model_turn_answered(
         self, question_text: str, text: str, is_voice: bool, translate: bool = True, write_result: bool = False,
-        task_completed: bool = False,
+        task_completed: bool = False, language: str | None = None,
     ) -> None:
-        """Synthesizes the same {assistant} + {result} wire pair a normal
+        """language: the language the user wrote this message in, when it is known from the message itself.
+        Synthesizes the same {assistant} + {result} wire pair a normal
         SDK turn's completion sends (see wire.py's message_to_wire), so
         chat.js needs no changes at all to render a small-model answer --
         it can't tell the difference from a real SDK turn's own reply.
@@ -301,10 +307,10 @@ class SmallModelTurnMixin:
         # (seen on the test box, 2026-10-22). The model already answers in the
         # user's language; the language is resolved from this turn right after
         # it is persisted, so later turns are checked as before.
-        if not silent and translate and _load_persisted_language(self.tab_id) is not None:
+        if not silent and translate and (language is not None or _load_persisted_language(self.tab_id) is not None):
             try:
                 translated = await translate_text(
-                    text, current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
+                    text, language or current_language_name(self.tab_id), gender=get_persona_gender(self.workspace_dir),
                     addressee_gender=get_owner_profile(self.workspace_dir).gender, context=question_text,
                 )
             except Exception as exc:
