@@ -220,8 +220,10 @@ def discover_plugins() -> list[Plugin]:
         # to import on Linux and are skipped" was never actually true at
         # this choke point; this is what makes it true.
         try:
+            # A module already loaded is never reloaded (2026-10-26): a reload made new exception classes in sw_api that the
+            # modules loaded before it (memory, speech, companion, calendar, evolution_client) no longer caught, and reset
+            # module state (the funds flag, every plugin's SW session). A new plugin file is still picked up here.
             module = importlib.import_module(f"app.plugins.{module_info.name}")
-            importlib.reload(module)  # pick up on-disk edits without a process restart
         except Exception as exc:  # noqa: BLE001 -- one broken/platform-unavailable plugin must never cost every other plugin, or the whole turn
             log_event("engine", "plugin_import_failed", module=module_info.name, error=str(exc), error_type=type(exc).__name__)
             continue
