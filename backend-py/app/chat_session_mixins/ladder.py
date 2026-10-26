@@ -42,6 +42,11 @@ class LadderMixin:
         try:
             if item.get("ladder_continuation"):
                 return  # the next rung of the turn in progress: the model was set when the verdict came
+            if self._ladder is not None and self._ladder.active and self._ladder_active():
+                # A message arrived while the turn is still being judged: it joins that turn. Starting a new one here
+                # would drop the replies held for the verdict.
+                self._ladder.user_text = (self._ladder.user_text + "\n" + (claude_ladder.user_text_of(item["message"]) or "")).strip()
+                return
             self._ladder = None
             if not self._ladder_active():
                 # A model pinned in Settings applies from this message on, also to a client the ladder had moved.

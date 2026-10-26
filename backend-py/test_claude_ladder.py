@@ -253,3 +253,18 @@ def test_pinning_a_model_moves_a_client_the_ladder_had_switched(monkeypatch):
     assert s._ladder is None and s.client.models == ["haiku", "opus"]
     run(s._ladder_before_yield(user_item()))              # and it stays there, no repeated switch
     assert s.client.models == ["haiku", "opus"]
+
+
+def test_message_during_a_judged_turn_joins_it_and_keeps_held_replies(monkeypatch):
+    s = Session()
+    verdicts(monkeypatch, ("done", ""))
+
+    async def go():
+        await s._ladder_before_yield(user_item("first"))
+        s._ladder_hold(text_wire("held draft"))
+        await s._ladder_before_yield(user_item("second"))     # arrives before the result
+        assert len(s._ladder.held) == 1 and "second" in s._ladder.user_text
+        await s._ladder_on_result(result_msg("held draft"))
+
+    run(go())
+    assert len(s.sent) == 1
