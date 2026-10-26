@@ -130,8 +130,10 @@ def _child_env() -> dict[str, str]:
     exe to launch, so app_browser_plugin.py's own Linux branch never reads
     this var in the first place."""
     env = dict(os.environ)
-    env["CAROLINE_MODELS_DIR"] = str(_ROOT_DIR / "art" / "models")
-    env["CAROLINE_WHISPER_MODEL_PATH"] = str(_ROOT_DIR / "art" / "whisper-model")
+    # A value already in the environment wins: a hosted desktop (Xopek) keeps the big animation models once per host,
+    # outside the app dir, and says where they are through these two variables.
+    env.setdefault("CAROLINE_MODELS_DIR", str(_ROOT_DIR / "art" / "models"))
+    env.setdefault("CAROLINE_WHISPER_MODEL_PATH", str(_ROOT_DIR / "art" / "whisper-model"))
     env["CAROLINE_PORT"] = str(BACKEND_PORT)
     if sys.platform == "win32":
         env["CAROLINE_FFMPEG_PATH"] = str(_ROOT_DIR / "runtime" / "ffmpeg" / "ffmpeg.exe")
