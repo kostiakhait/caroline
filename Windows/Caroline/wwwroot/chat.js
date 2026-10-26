@@ -74,6 +74,7 @@
   const settingsBtn = document.getElementById("settingsBtn");
   const closeSettingsBtn = document.getElementById("closeSettingsBtn");
   const settingsOverlay = document.getElementById("settingsOverlay");
+  // edition:cut claude-openai answer source (settings)
   const authStatusText = document.getElementById("authStatusText");
   const authLoginOutput = document.getElementById("authLoginOutput");
   const loginBtn = document.getElementById("loginBtn");
@@ -101,11 +102,15 @@
   const claudeModelSelect = document.getElementById("claudeModelSelect");
   const openaiModelSelect = document.getElementById("openaiModelSelect");
   let modelOverrides = { claude: { selected: null, options: [] }, openai: { selected: null } };
+  // edition:end
   const swAccountStatus = document.getElementById("swAccountStatus");
+  // edition:cut claude-openai answer source (settings)
   const swUpsellHint = document.getElementById("swUpsellHint");
+  // edition:end
   const swLoginBtn = document.getElementById("swLoginBtn");
 
 
+  // edition:cut claude-openai answer source (settings)
   // mode_get and sw_status are two independent control-op round trips (see their
   // handlers below) -- cached here so whichever one resolves last can still decide
   // whether to show the "connect SquirrelWisdom too" hint, which depends on BOTH.
@@ -134,6 +139,7 @@
     const show = typeof lastChatSource === "string" && lastChatSource.startsWith("own-anthropic-") && lastSwLoggedIn === false;
     swUpsellHint.style.display = show ? "" : "none";
   }
+  // edition:end
   const swTopUpBtn = document.getElementById("swTopUpBtn");
 
   const ratatoskStatusText = document.getElementById("ratatoskStatusText");
@@ -1610,6 +1616,7 @@
       }
       sendControl("visual_mode_get");
       sendControl("continuous_dialogue_get");
+      // edition:cut claude-openai answer source (tab header)
       // Bug fix (2026-09-22), confirmed live: chat_mode_get used to only be
       // requested when Settings was open (it used to feed nothing else) --
       // now the native tab-header menu mirrors its `available`/`mode`
@@ -1621,6 +1628,7 @@
       // default (all false except Claude) was never corrected. Sent
       // unconditionally now, same as visual_mode_get right above.
       sendControl("chat_mode_get");
+      // edition:end
       // Bug fix (2026-09-16): if Settings was already open (typically:
       // opened during the ~20-30s window right after a backend restart,
       // before this connection existed at all) its whole "load current
@@ -1696,10 +1704,12 @@
 
   function handleEvent(evt) {
     if (evt.type === "control_stream") {
+      // edition:cut claude-openai answer source (control responses)
       if (evt.op === "auth_login") {
         authLoginOutput.style.display = "block";
         authLoginOutput.textContent += evt.chunk;
       }
+      // edition:end
       return;
     }
 
@@ -1932,6 +1942,7 @@
           if (entries.length > 0) addStatusLine("— earlier conversation restored —");
         } catch { /* leave the chat empty rather than show garbage */ }
       }
+    // edition:cut claude-openai answer source (control responses)
     } else if (evt.op === "auth_status") {
       // Bug fix (2026-09-16), per explicit instruction ("все время
       // предлагается логин... но нигде не индицируется состояние уже
@@ -1977,6 +1988,7 @@
         lastChatSource = null;
       }
       renderSwUpsellHint();
+    // edition:end
     } else if (evt.op === "sw_status") {
       // Bug fix (2026-09-16), same reasoning as auth_status above: "Log in
       // / Register with SquirrelWisdom" showed unconditionally next to the
@@ -1993,9 +2005,12 @@
         } else {
           swAccountStatus.textContent = `Logged in as ${s.email}. Balance: ${s.balancePia} PIA.`;
         }
+        // edition:cut claude-openai answer source (control responses)
         lastSwLoggedIn = !!s.loggedIn;
+        // edition:end
         swLoginBtn.style.display = s.loggedIn ? "none" : "";
         swTopUpBtn.style.display = s.loggedIn ? "" : "none";
+        // edition:cut claude-openai answer source (control responses)
         // Per explicit instruction (2026-10-13): mirrors chat_mode_eligible's
         // own SW-side condition exactly (logged in AND a positive balance) --
         // see lastSwUsable's own declaration for the incident this fixes.
@@ -2004,12 +2019,18 @@
         const usable = !!s.loggedIn && !s.balanceError && Number(s.balancePia) > 0;
         if (lastSwUsable !== null && usable !== lastSwUsable) sendControl("chat_mode_get");
         lastSwUsable = usable;
+        // edition:end
       } catch {
         swAccountStatus.textContent = "Status unavailable.";
+        // edition:cut claude-openai answer source (control responses)
         lastSwLoggedIn = null;
         lastSwUsable = null;
+        // edition:end
       }
+      // edition:cut claude-openai answer source (control responses)
       renderSwUpsellHint();
+      // edition:end
+    // edition:cut claude-openai answer source (control responses)
     } else if (evt.op === "chat_mode_get") {
       // The switcher itself lives in the native tab header (MainWindow),
       // not on this page -- just report the state up to it.
@@ -2050,6 +2071,7 @@
     } else if (evt.op === "chat_mode_set") {
       if (!evt.ok) addBanner(`Could not change chat mode: ${evt.stderr || "unknown error"}`);
       sendControl("chat_mode_get");
+    // edition:end
     } else if (evt.op === "clear_tab") {
       if (evt.ok) {
         clearLocalTranscript();
@@ -2080,6 +2102,7 @@
       } catch {
         setStatusBarText("Ratatosk stop request sent.", 3000);
       }
+    // edition:cut claude-openai answer source (control responses)
     } else if (evt.op === "own_anthropic_key_get") {
       try {
         const s = JSON.parse(evt.stdout || "{}");
@@ -2092,11 +2115,17 @@
       sendControl("own_anthropic_key_get");
       sendControl("mode_get");
       sendControl("chat_mode_get");
+    // edition:end
     } else if (evt.op === "login_submit") {
+      // edition:cut claude-openai answer source (control responses)
       sendControl("mode_get");
+      // edition:end
       sendControl("sw_status");
+      // edition:cut claude-openai answer source (control responses)
       sendControl("chat_mode_get");
+      // edition:end
     } else if (evt.op === "open_login_from_settings") {
+      // edition:cut claude cli mcp management
       // Nothing to do here -- the actual login form opens via the
       // server-initiated "open_login" event this triggers (see chat.js's
       // open_login handler below), same as ensure_squirrelwisdom_login.
@@ -2105,6 +2134,7 @@
     } else if (evt.op === "mcp_add" || evt.op === "mcp_remove") {
       if (!evt.ok) addBanner(`MCP server change failed: ${evt.stderr || evt.stdout || "unknown error"}`);
       sendControl("mcp_list");
+      // edition:end
     } else if (evt.op === "persona_get") {
       try {
         const { edit } = JSON.parse(evt.stdout || "{}");
@@ -2189,6 +2219,7 @@
     sendControl("open_file", { path: link.dataset.path });
   });
 
+  // edition:cut claude cli mcp management
   // "name: command args - status" (one per line, from `claude mcp list`) ->
   // a short "name — status" listing. Keeps the raw command out of the
   // read-only view (it's internal paths, not useful to read) while the
@@ -2208,6 +2239,7 @@
     if (!any) mcpListOutput.textContent = raw || "(no servers)";
   }
 
+  // edition:end
   // Bug fix (2026-09-16), confirmed live via caroline.log ("поставь куда
   // надо логи и сам их читай"): this whole batch is fired exactly ONCE,
   // at the moment Settings is opened -- sendControl() silently no-ops
@@ -2224,22 +2256,29 @@
   // whenever Settings happens to already be open at (re)connect time,
   // not just at the original click.
   function refreshSettingsPanel() {
+    // edition:cut claude-openai answer source (settings)
     sendControl("auth_status");
     sendControl("mcp_list");
+    // edition:end
     sendControl("persona_get");
     sendControl("visual_mode_get");
       sendControl("continuous_dialogue_get");
     sendControl("local_stt_get");
+    // edition:cut claude-openai answer source (settings)
     sendControl("mode_get");
+    // edition:end
     sendControl("sw_status");
+    // edition:cut claude-openai answer source (settings)
     sendControl("chat_mode_get");
     sendControl("own_anthropic_key_get");
     sendControl("openai_status");
     sendControl("openai_key_get");
     sendControl("model_override_get");
+    // edition:end
     sendControl("ratatosk_status_get");
   }
 
+  // edition:cut openai and model settings
   // Renders the OpenAI settings block; while a browser sign-in is pending it
   // keeps polling until the backend reports it finished.
   let lastOpenaiModels = [];
@@ -2304,13 +2343,16 @@
     sendControl("openai_key_set", { apiKey: null });
   });
 
+  // edition:end
   function openSettings(section) {
     settingsOverlay.classList.add("open");
+    // edition:cut claude-openai answer source (settings)
     sendControl("openai_status");
     sendControl("openai_key_get");
     sendControl("model_override_get");
     authLoginOutput.textContent = "";
     authLoginOutput.style.display = "none";
+    // edition:end
     refreshSettingsPanel();
     // "I have my own Claude / OpenAI account" in the sign-in modal lands on that provider's block.
     if (typeof section === "string" && section) {
@@ -2333,6 +2375,7 @@
     sendControl("ratatosk_stop_session");
   });
 
+  // edition:cut claude-openai answer source (settings)
   ownAnthropicKeySaveBtn.addEventListener("click", () => {
     const key = ownAnthropicKeyInput.value.trim();
     if (!key) return;
@@ -2341,6 +2384,7 @@
   ownAnthropicKeyClearBtn.addEventListener("click", () => {
     sendControl("own_anthropic_key_set", { anthropicApiKey: null });
   });
+  // edition:end
   swLoginBtn.addEventListener("click", () => {
     sendControl("open_login_from_settings");
   });
@@ -2394,7 +2438,9 @@
   // стилизованной модалкой"): the confirm modal is the ONLY thing that can
   // trigger clear_tab -- the button itself just opens it.
   window.carolineRequestClear = () => clearConfirmOverlay.classList.add("open");
+  // edition:cut claude-openai answer source (tab header)
   window.carolineSetChatMode = (mode) => sendControl("chat_mode_set", { mode });
+  // edition:end
   clearConfirmCancelBtn.addEventListener("click", () => clearConfirmOverlay.classList.remove("open"));
   clearConfirmOverlay.addEventListener("click", (e) => {
     if (e.target === clearConfirmOverlay) clearConfirmOverlay.classList.remove("open");
@@ -2415,6 +2461,7 @@
     turnQueue = [];
   }
 
+  // edition:cut claude-openai answer source (settings)
   loginBtn.addEventListener("click", () => {
     authLoginOutput.textContent = "";
     authLoginOutput.style.display = "block";
@@ -2435,6 +2482,7 @@
     sendControl("mcp_remove", { name });
   });
 
+  // edition:end
   const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // 20MB, matches typical Claude API per-file limits
 
   function readFileAsBase64(file) {
@@ -2813,7 +2861,9 @@
         // confirms completion server-side; closing this window just means
         // "done browsing the checkout", so refresh the displayed balance.
         sendControl("sw_status");
+        // edition:cut claude-openai answer source (tab header)
         sendControl("chat_mode_get");
+        // edition:end
       } else if (data && data.type === "visual_model_download_progress") {
         // Native-only status text, same treatment as update_status just
         // below -- no need to round-trip every percent tick to the backend,

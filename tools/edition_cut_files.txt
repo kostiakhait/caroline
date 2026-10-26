@@ -1,0 +1,11 @@
+﻿# Files that exist only for the Claude and OpenAI answer sources: removed from the IntelliCat edition's build.
+# Paths are relative to the build output root (the dist-linux layout). Filled as each is verified unreachable.
+backend-py/app/engines/claude_engine.py
+backend-py/app/engines/codex_engine.py
+backend-py/app/engines/codex_rpc.py
+backend-py/app/claude_ladder.py
+backend-py/app/chat_session_mixins/ladder.py
+backend-py/app/cli_control.py
+backend-py/app/openai_account.py
+backend-py/app/openai_mode.py
+linux-shell

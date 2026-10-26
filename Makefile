@@ -66,8 +66,10 @@ LINUX_SHELL_DIR := $(SCRIPT_DIR)/linux-shell
 LINUX_SHELL_SRC := $(shell find "$(LINUX_SHELL_DIR)" -type f 2>/dev/null)
 WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
 OUT_LINUX := $(SCRIPT_DIR)/dist-linux
+OUT_INTELLICAT := $(SCRIPT_DIR)/dist-intellicat
+PYTHON ?= python
 
-.PHONY: help build installer clean dist-linux appimage-linux
+.PHONY: help build installer clean dist-linux dist-intellicat appimage-linux
 
 help:
 	@echo "Targets: build, installer, clean, dist-linux, appimage-linux"
@@ -266,6 +268,17 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	@echo "       \"env: node: No such file or directory\")."
 
 dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
+
+# The IntelliCat edition (SquirrelWisdom only): the dist-linux tree with everything that serves the Claude and
+# OpenAI answer sources removed -- files listed in tools/edition_cut_files.txt, and the regions marked
+# "edition:cut" in the sources (tools/edition_build.py explains the markers). The default build is not affected.
+dist-intellicat: dist-linux
+	@echo "=== Caroline, IntelliCat edition (SquirrelWisdom only) ==="
+	rm -rf "$(OUT_INTELLICAT)"
+	cp -r "$(OUT_LINUX)" "$(OUT_INTELLICAT)"
+	"$(PYTHON)" "$(SCRIPT_DIR)/tools/edition_build.py" "$(OUT_INTELLICAT)"
+	echo intellicat > "$(OUT_INTELLICAT)/EDITION"
+	@echo "IntelliCat edition complete: $(OUT_INTELLICAT)"
 
 # AppImage wrapping (Phase 5 of docs/LINUX_PORT_PLAN.md) -- same "can't run
 # the real tool from Windows" shape as provision_runtime.sh above: appimagetool

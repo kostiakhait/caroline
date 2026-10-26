@@ -71,4 +71,5 @@ backend-py/test_roundtrip.py
 # Local, never in this public repository: the Linux build output (like dist/),
 # and paper drafts (a named version would break double-blind review).
 dist-linux/
+dist-intellicat/
 Claude outputs/

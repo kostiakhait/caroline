@@ -29,7 +29,9 @@ from app.chat_session_mixins import (
     ReplyWatchMixin,
     WatchdogMixin,
     CompactionMixin,
+    # edition:cut claude model ladder
     LadderMixin,
+    # edition:end
     DeliveryReportMixin,
     CompactionRecoveryMixin,
 )
@@ -50,7 +52,9 @@ class ChatSession(
     ReplyWatchMixin,
     WatchdogMixin,
     CompactionMixin,
+    # edition:cut claude model ladder
     LadderMixin,
+    # edition:end
     DeliveryReportMixin,
     CompactionRecoveryMixin,
 ):
@@ -117,7 +121,10 @@ class ChatSession(
         self._reply_watch_timer: asyncio.TimerHandle | None = None
         memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
 
+        # edition:cut claude-openai engine
         self.client: AgentEngine | None = None
+        # edition:end
+        #ic| self.client = None
         # Which engine the current/next query() runs on: "openai" only while the
         # tab is switched to OpenAI AND it is actually usable, else "claude".
         self.engine_kind: str = "claude"

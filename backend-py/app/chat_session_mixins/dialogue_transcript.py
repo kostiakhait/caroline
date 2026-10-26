@@ -19,6 +19,7 @@ class DialogueTranscriptMixin:
         return "[Recent real user messages/approvals from the primary conversation, last hour:]\n" + "\n".join(
             f"- {m}" for m in lines
         )
+    # edition:cut claude-session code no longer reached
     def _gather_recent_dialogue_for_narration(self, limit: int = RECENT_DIALOGUE_WINDOW) -> str:
         """Per explicit correction (2026-09-10): the first version of
         _check_progress_narration fed generate_progress_comment only the
@@ -296,6 +297,8 @@ class DialogueTranscriptMixin:
                 return None
             wire["message"]["content"] = kept
         return wire
+    # edition:end
+    # edition:cut claude-session code no longer reached
     async def _check_question_already_answered(self, final_text: str) -> bool:
         """Per explicit instruction (2026-10-20), after a real incident:
         Caroline asked which Facebook account to connect, the user
@@ -459,6 +462,7 @@ class DialogueTranscriptMixin:
             log_event("engine", "transcript_patched", tab_id=self.tab_id, replacement_count=len(replacements))
             return
         log_event("engine", "transcript_patch_empty_file", tab_id=self.tab_id)
+    # edition:end
     async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False) -> None:
         """Per explicit instruction (2026-10-13), "Фоновые задачи... должны
         мержиться только на уровне вывода пользователю": delivers a reply that

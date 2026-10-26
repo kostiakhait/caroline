@@ -46,6 +46,7 @@ def claude_project_dir(workspace_dir: str) -> Path:
     return Path.home() / ".claude" / "projects" / encoded
 
 
+# edition:cut openai transcripts
 def openai_transcripts_dir(workspace_dir: str) -> Path:
     """workspace/openai-transcripts/ -- the conversation log of tabs answered
     by the OpenAI engine, in the same JSONL shape Claude Code writes, so every
@@ -61,6 +62,12 @@ def session_transcript_path(workspace_dir: str, session_id: str) -> Path:
     return own if own.exists() else claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
 
 
+# edition:end
+#ic| def session_transcript_path(workspace_dir: str, session_id: str) -> Path:
+#ic|     """Where a session's transcript lives (the project-dir layout every tab's history uses)."""
+#ic|     return claude_project_dir(workspace_dir) / f"{session_id}.jsonl"
+#ic| 
+#ic| 
 def dehydrated_dir(workspace_dir: str) -> Path:
     """workspace/dehydrated/ -- where the PreCompact hook copies a
     pre-compaction transcript so earlier context stays recoverable, and
@@ -395,12 +402,17 @@ def _tab_session_id_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"tab-session-{_sanitize_tab_id(tab_id)}.json"
 
 
+# edition:cut openai thread id
 # One file per tab holds the resume id of EACH engine that has run in it
 # ("sessionId" = the Claude session, "openaiThreadId" = the Codex thread), so
 # switching a tab between engines never loses either conversation.
 _SESSION_KEY = {"claude": "sessionId", "openai": "openaiThreadId"}
 
 
+# edition:end
+#ic| _SESSION_KEY = {"claude": "sessionId"}  # "claude" is only the storage key of the tab's session id
+#ic| 
+#ic| 
 def _read_tab_session_file(workspace_dir: str, tab_id: str) -> dict:
     path = _tab_session_id_path(workspace_dir, tab_id)
     if not path.exists():
@@ -511,6 +523,7 @@ def _chat_mode_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"chat-mode-{_sanitize_tab_id(tab_id)}.json"
 
 
+# edition:cut claude-openai chat mode
 def has_chat_mode(workspace_dir: str, tab_id: str) -> bool:
     """Whether this tab's mode was ever chosen (by the user or by
     ChatSession's default-to-sw-without-Claude rule), as opposed to falling
@@ -540,6 +553,20 @@ def save_chat_mode(workspace_dir: str, tab_id: str, mode: str) -> None:
         log_event("engine", "save_chat_mode_failed", tab_id=tab_id, error=str(exc))
 
 
+# edition:end
+#ic| def has_chat_mode(workspace_dir: str, tab_id: str) -> bool:
+#ic|     return True  # the IntelliCat edition has one answer source
+#ic| 
+#ic| 
+#ic| def load_chat_mode(workspace_dir: str, tab_id: str) -> str:
+#ic|     return "sw"
+#ic| 
+#ic| 
+#ic| def save_chat_mode(workspace_dir: str, tab_id: str, mode: str) -> None:
+#ic|     return None
+#ic| 
+#ic| 
+# edition:cut claude cli session migration
 def find_most_recent_claude_session_id(workspace_dir: str) -> str | None:
     """One-time migration for users upgrading from pre-multi-tab Caroline:
     reads Claude Code's own session transcript directory for this
@@ -563,6 +590,7 @@ def find_most_recent_claude_session_id(workspace_dir: str) -> str | None:
         return None
 
 
+# edition:end
 # --- dynamic block on foreign tools that duplicate one of Caroline's own ---
 
 # Per explicit, categorical instruction (2026-09-22): NO hardcoded list of

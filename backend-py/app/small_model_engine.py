@@ -1806,6 +1806,7 @@ def _make_executor_fn(
     return executor_fn
 
 
+# edition:cut claude model ladder
 _CLAUDE_ATTEMPT_QUESTION_RULE = (
     " A question to the user is NOT unfinished work when it is permitted or unavoidable, and such a reply is OK as it "
     "stands: asking the user to approve an outbound or irreversible action (sending a message or email, a payment, "
@@ -1817,9 +1818,13 @@ _CLAUDE_ATTEMPT_QUESTION_RULE = (
 )
 
 
+# edition:end
 def _build_verification_prompt(
     tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
+    # edition:cut claude model ladder
     can_deescalate: bool = False, can_retry: bool = False, evidence: str = "", claude_attempt: bool = False,
+    # edition:end
+    #ic| can_deescalate: bool = False, can_retry: bool = False, evidence: str = "",
     recent_dialogue: str = "",
 ) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
@@ -1884,6 +1889,7 @@ def _build_verification_prompt(
             "The files this task was to make, READ BY THE SYSTEM ITSELF just now -- what is in them at this "
             "moment (ground truth; the system read them, so nobody has to read them back):\n" + evidence
         )
+    # edition:cut claude model ladder
     if not tier_trace and not tracker.branch_trace and claude_attempt:
         # A Claude tab's attempt (app/claude_ladder.py): its tools are Claude Code's and the plugins',
         # not this engine's, so the memory-and-mailbox hint below does not apply -- only the plain fact.
@@ -1897,6 +1903,8 @@ def _build_verification_prompt(
                "shown." if recent_dialogue else ".")
         )
     elif not tier_trace and not tracker.branch_trace:
+    # edition:end
+    #ic| if not tier_trace and not tracker.branch_trace:
         # Said on every pass, not only the last one (2026-10-22): its absence read as
         # "nothing to check", and "Подключаю почту ..., проверю соединение и сообщу"
         # passed as a finished answer with no tool ever called.
@@ -1966,7 +1974,9 @@ def _build_verification_prompt(
             + _RESULT_READ_BACK_RULE
             + _REQUEST_VALUES_RULE
             + (
+                # edition:cut claude model ladder
                 _CLAUDE_ATTEMPT_QUESTION_RULE if claude_attempt else
+                # edition:end
                 " Never OK a reply that asks the user something -- which option to take, what to do next, a "
                 "detail, a confirmation -- or hands them a choice instead of finishing the task: escalate it, so a "
                 "stronger model tries to finish the task itself. The only question that goes to the user as it "
@@ -2186,6 +2196,7 @@ def _answer(text: str) -> dict[str, Any]:
     return {"status": "answered", "text": text}
 
 
+# edition:cut claude model ladder
 CLAUDE_ATTEMPT_VERDICT_TIMEOUT_S = 60.0
 
 
@@ -2251,6 +2262,7 @@ def read_claude_attempt_verdict(reply: str, can_escalate: bool) -> tuple[str, st
     return "done", ""
 
 
+# edition:end
 DELIVERY_VERDICT_TIMEOUT_S = 60.0
 
 

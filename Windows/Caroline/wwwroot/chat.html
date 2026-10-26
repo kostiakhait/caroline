@@ -152,6 +152,7 @@
         <div id="localSttUnavailableHint" class="settings-hint" style="display:none">Unavailable -- the local speech model wasn't installed (or was skipped, e.g. for low disk space). Voice messages still work via the cloud.</div>
       </section>
 
+      <!-- edition:cut claude-openai answer source (settings) -->
       <section class="settings-section">
         <h4>Claude account</h4>
         <p class="settings-hint">Caroline uses your own Claude subscription — no separate API key.</p>
@@ -163,9 +164,11 @@
         <pre id="authLoginOutput" class="settings-log" style="display:none"></pre>
       </section>
 
+      <!-- edition:end -->
       <section class="settings-section">
         <h4>Account &amp; Billing</h4>
         <p class="settings-hint">Which account is paying for chat right now, and your SquirrelWisdom balance for the voice/other features it also backs.</p>
+        <!-- edition:cut claude-openai answer source (settings) -->
         <div id="modeStatusText" class="settings-status">Checking…</div>
 
         <div class="settings-field">
@@ -178,6 +181,7 @@
         </div>
         <div id="ownAnthropicKeyStatus" class="settings-status"></div>
 
+        <!-- edition:end -->
         <div id="swAccountStatus" class="settings-status">Checking…</div>
         <div id="swUpsellHint" class="settings-hint" style="display:none">Connect SquirrelWisdom too to unlock Notes, Ratatosk messaging, and other features.</div>
         <div class="settings-row">
@@ -187,6 +191,7 @@
 
       </section>
 
+      <!-- edition:cut claude-openai answer source (settings) -->
       <section class="settings-section">
         <h4>Models</h4>
         <p class="settings-hint">Claude: Auto starts every message on Haiku, and moves to Sonnet, then Opus, only when an automatic check finds the answer unfinished; picking Haiku, Sonnet or Opus uses just that model, from the next message. OpenAI: Automatic uses the provider's own default, applied to conversations started after you change it.</p>
@@ -222,6 +227,7 @@
         <div id="openaiKeyStatus" class="settings-status"></div>
       </section>
 
+      <!-- edition:end -->
       <section class="settings-section">
         <h4>Ratatosk messenger</h4>
         <p class="settings-hint">Lets Caroline read/send messages on your Ratatosk (SquirrelWisdom messenger) account, and optionally register her own separate account so you can message her there directly.</p>

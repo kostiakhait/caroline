@@ -110,11 +110,14 @@ class StatusConnMixin:
             return False
         return time.monotonic() - max(self._inflight_since, getattr(self, "last_activity", 0.0) or 0.0) < self.INFLIGHT_STALE_S
 
+    # edition:cut claude-session code no longer reached
     def _inflight_begin(self) -> None:
         self._inflight_messages += 1
         self._inflight_since = time.monotonic()
         self._publish_status_if_changed()
+    # edition:end
 
+    # edition:cut claude-session code no longer reached
     def _inflight_end(self) -> None:
         self._inflight_messages = max(0, self._inflight_messages - 1)
         self._publish_status_if_changed()
@@ -126,14 +129,19 @@ class StatusConnMixin:
                 asyncio.get_running_loop().call_later(self.INFLIGHT_SETTLE_S, self._inflight_settle, marker)
             except RuntimeError:
                 pass
+    # edition:end
 
+    # edition:cut claude-session code no longer reached
     def _inflight_settle(self, marker: float) -> None:
         if self._inflight_messages > 0 and (getattr(self, "last_activity", 0.0) or 0.0) - marker < 0.5:
             self._inflight_messages = 0
             self._publish_status_if_changed()
+    # edition:end
 
+    # edition:cut claude-session code no longer reached
     def _inflight_reset(self) -> None:
         self._inflight_messages = 0
+    # edition:end
 
     def _publish_status_if_changed(self) -> None:
         try:

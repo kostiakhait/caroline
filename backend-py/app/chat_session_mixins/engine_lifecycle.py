@@ -19,6 +19,7 @@ class EngineLifecycleMixin:
         self._voice_narration_task = supervise("voice_narration", self._voice_narration_loop, self.tab_id)
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
             asyncio.create_task(self._prewarm_model_key())
+    # edition:cut claude-openai engine control
     async def _default_to_sw_without_claude(self) -> None:
         """Per explicit instruction (2026-10-22): a tab whose mode was never
         chosen starts in sw, not claude, when there is no Claude access on this
@@ -42,6 +43,7 @@ class EngineLifecycleMixin:
         save_chat_mode(self.workspace_dir, self.tab_id, "sw")
         log_event("engine", "chat_mode_defaulted_to_sw", tab_id=self.tab_id)
         asyncio.create_task(self._prewarm_model_key())
+    # edition:end
     async def _prewarm_model_key(self) -> None:
         """Fetches the provider key now rather than on the first question (2026-10-10):
         live, the first fast-lane call after a start took 4.9s instead of ~1.8s, the
@@ -62,8 +64,10 @@ class EngineLifecycleMixin:
         self._clear_api_retry_timer(clear_persisted=False)
         self._clear_one_shot_followup_timer(clear_persisted=False)
         self._clear_mcp_reconnect_timers()
+        # edition:cut claude-openai engine control
         if self.client:
             asyncio.create_task(self._safe_interrupt())
+        # edition:end
         # An sw turn ends with the session too, as a Claude turn does above (2026-10-22):
         # it was left running -- on the test box a disposed tab's cascade went on calling
         # its model until the backend was restarted. Cancelling the task is what Stop
@@ -74,6 +78,7 @@ class EngineLifecycleMixin:
             sw_turn.cancel()
         REGISTRY.cancel_for_tab(self.tab_id)
         self._queue_event.set()
+    # edition:cut claude-openai engine control
     def force_restart(self) -> None:
         """Forces this session down the same way hang-escalation's own hard-
         close does (disconnect() -> _run_loop's own exception handling ->
@@ -360,6 +365,7 @@ class EngineLifecycleMixin:
         self.restart_for_unrecoverable_session = True
         if self.client:
             asyncio.create_task(self._safe_disconnect(self.client))
+    # edition:end
     def clear_tab(self) -> None:
         """Per explicit instruction (2026-09-17): a deliberate, user-
         confirmed (via the frontend's own modal -- this method trusts
@@ -408,11 +414,14 @@ class EngineLifecycleMixin:
         if self.small_model_active:
             if self._small_model_task is not None:
                 self._small_model_task.cancel()
+        # edition:cut claude-openai engine control
         elif self.client:
             asyncio.create_task(self._force_stop_client())
+        # edition:end
         cancelled = REGISTRY.cancel_for_tab(self.tab_id)
         if cancelled:
             log_event("engine", "clear_tab_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+    # edition:cut claude-openai engine control
     async def _input_stream(self):
         while not self.ended:
             if not self.queue:
@@ -446,6 +455,7 @@ class EngineLifecycleMixin:
                 item["message"]["message"]["content"].append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + block})
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "memory_advisor_glue_failed", tab_id=self.tab_id, error=str(exc)[:200])
+    # edition:end
     async def _run_loop(self) -> None:
         set_send(lambda message: self.send(message))
         set_tab_id(self.tab_id)
@@ -458,7 +468,9 @@ class EngineLifecycleMixin:
         register_send_for_tab(self.tab_id, self.send)
         register_reply_watch(self.tab_id, self._on_outbound_message_sent)
         register_recent_real_user_directives(self.tab_id, self.recent_real_user_directives_text)
+        # edition:cut claude cli pid
         set_cli_pid_sink(self._on_cli_process_spawned)
+        # edition:end
         # Per explicit instruction (2026-10-15), after a real incident: a tab
         # that spends its WHOLE lifetime in sw mode never reaches the claude/
         # openai-specific branch below (see the sw-mode early-continue right
@@ -482,6 +494,7 @@ class EngineLifecycleMixin:
         # moments later, this is strictly an earlier, narrower first read.
         if self.last_saved_session_id is None:
             self.last_saved_session_id = load_tab_session_id(self.workspace_dir, self.tab_id, self.engine_kind)
+        # edition:cut claude-openai session loop
         await self._default_to_sw_without_claude()
         while not self.ended:
             try:
@@ -1659,3 +1672,9 @@ class EngineLifecycleMixin:
                     continue
 
                 await self._handle_failure(exc)
+        # edition:end
+        #ic| # The IntelliCat edition answers through SquirrelWisdom only: a tab builds no agent session, it only reports healthy.
+        #ic| self.client = None
+        #ic| self._set_conn_state("connected")
+        #ic| while not self.ended:
+        #ic|     await asyncio.sleep(5.0)

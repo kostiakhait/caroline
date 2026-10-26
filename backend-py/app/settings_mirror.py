@@ -58,7 +58,9 @@ STATIC_ITEMS: tuple[Item, ...] = (
     Item("continuous-dialogue", "continuousDialogue.json"),
     Item("visual-mode", "visualMode.json"),
     Item("local-stt", "local-stt-settings.json"),
+    # edition:cut claude-openai answer source
     Item("subscription", "subscription.json", secret_keys=("ownAnthropicApiKey", "ownOpenaiApiKey")),
+    # edition:end
     Item("wizard", "wizard.json"),
     Item("ratatosk-own-account", "ratatosk-own-account.json", all_secret=True),
 )

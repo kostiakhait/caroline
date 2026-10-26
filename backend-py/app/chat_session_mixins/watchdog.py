@@ -33,7 +33,9 @@ class WatchdogMixin:
                     await self._check_progress_narration()
                     self._check_forced_compaction()
                     self._check_compaction_stuck()
+                    # edition:cut claude-openai engine switch
                     self._check_deferred_engine_switch()
+                    # edition:end
                     self._check_funds_exhaustion_status()
                     self._publish_status_if_changed()      # a status that changed by itself (an in-flight message went stale)
                 except asyncio.CancelledError:
@@ -71,6 +73,7 @@ class WatchdogMixin:
             f"them now, directly, in {current_language_name(self.tab_id)}. Don't mention this note itself.]",
             [], False, False,
         )
+    # edition:cut claude-session code no longer reached
     async def _track_background_tasks(self, message: Any) -> None:
         """Feeds agent_registry from the SDK's typed task lifecycle events (see that module's docstring for
         why). A background task can end with a TaskNotificationMessage OR only a TaskUpdatedMessage whose
@@ -189,6 +192,8 @@ class WatchdogMixin:
                         name=tool_name, is_error=bool(block.is_error), result_preview=preview,
                         arguments_preview=args_preview,
                     )
+    # edition:end
+    # edition:cut claude-session code no longer reached
     def _turn_outcomes_summary(self) -> str:
         """Ground-truth text for the current real-user episode's tool calls
         (see turn_tool_outcomes' own __init__ comment) -- literally the
@@ -205,6 +210,8 @@ class WatchdogMixin:
             status = f"ERROR ({outcome.result_preview})" if outcome.is_error else "ok"
             lines.append(f"{outcome.name} -> {status}")
         return "Ground truth for tool calls this task actually made so far (not your own account of it): " + "; ".join(lines) + "."
+    # edition:end
+    # edition:cut claude-session code no longer reached
     def _turn_has_unresolved_tool_error(self) -> bool:
         """True when the ground-truth record (see _turn_outcomes_summary)
         shows at least one tool call still sitting at is_error=True for this
@@ -275,6 +282,7 @@ class WatchdogMixin:
         log_event("engine", "post_turn_completion_check", tab_id=self.tab_id, has_tool_outcomes=bool(outcomes_summary))
         self._awaiting_post_turn_check_reply = True
         self.inject_proactive(nudge)
+    # edition:end
     async def _check_hang(self) -> None:
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
             # sw mode (2026-10-03 bug fix, confirmed live): this whole check is built
@@ -480,6 +488,7 @@ class WatchdogMixin:
         cancelled = REGISTRY.cancel_for_tab(self.tab_id)
         if cancelled:
             log_event("engine", "hang_soft_interrupt_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+    # edition:cut claude-session code no longer reached
     async def _handle_failure(self, exc: BaseException, extra_note: str | None = None) -> None:
         # See _format_exception_chain's own docstring for the incident this
         # fixes -- error_chain carries whatever REAL underlying cause a
@@ -654,3 +663,4 @@ class WatchdogMixin:
                 refresh_language_in_background(self.last_saved_session_id, self.tab_id)
                 self.inject_proactive(f"{watchdog_note}\n\n{CONTINUE_OR_SILENT_NUDGE_TEMPLATE.format(language=lang)}")
         log_event("engine", "handle_failure_done", tab_id=self.tab_id)
+    # edition:end

@@ -47,6 +47,7 @@ class DeliveryReportMixin:
     def _dr_reset(self) -> None:
         self._dr = None
 
+    # edition:cut claude-session code no longer reached
     def _dr_begin(self, item: dict[str, Any]) -> None:
         try:
             if item.get("ladder_continuation") or not item.get("memory_advice_for"):
@@ -59,6 +60,7 @@ class DeliveryReportMixin:
         except Exception as exc:  # noqa: BLE001
             self._dr = None
             log_event("engine", "delivery_report_begin_failed", tab_id=self.tab_id, error=str(exc)[:200])
+    # edition:end
 
     def _dr_begin_sw(self, text: str) -> None:
         """An sw turn of a real user message opens the record (the sw path has no _input_stream); what reaches the window
@@ -77,12 +79,14 @@ class DeliveryReportMixin:
             return
         self._dr_finish(None)
 
+    # edition:cut claude-session code no longer reached
     def _dr_observe(self, wire: dict[str, Any] | None) -> None:
         if self._dr is not None:
             try:
                 self._dr.observe(wire)
             except Exception:  # noqa: BLE001
                 pass
+    # edition:end
 
     def _dr_finish(self, message: Any) -> None:
         """A real turn has ended and its answer stands. Starts the check in the background."""

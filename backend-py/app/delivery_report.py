@@ -16,7 +16,32 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+# edition:cut claude model ladder
 from app.claude_ladder import TRACE_LINES_KEPT, LadderTurn, visible_text
+# edition:end
+#ic| TRACE_LINES_KEPT = 40
+#ic|
+#ic|
+#ic| def visible_text(wire: dict[str, Any]) -> str:
+#ic|     content = (wire.get("message") or {}).get("content")
+#ic|     if not isinstance(content, list):
+#ic|         return ""
+#ic|     return "\n".join(
+#ic|         b.get("text", "") for b in content
+#ic|         if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+#ic|     )
+#ic|
+#ic|
+#ic| @dataclass
+#ic| class TurnWork:
+#ic|     """What one turn did: its tool calls as trace lines (filled from the sw turn recorder, see sw_trace)."""
+#ic|
+#ic|     user_text: str
+#ic|     trace: list[str] = field(default_factory=list)
+#ic|     open_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
+#ic|
+#ic|     def observe(self, wire: dict[str, Any]) -> None:
+#ic|         return None  # the turn's work is filled in at its end (sw_trace), not message by message
 
 MAX_DELIVERED_CHARS = 6000
 
@@ -26,11 +51,17 @@ class TurnRecord:
     """One real-user turn: the request, the work done (tool calls with results) and what was delivered."""
 
     user_text: str
+    # edition:cut claude model ladder
     work: LadderTurn = field(init=False)
+    # edition:end
+    #ic| work: TurnWork = field(init=False)
     delivered: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # edition:cut claude model ladder
         self.work = LadderTurn(user_text=self.user_text)
+        # edition:end
+        #ic| self.work = TurnWork(user_text=self.user_text)
 
     def observe(self, wire: dict[str, Any] | None) -> None:
         if wire is not None:

@@ -47,7 +47,10 @@
 <main>
   <h1 id="title">Caroline</h1>
   <p class="sub" id="subtitle"></p>
+  <!-- edition:cut claude-openai subscriptions step -->
   <div class="dots" id="dots"><span></span><span></span><span></span><span></span></div>
+  <!-- edition:end -->
+  <!--ic| <div class="dots" id="dots"><span></span><span></span><span></span></div> -->
   <section id="view"></section>
 </main>
 <script>
@@ -57,8 +60,10 @@ const T = {
     welcome:"Welcome to Caroline", welcomeSub:"Sign in to continue, or create an account.",
     login:"Login (e-mail)", password:"Password", signIn:"Sign in", register:"Register", toRegister:"I don't have an account — register", toLogin:"I already have an account",
     bad_input:"Enter a valid e-mail and a password.", failed:"That did not work", restored:"Found your earlier settings and restored them: ",
+    // edition:cut claude-openai subscriptions step
     subsTitle:"Your own subscriptions", subsSub:"Caroline can also work through your own Claude or OpenAI (Codex) subscription. Both are optional.",
     claude:"Claude subscription", openai:"OpenAI (Codex) subscription", connected:"connected", notConnected:"not connected", connect:"Connect", waiting:"Waiting for sign-in…", openLink:"Open this page to sign in:", code:"Code:",
+    // edition:end
     next:"Next", back:"Back", later:"Finish later", noSub:"I do not have one",
     accTitle:"Mailboxes and messengers", accSub:"Add what Caroline should know. Skip what you do not have.",
     caroline_mail:"Caroline's mailbox", owner_mail:"Your mailbox", caroline_messengers:"Caroline's messengers", owner_messengers:"Your messengers",
@@ -75,8 +80,10 @@ const T = {
     welcome:"Добро пожаловать в Caroline", welcomeSub:"Войдите, чтобы продолжить, или зарегистрируйтесь.",
     login:"Логин (e-mail)", password:"Пароль", signIn:"Войти", register:"Зарегистрироваться", toRegister:"У меня нет аккаунта — зарегистрироваться", toLogin:"У меня уже есть аккаунт",
     bad_input:"Введите корректный e-mail и пароль.", failed:"Не получилось", restored:"Найдены ваши прежние настройки, они восстановлены: ",
+    // edition:cut claude-openai subscriptions step
     subsTitle:"Ваши собственные подписки", subsSub:"Caroline может работать и через вашу подписку Claude или OpenAI (Codex). Обе необязательны.",
     claude:"Подписка Claude", openai:"Подписка OpenAI (Codex)", connected:"подключена", notConnected:"не подключена", connect:"Подключить", waiting:"Ждём завершения входа…", openLink:"Откройте страницу для входа:", code:"Код:",
+    // edition:end
     next:"Далее", back:"Назад", later:"Закончить позже", noSub:"У меня нет такой подписки",
     accTitle:"Почта и мессенджеры", accSub:"Добавьте то, что Caroline должна знать. Чего нет — пропустите.",
     caroline_mail:"Почта Caroline", owner_mail:"Ваша почта", caroline_messengers:"Мессенджеры Caroline", owner_messengers:"Ваши мессенджеры",
@@ -111,7 +118,10 @@ function el(tag, attrs, ...kids) {
 }
 function field(label, input) { return [el("label", {}, label), input]; }
 function setTitle(title, sub) { document.getElementById("title").textContent = title; document.getElementById("subtitle").textContent = sub || ""; }
+// edition:cut claude-openai subscriptions step
 function dots() { const i = step === "finish" ? 3 : ["account", "subscriptions", "mailboxes", "messengers"].indexOf(step); [...document.getElementById("dots").children].forEach((d, n) => d.classList.toggle("on", n <= i)); }
+// edition:end
+//ic| function dots() { const i = step === "finish" ? 2 : ["account", "mailboxes", "messengers"].indexOf(step); [...document.getElementById("dots").children].forEach((d, n) => d.classList.toggle("on", n <= i)); }
 let finished = false, lastHeight = 0;
 // The shell closes its window on the "done"/"dismissed" titles and sizes it to the height the page asks for.
 function signal(name) { finished = name.startsWith("caroline-wizard-d"); document.title = name; }
@@ -140,8 +150,11 @@ function renderAccount() {
       if (!r.ok) { err.textContent = r.error === "invalid_input" ? t("bad_input") : (t("failed") + ": " + (r.error || "")); return; }
       state = r.state;
       restoredNote = r.restored && r.restored.length ? t("restored") + r.restored.length : "";
+      // edition:cut claude-openai subscriptions step
       step = "subscriptions"; render();
       refresh().then(() => { if (step === "subscriptions") render(); });   // the Claude/OpenAI status arrives a moment later
+      // edition:end
+      //ic| step = "mailboxes"; render();
     } catch (e) { err.textContent = t("failed") + ": " + e; } finally { go.disabled = false; email.disabled = pass.disabled = false; progress.classList.add("hidden"); }
   };
   go.addEventListener("click", submit);
@@ -153,6 +166,7 @@ function renderAccount() {
   email.focus();
 }
 
+// edition:cut claude-openai subscriptions step
 function subCard(title, signedIn, pending, onConnect, extra) {
   return el("div", { class: "card" + (signedIn ? " done" : "") },
     el("span", { class: "badge" + (signedIn ? " ok" : "") }, signedIn ? "✓ " + t("connected") : t("notConnected")),
@@ -179,6 +193,7 @@ function renderSubscriptions() {
   ].filter(Boolean));
 }
 
+// edition:end
 // --- step 3: a list page; every mailbox and messenger account is a page of its own ---------------------------------
 const MESSENGERS = ["telegram", "whatsapp", "signal"];
 const ROLES = ["caroline", "owner"];
@@ -290,7 +305,7 @@ function messengersTab() {
 // Back / Next on every step; Next quietly marks what was left empty as "not needed", so the wizard does not ask again.
 function stepFooter(prevStep, nextStep, needs) {
   return el("div", { class: "actions" },
-    el("button", { class: "secondary", onclick: () => { step = prevStep; render(); } }, t("back")),
+    prevStep ? el("button", { class: "secondary", onclick: () => { step = prevStep; render(); } }, t("back")) : null,   // the first page has no Back
     el("button", { onclick: async () => {
       for (const need of needs) if (state.needs[need]) await api("/api/wizard/answer", { field: "decline", value: need });
       await refresh(); step = nextStep; render();
@@ -300,7 +315,10 @@ function stepFooter(prevStep, nextStep, needs) {
 function renderMailboxes() {
   if (sub && sub.type === "mailbox") return mailboxPage();
   setTitle(t("mailTitle"), t("mailSub"));
+  // edition:cut claude-openai subscriptions step
   view.replaceChildren(...mailTab(), stepFooter("subscriptions", "messengers", ["caroline_mail", "owner_mail"]));
+  // edition:end
+  //ic| view.replaceChildren(...mailTab(), stepFooter(null, "messengers", ["caroline_mail", "owner_mail"]));
 }
 
 function renderMessengers() {
@@ -316,6 +334,7 @@ function renderFinish() {
     el("button", { onclick: async () => { await api("/api/wizard/answer", { field: "completed", value: true }); signal("caroline-wizard-done"); view.replaceChildren(el("p", {}, t("finished"))); } }, t("finish"))));
 }
 
+// edition:cut claude-openai subscriptions step
 function startPolling() {
   if (polling) return;
   polling = setInterval(async () => {
@@ -327,19 +346,27 @@ function startPolling() {
   }, 2500);
 }
 
+// edition:end
 function render() {
   dots();
   document.getElementById("later")?.remove();
   if (state && state.loggedIn) document.querySelector("main").append(el("div", { class: "actions", id: "later" }, el("button", { class: "link", onclick: async () => { await api("/api/wizard/answer", { field: "dismissed", value: true }); signal("caroline-wizard-dismissed"); } }, t("later"))));
+  // edition:cut claude-openai subscriptions step
   ({ account: renderAccount, subscriptions: renderSubscriptions, mailboxes: renderMailboxes, messengers: renderMessengers, finish: renderFinish })[step]();
+  // edition:end
+  //ic| ({ account: renderAccount, mailboxes: renderMailboxes, messengers: renderMessengers, finish: renderFinish })[step]();
   reportHeight();
 }
 
 (async function init() {
   await refresh();
   if (state.loggedIn && !state.needed) { signal("caroline-wizard-done"); }
+  // edition:cut claude-openai subscriptions step
   step = state.loggedIn ? "subscriptions" : "account";
   if (step === "subscriptions" || step === "accounts") restoredNote = "";
+  // edition:end
+  //ic| step = state.loggedIn ? "mailboxes" : "account";
+  //ic| if (step === "accounts") restoredNote = "";
   render();
 })();
 </script>

@@ -89,7 +89,9 @@ from app.durability import (
     clear_tab_session_id,
     compute_foreign_tool_overlap,
     dehydrated_dir,
+    # edition:cut claude cli session migration
     find_most_recent_claude_session_id,
+    # edition:end
     has_chat_mode,
     load_action_state,
     load_chat_mode,
@@ -106,13 +108,17 @@ from app.durability import (
     save_tab_continuity_archive,
     save_tab_session_id,
     session_transcript_path,
+    # edition:cut openai transcripts
     openai_transcripts_dir,
+    # edition:end
 )
 from app.compaction import compact_session_if_due
+# edition:cut claude-openai engines
 from app.engines.base import AgentEngine
 from app.engines.claude_engine import ClaudeEngine
 from app.engines.codex_engine import CodexEngine
 from app.openai_mode import build_codex_options, openai_available
+# edition:end
 from app.transcript_rotate import rotate_transcript
 from app.history import ATTACHMENT_NOTE_MARKER, _ATTACHMENT_NOTE_PREFIXES, _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
 from app.failure_classification import (
@@ -155,12 +161,14 @@ from app.plugins.sw_api import get_funds_exhausted_reason, mark_funds_exhausted
 from app import memory_turns
 from app.process_kill import kill_process_tree
 from app.sw_gate import require_sw_or_prompt
+# edition:cut claude-openai answer-source choice
 from app.subscription_mode import (
     build_options_env,
     chat_mode_eligible,
     get_model_override,
     resolve_mode,
 )
+# edition:end
 from app.wire import message_to_wire
 from app.workspace_dir import WORKSPACE_DIR
 from app import sw_history
@@ -710,6 +718,7 @@ CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
 # since fixed -- see CodexInstaller.cs -- but the underlying tendency to
 # paper over a failed/skipped tool call with a fabricated-sounding result is
 # a real, separate risk worth guarding against regardless).
+# edition:cut openai instruction
 OPENAI_TOOL_HONESTY_INSTRUCTION = (
     "Before reporting that you checked, read, listed, opened, or otherwise looked at something real (a file, an "
     "inbox, a screenshot, a search result, anything outside your own reasoning), confirm to yourself that a real "
@@ -717,6 +726,7 @@ OPENAI_TOOL_HONESTY_INSTRUCTION = (
     "from an actual tool call, even if it sounds plausible or is what you'd expect to find. If a tool call "
     "errored, timed out, or wasn't available, say so plainly instead of substituting a made-up-sounding answer."
 )
+# edition:end
 
 # Fires once per backend-process lifetime, the moment the primary tab's
 # very first turn is about to run -- Caroline must never come back up
@@ -1296,7 +1306,10 @@ def _gather_recent_usable_lines(session_id: str | None, tab_id: str, workspace_d
     switching a tab between Claude and OpenAI must not make the new engine
     start blind."""
     lines: list[str] = []
+    # edition:cut openai transcripts
     session_ids = [session_id, *(load_tab_session_id(workspace_dir, tab_id, kind) for kind in ("claude", "openai"))]
+    # edition:end
+    #ic| session_ids = [session_id, *(load_tab_session_id(workspace_dir, tab_id, kind) for kind in ("claude",))]  # "claude" is the storage key of the tab's session pointer
     paths: list[Path] = []
     for sid in dict.fromkeys(i for i in session_ids if i):
         path = session_transcript_path(workspace_dir, sid)
@@ -1619,12 +1632,14 @@ def clear_tab_disk_state(workspace_dir: str, tab_id: str) -> None:
             (claude_project_dir(workspace_dir) / f"{old_session_id}.jsonl").unlink(missing_ok=True)
         except Exception as exc:
             log_event("engine", "clear_tab_delete_session_file_failed", tab_id=tab_id, error=str(exc))
+    # edition:cut openai transcripts
     openai_thread_id = load_tab_session_id(workspace_dir, tab_id, "openai")
     if openai_thread_id:
         try:
             (openai_transcripts_dir(workspace_dir) / f"{openai_thread_id}.jsonl").unlink(missing_ok=True)
         except Exception as exc:
             log_event("engine", "clear_tab_delete_openai_transcript_failed", tab_id=tab_id, error=str(exc))
+    # edition:end
     clear_tab_session_id(workspace_dir, tab_id, engine=None)
     clear_tab_continuity_archive(workspace_dir, tab_id)
     clear_pending_turn(workspace_dir, tab_id)
@@ -1739,11 +1754,15 @@ __all__ = [
     'clear_tab_session_id',
     'compute_foreign_tool_overlap',
     'dehydrated_dir',
+    # edition:cut claude cli session migration
     'find_most_recent_claude_session_id',
+    # edition:end
     'has_chat_mode',
     'load_chat_mode',
     'save_chat_mode',
+    # edition:cut claude-openai re-exports
     'chat_mode_eligible',
+    # edition:end
     'load_discovered_foreign_tool_overlap',
     'load_tab_continuity_archive',
     'load_tab_session_id',
@@ -1755,13 +1774,17 @@ __all__ = [
     'save_tab_continuity_archive',
     'save_tab_session_id',
     'session_transcript_path',
+    # edition:cut claude-openai re-exports
     'openai_transcripts_dir',
+    # edition:end
     'compact_session_if_due',
+    # edition:cut claude-openai re-exports
     'AgentEngine',
     'ClaudeEngine',
     'CodexEngine',
     'build_codex_options',
     'openai_available',
+    # edition:end
     'rotate_transcript',
     'ATTACHMENT_NOTE_MARKER',
     '_ATTACHMENT_NOTE_PREFIXES',
@@ -1826,9 +1849,11 @@ __all__ = [
     'memory_turns',
     'kill_process_tree',
     'require_sw_or_prompt',
+    # edition:cut claude-openai re-exports
     'build_options_env',
     'get_model_override',
     'resolve_mode',
+    # edition:end
     'message_to_wire',
     'WORKSPACE_DIR',
     'SendFn',
@@ -1904,7 +1929,9 @@ __all__ = [
     'FALLBACK_COMPACTION_THRESHOLD_TOKENS',
     'AUTH_RETRY_ESCALATION_THRESHOLD',
     'CONTINUE_OR_SILENT_NUDGE_TEMPLATE',
+    # edition:cut claude-openai re-exports
     'OPENAI_TOOL_HONESTY_INSTRUCTION',
+    # edition:end
     'STARTUP_GREETING_NUDGE_TEMPLATE',
     'BALANCE_EXHAUSTED_MESSAGE',
     '_SYNTHETIC_HISTORY_TEXT_PATTERNS',

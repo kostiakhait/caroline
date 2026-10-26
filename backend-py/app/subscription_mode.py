@@ -22,7 +22,9 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Literal
 
+# edition:cut claude sdk binary path
 import claude_agent_sdk
+# edition:end
 import httpx
 
 # Our own subprocess spawns run under pythonw.exe, which has NO console of
@@ -49,6 +51,7 @@ SQUIRRELWISDOM_ORIGIN = "https://www.squirrelwisdom.com"
 # sw_service_keys_local.py (gitignored) -- see sw_api.py's own import comment.
 from app.sw_service_keys_local import V2_LOGIN_SERVICE_KEY as SW_SERVICE_KEY
 
+# edition:cut claude-openai answer source (settings, models)
 ChatSource = Literal["own-anthropic-oauth", "own-anthropic-key", "none"]
 
 # The Python SDK ships its own bundled claude.exe (a sibling package to the
@@ -129,6 +132,7 @@ def set_model_override(workspace_dir: str, provider: str, model: str | None) -> 
     path.write_text(json.dumps(settings, indent=2) + chr(10), encoding="utf-8")
 
 
+# edition:end
 # --- mode resolve ------------------------------------------------------------
 
 # --- cached account state ----------------------------------------------------
@@ -140,13 +144,16 @@ def set_model_override(workspace_dir: str, provider: str, model: str | None) -> 
 # reads the cache instead of spawning its own `claude auth status` / making
 # its own network call from scratch.
 
+# edition:cut claude auth status
 # How old a cached value may be before a reader triggers a background refresh
 # (readers still get the old value INSTANTLY -- stale-while-revalidate).
 AUTH_STATUS_TTL_S = 120.0
+# edition:end
 SW_STATUS_TTL_S = 60.0
 # How often the background refresher re-checks both, so the cache is warm
 # before anyone asks (Settings opening, a tab starting).
 ACCOUNT_STATE_REFRESH_INTERVAL_S = 120.0
+# edition:cut claude auth status, mode resolve
 # `claude auth status` normally answers in ~3 s; anything past this is a
 # wedged CLI, not a slow one -- killed (see cli_control._run), and the last
 # good value stays in place (see account_state's stale-on-error).
@@ -238,6 +245,7 @@ async def build_options_env(workspace_dir: str, mode: ResolvedMode) -> dict[str,
     return None
 
 
+# edition:end
 # --- SW account status -------------------------------------------------------
 
 class SwStatus:
@@ -308,10 +316,12 @@ async def run_account_state_refresher() -> None:
     ACCOUNT_STATE_REFRESH_INTERVAL_S so it stays warm. A failure of either
     is logged by the cache itself and simply retried next round."""
     while True:
+        # edition:cut claude auth status
         try:
             await _claude_auth_status_cache.refresh()
         except Exception:
             pass
+        # edition:end
         if load_credentials():
             try:
                 await _sw_status_cache.refresh()

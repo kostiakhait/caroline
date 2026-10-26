@@ -30,9 +30,11 @@ MESSENGERS = ("telegram", "whatsapp", "signal")
 # What step 3 wants, each satisfied by an entry or declined by the user with "none".
 NEEDS = ("caroline_mail", "owner_mail", "caroline_messengers", "owner_messengers")
 
+# edition:cut claude-openai subscriptions step
 _claude_login_task: "asyncio.Task[Any] | None" = None
 
 
+# edition:end
 def _path(workspace_dir: str) -> Path:
     return Path(workspace_dir) / "wizard.json"
 
@@ -75,6 +77,7 @@ async def _vault_mailboxes() -> list[str]:
     return sorted(set(out))
 
 
+# edition:cut claude-openai subscriptions step
 async def _claude_signed_in(wait_s: float = 8.0) -> bool:
     try:
         from app.subscription_mode import get_claude_auth_status
@@ -96,6 +99,7 @@ def _openai_signed_in(workspace_dir: str) -> bool:
         return False
 
 
+# edition:end
 def _needs(data: dict[str, Any], vault_addresses: list[str]) -> dict[str, bool]:
     """For each of NEEDS: True when it is still missing."""
     roles: dict[str, str] = data.get("emailRoles") or {}
@@ -115,16 +119,22 @@ async def get_state(workspace_dir: str, quick: bool = False) -> dict[str, Any]:
     minute); the page asks again a moment later and fills it in."""
     data = load(workspace_dir)
     logged_in = is_logged_in()
+    # edition:cut claude-openai subscriptions step
     claude = await _claude_signed_in(0.3 if quick else 8.0) if logged_in else False
     openai = _openai_signed_in(workspace_dir)
+    # edition:end
     vault = await _vault_mailboxes() if logged_in else []
     roles = data.get("emailRoles") or {}
     unassigned = [a for a in vault if a not in roles]
     needs = _needs(data, vault) if logged_in else {n: True for n in NEEDS}
+    # edition:cut claude-openai subscriptions step
     subscriptions_done = bool(data.get("subscriptionsAnswered")) or claude or openai
+    # edition:end
     steps = [
         {"id": "account", "status": "done" if logged_in else "todo"},
+        # edition:cut claude-openai subscriptions step
         {"id": "subscriptions", "status": "done" if subscriptions_done else "todo"},
+        # edition:end
         {"id": "mailboxes", "status": "done" if not (needs["caroline_mail"] or needs["owner_mail"]) else "todo"},
         {"id": "messengers", "status": "done" if not (needs["caroline_messengers"] or needs["owner_messengers"]) else "todo"},
     ]
@@ -135,8 +145,10 @@ async def get_state(workspace_dir: str, quick: bool = False) -> dict[str, Any]:
         "dismissed": bool(data.get("dismissed")),
         "needed": (not logged_in) or not (data.get("completed") or data.get("dismissed")),
         "steps": steps,
+        # edition:cut claude-openai subscriptions step
         "claude": {"signedIn": claude, "pending": _claude_login_task is not None and not _claude_login_task.done()},
         "openai": {"signedIn": openai},
+        # edition:end
         "needs": needs,
         "mailboxes": {"found": vault, "roles": roles, "unassigned": unassigned, "createdHere": data.get("createdHere") or []},
         "contacts": data.get("contacts") or {},
@@ -156,6 +168,7 @@ async def login(workspace_dir: str, email: str, password: str, register: bool) -
     return {"ok": True, "restored": sync.get("restored", []), "state": await get_state(workspace_dir, quick=True)}
 
 
+# edition:cut claude login
 async def start_claude_login(workspace_dir: str) -> dict[str, Any]:
     """`claude auth login` opens the system browser itself; the state's claude.signedIn flips when it is done."""
     global _claude_login_task
@@ -180,12 +193,16 @@ async def start_claude_login(workspace_dir: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+# edition:end
 def answer(workspace_dir: str, field: str, value: Any) -> dict[str, Any]:
     """One answer of the user. Only the fields the wizard owns are accepted."""
     data = load(workspace_dir)
+    # edition:cut claude-openai subscriptions step
     if field == "subscriptionsAnswered":
         data["subscriptionsAnswered"] = bool(value)
     elif field in ("completed", "dismissed"):
+    # edition:end
+    #ic| if field in ("completed", "dismissed"):
         data[field] = bool(value)
     elif field == "emailRole":
         address, role = str((value or {}).get("address", "")).strip().lower(), (value or {}).get("role")

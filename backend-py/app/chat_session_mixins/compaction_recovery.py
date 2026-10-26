@@ -19,16 +19,21 @@ class CompactionRecoveryMixin:
 
     async def _run_forced_compaction(self) -> None:
         """Sets the model that writes the summary, then sends /compact with its instruction."""
+        # edition:cut claude model ladder
         try:
             if self._ladder_active():           # a model pinned in Settings is left as the user chose it
                 await self._ladder_set_model(COMPACTION_MODEL)
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "compaction_model_switch_failed", tab_id=self.tab_id, error=str(exc)[:200])
+        # edition:end
         self._push_internal_command(compaction_guard.COMPACT_COMMAND)
 
+    # edition:cut claude-session code no longer reached
     def _schedule_compaction_check(self) -> None:
         asyncio.get_running_loop().create_task(self._check_compaction_summary())
+    # edition:end
 
+    # edition:cut claude-session code no longer reached
     async def _check_compaction_summary(self) -> None:
         try:
             await asyncio.sleep(SUMMARY_CHECK_DELAY_S)       # the CLI writes the summary right after the boundary
@@ -52,7 +57,9 @@ class CompactionRecoveryMixin:
                       rebuilt_chars=len(rebuilt), digest_chars=len(digest))
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "compaction_summary_check_failed", tab_id=self.tab_id, error=str(exc)[:200])
+    # edition:end
 
+    # edition:cut claude-session code no longer reached
     def _compaction_state_text(self) -> str:
         """The facts the system itself holds, written after the rebuilt summary: open actions, finished actions, and the exact
         last messages of the dialogue as the user saw them."""
@@ -77,7 +84,9 @@ class CompactionRecoveryMixin:
         except Exception:  # noqa: BLE001
             pass
         return "\n\n".join(parts)
+    # edition:end
 
+    # edition:cut claude-session code no longer reached
     def _glue_context_recovery(self, item: dict[str, Any]) -> None:
         """The rebuilt context goes in as one more text block of the next message to the model."""
         block, self._context_recovery = self._context_recovery, None
@@ -94,3 +103,4 @@ class CompactionRecoveryMixin:
         except Exception as exc:  # noqa: BLE001
             self._context_recovery = block
             log_event("engine", "compaction_recovery_glue_failed", tab_id=self.tab_id, error=str(exc)[:200])
+    # edition:end

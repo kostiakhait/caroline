@@ -78,10 +78,12 @@ class StopControlMixin:
             # engine afterwards; _stop_killed_idle_engine tells it that this
             # was the user's doing and that no turn is to be started over it.
             killed = 0
+            # edition:cut claude-openai engine stop
             if self.client and not self.small_model_active:
                 self._stop_killed_idle_engine = True
                 killed = self._kill_engine_process_tree("Stop between turns")
                 asyncio.create_task(self._force_stop_client())
+            # edition:end
             log_event(
                 "engine", "user_stop_between_turns", tab_id=self.tab_id, cancelled_retry=had_retry,
                 cancelled_operations=cancelled, killed_processes=killed,
@@ -96,6 +98,7 @@ class StopControlMixin:
             # below, any tool call it already dispatched.
             if self._small_model_task is not None:
                 self._small_model_task.cancel()
+        # edition:cut claude-openai engine stop
         elif self.client:
             # Bug fix (2026-09-15), per explicit instruction: "Кнопка стоп
             # это абсолютный рубильник... Сразу по нажатии" -- Stop must
@@ -117,6 +120,7 @@ class StopControlMixin:
             # anything asynchronous below even gets scheduled.
             self._kill_engine_process_tree("Stop during a turn")
             asyncio.create_task(self._force_stop_client())
+        # edition:end
         # Idle at once: the run loop only notices the dead engine when its
         # stream breaks, which was seen to take 20-55 s; the status bar and
         # the next message must not wait for that.
@@ -133,6 +137,7 @@ class StopControlMixin:
         cancelled = REGISTRY.cancel_for_tab(self.tab_id, keep_tools=STOP_KEEPS_TOOLS)
         if cancelled:
             log_event("engine", "user_stop_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+    # edition:cut claude-session code no longer reached
     def _reset_after_stop(self) -> None:
         """The run loop's side of a Stop, once the killed engine's stream has
         broken. A message the user sent AFTER the click is already queued
@@ -157,3 +162,4 @@ class StopControlMixin:
             log_event("engine", f"{what}_not_scheduled_after_stop", tab_id=self.tab_id, reason=reason)
             return True
         return False
+    # edition:end

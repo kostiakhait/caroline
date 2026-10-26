@@ -4,6 +4,7 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 
 class CompactionMixin:
+    # edition:cut claude-session code no longer reached
     async def _pre_compact_hook(self, hook_input: Any, tool_use_id: Any, context: Any) -> dict[str, Any]:
         """Fires just before Claude's own compaction summarises older turns
         -- either its own native auto-compaction, or our forced "/compact"
@@ -54,6 +55,7 @@ class CompactionMixin:
         )
         self.forced_compaction_result_pending = True
         return {}
+    # edition:end
     def _current_session_file_size(self) -> int | None:
         """Bytes on disk for this tab's currently-resumed session transcript,
         or None if there's nothing resolvable yet (no session id, or the
@@ -307,6 +309,7 @@ class CompactionMixin:
                 await self.client.disconnect()
         except Exception as exc:
             log_event("engine", "fallback_compaction_disconnect_failed", tab_id=self.tab_id, error=str(exc))
+    # edition:cut claude-session code no longer reached
     def _note_compaction_hit_limit(self, limit_text: str) -> None:
         """A forced compaction just failed because the usage cap is in force.
         Per explicit instruction (2026-09-20), after a real outage: this used
@@ -328,6 +331,7 @@ class CompactionMixin:
             "engine", "forced_compaction_hit_limit", tab_id=self.tab_id,
             pause_s=FORCED_COMPACTION_LIMIT_PAUSE_MS // 1000, message=limit_text[:200],
         )
+    # edition:end
     def _drain_funds_blocked_queue(self) -> None:
         """Called right after _check_funds_exhaustion_status notices
         sw_api.get_funds_exhausted_reason() has gone back to None --

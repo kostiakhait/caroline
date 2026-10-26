@@ -115,6 +115,7 @@ class ReplyWatchMixin:
                 return
             interval_s = REPLY_WATCH_SCHEDULE[watch["phase"]][0]
         self._schedule_reply_watch_tick(interval_s)
+    # edition:cut claude-session code no longer reached
     async def _check_refusal_and_maybe_retry(self) -> None:
         """Per explicit instruction (2026-10-12): a separate concern from
         _check_permission_guard (that one is about a missing user APPROVAL;
@@ -154,6 +155,7 @@ class ReplyWatchMixin:
             return
         log_event("engine", "refusal_guard_retrying_via_sw", tab_id=self.tab_id, reason=result["reason"])
         self._start_small_model_turn(task, [], True, self.turn_is_voice)
+    # edition:end
     def _on_outbound_message_sent(self, channel: str, args: dict[str, Any], result: Any) -> None:
         """Per explicit instruction (2026-10-12): registered with
         session_context's register_reply_watch, called synchronously by

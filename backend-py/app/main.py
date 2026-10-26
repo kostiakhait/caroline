@@ -25,13 +25,17 @@ from app import memory_turns
 from app import pseudo_tab
 from app.session_context import register_sessions_getter
 from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear_tab_disk_state, current_language_name, refresh_language_in_background
+# edition:cut claude cli
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
+# edition:end
 from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app.stt_adaptation import apply_adaptation, observe_user_message
 from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcript
+# edition:cut openai
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
+# edition:end
 from app.history import read_archived_entries, read_recent_history_for_session
 from app import settings_mirror, vault_backup, wizard
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
@@ -76,11 +80,14 @@ from app.discord_channel import get_discord_channel_status, start_discord_channe
 from app.whatsapp_channel import get_whatsapp_channel_status, start_whatsapp_channel
 from app.messenger_channel import get_messenger_channel_status, start_messenger_channel
 from app.signal_channel import get_signal_channel_status, start_signal_channel
+# edition:cut claude-openai answer source
 from app.subscription_mode import (
     chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
     invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
     CLAUDE_MODEL_ALIASES, get_model_override, set_model_override,
 )
+# edition:end
+#ic| from app.subscription_mode import create_topup_checkout_url, get_sw_status, invalidate_sw_status, run_account_state_refresher
 from app.plugins.visual_models_plugin import (
     FACE_ANIMATION_BASE_URL,
     load_pending_visual_model_downloads,
@@ -827,6 +834,7 @@ async def get_companion_logs(fromNumber: str | None = None, maxChars: int | None
     return JSONResponse({"ok": True, "phoneNumber": device.get("phoneNumber"), "log": result.get("log") or "", "truncated": bool(result.get("truncated"))})
 
 
+# edition:cut claude-openai answer source (rest)
 @app.get("/api/mode")
 async def get_mode(tab: str = PRIMARY_TAB_ID) -> JSONResponse:
     """{ok, mode, available:{claude,sw,openai}, eligible} for a tab."""
@@ -837,6 +845,7 @@ class ModeBody(BaseModel):
     mode: str
 
 
+# edition:end
 @app.get("/api/continuous-dialogue")
 async def get_continuous_dialogue() -> JSONResponse:
     """{ok, enabled}: the continuous-dialogue switch (app/continuous_dialogue.py)."""
@@ -854,6 +863,7 @@ async def post_continuous_dialogue(body: ContinuousDialogueBody) -> JSONResponse
     return await _control_json("continuous_dialogue_set", PRIMARY_TAB_ID, {"enabled": body.enabled})
 
 
+# edition:cut claude-openai answer source (rest)
 @app.post("/api/mode")
 async def post_mode(body: ModeBody, tab: str = PRIMARY_TAB_ID) -> JSONResponse:
     """Switches a tab to "claude", "sw" or "openai". A Claude<->OpenAI change
@@ -887,6 +897,7 @@ async def post_openai_cancel() -> JSONResponse:
     return await _control_json("openai_cancel_login", PRIMARY_TAB_ID)
 
 
+# edition:end
 # --- the start-up wizard (app/wizard.py; page app/assets/wizard.html) -----------
 # Served by the backend itself so the page and its API share one origin -- the shells only open
 # http://127.0.0.1:<port>/wizard in a window of their own.
@@ -919,6 +930,7 @@ async def post_wizard_login(body: WizardLoginBody) -> JSONResponse:
     return JSONResponse(await wizard.login(WORKSPACE_DIR, body.email, body.password, body.isRegister))
 
 
+# edition:cut claude-openai answer source (rest)
 @app.post("/api/wizard/claude-login")
 async def post_wizard_claude_login() -> JSONResponse:
     return JSONResponse(await wizard.start_claude_login(WORKSPACE_DIR))
@@ -929,6 +941,7 @@ async def post_wizard_openai_login() -> JSONResponse:
     return await _control_json("openai_login", PRIMARY_TAB_ID, {"method": "chatgpt"})
 
 
+# edition:end
 class WizardMailboxRemoveBody(BaseModel):
     address: str
 
@@ -1182,8 +1195,11 @@ def _ratatosk_stop_session() -> bool:
 # (settings_mirror.py) writes the change to Notes, so a reinstall picks it up.
 _SETTINGS_OPS = frozenset({
     "persona_set", "persona_reset", "continuous_dialogue_set", "visual_mode_set", "local_stt_set",
+    # edition:cut claude-openai answer source
     "chat_mode_set", "model_override_set", "openai_key_set", "own_anthropic_key_set",
     "ratatosk_own_account_register", "openai_login", "auth_login",
+    # edition:end
+    #ic| "ratatosk_own_account_register",
 })
 
 
@@ -1529,6 +1545,7 @@ async def _handle_control_request_inner(
                 import uuid as _uuid
                 await send({"type": "open_login", "requestId": _uuid.uuid4().hex, "error": result.error})
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    # edition:cut claude-openai answer source (control ops)
     if op == "auth_status":
         try:
             # From the account-state cache (see app/account_state.py) --
@@ -1571,6 +1588,7 @@ async def _handle_control_request_inner(
         stdout = json.dumps({"chatSource": mode.chat_source, "swLoggedIn": mode.sw_logged_in})
         log_event("engine", "mode_get", stdout=stdout)
         return {"type": "control_response", "op": op, "ok": True, "stdout": stdout, "requestId": request_id}
+    # edition:end
     if op == "sw_status":
         status = await get_sw_status()
         stdout = json.dumps({"loggedIn": status.logged_in, "email": status.email, "balancePia": status.balance_pia, "balanceError": status.balance_error})
@@ -1580,6 +1598,7 @@ async def _handle_control_request_inner(
         log_event("engine", "sw_logout")
         clear_credentials()
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    # edition:cut claude-openai answer source (control ops)
     if op == "chat_mode_get":
         tab_id = str(parsed.get("tabId") or (session.tab_id if session is not None else PRIMARY_TAB_ID))
         current_mode = load_chat_mode(WORKSPACE_DIR, tab_id)
@@ -1664,6 +1683,7 @@ async def _handle_control_request_inner(
         log_event("engine", "openai_key_set", clearing=not parsed.get("apiKey"))
         set_own_openai_api_key(WORKSPACE_DIR, parsed.get("apiKey") or None)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    # edition:end
     if op == "clear_tab":
         # Bug fix (2026-09-17), per explicit instruction: a full, deliberate
         # tab wipe -- the frontend's own confirm modal already gated this
@@ -1678,6 +1698,7 @@ async def _handle_control_request_inner(
         else:
             clear_tab_disk_state(WORKSPACE_DIR, tab_id)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    # edition:cut claude-openai answer source (control ops)
     if op == "own_anthropic_key_get":
         key = get_own_anthropic_api_key(WORKSPACE_DIR)
         log_event("engine", "own_anthropic_key_get", is_set=bool(key))
@@ -1686,6 +1707,7 @@ async def _handle_control_request_inner(
         log_event("engine", "own_anthropic_key_set", clearing=not parsed.get("anthropicApiKey"))
         set_own_anthropic_api_key(WORKSPACE_DIR, parsed.get("anthropicApiKey") or None)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    # edition:end
     if op == "open_payment_from_settings":
         log_event("engine", "open_payment_from_settings")
         try:
@@ -1698,6 +1720,7 @@ async def _handle_control_request_inner(
             import uuid as _uuid
             await send({"type": "open_payment", "requestId": _uuid.uuid4().hex, "checkoutUrl": checkout_url})
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    # edition:cut claude cli mcp management
     if op == "mcp_list":
         r = await cli_mcp_list(WORKSPACE_DIR)
         return {"type": "control_response", "op": op, "ok": r["code"] == 0, "stdout": r["stdout"], "stderr": r["stderr"], "requestId": request_id}
@@ -1713,6 +1736,7 @@ async def _handle_control_request_inner(
         r = await cli_mcp_remove(WORKSPACE_DIR, parsed["name"])
         log_event("engine", "mcp_remove", name=parsed["name"], ok=r["code"] == 0)
         return {"type": "control_response", "op": op, "ok": r["code"] == 0, "stdout": r["stdout"], "stderr": r["stderr"], "requestId": request_id}
+    # edition:end
     if op == "persona_get":
         log_event("engine", "persona_get")
         p = get_persona(WORKSPACE_DIR)

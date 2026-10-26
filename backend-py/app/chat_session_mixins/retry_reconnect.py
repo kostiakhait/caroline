@@ -19,6 +19,7 @@ class RetryReconnectMixin:
             self.api_retry_timer = None
         if clear_persisted:
             clear_pending_api_retry(self.workspace_dir, self.tab_id)
+    # edition:cut claude-session code no longer reached
     def _schedule_api_retry(self, reason: str, is_voice: bool) -> None:
         if self._stopped_by_user("api_retry", reason):
             return
@@ -56,6 +57,8 @@ class RetryReconnectMixin:
 
         loop = asyncio.get_event_loop()
         self.api_retry_timer = loop.call_later(API_RETRY_INTERVAL_MS / 1000, _fire)
+    # edition:end
+    # edition:cut claude-session code no longer reached
     def _schedule_one_shot_followup_check(self, reason: str, is_voice: bool) -> None:
         """Per explicit instruction (2026-09-11): distinguishes "the
         operation never even started" (a genuine rejection -- no balance,
@@ -122,6 +125,7 @@ class RetryReconnectMixin:
 
         loop = asyncio.get_event_loop()
         self.one_shot_followup_timer = loop.call_later(ONE_SHOT_FOLLOWUP_CHECK_DELAY_MS / 1000, _fire)
+    # edition:end
     def _clear_one_shot_followup_timer(self, clear_persisted: bool = True) -> None:
         """Same `clear_persisted=False`-only-from-dispose() reasoning as
         _clear_api_retry_timer's own docstring."""
@@ -134,6 +138,7 @@ class RetryReconnectMixin:
         for t in self.mcp_reconnect_timers.values():
             t.cancel()
         self.mcp_reconnect_timers.clear()
+    # edition:cut claude client mcp reconnect
     def _schedule_mcp_reconnect(self, client: AgentEngine, name: str, attempt: int = 0) -> None:
         """Keeps retrying client.reconnect_mcp_server(name) on a FLAT
         interval until it succeeds -- so a server that's down for a
@@ -170,6 +175,8 @@ class RetryReconnectMixin:
         except Exception as exc:
             log_event("engine", "mcp_server_reconnect_failed", tab_id=self.tab_id, server=name, attempt=attempt, retry_in_ms=MCP_RECONNECT_INTERVAL_MS, error=str(exc))
             self._schedule_mcp_reconnect(client, name, attempt + 1)
+    # edition:end
+    # edition:cut claude-session code no longer reached
     def _handle_balance_exhausted(self) -> str:
         """Own-Anthropic credits/quota ran out. Nothing to fall back to and
         no top-up we can drive (it's the user's own Anthropic billing) --
@@ -191,3 +198,4 @@ class RetryReconnectMixin:
         log_event("engine", "rate_limit_rejected", tab_id=self.tab_id, source=source)
         self._set_conn_state("limited", text)
         self._schedule_api_retry(f"rate_limit_rejected:{source}", self.turn_is_voice)
+    # edition:end

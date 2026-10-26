@@ -99,6 +99,7 @@ async def _select_via_sw(query: str, candidates: list[dict[str, Any]], session: 
     return _parse_ids(answer, {c["id"] for c in candidates})
 
 
+# edition:cut claude
 async def _select_via_claude(query: str, candidates: list[dict[str, Any]]) -> list[str]:
     from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
     from claude_agent_sdk import query as sdk_query
@@ -114,6 +115,7 @@ async def _select_via_claude(query: str, candidates: list[dict[str, Any]]) -> li
                 if isinstance(block, TextBlock):
                     answer += block.text
     return _parse_ids(answer, {c["id"] for c in candidates})
+# edition:end
 
 
 async def recall_memory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
@@ -128,11 +130,15 @@ async def recall_memory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
     mode = load_chat_mode(WORKSPACE_DIR, get_tab_id() or "")
     try:
+        # edition:cut claude
         if mode == "claude":
             ids = await _select_via_claude(query, candidates)
         else:
             _email, _hash16, session = await _sessions.ensure_session()
             ids = await _select_via_sw(query, candidates, session)
+        # edition:end
+        #ic| _email, _hash16, session = await _sessions.ensure_session()
+        #ic| ids = await _select_via_sw(query, candidates, session)
     except Exception as exc:
         return {"text": f'recall_memory\'s search failed: {exc}. Your other notes_* tools (notes_search, notes_list) still work directly.', "is_error": True}
 

@@ -1,2 +1,7 @@
 # A patch for another repository whose files have CRLF line endings: kept byte for byte.
 docs/reforce-resolveAgenticStep-options.patch -text
+
+# Scripts that run on Linux must keep LF line endings on a Windows checkout (autocrlf).
+*.sh text eol=lf
+tools/*.py text eol=lf
+tools/*.txt text eol=lf

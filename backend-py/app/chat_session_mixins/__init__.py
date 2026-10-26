@@ -14,7 +14,9 @@ from app.chat_session_mixins.dialogue_transcript import DialogueTranscriptMixin
 from app.chat_session_mixins.reply_watch import ReplyWatchMixin
 from app.chat_session_mixins.watchdog import WatchdogMixin
 from app.chat_session_mixins.compaction import CompactionMixin
+# edition:cut claude model ladder
 from app.chat_session_mixins.ladder import LadderMixin
+# edition:end
 from app.chat_session_mixins.delivery_report import DeliveryReportMixin
 from app.chat_session_mixins.compaction_recovery import CompactionRecoveryMixin
 
@@ -33,7 +35,9 @@ __all__ = [
     'ReplyWatchMixin',
     'WatchdogMixin',
     'CompactionMixin',
+    # edition:cut claude model ladder
     'LadderMixin',
+    # edition:end
     'DeliveryReportMixin',
     'CompactionRecoveryMixin',
 ]
