@@ -114,6 +114,11 @@ internal static class PythonInstaller
          // Caroline answers "I can't answer this right now" to everything, including her first greeting (2026-10-25).
          // Same pin as requirements-linux.txt.
          "openai==3.24.0",
+         // Every other third-party module the backend imports and no entry above brings in (audited 2026-10-25 against
+         // backend-py/app and camerlengo-vendor-stubs): requests is imported by AI.py at load time -- without it the SW
+         // engine fails to load and Caroline answers nothing; the three Office libraries are what files_plugin.py opens
+         // Word/Excel/PowerPoint files with. Same pins as requirements-linux.txt.
+         "requests==2.34.2", "python-docx==1.2.0", "openpyxl==3.1.5", "python-pptx==1.0.2",
          "slack_sdk",
          // app/telegram_channel.py's Telethon (MTProto Client API) connection --
          // second messenger. Confirmed live: telethon's own dependency (pyaes)

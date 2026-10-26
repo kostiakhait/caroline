@@ -9,6 +9,7 @@ script's own directory is always sys.path[0], confirmed empirically against
 the actual embeddable runtime this ships with (see PythonInstaller.cs).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,7 @@ if __name__ == "__main__":
     # called in-process, on demand, from voice_api.py's own TTS path, not
     # launched once at startup.
     #
+    # (Since 2026-10-25 the second listener only runs when CAROLINE_REMOTE_ACCESS=1 -- see _serve_both.)
     # Two listeners (2026-10-05), same app/event loop -- see main.py's
     # _require_remote_owner_session for the SW-session gate that makes
     # REMOTE_PORT (0.0.0.0, reachable from another device) safe to serve the
@@ -73,7 +75,13 @@ if __name__ == "__main__":
 
     async def _serve_both() -> None:
         local = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PORT, log_level="info"))
-        asyncio.create_task(_serve_remote_forever())
+        # Decided 2026-10-25: the backend listens only on this machine (127.0.0.1). The second listener on 0.0.0.0
+        # is OFF unless CAROLINE_REMOTE_ACCESS=1 is set on purpose: with it on, Windows asked for a firewall exception
+        # for pythonw.exe at every new install path (three Public-profile allow rules appeared in one day).
+        if os.environ.get("CAROLINE_REMOTE_ACCESS") == "1":
+            asyncio.create_task(_serve_remote_forever())
+        else:
+            log_event("engine", "remote_listener_off", port=REMOTE_PORT, hint="set CAROLINE_REMOTE_ACCESS=1 to listen on 0.0.0.0")
         await local.serve()
 
     asyncio.run(_serve_both())
