@@ -29,6 +29,7 @@ from app.chat_session_mixins import (
     ReplyWatchMixin,
     WatchdogMixin,
     CompactionMixin,
+    LadderMixin,
 )
 
 
@@ -47,6 +48,7 @@ class ChatSession(
     ReplyWatchMixin,
     WatchdogMixin,
     CompactionMixin,
+    LadderMixin,
 ):
     def __init__(
         self, tab_id: str, workspace_dir: str, send: SendFn, *,

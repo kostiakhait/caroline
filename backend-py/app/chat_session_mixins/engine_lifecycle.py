@@ -423,6 +423,7 @@ class EngineLifecycleMixin:
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
             if item.get("memory_advice_for"):
                 await self._glue_memory_advice(item)
+            await self._ladder_before_yield(item)
             yield item["message"]
     async def _glue_memory_advice(self, item: dict[str, Any]) -> None:
         """The memory advisor (app/memory_advisor.py) for a real user message of the Claude/Codex engines: the
@@ -549,6 +550,7 @@ class EngineLifecycleMixin:
                 # reasoning as last_activity/last_visible_output_at just above.
                 self.hang_interrupt_result_pending = False
                 self.ignore_next_result_recovery = False
+                self._ladder_reset()
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
                 self.engine_kind = (
@@ -1110,6 +1112,8 @@ class EngineLifecycleMixin:
                         # here would risk clobbering pending_user_text/
                         # pending_attachments for something ELSE that got
                         # queued in the meantime.
+                        if await self._ladder_on_result(message):
+                            continue  # the attempt was rejected: the next model has the turn, nothing of this one is shown
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending or self.clear_tab_result_pending
                         if not result_is_fake:
                             was_real_user_turn = self.pending_is_real_user
@@ -1300,6 +1304,9 @@ class EngineLifecycleMixin:
                                 self._set_conn_state("connected")
 
                     wire = message_to_wire(message)
+                    self._ladder_observe(wire)
+                    if not isinstance(message, ResultMessage) and self._ladder_hold(wire):
+                        wire = None  # kept for the verdict of the model ladder (_ladder_on_result sends it)
                     # Bug fix (2026-09-10/11): an interrupted or rejected
                     # turn's own ResultMessage carries whatever partial/
                     # empty/error result the CLI had at that moment --

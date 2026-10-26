@@ -1808,7 +1808,7 @@ def _make_executor_fn(
 
 def _build_verification_prompt(
     tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
-    can_deescalate: bool = False, can_retry: bool = False, evidence: str = "",
+    can_deescalate: bool = False, can_retry: bool = False, evidence: str = "", claude_attempt: bool = False,
 ) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
     any work. It checks the candidate against the mechanical facts below.
@@ -1872,7 +1872,15 @@ def _build_verification_prompt(
             "The files this task was to make, READ BY THE SYSTEM ITSELF just now -- what is in them at this "
             "moment (ground truth; the system read them, so nobody has to read them back):\n" + evidence
         )
-    if not tier_trace and not tracker.branch_trace:
+    if not tier_trace and not tracker.branch_trace and claude_attempt:
+        # A Claude tab's attempt (app/claude_ladder.py): its tools are Claude Code's and the plugins',
+        # not this engine's, so the memory-and-mailbox hint below does not apply -- only the plain fact.
+        parts.append(
+            "No tool calls were made in this attempt. So any action the reply says is done, is being done right "
+            "now, or is about to be done did NOT happen; a reply that merely promises work is not finished. A "
+            "plain answer from knowledge or from the conversation itself needs no tool."
+        )
+    elif not tier_trace and not tracker.branch_trace:
         # Said on every pass, not only the last one (2026-10-22): its absence read as
         # "nothing to check", and "Подключаю почту ..., проверю соединение и сообщу"
         # passed as a finished answer with no tool ever called.
@@ -2154,6 +2162,70 @@ def _read_verifier_reply(verified: str, candidate: str) -> tuple[str, str]:
 
 def _answer(text: str) -> dict[str, Any]:
     return {"status": "answered", "text": text}
+
+
+CLAUDE_ATTEMPT_VERDICT_TIMEOUT_S = 60.0
+
+
+async def verify_claude_attempt(
+    user_text: str, candidate_text: str, trace: list[str], can_escalate: bool, tab_id: str,
+) -> tuple[str, str]:
+    """The same verifier a cascade tier's answer goes through (run_verifier/verify_candidate in
+    run_small_model_turn), asked about one attempt of a Claude tab's model ladder
+    (app/claude_ladder.py). Returns (action, note): "done" -- the reply may go to the user as it
+    stands -- or "up" -- the task is not finished (or the reply has to change), the next model
+    takes it, `note` saying what is missing. Never raises and never blocks the turn: no key,
+    no answer, an error or a timeout all mean "done", exactly as the cascade's own verifier
+    falls back to its candidate. The reply is never rewritten here; a correction found by the
+    verifier is a reason to escalate, not text to send."""
+    try:
+        ai = await _model_ai()
+        if ai is None:
+            return "done", ""
+        cfg = camerlengo_ai.Config
+        tracker = _TurnTracker()
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "You check another assistant's work for the person who asked for it."},
+            {"role": "user", "content": user_text or "(no text)"},
+            {"role": "assistant", "content": candidate_text or "(no answer was produced)"},
+            {"role": "user", "content": _build_verification_prompt(
+                tracker, candidate_text, can_escalate, trace, False, False, "", claude_attempt=True,
+            )},
+        ]
+
+        def executor_fn(name: str, args: dict[str, Any]) -> str:
+            return "The verifier has no tools."
+
+        def on_usage(usage: dict[str, Any]) -> None:
+            log_event("engine", "small_model_usage", tab_id=tab_id, role="claude_ladder_verifier", **usage)
+
+        reply = await asyncio.wait_for(_call_with_funds_wait(
+            lambda: _hedged_verifier_call(lambda: _resolve_agentic_with_watchdog(
+                ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
+                max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
+                transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+            ), tab_id),
+            tab_id, lambda _line: None,
+        ), timeout=CLAUDE_ATTEMPT_VERDICT_TIMEOUT_S)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- the verdict is advice; the reply must still go out
+        log_event("engine", "claude_ladder_verifier_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+        return "done", ""
+    return read_claude_attempt_verdict(reply, can_escalate)
+
+
+def read_claude_attempt_verdict(reply: str, can_escalate: bool) -> tuple[str, str]:
+    """(action, note) for the verifier's reply -- see verify_claude_attempt. An unreadable or
+    empty reply is "done"."""
+    stripped = (reply or "").strip()
+    if not stripped or _VERIFIER_OK.match(stripped):
+        return "done", ""
+    if can_escalate and ESCALATION_SENTINEL in stripped:
+        return "up", stripped.replace(ESCALATION_SENTINEL, "").strip()[:300]
+    if can_escalate and _VERIFIER_FINAL.search(stripped):
+        return "up", "the checker found the reply wrong or incomplete"
+    return "done", ""
 
 
 # How much of a tool result the trace keeps -- the trace is the verifier's "ground truth"

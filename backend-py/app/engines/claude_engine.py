@@ -21,6 +21,9 @@ class ClaudeEngine:
     def receive_messages(self) -> AsyncIterator[Any]:
         return self._client.receive_messages()
 
+    async def set_model(self, model: str | None) -> None:
+        await self._client.set_model(model)
+
     async def interrupt(self) -> None:
         await self._client.interrupt()
 
