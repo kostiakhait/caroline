@@ -2240,6 +2240,76 @@ def read_claude_attempt_verdict(reply: str, can_escalate: bool) -> tuple[str, st
     return "done", ""
 
 
+DELIVERY_VERDICT_TIMEOUT_S = 60.0
+
+
+def _build_delivery_prompt(user_text: str, trace: list[str], delivered: str) -> str:
+    return (
+        "A person asked an assistant for something, the assistant did work, and the person was shown the messages "
+        "below. Decide whether the person now has enough information about the RESULT of that work.\n\n"
+        f"THE REQUEST:\n{user_text or '(no text)'}\n\n"
+        "THE WORK THE ASSISTANT DID -- real tool calls with their real results (ground truth for what happened):\n"
+        f"{_trace_text(trace, 40)}\n\n"
+        f"WHAT THE PERSON WAS ACTUALLY SHOWN, in order -- only this reached them:\n---\n{delivered}\n---\n\n"
+        "Enough information means the person can tell from what they were shown: what was done, how it ended "
+        "(done, failed, or waiting for them), and anything they have to know or do next. Judge ONLY what they were "
+        "shown; do not credit them with anything that is only in the work log. Progress notes (\"checking...\") are "
+        "not a result. A message that asks them for a needed approval or answer is a sufficient ending when the "
+        "question is clear and carries what they must decide on (for example the exact text to approve).\n\n"
+        "Reply with exactly one of:\n"
+        '- "OK" -- they have enough.\n'
+        "- <final>the report</final> -- they do not. Write the report to them yourself: in the language of the "
+        "request, directly to the person, short and concrete, stating the outcome and what matters, using only "
+        "facts the work log supports. No promises of further work, no apologies, no mention of this check."
+    )
+
+
+async def verify_delivery(user_text: str, trace: list[str], delivered: str, tab_id: str) -> str | None:
+    """The end-of-turn check (app/delivery_report.py): None when the person was shown enough about the result, else
+    the report to send them. Never raises: no key, no answer, an error or a timeout all mean None -- a missing
+    check must not put anything in front of the user."""
+    try:
+        ai = await _model_ai()
+        if ai is None:
+            return None
+        cfg = camerlengo_ai.Config
+        tracker = _TurnTracker()
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "You check what a person was shown against what was done for them."},
+            {"role": "user", "content": _build_delivery_prompt(user_text, trace, delivered)},
+        ]
+
+        def executor_fn(name: str, args: dict[str, Any]) -> str:
+            return "The checker has no tools."
+
+        def on_usage(usage: dict[str, Any]) -> None:
+            log_event("engine", "small_model_usage", tab_id=tab_id, role="delivery_report_verifier", **usage)
+
+        reply = await asyncio.wait_for(_call_with_funds_wait(
+            lambda: _hedged_verifier_call(lambda: _resolve_agentic_with_watchdog(
+                ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
+                max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
+                transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+            ), tab_id),
+            tab_id, lambda _line: None,
+        ), timeout=DELIVERY_VERDICT_TIMEOUT_S)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "delivery_verifier_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+        return None
+    return read_delivery_verdict(reply)
+
+
+def read_delivery_verdict(reply: str) -> str | None:
+    stripped = (reply or "").strip()
+    if not stripped or _VERIFIER_OK.match(stripped):
+        return None
+    found = _VERIFIER_FINAL.search(stripped)
+    report = found.group(1).strip() if found else ""
+    return report or None
+
+
 # How much of a tool result the trace keeps -- the trace is the verifier's "ground truth"
 # and what an escalated tier continues from. It was the first 300 characters. Live
 # (2026-10-11, twice in a row, the same question): a web_search result is five sources

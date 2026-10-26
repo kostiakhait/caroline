@@ -30,6 +30,7 @@ from app.chat_session_mixins import (
     WatchdogMixin,
     CompactionMixin,
     LadderMixin,
+    DeliveryReportMixin,
 )
 
 
@@ -49,6 +50,7 @@ class ChatSession(
     WatchdogMixin,
     CompactionMixin,
     LadderMixin,
+    DeliveryReportMixin,
 ):
     def __init__(
         self, tab_id: str, workspace_dir: str, send: SendFn, *,
@@ -56,7 +58,7 @@ class ChatSession(
     ) -> None:
         self.tab_id = tab_id
         self.workspace_dir = workspace_dir
-        self.send = send
+        self.send = self._dr_wrap_send(send)  # records what really reaches the window (delivery_report.py)
         # Per explicit instruction (2026-10-13): a session with no chat window
         # of its own -- the Ratatosk owner-DM channel, and every tab's own
         # pseudo-session (see main.py's get_or_create_ratatosk_session/

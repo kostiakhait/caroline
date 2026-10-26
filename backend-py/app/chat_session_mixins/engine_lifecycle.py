@@ -423,6 +423,7 @@ class EngineLifecycleMixin:
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
             if item.get("memory_advice_for"):
                 await self._glue_memory_advice(item)
+            self._dr_begin(item)
             await self._ladder_before_yield(item)
             yield item["message"]
     async def _glue_memory_advice(self, item: dict[str, Any]) -> None:
@@ -551,6 +552,7 @@ class EngineLifecycleMixin:
                 self.hang_interrupt_result_pending = False
                 self.ignore_next_result_recovery = False
                 self._ladder_reset()
+                self._dr_reset()
                 log_event("engine", "run_loop_fresh_session", tab_id=self.tab_id)
 
                 self.engine_kind = (
@@ -1305,6 +1307,7 @@ class EngineLifecycleMixin:
 
                     wire = message_to_wire(message)
                     self._ladder_observe(wire)
+                    self._dr_observe(wire)
                     if not isinstance(message, ResultMessage) and self._ladder_hold(wire):
                         wire = None  # kept for the verdict of the model ladder (_ladder_on_result sends it)
                     # Bug fix (2026-09-10/11): an interrupted or rejected
@@ -1480,6 +1483,7 @@ class EngineLifecycleMixin:
                             # turn (_input_stream yields it). No per-turn
                             # restart.
                             self.turn_is_voice = False
+                            self._dr_finish(message)
 
                     if isinstance(message, SystemMessage) and message.subtype == "init":
                         self.has_seen_init = True

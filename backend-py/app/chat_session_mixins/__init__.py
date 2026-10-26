@@ -15,6 +15,7 @@ from app.chat_session_mixins.reply_watch import ReplyWatchMixin
 from app.chat_session_mixins.watchdog import WatchdogMixin
 from app.chat_session_mixins.compaction import CompactionMixin
 from app.chat_session_mixins.ladder import LadderMixin
+from app.chat_session_mixins.delivery_report import DeliveryReportMixin
 
 __all__ = [
     'EngineLifecycleMixin',
@@ -32,4 +33,5 @@ __all__ = [
     'WatchdogMixin',
     'CompactionMixin',
     'LadderMixin',
+    'DeliveryReportMixin',
 ]
