@@ -68,15 +68,6 @@ class LadderMixin:
         if turn is not None and turn.active and wire is not None:
             turn.observe(wire)
 
-    async def _ladder_release_interim(self, wire: dict[str, Any] | None) -> None:
-        """The turn went on (a tool call, a tool result) after text that was held: that was narration, send it now."""
-        turn = self._ladder
-        if turn is not None and turn.active and wire is not None and turn.releases_held(wire):
-            try:
-                await self._ladder_flush(turn)
-            except Exception as exc:  # noqa: BLE001
-                log_event("engine", "claude_ladder_release_failed", tab_id=self.tab_id, error=str(exc)[:200])
-
     def _ladder_hold(self, wire: dict[str, Any] | None) -> bool:
         """True: this assistant message waits for the verdict (it is kept, not sent)."""
         turn = self._ladder

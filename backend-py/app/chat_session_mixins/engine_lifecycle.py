@@ -1305,8 +1305,6 @@ class EngineLifecycleMixin:
 
                     wire = message_to_wire(message)
                     self._ladder_observe(wire)
-                    if not isinstance(message, ResultMessage):
-                        await self._ladder_release_interim(wire)
                     if not isinstance(message, ResultMessage) and self._ladder_hold(wire):
                         wire = None  # kept for the verdict of the model ladder (_ladder_on_result sends it)
                     # Bug fix (2026-09-10/11): an interrupted or rejected
