@@ -433,10 +433,14 @@ class EngineLifecycleMixin:
         try:
             from app.memory_advisor import memory_block
 
+            started = time.monotonic()
             dialogue = await asyncio.to_thread(
                 _read_recent_dialogue_lines, self.last_saved_session_id, self.tab_id, self.workspace_dir, 6,
             )
+            dialogue_ms = round((time.monotonic() - started) * 1000)
             block = await memory_block(item["memory_advice_for"], dialogue, self.tab_id)
+            log_event("engine", "memory_advisor_glue_timing", tab_id=self.tab_id, dialogue_read_ms=dialogue_ms,
+                      total_ms=round((time.monotonic() - started) * 1000), block_chars=len(block))
             if block:
                 item["message"]["message"]["content"].append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + block})
         except Exception as exc:  # noqa: BLE001

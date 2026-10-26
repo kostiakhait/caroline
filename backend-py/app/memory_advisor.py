@@ -50,11 +50,15 @@ async def _decide(message: str, dialogue: list[str], tab_id: str | None) -> tupl
 async def _search(query: str) -> str | None:
     from app.plugins.memory_plugin import _run_memory_query
 
+    started = time.monotonic()
     try:
         reply = await asyncio.wait_for(_run_memory_query(query), SEARCH_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 -- timeouts included
-        log_event("engine", "memory_advisor_search_failed", error=str(exc)[:200], error_type=type(exc).__name__)
+        log_event("engine", "memory_advisor_search_failed", error=str(exc)[:200], error_type=type(exc).__name__,
+                  ms=round((time.monotonic() - started) * 1000), query=query[:80])
         return None
+    log_event("engine", "memory_advisor_search_timing", ms=round((time.monotonic() - started) * 1000), query=query[:80],
+              chars=len(str(reply.get("text") or "")), is_error=bool(reply.get("is_error")))
     if reply.get("is_error"):
         log_event("engine", "memory_advisor_search_refused", error=str(reply.get("text"))[:200])
         return None
@@ -80,13 +84,17 @@ async def memory_block(message: str, dialogue: list[str] | None = None, tab_id: 
 async def _block(message: str, dialogue: list[str], tab_id: str | None) -> str:
     started = time.monotonic()
     needed, queries, why = await _decide(message, dialogue, tab_id)
+    log_event("engine", "memory_advisor_decide_timing", tab_id=tab_id, ms=round((time.monotonic() - started) * 1000), needed=needed,
+              queries=len(queries), dialogue_lines=len(dialogue), message_chars=len(message))
     if not needed:
         log_event("engine", "memory_advisor_not_needed", tab_id=tab_id, why=why, ms=int((time.monotonic() - started) * 1000))
         return ""
+    search_started = time.monotonic()
     replies = await asyncio.gather(*(_search(q) for q in queries))
     found = [(q, r) for q, r in zip(queries, replies) if r]
     log_event("engine", "memory_advisor_searched", tab_id=tab_id, why=why, queries=queries,
-              answered=len(found), ms=int((time.monotonic() - started) * 1000))
+              answered=len(found), ms=int((time.monotonic() - started) * 1000),
+              search_ms=int((time.monotonic() - search_started) * 1000))
     if not found:
         return ""
     parts = [f"{BLOCK_HEADER}: your memory was searched because {why or 'the message may rely on what you already know'}. "

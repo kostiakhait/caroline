@@ -463,9 +463,11 @@ async def _review_invented(original: str, revised: str, time_left_s: float) -> b
         runtime.register(agent)
     started = time.monotonic()
     try:
+        from app.microagent_client import run_timed
+
         result = await asyncio.wait_for(asyncio.to_thread(
-            runtime.run, reply_review_check.REVIEW_CHECK, {"original": original, "revised": revised},
-            runtime.new_context(budget=new_budget())), time_left_s)
+            run_timed, runtime, reply_review_check.REVIEW_CHECK, {"original": original, "revised": revised},
+            runtime.new_context(budget=new_budget()), time.monotonic()), time_left_s)
     except Exception as exc:  # noqa: BLE001 -- fail-open
         log_event("plugin:voice", "review_check_failed", error=f"{type(exc).__name__}: {exc}"[:300],
                   ms=int((time.monotonic() - started) * 1000))
@@ -632,7 +634,9 @@ async def _identify_pending_action_locally(
             # argument settles whose identity it goes out under -- see the agent's
             # own prompt, THE TOOL CALL.
             agent_input["tool_call"] = tool_call
-        result = await asyncio.to_thread(runtime.run, IDENTIFY, agent_input, context)
+        from app.microagent_client import run_timed
+
+        result = await asyncio.to_thread(run_timed, runtime, IDENTIFY, agent_input, context, time.monotonic())
     except Exception as exc:
         log_event("plugin:voice", "permission_identify_local_failed", error=str(exc))
         return None
@@ -667,7 +671,10 @@ async def judge_file_transfer_locally(
     agent_input = {"direction": direction, "path_facts": path_facts, "turn_started_by": turn_started_by,
                    "tool_call": tool_call, "task": task, "recent_dialogue": recent_dialogue}
     try:
-        result = await asyncio.to_thread(runtime.run, FILE_TRANSFER, agent_input, runtime.new_context(budget=new_budget()))
+        from app.microagent_client import run_timed
+
+        result = await asyncio.to_thread(
+            run_timed, runtime, FILE_TRANSFER, agent_input, runtime.new_context(budget=new_budget()), time.monotonic())
     except Exception as exc:
         log_event("plugin:voice", "file_transfer_judge_failed", error=str(exc))
         return None
@@ -944,7 +951,9 @@ async def _run_local_microagent(agent_name: str, agent_module: str, agent_input:
         except ValueError:
             pass
     context = runtime.new_context(budget=new_budget())
-    return await asyncio.to_thread(runtime.run, agent_name, agent_input, context)
+    from app.microagent_client import run_timed
+
+    return await asyncio.to_thread(run_timed, runtime, agent_name, agent_input, context, time.monotonic())
 
 
 async def check_action_sanction(message: str, open_actions: list[dict[str, str]]) -> list[dict[str, Any]] | None:

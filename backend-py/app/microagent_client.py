@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,58 @@ def _post_json_sync(body: dict[str, Any], timeout: float = 30.0, retries: int = 
         return res.json()
 
 
+# --- timing (2026-10-26: the memory advisor waited 13-25 s per message and nothing said where the time went) ----------
+# Every agent runs in its own thread named "microagent:<agent>" (Microagent.py), and that is the thread _llm_call executes in.
+_active_runs = 0
+_inflight_calls = 0
+_calls_by_agent: dict[str, int] = {}
+_active_lock = threading.Lock()
+
+
+def _note_llm_call(model_class: str, reasoning: str | None, prompt: str, started: float, ok: bool,
+                   usage: Any = None, error: str | None = None, inflight: int | None = None) -> None:
+    """One network hop of the ladder (a rung): how long the server took and what it spent. Never raises."""
+    try:
+        agent = threading.current_thread().name.removeprefix("microagent:")
+        with _active_lock:
+            _calls_by_agent[agent] = _calls_by_agent.get(agent, 0) + 1
+            n = _calls_by_agent[agent]
+        usage = usage if isinstance(usage, dict) else {}
+        log_event("engine", "microagent_llm_call", agent=agent, model_class=model_class, reasoning=reasoning,
+                  rung_call=n, inflight_calls=inflight, prompt_chars=len(prompt or ""), ms=round((time.monotonic() - started) * 1000), ok=ok, error=error,
+                  prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
+                  reasoning_tokens=usage.get("reasoning_tokens") or (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def run_timed(runtime: Any, agent_name: str, agent_input: dict[str, Any], context: Any, submitted: float) -> Any:
+    """runtime.run() for the worker thread, measured: how long the run waited for a thread (`queued_ms`: the default pool is
+    shared with every other to_thread call), how many runs were going at the same moment, how long it ran, how many model
+    calls it made (two runs of the same agent at once share the count). The result is returned unchanged."""
+    global _active_runs
+    started = time.monotonic()
+    with _active_lock:
+        _active_runs += 1
+        concurrent = _active_runs
+        _calls_by_agent[agent_name] = 0
+    status = None
+    try:
+        result = runtime.run(agent_name, agent_input, context)
+        status = result.get("status") if isinstance(result, dict) else None
+        return result
+    finally:
+        with _active_lock:
+            _active_runs -= 1
+            calls = _calls_by_agent.get(agent_name, 0)
+        try:
+            log_event("engine", "microagent_run", agent=agent_name, queued_ms=round((started - submitted) * 1000),
+                      run_ms=round((time.monotonic() - started) * 1000), model_calls=calls,
+                      concurrent_runs=concurrent, threads=threading.active_count(), status=status)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _llm_call(model_class: str, prompt: str, timeout_s: float, reasoning: str | None = None,
               images: list | None = None) -> dict:
     """Microagent.Runtime's own llm_call contract -- POSTs Camerlengo's
@@ -132,7 +185,21 @@ def _llm_call(model_class: str, prompt: str, timeout_s: float, reasoning: str | 
         body["reasoning"] = reasoning
     if images:
         body["images"] = images
-    envelope = _post_json_sync(body, timeout=timeout_s + 15.0, retries=1)
+    global _inflight_calls
+    started = time.monotonic()
+    with _active_lock:
+        _inflight_calls += 1
+        inflight = _inflight_calls
+    try:
+        envelope = _post_json_sync(body, timeout=timeout_s + 15.0, retries=1)
+    except Exception as exc:  # noqa: BLE001 -- measured, then raised as before
+        _note_llm_call(model_class, reasoning, prompt, started, ok=False, error=f"{type(exc).__name__}: {str(exc)[:120]}", inflight=inflight)
+        raise
+    finally:
+        with _active_lock:
+            _inflight_calls -= 1
+    _note_llm_call(model_class, reasoning, prompt, started, ok=envelope.get(".status") == "ok", usage=envelope.get("usage"),
+                   error=None if envelope.get(".status") == "ok" else envelope.get(".reason"), inflight=inflight)
     if envelope.get(".status") != "ok":
         raise RuntimeError(envelope.get(".reason") or "microagent:call failed")
     # cmdV2MicroagentCall's payload (text/usage) is merged at the TOP level
