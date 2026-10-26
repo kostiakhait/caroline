@@ -87,3 +87,24 @@ def test_build_group_server_and_call(plugins, calls, monkeypatch):
     assert calls == [("greet", {"x": "hi"})] and not out.get("isError")
     bad = asyncio.run(group_tools["call_tool"].handler({"name": "nope", "args": {}}))
     assert bad.get("isError")
+
+
+def test_real_catalog_end_to_end(monkeypatch):
+    """The real plugins: every grouped tool can be described, and a harmless one runs through call_tool -> dispatch."""
+    captured = {}
+    original = loader.create_sdk_mcp_server
+
+    def capture(name, tools):
+        captured[name] = {t.name: t for t in tools}
+        return original(name=name, tools=tools)
+
+    monkeypatch.setattr(loader, "create_sdk_mcp_server", capture)
+    loader.build_mcp_servers()
+    real = loader.discover_plugins()
+    grouped = tool_groups.grouped_plugins(real)
+    assert grouped and "caroline-tools" is not None
+    for plugin in grouped:
+        for tool in plugin.tools:
+            assert not tool_groups.describe_tool_text(real, tool.name).startswith("No tool")
+    out = asyncio.run(captured["tools"]["call_tool"].handler({"name": "get_current_time", "args": {}}))
+    assert "done" in out["content"][0]["text"]
