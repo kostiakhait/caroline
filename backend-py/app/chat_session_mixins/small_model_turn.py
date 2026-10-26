@@ -38,6 +38,10 @@ class SmallModelTurnMixin:
         self._pending_tool_calls = {}
         self.turn_tool_outcomes = {}
         if is_real_user:
+            self._dr_begin_sw(text)
+        else:
+            self._dr_reset()
+        if is_real_user:
             self._post_turn_check_rounds = 0
             self._post_turn_checks_halted = False
             self.last_real_user_turn_at = time.monotonic()
@@ -197,13 +201,15 @@ class SmallModelTurnMixin:
             # Stop button -- see stop()'s own small_model_active branch. Never starts a
             # queued real turn -- an explicit Stop means stop, not run the next thing.
             log_event("engine", "small_model_turn_cancelled", tab_id=self.tab_id)
+            self._dr_reset()
             clear_pending_turn(self.workspace_dir, self.tab_id)
             self.turn_pending = False
             self._end_small_model_turn(start_queued_real_turn=False)
             raise
         except Exception as exc:  # noqa: BLE001 -- this path must never wedge the session
             log_event("engine", "small_model_turn_unexpected_error", tab_id=self.tab_id, error=str(exc), error_type=type(exc).__name__)
-            result = {"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
+            self._dr_reset()  # an error answer is not a delivery to check (same as an error result on the SDK path)
+            result ={"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
         if not is_real_user and STARTUP_GREETING_NUDGE_TEMPLATE[:60] in text:
             from app.small_model_engine import _UNAVAILABLE_ANSWER
@@ -328,6 +334,11 @@ class SmallModelTurnMixin:
             if translated and translated != text:
                 log_event("engine", "small_model_translate_applied", tab_id=self.tab_id, original_len=len(text), translated_len=len(translated))
                 text = translated
+        # Same rule as the SDK path (_translate_wire_visible_text): a reply to an internal message (a finished background
+        # task, a check) that only repeats what the user was told a moment ago is not shown.
+        if not silent and not self.small_model_turn_is_real_user and self._recent_repeat_of(text):
+            silent = True
+            log_event("engine", "repeat_reply_suppressed", tab_id=self.tab_id, text=text[:300], engine="sw")
         # Per explicit instruction (2026-10-11): re-evaluate the permission
         # guard on every outbound message -- see _check_permission_guard's
         # own docstring for why this runs here too, not just in submit().
@@ -379,6 +390,8 @@ class SmallModelTurnMixin:
                 "result": text,
             }
             await self.send({"type": "sdk_message", "message": result_wire, "isVoice": is_voice})
+        # The end-of-turn delivery check (app/delivery_report.py): what reached the window against this turn's tool calls.
+        self._dr_finish_sw(recorder.calls if recorder is not None else [])
         self.real_user_turn_answered = True
         self.last_visible_output_at = time.monotonic()
         self.consecutive_narration_count = 0

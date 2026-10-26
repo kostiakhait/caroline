@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.claude_ladder import LadderTurn, visible_text
+from app.claude_ladder import TRACE_LINES_KEPT, LadderTurn, visible_text
 
 MAX_DELIVERED_CHARS = 6000
 
@@ -52,7 +52,13 @@ class TurnRecord:
         return text if len(text) <= MAX_DELIVERED_CHARS else "...\n" + text[-MAX_DELIVERED_CHARS:]
 
 
-DUPLICATE_SHARE = 0.5        # the share of the SHORTER text's words found in the other one that makes the two a repeat
+def sw_trace(calls: list[dict[str, Any]]) -> list[str]:
+    """An sw turn's tool calls (sw_history.TurnRecorder.calls) as the trace lines the verifier reads, the same shape as
+    LadderTurn.observe writes for a Claude turn."""
+    return [f"- {c.get('tool')}({c.get('args')}) -> {c.get('result')}" for c in calls][-TRACE_LINES_KEPT:]
+
+
+DUPLICATE_SHARE = 0.5       # the share of the SHORTER text's words found in the other one that makes the two a repeat
 MIN_STEMS_FOR_COMPARISON = 4  # a shorter text than this ("Done.") proves nothing about being a repeat
 DUPLICATE_SHARE_ALL = 0.75   # ... or found across all of the recent messages together
 

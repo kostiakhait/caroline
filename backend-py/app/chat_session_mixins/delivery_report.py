@@ -60,6 +60,23 @@ class DeliveryReportMixin:
             self._dr = None
             log_event("engine", "delivery_report_begin_failed", tab_id=self.tab_id, error=str(exc)[:200])
 
+    def _dr_begin_sw(self, text: str) -> None:
+        """An sw turn of a real user message opens the record (the sw path has no _input_stream); what reaches the window
+        is recorded by the same send wrapper."""
+        self._dr = delivery_report.TurnRecord(user_text=text)
+
+    def _dr_finish_sw(self, calls: list[dict[str, Any]]) -> None:
+        """An sw turn has ended and its answer was sent: its tool calls (the turn recorder's) are the work done."""
+        if self._dr is None:
+            return
+        try:
+            self._dr.work.trace.extend(delivery_report.sw_trace(calls))
+        except Exception as exc:  # noqa: BLE001
+            self._dr = None
+            log_event("engine", "delivery_report_sw_trace_failed", tab_id=self.tab_id, error=str(exc)[:200])
+            return
+        self._dr_finish(None)
+
     def _dr_observe(self, wire: dict[str, Any] | None) -> None:
         if self._dr is not None:
             try:
