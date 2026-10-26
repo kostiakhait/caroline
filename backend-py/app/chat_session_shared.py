@@ -1275,6 +1275,16 @@ def _read_recent_user_lines(session_id: str | None, tab_id: str, workspace_dir: 
                 user_lines = _recent_usable_lines(Path(archive_path), limit=count, user_only=True) + user_lines
             except Exception as exc:
                 log_event("engine", "recent_user_lines_archive_read_failed", tab_id=tab_id, path=archive_path, error=str(exc))
+    # The exact dialogue record (app/dialogue_log.py) is written the moment the user sends a message, so it already holds
+    # the message being answered and works in a brand-new tab, where the transcript file does not exist yet (2026-10-26:
+    # a first message in a new tab was answered in Russian and translated into English, no language having been resolved).
+    try:
+        from app import dialogue_log
+
+        logged = [e["text"].split("\n[")[0] for e in dialogue_log.read_entries(workspace_dir, tab_id) if e.get("role") == dialogue_log.USER][-count:]
+        user_lines = [line for line in user_lines if line not in logged] + logged
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "recent_user_lines_dialogue_log_failed", tab_id=tab_id, error=str(exc)[:200])
     return user_lines[-count:]
 
 

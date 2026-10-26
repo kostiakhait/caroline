@@ -107,3 +107,19 @@ def test_a_headless_session_logs_nothing(tmp_path):
     s = Session(str(tmp_path), headless=True)
     asyncio.run(s.send(assistant_env("background chatter")))
     assert dl.read_entries(str(tmp_path), "1") == []
+
+
+def test_language_is_read_from_the_last_five_user_messages_even_in_a_new_tab(tmp_path):
+    """A first message in a new tab has no transcript file yet: the language was never resolved and replies were translated
+    into the English default (2026-10-26)."""
+    from app.chat_session_shared import _read_recent_user_lines
+
+    ws = str(tmp_path)
+    for i in range(7):
+        dl.append(ws, "2", dl.USER, f"Сообщение номер {i}")
+    dl.append(ws, "2", dl.ASSISTANT, "Ответ")
+    dl.append(ws, "2", dl.USER, "Открой свой браузер чтобы я залогинился в линкедин\n[1 attachment(s)]")
+    lines = _read_recent_user_lines(None, "2", ws, 5)
+    assert len(lines) == 5 and lines[-1] == "Открой свой браузер чтобы я залогинился в линкедин"
+    assert lines[0] == "Сообщение номер 3"
+    assert _read_recent_user_lines(None, "nope", ws, 5) == []
