@@ -2329,6 +2329,62 @@ def read_delivery_verdict(reply: str) -> str | None:
     return report or None
 
 
+RECOVERY_SUMMARY_TIMEOUT_S = 120.0
+
+
+def _build_recovery_summary_prompt(digest: str) -> str:
+    return (
+        "Below is the record of a conversation between a person and an AI assistant (Caroline), with the tool calls she made. "
+        "Her own summary of it was lost; write the summary she needs to carry on.\n\n"
+        "Write it as plain text, detailed but compact, in the language the conversation is in, with these parts:\n"
+        "1. What the person asked for, and why.\n"
+        "2. What was DONE: every action completed (what was sent or changed, to whom, when) and its outcome.\n"
+        "3. OPEN items: everything still waiting -- above all any draft message or email shown to the person for approval "
+        "(quote its full text and the recipient), questions waiting for their answer, tasks promised and not done.\n"
+        "4. The person's last request and what was done about it.\n"
+        "5. Facts that matter later: names, addresses, numbers, dates, decisions, preferences the person stated.\n"
+        "Use only what the record shows; do not invent. Do not address the person; no greeting; do not answer the conversation.\n\n"
+        f"THE RECORD:\n---\n{digest}\n---"
+    )
+
+
+async def summarize_conversation(digest: str, tab_id: str) -> str | None:
+    """A rebuilt summary of a conversation whose own compaction summary was lost (app/compaction_guard.py). None on any
+    failure -- the caller then falls back to the plain digest; it never raises."""
+    try:
+        ai = await _model_ai()
+        if ai is None:
+            return None
+        cfg = camerlengo_ai.Config
+        tracker = _TurnTracker()
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "You write faithful summaries of conversations."},
+            {"role": "user", "content": _build_recovery_summary_prompt(digest)},
+        ]
+
+        def executor_fn(name: str, args: dict[str, Any]) -> str:
+            return "No tools."
+
+        def on_usage(usage: dict[str, Any]) -> None:
+            log_event("engine", "small_model_usage", tab_id=tab_id, role="compaction_recovery_summary", **usage)
+
+        reply = await asyncio.wait_for(_call_with_funds_wait(
+            lambda: _hedged_verifier_call(lambda: _resolve_agentic_with_watchdog(
+                ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
+                max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
+                transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+            ), tab_id),
+            tab_id, lambda _line: None,
+        ), timeout=RECOVERY_SUMMARY_TIMEOUT_S)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "compaction_recovery_summary_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+        return None
+    text = (reply or "").strip()
+    return text or None
+
+
 # How much of a tool result the trace keeps -- the trace is the verifier's "ground truth"
 # and what an escalated tier continues from. It was the first 300 characters. Live
 # (2026-10-11, twice in a row, the same question): a web_search result is five sources

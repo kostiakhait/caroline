@@ -423,6 +423,7 @@ class EngineLifecycleMixin:
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
             if item.get("memory_advice_for"):
                 await self._glue_memory_advice(item)
+            self._glue_context_recovery(item)
             self._dr_begin(item)
             await self._ladder_before_yield(item)
             yield item["message"]
@@ -989,6 +990,7 @@ class EngineLifecycleMixin:
                             pre_tokens=(message.data.get("compact_metadata") or {}).get("pre_tokens"),
                             post_tokens=post_tokens, trigger=(message.data.get("compact_metadata") or {}).get("trigger"),
                         )
+                        self._schedule_compaction_check()
                         if isinstance(post_tokens, int):
                             self.tokens_at_last_forced_compaction = post_tokens
                             # A boundary is itself the freshest possible

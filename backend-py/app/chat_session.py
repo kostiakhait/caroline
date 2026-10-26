@@ -31,6 +31,7 @@ from app.chat_session_mixins import (
     CompactionMixin,
     LadderMixin,
     DeliveryReportMixin,
+    CompactionRecoveryMixin,
 )
 
 
@@ -51,6 +52,7 @@ class ChatSession(
     CompactionMixin,
     LadderMixin,
     DeliveryReportMixin,
+    CompactionRecoveryMixin,
 ):
     def __init__(
         self, tab_id: str, workspace_dir: str, send: SendFn, *,

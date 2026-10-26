@@ -667,7 +667,7 @@ FORCED_COMPACTION_LIMIT_PAUSE_MS = 30 * 60_000
 # 3.5K-7K tokens in context (5.7K -> 6.0K "after"), while every compaction
 # that did real work started at 52K-99K. This sits clearly between the two.
 # Own choice of value, not a specified one.
-FORCED_COMPACTION_MIN_CONTEXT_TOKENS = 20_000
+FORCED_COMPACTION_MIN_CONTEXT_TOKENS = 150_000   # raised from 20 000 (2026-10-26): compacting a small context saves nothing and loses state
 # Fallback-compaction threshold (2026-10-17): native/forced compaction (the
 # "/compact" sent above) is confirmed to sometimes achieve only a weak
 # reduction (observed live: ~14%, once even negative) on a badly bloated

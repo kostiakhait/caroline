@@ -123,6 +123,15 @@ class CompactionMixin:
         if now < self.forced_compaction_blocked_until:
             return
 
+        # No compaction because a session has just started (2026-10-26: two tabs were compacted 5 seconds after waking up,
+        # at 50 thousand tokens, and lost what they held): the hour clock starts together with the process, and the startup
+        # request main.py makes is dropped.
+        if self.needs_startup_compaction:
+            self.needs_startup_compaction = False
+            log_event("engine", "forced_compaction_skipped_startup", tab_id=self.tab_id)
+        if self.last_forced_compaction_at is None:
+            self.last_forced_compaction_at = now
+            return
         if self.tokens_at_last_forced_compaction is not None and self.tokens_at_last_forced_compaction >= FALLBACK_COMPACTION_THRESHOLD_TOKENS:
             # Highest priority, and deliberately ahead of the MIN_INTERVAL
             # cooldown below: this baseline was JUST refreshed by a
@@ -218,7 +227,7 @@ class CompactionMixin:
             asyncio.create_task(self._run_fallback_compaction())
             return
         self.forced_compaction_result_pending = True
-        self._push_internal_command("/compact")
+        asyncio.create_task(self._run_forced_compaction())     # a strong model, with the summarization instruction
     def _check_compaction_stuck(self) -> None:
         """Per explicit instruction (2026-10-19), after a real incident:
         the CLI's own native "/compact" can simply never finish -- confirmed
