@@ -29,6 +29,7 @@ from typing import Any
 from claude_agent_sdk import McpServerConfig, SdkMcpTool, create_sdk_mcp_server, tool as sdk_tool
 from claude_agent_sdk import _build_input_schema as _sdk_build_input_schema
 
+from app import tool_groups
 from app.logging_setup import log_event
 from app.operations import ToolHandler, build_operations_mcp_server, dispatch
 
@@ -81,6 +82,11 @@ class Plugin:
     # conventions/gotchas. Empty/None means the plugin's tools are
     # self-explanatory from their own short `description` alone.
     usage_instructions: str | None = None
+    # One line saying what the plugin is for -- shown in the tool-group list (app/tool_groups.py). Optional: the
+    # group line always lists the tool names anyway.
+    description: str | None = None
+    # True: the tools stay directly callable, not behind the group tools. For the few tools used all the time.
+    always_loaded: bool = False
 
 
 def _envelope_to_mcp_response(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -223,10 +229,12 @@ def build_mcp_servers() -> dict[str, McpServerConfig]:
     tool_instructions: dict[str, str] = {}
     own_plugins: list[dict[str, Any]] = []
     mcp_servers: dict[str, McpServerConfig] = {}
+    tool_groups.remember_catalog(plugins)
     for plugin in plugins:
-        wrapped_tools = [wrap_tool(plugin.name, t) for t in plugin.tools]
         server_name = f"caroline-{plugin.name}"
-        mcp_servers[server_name] = create_sdk_mcp_server(name=plugin.name, tools=wrapped_tools)
+        if not tool_groups.is_grouped(plugin):
+            wrapped_tools = [wrap_tool(plugin.name, t) for t in plugin.tools]
+            mcp_servers[server_name] = create_sdk_mcp_server(name=plugin.name, tools=wrapped_tools)
         own_plugins.append({
             "server_name": server_name,
             "tools": [{"name": t.name, "description": t.description} for t in plugin.tools],
@@ -234,5 +242,69 @@ def build_mcp_servers() -> dict[str, McpServerConfig]:
         if plugin.usage_instructions:
             for t in plugin.tools:
                 tool_instructions[t.name] = plugin.usage_instructions
+    if tool_groups.grouped_plugins(plugins):
+        mcp_servers["caroline-tools"] = _build_group_tools_server(plugins)
     mcp_servers["caroline-operations"] = build_operations_mcp_server(tool_instructions, own_plugins)
     return mcp_servers
+
+
+def _build_group_tools_server(plugins: list[Plugin]) -> McpServerConfig:
+    """list_groups / list_tools / describe_tool / call_tool (app/tool_groups.py): the only way to reach the tools
+    of the grouped plugins, so the base request carries one line per group instead of every tool's full
+    schema. call_tool runs the tool through wrap_tool() -- the same dispatch() as a direct registration."""
+    wrapped: dict[str, SdkMcpTool[Any]] = {}
+
+    def reply(text: str, error: bool = False) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": text}], **({"isError": True} if error else {})}
+
+    groups = tool_groups.groups_text(plugins)
+
+    @sdk_tool(
+        tool_groups.LIST_GROUPS,
+        "Your tool groups. Most of your tools are not listed one by one: they sit in groups, one line each "
+        "(group, number of tools, the first tool names). To use one: list_tools(group) for the group's tools, "
+        "describe_tool(name) for its parameters and guidance, then call_tool(name, args). The groups now:\n" + groups,
+        {},
+    )
+    async def list_groups(args: dict[str, Any]) -> dict[str, Any]:
+        log_event("engine", "tool_groups_list_groups")
+        return reply(groups)
+
+    @sdk_tool(tool_groups.LIST_TOOLS, "The tools of one group: name and short description. Takes the group name from list_groups.", {"group": str})
+    async def list_tools(args: dict[str, Any]) -> dict[str, Any]:
+        log_event("engine", "tool_groups_list_tools", group=args.get("group"))
+        return reply(tool_groups.list_tools_text(plugins, str(args.get("group") or "")))
+
+    @sdk_tool(
+        tool_groups.DESCRIBE_TOOL,
+        "One tool in full: description, parameters (JSON schema) and the usage guidance of its group. Call it before "
+        "the first use of a tool you have not used in this conversation.",
+        {"name": str},
+    )
+    async def describe_tool(args: dict[str, Any]) -> dict[str, Any]:
+        log_event("engine", "tool_groups_describe_tool", tool=args.get("name"))
+        return reply(tool_groups.describe_tool_text(plugins, str(args.get("name") or "")))
+
+    @sdk_tool(
+        tool_groups.CALL_TOOL,
+        "Calls a tool of a group: name = the tool's name, args = an object with its parameters ({} when it has none). "
+        "It behaves exactly as a direct call of that tool (results, long-running operations, check_operation_status).",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "args": {"type": "object"}},
+            "required": ["name"],
+        },
+    )
+    async def call_tool(args: dict[str, Any]) -> dict[str, Any]:
+        name, inner = str(args.get("name") or ""), args.get("args")
+        inner = {} if inner is None else inner
+        refusal = tool_groups.refusal_for_call(plugins, name, inner)
+        if refusal:
+            log_event("engine", "tool_groups_call_refused", tool=name, reason=refusal[:200])
+            return reply(refusal, error=True)
+        plugin, plugin_tool = tool_groups.find_tool(plugins, name)  # type: ignore[misc]
+        if name not in wrapped:
+            wrapped[name] = wrap_tool(plugin.name, plugin_tool)
+        return await wrapped[name].handler(inner)
+
+    return create_sdk_mcp_server(name="tools", tools=[list_groups, list_tools, describe_tool, call_tool])

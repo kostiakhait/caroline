@@ -155,8 +155,9 @@ class WatchdogMixin:
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
-                    args_preview = json.dumps(block.input, ensure_ascii=False, default=str)[:120] if isinstance(block.input, dict) else str(block.input)[:120]
-                    self._pending_tool_calls[block.id] = (block.name, args_preview)
+                    call_name, call_input = normalize_call(block.name, block.input)    # call_tool -> the real tool (app/tool_groups.py)
+                    args_preview = json.dumps(call_input, ensure_ascii=False, default=str)[:120] if isinstance(call_input, dict) else str(call_input)[:120]
+                    self._pending_tool_calls[block.id] = (call_name, args_preview)
             return
         if isinstance(message, UserMessage) and isinstance(message.content, list):
             for block in message.content:

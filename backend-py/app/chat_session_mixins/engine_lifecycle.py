@@ -792,7 +792,7 @@ class EngineLifecycleMixin:
                     if isinstance(message, AssistantMessage):
                         tool_use_block = next((b for b in message.content if isinstance(b, ToolUseBlock)), None)
                         if tool_use_block:
-                            self.last_tool_use_name = tool_use_block.name
+                            self.last_tool_use_name = normalize_call(tool_use_block.name, tool_use_block.input)[0]
                             self.last_tool_use_started_at = time.monotonic()
 
                     # Ground-truth tool-outcome tracking -- see

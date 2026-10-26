@@ -31,6 +31,7 @@ from claude_agent_sdk import (
 
 from app.engines.codex_rpc import CodexRpcClient, CodexRpcError, build_env, codex_argv
 from app.logging_setup import log_event
+from app.tool_groups import normalize_call
 from app.session_context import (
     get_cli_pid_sink, get_inject_proactive, get_send, get_tab_id,
     set_cli_pid_sink, set_inject_proactive, set_send, set_tab_id,
@@ -202,7 +203,8 @@ def _block_dict(block: Any) -> dict[str, Any]:
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text}
     if isinstance(block, ToolUseBlock):
-        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+        name, tool_input = normalize_call(block.name, block.input)    # a call_tool shows as the real tool (app/tool_groups.py)
+        return {"type": "tool_use", "id": block.id, "name": name, "input": tool_input}
     if isinstance(block, ToolResultBlock):
         return {"type": "tool_result", "tool_use_id": block.tool_use_id, "content": block.content, "is_error": block.is_error}
     if isinstance(block, ThinkingBlock):

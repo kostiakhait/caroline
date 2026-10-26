@@ -1181,6 +1181,7 @@ _USAGE_INSTRUCTIONS = (
 
 PLUGIN = Plugin(
     name="memory",
+    always_loaded=True,    # used all the time: stays directly callable, outside the tool groups (app/tool_groups.py)
     usage_instructions=_USAGE_INSTRUCTIONS,
     tools=[
         PluginTool(

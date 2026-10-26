@@ -25,11 +25,15 @@ from claude_agent_sdk import (
 )
 
 
+from app.tool_groups import normalize_call
+
+
 def _block_to_dict(block: Any) -> dict[str, Any]:
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text}
     if isinstance(block, ToolUseBlock):
-        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+        name, tool_input = normalize_call(block.name, block.input)    # a call_tool shows as the real tool (app/tool_groups.py)
+        return {"type": "tool_use", "id": block.id, "name": name, "input": tool_input}
     if isinstance(block, ThinkingBlock):
         return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
     if isinstance(block, ToolResultBlock):

@@ -76,11 +76,12 @@ import re
 import sys
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import session_context, sw_tier_stats
+from app import session_context, sw_tier_stats, tool_groups
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
@@ -1369,6 +1370,7 @@ async def _run_parallel_stage(
                 )
                 if recorder is not None:
                     base_executor = recorder.wrap(base_executor, skip=_PLAN_TOOL_NAMES)
+                base_executor = _with_groups(base_executor, registry)
                 calls: list[str] = []
 
                 def traced_executor(name: str, args: dict[str, Any], _base=base_executor, _calls=calls) -> str:
@@ -1448,6 +1450,58 @@ class ToolRegistry:
     # policies.py's prefer_own_backend_tools_instruction for why this must
     # never be a fixed/hardcoded list.
     own_plugins: list[dict[str, Any]] = field(default_factory=list)
+    # The plugins (their allowed tools) behind the tool groups -- app/tool_groups.py builds the group texts from them.
+    plugins: list[Any] = field(default_factory=list)
+
+
+def _group_tool_defs(groups_text: str) -> list[dict[str, Any]]:
+    """The same four group tools the Claude/Codex engines get (plugins/loader.py), in function-calling form."""
+    def fn(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+        return {"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": required},
+        }}
+
+    string = {"type": "string"}
+    return [
+        fn(tool_groups.LIST_GROUPS,
+           "Your tool groups. Most of your tools are not listed one by one: they sit in groups, one line each "
+           "(group, number of tools, the first tool names). To use one: list_tools(group) for the group's tools, "
+           "describe_tool(name) for its parameters and guidance, then call_tool(name, args). The groups now:\n" + groups_text,
+           {}, []),
+        fn(tool_groups.LIST_TOOLS, "The tools of one group: name and short description. Takes the group name from list_groups.",
+           {"group": string}, ["group"]),
+        fn(tool_groups.DESCRIBE_TOOL,
+           "One tool in full: description, parameters (JSON schema) and the usage guidance of its group. Call it before "
+           "the first use of a tool you have not used in this conversation.", {"name": string}, ["name"]),
+        fn(tool_groups.CALL_TOOL,
+           "Calls a tool of a group: name = the tool's name, args = an object with its parameters ({} when it has none). "
+           "It behaves exactly as a direct call of that tool.",
+           {"name": string, "args": {"type": "object"}}, ["name"]),
+    ]
+
+
+def _with_groups(executor_fn: Callable[[str, dict[str, Any]], str], registry: "ToolRegistry") -> Callable[[str, dict[str, Any]], str]:
+    """The group tools in front of an executor: list_groups/list_tools/describe_tool answer from the plugin
+    catalog; call_tool becomes the real call (so every check, log and record sees the tool's own name)."""
+
+    def run(name: str, args: dict[str, Any]) -> str:
+        args = args or {}
+        if name == tool_groups.LIST_GROUPS:
+            return tool_groups.groups_text(registry.plugins)
+        if name == tool_groups.LIST_TOOLS:
+            return tool_groups.list_tools_text(registry.plugins, str(args.get("group") or ""))
+        if name == tool_groups.DESCRIBE_TOOL:
+            return tool_groups.describe_tool_text(registry.plugins, str(args.get("name") or ""))
+        if name == tool_groups.CALL_TOOL:
+            real, inner = tool_groups.unwrap_call(name, args)
+            refusal = tool_groups.refusal_for_call(registry.plugins, real, args.get("args") if args.get("args") is not None else {})
+            if refusal:
+                return f"ERROR: {refusal}"
+            return executor_fn(real, inner)
+        return executor_fn(name, args)
+
+    return run
 
 
 def build_tool_registry() -> ToolRegistry:
@@ -1467,19 +1521,24 @@ def build_tool_registry() -> ToolRegistry:
     lookup: dict[str, tuple[str, PluginTool]] = {}
     tool_instructions: dict[str, str] = {}
     own_plugins: list[dict[str, Any]] = []
+    plugins_left: list[Any] = []
     for plugin in discover_plugins():
         plugin_tools_for_summary = []
-        for t in plugin.tools:
-            if t.name in _DISALLOWED_TOOL_NAMES:
-                continue
-            tool_defs.append(to_openai_tool_def(t))
+        allowed = [t for t in plugin.tools if t.name not in _DISALLOWED_TOOL_NAMES]
+        plugins_left.append(dataclasses.replace(plugin, tools=allowed))
+        for t in allowed:
+            if not tool_groups.is_grouped(plugin):
+                tool_defs.append(to_openai_tool_def(t))
             lookup[t.name] = (plugin.name, t)
             plugin_tools_for_summary.append({"name": t.name, "description": t.description})
             if plugin.usage_instructions:
                 tool_instructions[t.name] = plugin.usage_instructions
         if plugin_tools_for_summary:
             own_plugins.append({"server_name": f"caroline-{plugin.name}", "tools": plugin_tools_for_summary})
-    return ToolRegistry(tool_defs=tool_defs, lookup=lookup, tool_instructions=tool_instructions, own_plugins=own_plugins)
+    if tool_groups.grouped_plugins(plugins_left):
+        tool_defs.extend(_group_tool_defs(tool_groups.groups_text(plugins_left)))
+    return ToolRegistry(tool_defs=tool_defs, lookup=lookup, tool_instructions=tool_instructions, own_plugins=own_plugins,
+                        plugins=plugins_left)
 
 
 async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRegistry, tracker: _TurnTracker) -> str:
@@ -3062,6 +3121,7 @@ async def run_small_model_turn(
     )
     if recorder is not None:
         executor_fn = recorder.wrap(executor_fn, skip=_PLAN_TOOL_NAMES)
+    executor_fn = _with_groups(executor_fn, registry)
 
     def on_progress(evt: dict[str, Any]) -> None:
         # An abandoned attempt's thread must not touch the live attempt's progress

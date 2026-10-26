@@ -129,6 +129,7 @@ from app.failure_classification import (
 from app.logging_setup import log_event
 from app.login_api import is_logged_in
 from app.plugins.loader import build_mcp_servers
+from app.tool_groups import normalize_call
 from app.small_model_engine import (
     CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE, answer_is_in_language, draft_narration_remark, run_small_model_turn,
     try_fast_answer,
@@ -1755,6 +1756,7 @@ __all__ = [
     'log_event',
     'is_logged_in',
     'build_mcp_servers',
+    'normalize_call',
     'CASCADE_SKIP_TRANSLATION_WHEN_IN_LANGUAGE',
     'answer_is_in_language',
     'draft_narration_remark',
