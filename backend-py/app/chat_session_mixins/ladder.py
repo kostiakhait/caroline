@@ -44,6 +44,10 @@ class LadderMixin:
                 return  # the next rung of the turn in progress: the model was set when the verdict came
             self._ladder = None
             if not self._ladder_active():
+                # A model pinned in Settings applies from this message on, also to a client the ladder had moved.
+                pinned = get_model_override(self.workspace_dir, "claude")
+                if pinned and getattr(self, "engine_kind", "") == "claude" and self._ladder_model not in (None, pinned):
+                    await self._ladder_set_model(pinned)
                 return
             text = claude_ladder.user_text_of(item["message"]) or item.get("memory_advice_for") or ""
             turn = claude_ladder.LadderTurn(user_text=text)

@@ -2022,7 +2022,9 @@
     } else if (evt.op === "model_override_get") {
       if (evt.ok) {
         modelOverrides = JSON.parse(evt.stdout || "{}");
-        fillModelSelect(claudeModelSelect, (modelOverrides.claude.options || []).map((id) => ({ id, displayName: id.charAt(0).toUpperCase() + id.slice(1) })), modelOverrides.claude.selected);
+        const claudeOrder = ["haiku", "sonnet", "opus"];
+        const claudeOptions = (modelOverrides.claude.options || []).slice().sort((a, b) => claudeOrder.indexOf(a) - claudeOrder.indexOf(b));
+        fillModelSelect(claudeModelSelect, claudeOptions.map((id) => ({ id, displayName: id.charAt(0).toUpperCase() + id.slice(1) })), modelOverrides.claude.selected, "Auto (Haiku → Sonnet → Opus)");
         fillModelSelect(openaiModelSelect, lastOpenaiModels, modelOverrides.openai.selected);
       }
     } else if (evt.op === "model_override_set") {
@@ -2241,10 +2243,10 @@
   // Renders the OpenAI settings block; while a browser sign-in is pending it
   // keeps polling until the backend reports it finished.
   let lastOpenaiModels = [];
-  function fillModelSelect(select, models, selected) {
+  function fillModelSelect(select, models, selected, autoLabel) {
     select.textContent = "";
     const auto = document.createElement("option");
-    auto.value = ""; auto.textContent = "Automatic";
+    auto.value = ""; auto.textContent = autoLabel || "Automatic";
     select.appendChild(auto);
     for (const m of models) {
       const o = document.createElement("option");

@@ -242,3 +242,14 @@ def test_reset_clears_state():
     run(s._ladder_before_yield(user_item()))
     s._ladder_reset()
     assert s._ladder is None and s._ladder_model is None
+
+
+def test_pinning_a_model_moves_a_client_the_ladder_had_switched(monkeypatch):
+    s = Session()
+    run(s._ladder_before_yield(user_item()))              # Auto: the ladder puts the client on haiku
+    assert s.client.models == ["haiku"]
+    monkeypatch.setattr("app.chat_session_mixins.ladder.get_model_override", lambda ws, p: "opus")
+    run(s._ladder_before_yield(user_item()))              # the user picked Opus in Settings
+    assert s._ladder is None and s.client.models == ["haiku", "opus"]
+    run(s._ladder_before_yield(user_item()))              # and it stays there, no repeated switch
+    assert s.client.models == ["haiku", "opus"]

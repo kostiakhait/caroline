@@ -189,10 +189,10 @@
 
       <section class="settings-section">
         <h4>Models</h4>
-        <p class="settings-hint">Automatic uses each provider's own default. A choice applies to conversations started after you change it.</p>
+        <p class="settings-hint">Claude: Auto starts every message on Haiku, and moves to Sonnet, then Opus, only when an automatic check finds the answer unfinished; picking Haiku, Sonnet or Opus uses just that model, from the next message. OpenAI: Automatic uses the provider's own default, applied to conversations started after you change it.</p>
         <div class="settings-field">
           <label>Claude model</label>
-          <select id="claudeModelSelect"><option value="">Automatic</option></select>
+          <select id="claudeModelSelect"><option value="">Auto (Haiku &rarr; Sonnet &rarr; Opus)</option></select>
         </div>
         <div class="settings-field">
           <label>OpenAI model</label>
