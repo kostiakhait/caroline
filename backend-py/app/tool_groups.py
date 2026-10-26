@@ -98,9 +98,12 @@ def list_tools_text(plugins: list[Any], group: str) -> str:
 
 def _schema(tool: Any) -> Any:
     try:
-        from claude_agent_sdk import _build_input_schema
+        from claude_agent_sdk import SdkMcpTool, _build_input_schema
+        from app.plugins.loader import schema_with_optionals
 
-        return _build_input_schema(tool)
+        return _build_input_schema(SdkMcpTool(
+            name=tool.name, description=tool.description, input_schema=schema_with_optionals(tool.input_schema), handler=None,
+        ))
     except Exception:  # noqa: BLE001 -- the raw schema is still informative
         return tool.input_schema
 

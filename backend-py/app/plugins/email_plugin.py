@@ -337,8 +337,75 @@ def _validate_addresses(value: Any, field_name: str) -> None:
         _validate_header_value(one, field_name)
 
 
+_RE_PREFIX = re.compile(r"^\s*(re|ответ|aw|sv|antw)\s*:", re.IGNORECASE)
+
+
+def _first_value(data: dict[str, Any], *names: str) -> Any:
+    lowered = {str(k).lower().replace("-", "").replace("_", ""): v for k, v in data.items()}
+    for name in names:
+        value = lowered.get(name.lower().replace("-", "").replace("_", ""))
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def reply_fields(original: dict[str, Any], own_address: str, reply_all: bool) -> dict[str, Any]:
+    """Who, what subject and which thread a reply to `original` (an email:getMessage result) has to carry."""
+    subject = str(original.get("subject") or "").strip()
+    sender = _first_value(original, "replyTo") or original.get("from") or ""
+    to = [addr for _, addr in getaddresses([sender if isinstance(sender, str) else ", ".join(sender)]) if addr]
+    fields: dict[str, Any] = {"to": to, "subject": subject if _RE_PREFIX.match(subject) else f"Re: {subject}".strip()}
+    if reply_all:
+        own = (own_address or "").lower()
+        others = getaddresses([str(original.get("to") or ""), str(original.get("cc") or "")])
+        fields["cc"] = [addr for _, addr in others if addr and addr.lower() != own and addr not in to]
+    message_id = _first_value(original, "messageId", "message_id", "messageid")
+    if message_id:
+        message_id = str(message_id).strip()
+        fields["inReplyTo"] = message_id
+        earlier = _first_value(original, "references")
+        refs = earlier if isinstance(earlier, list) else str(earlier or "").split()
+        fields["references"] = [*refs, message_id] if message_id not in refs else refs
+    return fields
+
+
+@_with_saved_credentials
+async def _fetch_original(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    return await _sessions.with_session(lambda session: call_v2(
+        "email:getMessage", session=session, folder=args["folder"], uid=args["uid"], **_creds_kwargs(args),
+    ))
+
+
+async def email_send_reply(args: dict[str, Any], rp: Any) -> dict[str, Any]:
+    """A reply to one message: the addressee, the "Re:" subject and the thread (In-Reply-To/References) come from the
+    original, which is read first -- the reply is written knowing what it answers (2026-10-26: a reply went out in the
+    wrong thread, under the subject of another conversation, drafted without the question it answered being opened).
+    `args` is changed in place on purpose: what dispatch() records about a finished send is this same dict."""
+    if not args.get("folder") or args.get("uid") is None:
+        raise ValueError("email_send_reply needs folder and uid: the message you are answering.")
+    original = await _fetch_original({k: v for k, v in args.items() if k in (*_CREDENTIAL_PARAMS, "folder", "uid")}, rp)
+    fields = reply_fields(original, args.get("address") or "", bool(args.get("replyAll")))
+    if args.get("to"):
+        fields["to"] = _address_strings(args["to"])
+    if not fields["to"]:
+        raise ValueError("The original message has no sender address to reply to; pass `to` yourself.")
+    args.update({k: v for k, v in fields.items() if k != "cc" or not args.get("cc")})
+    send_args = {k: v for k, v in args.items() if k not in ("folder", "uid", "replyAll")}
+    send_args["_reply_ok"] = True
+    result = await email_send(send_args, rp)
+    if not fields.get("inReplyTo"):
+        result["text"] += " (The original carried no Message-Id, so the reply is matched by subject only.)"
+    return result
+
+
 @_with_saved_credentials
 async def email_send(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    if _RE_PREFIX.match(str(args.get("subject") or "")) and not args.get("inReplyTo") and not args.get("_reply_ok"):
+        raise ValueError(
+            'A subject starting with "Re:" means an answer to a message, and an answer has to be tied to that message: '
+            "use email_send_reply (folder + uid of the message you are answering; it takes the addressee, the subject and "
+            "the thread from the original). For a NEW message, write a subject that does not start with \"Re:\"."
+        )
     args = {**args, **{k: _address_strings(args.get(k)) for k in ("to", "cc", "bcc") if args.get(k) is not None}}
     _validate_addresses(args.get("from"), "from")
     _validate_addresses(args.get("to"), "to")
@@ -541,6 +608,20 @@ PLUGIN = Plugin(
                 "text": str | None, "html": str | None, "cc": list | None, "bcc": list | None,
                 "attachments": list | None, "inReplyTo": str | None, "references": list | None,
             }, email_send,
+        ),
+        PluginTool(
+            "email_send_reply",
+            "Sends an ANSWER to one message you have read: pass the message's `folder` and `uid` and what you want to say "
+            "(`text` and/or `html`). The addressee (the sender, or everyone with replyAll), the \"Re:\" subject and the "
+            "thread all come from the original, so the answer lands in its conversation. Use this, not email_send, for "
+            "every reply -- email_send refuses a \"Re:\" subject that is not tied to a message. Read the message first "
+            "(email_get_message) so you know what you are answering. `to` is only for sending the answer somewhere other "
+            "than the sender. Same mailbox parameters and the same approval rules as email_send." + _ACCOUNT_PARAM_NOTE,
+            {
+                **_CREDENTIAL_PARAMS, "folder": str, "uid": int, "text": str | None, "html": str | None,
+                "replyAll": bool | None, "to": list | None, "cc": list | None, "bcc": list | None,
+                "from": str | None, "attachments": list | None,
+            }, email_send_reply,
         ),
     ],
 )

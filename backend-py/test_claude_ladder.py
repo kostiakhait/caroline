@@ -68,7 +68,7 @@ def verdicts(monkeypatch, *answers):
     calls = []
     queue = list(answers)
 
-    async def fake(user_text, candidate, trace, can_escalate, tab_id):
+    async def fake(user_text, candidate, trace, can_escalate, tab_id, *extra):
         calls.append((user_text, candidate, list(trace), can_escalate))
         return queue.pop(0)
 

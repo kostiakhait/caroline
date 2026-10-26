@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
 
+DELIVERY_CORRECTION_COOLDOWN_S = 300.0
+
 
 class DialogueTranscriptMixin:
     def recent_real_user_directives_text(self, within_hours: float = 1.0) -> str:
@@ -354,6 +356,11 @@ class DialogueTranscriptMixin:
         from app.plugins.voice_api import check_delivery_completeness
 
         dialogue = self._gather_recent_dialogue_for_permission_guard()
+        from app import action_ledger
+
+        done = action_ledger.checker_note(self.workspace_dir)
+        if done:
+            dialogue = dialogue + chr(10) * 2 + done
         try:
             result = await check_delivery_completeness(final_text, dialogue)
         except Exception as exc:
@@ -362,6 +369,14 @@ class DialogueTranscriptMixin:
         if result is None or result["complete"]:
             return
         missing = result["missing"]
+        # One correction per DELIVERY_CORRECTION_COOLDOWN_S: on 2026-10-26 every status reply that mentioned a draft
+        # was answered with "include the text now", and the model went round in circles offering a text it had been
+        # told not to send.
+        now = time.monotonic()
+        if now - getattr(self, "_last_delivery_correction_at", -1e9) < DELIVERY_CORRECTION_COOLDOWN_S:
+            log_event("engine", "delivery_incomplete_skipped_cooldown", tab_id=self.tab_id, missing=missing)
+            return
+        self._last_delivery_correction_at = now
         log_event("engine", "delivery_incomplete", tab_id=self.tab_id, missing=missing)
         self.inject_proactive(
             f"[Internal: the last message you sent did not actually deliver everything it claimed to -- "

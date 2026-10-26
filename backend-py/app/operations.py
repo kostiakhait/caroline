@@ -87,6 +87,7 @@ NOTIFY_GRACE_S = 10.0
 # handler individually.
 REPLY_WATCH_CHANNEL_BY_TOOL = {
     "email_send": "email",
+    "email_send_reply": "email",
     "discord_send_message": "discord",
     "ratatosk_send_message": "ratatosk",
     "signal_send_message": "signal",
@@ -313,6 +314,8 @@ async def dispatch(
             closer = get_action_closer(tab_id)
             if closer:
                 closer()
+            if channel:
+                _record_finished_send(tab_id, tool_name, args)
             return result
         except asyncio.CancelledError:
             op.status = "cancelled"
@@ -385,6 +388,27 @@ async def dispatch(
         log_event(f"plugin:{plugin_name}", "operation_error", tool=tool_name, operation_id=op.id, duration_ms=duration_ms, error=str(exc))
         REGISTRY.forget(op.id)
         return _with_note({"operation_id": op.id, "status": "error", "error": str(exc)}, memory_note)
+
+
+def _record_finished_send(tab_id: str | None, tool_name: str, args: dict[str, Any]) -> None:
+    """A send tool call has succeeded: the action goes into the action log (app/action_ledger.py) and, as a finished
+    fact, into memory -- by code, so it never depends on the model remembering to. Never raises, never waits."""
+    try:
+        from app import action_ledger
+
+        entry = action_ledger.append(WORKSPACE_DIR, tab_id, tool_name, args)
+        if entry is None:
+            return
+        log_event("engine", "action_recorded", tab_id=tab_id, tool=tool_name, to=entry.get("to"), subject=entry.get("subject"))
+
+        async def save() -> None:
+            from app.plugins.memory_plugin import save_fact_from_code
+
+            await save_fact_from_code(action_ledger.fact_text(entry), tab_id)
+
+        asyncio.get_running_loop().create_task(save())
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "action_record_failed", tool=tool_name, error=str(exc)[:200])
 
 
 def _with_note(envelope: dict[str, Any], memory_note: str | None) -> dict[str, Any]:

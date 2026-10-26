@@ -442,6 +442,27 @@ async def save_info(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": "Saving to memory in the background; you do not need to wait for it. You will be told only if it fails."}
 
 
+async def save_fact_from_code(text: str, tab_id: str | None) -> bool:
+    """A fact the CODE knows for certain (a finished outbound action, app/action_ledger.py), saved the way save_info saves
+    -- durable queue, background drain -- without the model having to remember to. No login (the gate refuses): nothing
+    is saved, False. Never raises."""
+    try:
+        if await _gate():
+            return False
+        params: dict[str, Any] = {"text": text.strip(), "traceId": uuid.uuid4().hex, "language": _language()}
+        if tab_id:
+            params["_tab_id"] = tab_id
+        entry_id = memory_save_queue.enqueue(WORKSPACE_DIR, params)
+        task = asyncio.create_task(_drain_one(entry_id, None))
+        _background_saves.add(task)
+        task.add_done_callback(_background_saves.discard)
+        log_event("plugin:memory", "save_started", trace_id=params["traceId"], materials=0, queue_id=entry_id, by="code")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log_event("plugin:memory", "save_fact_from_code_failed", error=str(exc)[:200])
+        return False
+
+
 _background_saves: set[asyncio.Task[Any]] = set()   # strong references: a bare task may be collected mid-way
 # Per explicit instruction (2026-10-13): entry ids currently being drained in
 # THIS process -- guards against the eager _drain_one (fired straight from

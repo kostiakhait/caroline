@@ -108,3 +108,21 @@ def test_real_catalog_end_to_end(monkeypatch):
             assert not tool_groups.describe_tool_text(real, tool.name).startswith("No tool")
     out = asyncio.run(captured["tools"]["call_tool"].handler({"name": "get_current_time", "args": {}}))
     assert "done" in out["content"][0]["text"]
+
+
+def test_optional_parameters_are_not_required_and_are_filled_with_none():
+    """A smaller model failed request_info five times on "'history' is a required property" (2026-10-26)."""
+    seen = []
+
+    async def handler(args, report_progress):
+        seen.append(dict(args))
+        return {"ok": True}
+
+    tool = PluginTool(name="t", description="d", input_schema={"query": str, "history": int | None, "topic": str | None}, handler=handler)
+    schema = loader.schema_with_optionals(tool.input_schema)
+    assert schema["required"] == ["query"] and set(schema["properties"]) == {"query", "history", "topic"}
+    assert loader.optional_keys({"type": "object", "properties": {}}) == []          # a ready JSON schema is left alone
+    assert loader.schema_with_optionals({"a": str}) == {"a": str}                    # nothing optional: unchanged
+    wrapped = loader.wrap_tool("p", tool)
+    asyncio.run(wrapped.handler({"query": "x"}))
+    assert seen == [{"query": "x", "history": None, "topic": None}]

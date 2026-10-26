@@ -189,7 +189,11 @@ class CompactionMixin:
         if reason in ("hourly", "growth") and memory_nudge.has_unsaved_work(self.tab_id) and not self._memory_flushed_for_compaction:
             self._memory_flushed_for_compaction = True
             log_event("engine", "memory_flush_before_compaction", tab_id=self.tab_id, reason=reason)
-            self.inject_proactive(MEMORY_FLUSH_BEFORE_COMPACTION_TEXT, suppress_narration=True)
+            from app import action_ledger
+
+            self.inject_proactive(
+                MEMORY_FLUSH_BEFORE_COMPACTION_TEXT + action_ledger.flush_addendum(self.workspace_dir), suppress_narration=True,
+            )
             return
         self._memory_flushed_for_compaction = False
 

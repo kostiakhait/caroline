@@ -32,6 +32,36 @@ from claude_agent_sdk import _build_input_schema as _sdk_build_input_schema
 from app import tool_groups
 from app.logging_setup import log_event
 from app.operations import ToolHandler, build_operations_mcp_server, dispatch
+import types as _types
+import typing as _typing
+
+
+def _is_optional_type(annotation: Any) -> bool:
+    """True for `X | None` / Optional[X] -- a parameter the model may leave out."""
+    if _typing.get_origin(annotation) in (_typing.Union, _types.UnionType):
+        return type(None) in _typing.get_args(annotation)
+    return annotation is type(None)
+
+
+def optional_keys(input_schema: Any) -> list[str]:
+    """The parameters of a `{name: type}` schema that were declared optional (`str | None`)."""
+    if not isinstance(input_schema, dict) or ("type" in input_schema and "properties" in input_schema):
+        return []
+    return [name for name, annotation in input_schema.items() if _is_optional_type(annotation)]
+
+
+def schema_with_optionals(input_schema: Any) -> Any:
+    """The JSON Schema of a tool whose optional parameters are really optional.
+
+    The SDK turns a `{name: type}` schema into one with EVERY parameter required, `X | None` included, so a model
+    had to supply even the ones it had nothing for -- a smaller model failed request_info five times in a row on
+    "'history' is a required property" (2026-10-26). Here only the parameters not declared optional stay required;
+    wrap_tool() fills the left-out optional ones with None, which is what a model passing null used to produce."""
+    optional = optional_keys(input_schema)
+    if not optional:
+        return input_schema
+    full = _sdk_build_input_schema(SdkMcpTool(name="", description="", input_schema=input_schema, handler=None))
+    return {**full, "required": [k for k in full.get("required", []) if k not in optional]}
 
 
 @dataclass
@@ -127,8 +157,12 @@ def wrap_tool(plugin_name: str, plugin_tool: PluginTool) -> SdkMcpTool[Any]:
     an MCP tool whose OWN result is always {operation_id, status, ...},
     never a raw blocking return."""
 
-    @sdk_tool(plugin_tool.name, plugin_tool.description, plugin_tool.input_schema)
+    left_out_ok = optional_keys(plugin_tool.input_schema)
+
+    @sdk_tool(plugin_tool.name, plugin_tool.description, schema_with_optionals(plugin_tool.input_schema))
     async def dispatching_handler(args: dict[str, Any]) -> dict[str, Any]:
+        if left_out_ok:
+            args = {**{k: None for k in left_out_ok}, **args}  # what a model passing null would have sent
         envelope = await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args)
         response = _envelope_to_mcp_response(envelope)
         if envelope.get("memory_note"):

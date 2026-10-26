@@ -1820,6 +1820,7 @@ _CLAUDE_ATTEMPT_QUESTION_RULE = (
 def _build_verification_prompt(
     tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
     can_deescalate: bool = False, can_retry: bool = False, evidence: str = "", claude_attempt: bool = False,
+    recent_dialogue: str = "",
 ) -> str:
     """Verification only (2026-10-03): the verifier has NO tools and must not do
     any work. It checks the candidate against the mechanical facts below.
@@ -1888,8 +1889,12 @@ def _build_verification_prompt(
         # not this engine's, so the memory-and-mailbox hint below does not apply -- only the plain fact.
         parts.append(
             "No tool calls were made in this attempt. So any action the reply says is done, is being done right "
-            "now, or is about to be done did NOT happen; a reply that merely promises work is not finished. A "
-            "plain answer from knowledge or from the conversation itself needs no tool."
+            "now, or is about to be done did NOT happen"
+            + (" -- unless the RECENT DIALOGUE below shows it was done earlier in this conversation" if recent_dialogue else "")
+            + "; a reply that merely promises work is not finished. A plain answer from "
+            "knowledge or from the conversation itself needs no tool"
+            + (", and neither does a reply that only reports on, summarizes or refers to work the person was already "
+               "shown." if recent_dialogue else ".")
         )
     elif not tier_trace and not tracker.branch_trace:
         # Said on every pass, not only the last one (2026-10-22): its absence read as
@@ -1904,6 +1909,11 @@ def _build_verification_prompt(
             "request_info (memory) for credentials, addresses or anything said before, the email tools with "
             "just the mailbox address, the files. (2026-10-22: asked to check a mailbox whose credentials were already "
             "saved, the reply asked which credentials to use, with no tool ever called.)"
+        )
+    if recent_dialogue:
+        parts.append(
+            "RECENT DIALOGUE -- the exact record of what the person wrote and was actually shown, oldest first "
+            "(earlier work and earlier replies are in it; a message marked WITHHELD was never shown):" + chr(10) + recent_dialogue
         )
     if tracker.plan_steps is not None:
         undone = [s for i, s in enumerate(tracker.plan_steps) if i not in tracker.plan_done]
@@ -2180,7 +2190,7 @@ CLAUDE_ATTEMPT_VERDICT_TIMEOUT_S = 60.0
 
 
 async def verify_claude_attempt(
-    user_text: str, candidate_text: str, trace: list[str], can_escalate: bool, tab_id: str,
+    user_text: str, candidate_text: str, trace: list[str], can_escalate: bool, tab_id: str, recent_dialogue: str = "",
 ) -> tuple[str, str]:
     """The same verifier a cascade tier's answer goes through (run_verifier/verify_candidate in
     run_small_model_turn), asked about one attempt of a Claude tab's model ladder
@@ -2202,6 +2212,7 @@ async def verify_claude_attempt(
             {"role": "assistant", "content": candidate_text or "(no answer was produced)"},
             {"role": "user", "content": _build_verification_prompt(
                 tracker, candidate_text, can_escalate, trace, False, False, "", claude_attempt=True,
+                recent_dialogue=recent_dialogue,
             )},
         ]
 

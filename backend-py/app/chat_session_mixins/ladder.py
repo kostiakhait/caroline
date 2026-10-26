@@ -115,7 +115,9 @@ class LadderMixin:
             if claude_ladder.needs_verdict(turn, candidate, is_error):
                 from app.small_model_engine import verify_claude_attempt
 
-                action, note = await verify_claude_attempt(turn.user_text, candidate, list(turn.trace), not turn.is_top, self.tab_id)
+                action, note = await verify_claude_attempt(
+                    turn.user_text, candidate, list(turn.trace), not turn.is_top, self.tab_id, self._ladder_recent_dialogue(),
+                )
             if action == "up" and not turn.is_top:
                 turn.next_rung(note)
                 if await self._ladder_set_model(turn.model):
@@ -128,6 +130,17 @@ class LadderMixin:
         turn.active = False
         await self._ladder_flush(turn)
         return False
+
+    def _ladder_recent_dialogue(self) -> str:
+        """The exact record of the last messages (app/dialogue_log.py), for the verifier: what was done and shown earlier."""
+        try:
+            from app import dialogue_log
+
+            entries = dialogue_log.select(dialogue_log.read_entries(self.workspace_dir, self.tab_id), limit=8)
+            text = dialogue_log.render(entries)
+            return "" if text == "(no messages match)" else text[-5000:]
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _ladder_queue_continuation(self, turn: claude_ladder.LadderTurn, note: str) -> None:
         text = _SYNTHETIC_TURN_MARKER + claude_ladder.continuation_note(turn, note)
