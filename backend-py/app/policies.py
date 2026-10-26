@@ -314,10 +314,9 @@ def learn_from_mistakes_instruction() -> str:
         "a skill shown to you before you decide to open it -- write it specific and concrete enough that you'd "
         "actually recognize a matching situation from the description alone; a vague one is as good as no skill "
         "at all. This is for genuine, non-obvious lessons worth carrying forward -- not routine tool errors or "
-        "anything you'd already handle correctly without having been burned by it once. These skills only live "
-        "on this one machine's local disk until they're backed up -- see the vault-backups skill, which now "
-        "also covers syncing Skills/lessons-learned/ to Notes every backup cycle; that part is mandatory, not "
-        "optional, so a lesson survives a lost or reinstalled machine."
+        "anything you'd already handle correctly without having been burned by it once. The backend copies "
+        "Skills/lessons-learned/ to Notes by itself every hour (nothing for you to do), so a lesson survives a "
+        "lost or reinstalled machine."
     )
 
 

@@ -33,7 +33,7 @@ from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcr
 from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 from app.history import read_archived_entries, read_recent_history_for_session
-from app import settings_mirror, wizard
+from app import settings_mirror, vault_backup, wizard
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
@@ -65,7 +65,7 @@ from app.plugins.companion_sms_store import (
 )
 from app.plugins.memory_plugin import start_save_drain_loop, start_topic_prefetch_loop
 from app.sw_tier_stats import start_sync_loop as start_tier_stats_sync_loop
-from app.plugins.scheduler_plugin import BACKUP_KIND, ensure_recurring_backup, start_due_check_loop
+from app.plugins.scheduler_plugin import BACKUP_KIND, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, transcribe_audio, voice_for_gender
@@ -120,18 +120,8 @@ RATATOSK_TAB_ID = "ratatosk"
 # is gone; _on_reminder_due below now routes each reminder to its own real
 # tab's pseudo-session via pseudo_tab.get_or_create_pseudo_session_sync.
 
-# Ported verbatim from server.ts's own BACKUP_NUDGE -- seeded (idempotently,
-# via the "vault-backup-hourly" kind tag) unconditionally at module load,
-# same as the TS original, so it doesn't depend on the event loop existing
-# yet (pure sync file I/O).
-BACKUP_NUDGE = (
-    "Time for your periodic memory backup: if Notes is available, save your current persona/reminders/anything "
-    "worth keeping into the \"Caroline:Vault\" folder now (see your system instructions). If Notes isn't "
-    "available, do nothing. Either way, this is routine background maintenance -- reply with exactly "
-    "[[NO_UPDATE]] afterward, not a normal reply, unless something actually went wrong that the user needs to "
-    "know about."
-)
-ensure_recurring_backup(BACKUP_NUDGE)
+# The hourly memory backup is no longer a reminder that wakes a model (2026-10-26): app/vault_backup.py copies the
+# memory to Notes by code. The old reminder (kind BACKUP_KIND) is removed from the schedule at start-up.
 
 app = FastAPI()
 
@@ -546,6 +536,8 @@ async def _start_ratatosk_background_loops() -> None:
     asyncio.create_task(_prune_redundant_archives_in_background())
     # Settings kept in Notes (app/settings_mirror.py): restored once there is a login, pushed when they change.
     asyncio.create_task(settings_mirror.run_forever(WORKSPACE_DIR))
+    # The memory backup to Notes, by code, no model (app/vault_backup.py): restore after a login, then hourly.
+    asyncio.create_task(vault_backup.run_forever(WORKSPACE_DIR))
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _inject_from_ratatosk_owner_account, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
@@ -1841,12 +1833,12 @@ async def _handle_control_request_inner(
         # deliver_relayed_reply/check_background_relay_worth like every
         # other background chore's output already is.
         log_event("engine", "shutdown_sync")
-        pseudo = pseudo_tab.get_or_create_pseudo_session_sync(PRIMARY_TAB_ID, "shutdown-backup", sessions.get)
-        if pseudo is not None:
-            pseudo.inject_proactive(
-                "The app is closing right now. " + BACKUP_NUDGE + " Do it immediately, as briefly as possible.",
-                suppress_narration=True,
-            )
+        # 2026-10-26: the backup is done by code (app/vault_backup.py), no model turn; a short wait at most --
+        # the shell kills the process right after asking.
+        try:
+            await asyncio.wait_for(vault_backup.backup_now(WORKSPACE_DIR), 8.0)
+        except Exception as exc:  # noqa: BLE001 -- best effort
+            log_event("engine", "shutdown_sync_backup_failed", error=str(exc)[:200], error_type=type(exc).__name__)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
     if op == "get_history":
         # Issue #4 (2026-10-24): the requesting tab's own transcript -- this used to

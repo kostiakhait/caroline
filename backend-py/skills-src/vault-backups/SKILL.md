@@ -16,49 +16,16 @@ Never write secrets/passwords/API keys/tokens to local files, chat history, or S
 Always save them as notes in the folder "Caroline:Vault" (create it if it doesn't exist), one note
 per secret, title starting with `vault:`.
 
-## Periodic/shutdown memory backup
+## Periodic/shutdown memory backup -- done by the backend, not by you
 
-When a periodic or shutdown memory-backup reminder fires, save your own working memory into that
-same "Caroline:Vault" folder as a note (e.g. title "vault:backup"), so it can be restored on
-another machine or after a restart. Worth including:
-- Your persona and any customizations.
-- Currently scheduled reminders.
-- Anything else worth keeping that isn't already durable elsewhere (an in-progress task's status,
-  a decision the user made that isn't written down anywhere else).
+Since 2026-10-26 there is no backup reminder and nothing for you to do: the backend itself copies, by code and
+only what changed, every hour and when the app closes, into the "Caroline:Vault" folder:
+- the scheduled reminders -> note `vault:backup`;
+- every Skills/lessons-learned/<topic>/SKILL.md -> note `vault:skill:<topic>`;
+- the files of workspace/dehydrated/ and workspace/uploads/ -> attachments of note `vault:dehydrated-files`
+  (named `<dir>__<file name>`).
+The persona and the other settings are mirrored separately ("Caroline:Settings").
 
-If Notes isn't available (not logged in), skip this silently -- don't pester the user about it.
-
-## Lessons-learned skills -- also synced every cycle, mandatory
-
-Skills/lessons-learned/ (see the learn-from-mistakes policy) lives only on this one machine's
-local disk -- nothing else backs it up. As part of this SAME periodic cycle (not a separate
-reminder), sync every file under Skills/lessons-learned/ to "Caroline:Vault" too: one note per
-lesson skill, title `vault:skill:<topic-name>` (matching the skill's own folder name), body = that
-skill's SKILL.md content verbatim. Create the note if it doesn't exist yet; update it if the local
-file has changed since the last sync (compare against the note's current content via notes_get --
-skip the write if they already match, no need to re-save something unchanged every single hour).
-This is what makes a lesson survive a lost/reinstalled machine -- treat it as mandatory, not
-optional, every time this cycle runs, not just when you happen to have written a new one recently.
-
-To restore on a fresh machine: list notes titled `vault:skill:*` in "Caroline:Vault", and recreate
-each one as Skills/lessons-learned/<topic-name>/SKILL.md from the note's content.
-
-## Dehydrated attachments/images -- also synced every cycle, mandatory
-
-workspace/dehydrated/ (plus workspace/uploads/) holds every image/document a dehydration pass has
-ever stripped out of chat history and replaced with a `[... Сохранено в файле: <path>. Прочитать
-через Read при необходимости.]` note (see server.ts's runDehydration/dehydrate.ts) -- like
-Skills/lessons-learned/, this lives only on this one machine's local disk, so a note pointing at
-one of these files is only as durable as the file itself.
-
-As part of this SAME periodic cycle, back these up too: find (or create) a note titled
-"vault:dehydrated-files" in "Caroline:Vault", call notes_list_attachments restricted to that note
-to see which filenames are already backed up, then list workspace/dehydrated/ and
-workspace/uploads/ and notes_attach every file NOT already on that list (call notes_attach with
-just the file path, no explicit originalName, so the attachment's stored name matches the local
-filename exactly -- that's what makes the "already attached?" comparison work). Skip files already
-attached; don't re-upload the same file twice. Mandatory, not optional, every time this cycle runs.
-
-If a resumed conversation later references a dehydrated file that's gone from local disk (a lost/
-reinstalled machine), look for it as an attachment on "vault:dehydrated-files" by filename before
-telling the user it's unrecoverable.
+After a login on a fresh install the backend restores what is missing (reminders, lesson skills, files) by itself.
+If a resumed conversation references a dehydrated file that is gone from the local disk, look for it as an
+attachment on `vault:dehydrated-files` before telling the user it is unrecoverable.

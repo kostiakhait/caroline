@@ -352,28 +352,6 @@ def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: f
     return supervise("due_check", _loop)
 
 
-def ensure_recurring_backup(note: str) -> None:
-    """Seeds the hourly memory-backup reminder once; detected by its kind tag."""
-    reminders = _load_reminders()
-    if any(r.get("kind") == BACKUP_KIND for r in reminders):
-        log_event("engine", "ensure_recurring_backup_already_seeded")
-        return
-    cron = "0 0 * * * *"
-    log_event("engine", "ensure_recurring_backup_seeding", cron=cron)
-    reminders.append({
-        "id": uuid.uuid4().hex,
-        "dueAtIso": _Cron(cron).next_after(datetime.now().astimezone()).isoformat(),
-        "note": note,
-        "createdAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "fired": False,
-        "cron": cron,
-        "kind": BACKUP_KIND,
-        "eventType": "service",
-        "tabId": _DEFAULT_TAB_ID,
-    })
-    _save_reminders(reminders)
-
-
 def _usage_instructions() -> str:
     return "\n\n".join((
         "For ANY periodic/recurring task (checking something on a schedule, a daily/weekly routine, a birthday or "
