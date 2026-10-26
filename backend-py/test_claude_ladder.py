@@ -268,3 +268,11 @@ def test_message_during_a_judged_turn_joins_it_and_keeps_held_replies(monkeypatc
 
     run(go())
     assert len(s.sent) == 1
+
+
+def test_verifier_prompt_lets_a_permitted_question_through_for_a_claude_attempt():
+    tracker = sme._TurnTracker()
+    claude = sme._build_verification_prompt(tracker, "Send it? Here is the text.", True, ["- Bash({}) -> ok"], claude_attempt=True)
+    assert "NOT unfinished work" in claude and "Never OK a reply that asks the user something" not in claude
+    cascade = sme._build_verification_prompt(tracker, "Send it?", True, ["- x -> ok"])
+    assert "Never OK a reply that asks the user something" in cascade and "NOT unfinished work" not in cascade

@@ -1806,6 +1806,17 @@ def _make_executor_fn(
     return executor_fn
 
 
+_CLAUDE_ATTEMPT_QUESTION_RULE = (
+    " A question to the user is NOT unfinished work when it is permitted or unavoidable, and such a reply is OK as it "
+    "stands: asking the user to approve an outbound or irreversible action (sending a message or email, a payment, "
+    "deleting, publishing) that needs their approval; asking for something only the user can supply, which memory, "
+    "files and tools could not (after they were tried); a choice that really depends on the user's preference; a "
+    "permission only the user can give. Do not escalate such a reply -- a stronger model would only ask the same "
+    "thing. Escalate a question only when the assistant could have found the answer or done the step itself with "
+    "its tools and did not try."
+)
+
+
 def _build_verification_prompt(
     tracker: _TurnTracker, final_text: str, can_escalate: bool, tier_trace: list[str] | None = None,
     can_deescalate: bool = False, can_retry: bool = False, evidence: str = "", claude_attempt: bool = False,
@@ -1945,6 +1956,7 @@ def _build_verification_prompt(
             + _RESULT_READ_BACK_RULE
             + _REQUEST_VALUES_RULE
             + (
+                _CLAUDE_ATTEMPT_QUESTION_RULE if claude_attempt else
                 " Never OK a reply that asks the user something -- which option to take, what to do next, a "
                 "detail, a confirmation -- or hands them a choice instead of finishing the task: escalate it, so a "
                 "stronger model tries to finish the task itself. The only question that goes to the user as it "
