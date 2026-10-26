@@ -631,13 +631,22 @@ class Shell:
         no WebView2 "airspace" bug forces a Show()/Hide() dance here first;
         a GTK window never shown at all is enough. Called while the splash
         is up so the chat page is already loading underneath it."""
+        self._restoring_tabs = False
+        GLib.timeout_add(SUPERVISOR_STATUS_POLL_INTERVAL_MS, self._poll_supervisor_status)
+
+    def _start_tabs(self) -> None:
+        """Creates the saved tabs (each starts loading chat.html, i.e. connects to the backend and makes it greet).
+        Done only once the start-up wizard is out of the way -- like the WPF build's StartTabsAsync -- so the greeting
+        and the old login window never come up on top of the wizard. Once only."""
+        if getattr(self, "_tabs_started", False):
+            return
+        self._tabs_started = True
         self._restoring_tabs = True
         tab_ids = self.settings.open_tab_ids or ["1"]
         for i, tab_id in enumerate(tab_ids):
             self.add_tab(tab_id, select=(i == 0))
         self._restoring_tabs = False
         self._persist_open_tab_ids()
-        GLib.timeout_add(SUPERVISOR_STATUS_POLL_INTERVAL_MS, self._poll_supervisor_status)
 
     def _persist_open_tab_ids(self) -> None:
         """Port of MainWindow's PersistOpenTabIds."""
@@ -750,6 +759,7 @@ class Shell:
         threading.Thread(target=check, daemon=True).start()
 
     def _reveal_now(self) -> bool:
+        self._start_tabs()
         self.window.show_all()
         if self.settings.window_left is not None and self.settings.window_top is not None:
             self.window.move(int(self.settings.window_left), int(self.settings.window_top))
@@ -814,7 +824,11 @@ class Shell:
         if self.window.get_visible():
             self.window.hide()
         else:
-            self._wizard_first(self.window.present)
+            def show_chat() -> None:
+                self._start_tabs()
+                self.window.present()
+
+            self._wizard_first(show_chat)
 
     def show_and_activate(self) -> None:
         """Port of MainWindow's ShowAndActivate -- the tray's "Open
@@ -822,6 +836,7 @@ class Shell:
         than toggle_visibility, matching Windows: always brings the window
         to front, never hides an already-visible one."""
         def show_chat() -> None:
+            self._start_tabs()
             self.window.show_all()
             self.window.deiconify()
             self.window.present()
