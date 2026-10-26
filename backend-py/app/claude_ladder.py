@@ -71,7 +71,15 @@ class LadderTurn:
             return True
         if wire.get("type") != "assistant" or wire.get("parent_tool_use_id"):
             return False
+        if has_tool_use(wire):
+            return False  # narration before a tool call is shown at once, as it always was
         return bool(visible_text(wire))
+
+    def releases_held(self, wire: dict[str, Any]) -> bool:
+        """True when this message shows the turn went on after the text held so far: that text was interim narration,
+        not the answer under judgement, and goes out now (the verdict is about the last text before the result)."""
+        return bool(self.held) and wire.get("type") in ("assistant", "user") and not wire.get("parent_tool_use_id") \
+            and (has_tool_use(wire) or _has_tool_result(wire))
 
     def next_rung(self, note: str) -> None:
         self.escalations.append(f"{self.model}: {note}")
@@ -89,6 +97,16 @@ def visible_text(wire: dict[str, Any]) -> str:
         b.get("text", "") for b in content
         if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
     )
+
+
+def has_tool_use(wire: dict[str, Any]) -> bool:
+    content = (wire.get("message") or {}).get("content")
+    return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+
+
+def _has_tool_result(wire: dict[str, Any]) -> bool:
+    content = (wire.get("message") or {}).get("content")
+    return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
 
 
 def _result_text(content: Any) -> str:

@@ -276,3 +276,22 @@ def test_verifier_prompt_lets_a_permitted_question_through_for_a_claude_attempt(
     assert "NOT unfinished work" in claude and "Never OK a reply that asks the user something" not in claude
     cascade = sme._build_verification_prompt(tracker, "Send it?", True, ["- x -> ok"])
     assert "Never OK a reply that asks the user something" in cascade and "NOT unfinished work" not in cascade
+
+
+def test_interim_narration_is_sent_when_the_turn_goes_on_and_only_the_last_text_waits(monkeypatch):
+    s = Session()
+    verdicts(monkeypatch, ("done", ""))
+    mixed = {"type": "assistant", "message": {"content": [{"type": "text", "text": "looking"}, {"type": "tool_use", "id": "z", "name": "X", "input": {}}]}}
+    tool_result = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "z", "content": "ok"}]}}
+
+    async def go():
+        await s._ladder_before_yield(user_item())
+        assert s._ladder_hold(text_wire("still checking")) is True      # might be the answer: waits
+        await s._ladder_release_interim(tool_result)                    # the turn went on: it was narration
+        assert [e["message"]["message"]["content"][0]["text"] for e in s.sent] == ["still checking"]
+        assert s._ladder_hold(mixed) is False                           # text + a tool call is never held
+        assert s._ladder_hold(text_wire("final report")) is True
+        assert await s._ladder_on_result(result_msg("final report")) is False
+
+    run(go())
+    assert [e["message"]["message"]["content"][0]["text"] for e in s.sent] == ["still checking", "final report"]
