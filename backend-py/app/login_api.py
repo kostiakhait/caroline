@@ -24,6 +24,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from app.logging_setup import log_event
+from app import external_session
 from app.plugins import notes_api
 from app.plugins.notes_api import NotesApiError
 from app.plugins.sw_api import _post_json as _sw_post_json  # noqa: F401 -- reuse the same retrying POST helper
@@ -43,6 +44,7 @@ class LoginResult:
 def clear_credentials() -> None:
     """Logging out here logs Notes/SMS/email out too -- same shared
     account either way (see this module's own docstring)."""
+    external_session.leave("signed out")
     from app.plugins.sw_api import CREDENTIALS_PATH
     log_event("engine", "credentials_cleared")
     CREDENTIALS_PATH.unlink(missing_ok=True)

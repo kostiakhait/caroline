@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 from app.http_tls import ssl_context
+from app import external_session
 
 API_URL = "https://www.squirrelwisdom.com/"
 
@@ -193,6 +194,7 @@ async def call_v2(command: str, **extra: Any) -> dict[str, Any]:
     if envelope.get(".status") != "ok":
         reason = envelope.get(".reason", json.dumps(envelope))
         if isinstance(reason, str) and "session" in reason.lower():
+            external_session.on_session_error(extra.get("session"))
             raise SessionExpiredError(reason)
         raise SwApiError(f'command "{command}" failed: {reason}')
     return envelope
@@ -214,6 +216,9 @@ async def get_session_user(session: str) -> str | None:
 
 
 async def mint_v2_session(email: str, password: str) -> str:
+    # Signed in with a session handed over by the host (external_session.py): a credential-less call gets that session.
+    if not password and external_session.matches(email):
+        return external_session.session() or ""
     data = await _post_json({"command": "user:verify", "key": V2_LOGIN_SERVICE_KEY, "path": "/users", "user": email, "password": password})
     if data.get(".status") != "ok" or not data.get("session"):
         raise SwApiError(f'SquirrelWisdom v2 login failed for "{email}": {data.get(".reason", json.dumps(data))}')
@@ -221,6 +226,8 @@ async def mint_v2_session(email: str, password: str) -> str:
 
 
 def load_credentials() -> dict[str, str] | None:
+    if external_session.active():
+        return {"email": external_session.user() or "", "password": ""}
     try:
         return json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -228,6 +235,7 @@ def load_credentials() -> dict[str, str] | None:
 
 
 def save_credentials(email: str, password: str) -> None:
+    external_session.leave("signed in with a password")
     CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
     CREDENTIALS_PATH.write_text(json.dumps({"email": email, "password": password}, indent=2), encoding="utf-8")
 

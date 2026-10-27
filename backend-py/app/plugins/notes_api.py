@@ -12,6 +12,7 @@ import secrets
 import string
 from typing import Any
 
+from app import external_session
 from app.plugins.sw_api import load_credentials, save_credentials
 from app.reforce_v2 import ReforceError as NotesApiError
 from app.reforce_v2 import ReforceSessionExpired as SessionExpiredError
@@ -25,6 +26,9 @@ MAX_ATTACHMENT_BYTES = 47 * 1024 * 1024
 
 
 async def verify_password(email: str, password: str) -> str:
+    # Signed in with a session handed over by the host (external_session.py): a credential-less call gets that session.
+    if not password and external_session.matches(email):
+        return external_session.session() or ""
     result = await reforce_call("user:verify", {"path": "/users", "user": email, "password": password})
     session = result.get("session")
     if not session:
