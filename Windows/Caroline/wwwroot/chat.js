@@ -494,6 +494,12 @@
     } catch (err) { console.error("[caroline] loadAttachmentBlob failed (ignored):", err); return null; }
   }
 
+  function isLeakedInternalText(text) {
+    return typeof text === "string" && (
+      text.includes("[[NO_UPDATE]]") || text.includes("PreCompact callback") || text.includes("[[caroline-internal-turn]]")
+    );
+  }
+
   function loadTranscript() {
     try {
       const raw = localStorage.getItem(TRANSCRIPT_KEY);
@@ -517,9 +523,11 @@
       // compact_continuation_is_genuine_instruction() server-side) no real
       // user or Caroline reply would ever contain -- safe as a substring
       // match, same as NO_UPDATE above.
-      const cleaned = list.filter((e) => !(e && typeof e.text === "string" && (
-        e.text.includes("[[NO_UPDATE]]") || e.text.includes("PreCompact callback")
-      )));
+      //
+      // Same again (2026-10-26): a Caroline-internal turn (the startup
+      // greeting nudge) was recovered via get_history as a user bubble and
+      // persisted here before history.py learned to drop it.
+      const cleaned = list.filter((e) => !isLeakedInternalText(e && e.text));
       if (cleaned.length !== list.length) {
         try { localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(cleaned)); } catch { /* quota/private mode */ }
       }
@@ -1924,7 +1932,7 @@
     if (evt.op === "get_history") {
       if (evt.ok) {
         try {
-          const entries = JSON.parse(evt.stdout || "[]");
+          const entries = JSON.parse(evt.stdout || "[]").filter((e) => !isLeakedInternalText(e && e.text));
           for (const entry of entries) {
             // Bug fix (2026-09-09): this used to hardcode [] here, so a
             // get_history-recovered bubble could never show an attachment at

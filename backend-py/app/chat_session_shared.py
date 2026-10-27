@@ -120,7 +120,7 @@ from app.engines.codex_engine import CodexEngine
 from app.openai_mode import build_codex_options, openai_available
 # edition:end
 from app.transcript_rotate import rotate_transcript
-from app.history import ATTACHMENT_NOTE_MARKER, _ATTACHMENT_NOTE_PREFIXES, _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
+from app.history import ATTACHMENT_NOTE_MARKER, SYNTHETIC_TURN_MARKER, _ATTACHMENT_NOTE_PREFIXES, _HISTORY_STAMP_PATTERN, iter_entries_reversed, iter_lines_reversed, read_last_context_tokens
 from app.failure_classification import (
     CC_CLI_LIMIT_PATTERN,
     CLASSIFIER_REFUSAL_PATTERN,
@@ -869,7 +869,7 @@ _ATTACHMENT_NOTE_PREFIX_TUPLE = tuple(_ATTACHMENT_NOTE_PREFIXES) + (
 # fix, written without the marker). U+2063 (invisible separator) means
 # this never visibly renders as odd text in the rare case it ever leaked
 # somewhere unfiltered.
-_SYNTHETIC_TURN_MARKER = "⁣[[caroline-internal-turn]]⁣"
+_SYNTHETIC_TURN_MARKER = SYNTHETIC_TURN_MARKER  # defined in history.py, whose parser drops marked turns
 
 # Backward-compat only (2026-09-22): a same-day, since-reverted experiment
 # briefly had submit() prepend a "last hour of dialogue" block directly

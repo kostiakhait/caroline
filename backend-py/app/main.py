@@ -2016,6 +2016,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         old_session.dispose()
         if sessions.get(tab_id) is old_session:
             del sessions[tab_id]
+        _resumed_unfinished_turn_for_tab.discard(tab_id)  # its cancelled turn must be resumed by this connect
 
     # A FRESH ChatSession every connection (not reused across reconnects) --
     # matches server.ts's own design exactly: continuity across a
@@ -2357,6 +2358,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         session.dispose()
         if sessions.get(tab_id) is session:
             del sessions[tab_id]
+        # Bug fix (2026-10-26), confirmed live: the resume check is once per process, but the backend can
+        # outlive the window (app restarted/updated, tab reloaded) -- the dispose above cancels the running
+        # turn, so the NEXT connect of this tab must look for its pending turn again, or the request is lost.
+        _resumed_unfinished_turn_for_tab.discard(tab_id)
 
 
 if __name__ == "__main__":

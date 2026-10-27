@@ -294,6 +294,14 @@ class TurnSubmissionMixin:
 
             dialogue_log.append(self.workspace_dir, self.tab_id, dialogue_log.USER,
                                 text + (f"\n[{len(attachments)} attachment(s)]" if attachments else ""), voice=is_voice)
+        # Bug fix (2026-10-26), found by closing the window while a message was still held: submit()
+        # is what saves the pending turn, and it only runs when the merge window ends -- a session
+        # disposed before that took the user's request with it, and nothing was resumed. Saved now,
+        # for the held messages as one (what submit() will be handed), and overwritten there as usual.
+        save_pending_turn(
+            self.workspace_dir, self.tab_id, "\n\n".join(t for t, _a, _v in self._held_user_messages if t),
+            [att for _t, atts, _v in self._held_user_messages for att in atts],
+        )
         if self._held_user_flush is not None:
             self._held_user_flush.cancel()
         self._held_user_flush = asyncio.get_running_loop().call_later(USER_MESSAGE_MERGE_WINDOW_S, self._flush_held_user_messages)

@@ -35,6 +35,15 @@ _ATTACHMENT_NOTE_PREFIXES = [
 # same convention as chat_session.py's _SYNTHETIC_TURN_MARKER.
 ATTACHMENT_NOTE_MARKER = "\u2063[[caroline-attachment-note]]\u2063"
 
+# Bug fix (2026-10-26), confirmed live: the startup-greeting nudge ("[[caroline-internal-turn]]You
+# just started up...") showed up in the chat as the user's own bubble, twice, after a tab's local
+# cache was empty and chat.js recovered it via get_history. submit() tags every non-user turn with
+# this marker, but this parser -- the one get_history, the companion mirror and every dialogue
+# reader draw from -- never dropped marked turns; only the dialogue readers filtered them on their
+# own. Defined here (not chat_session_shared, which imports this module) so the parser can use it;
+# chat_session_shared's _SYNTHETIC_TURN_MARKER is this same constant.
+SYNTHETIC_TURN_MARKER = "\u2063[[caroline-internal-turn]]\u2063"
+
 _SAVED_PATH_RE = re.compile(r"saved (?:to|at) (.+?)(?: -- |\]|$)")
 
 _UUID_PREFIX_RE = re.compile(
@@ -206,6 +215,11 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
                     continue
                 text, attachments = _extract_text_and_attachments(group)
                 if not text.strip() and not attachments:
+                    continue
+                # A Caroline-internal turn (see SYNTHETIC_TURN_MARKER) is never the user's words:
+                # dropped per sub-message, so a real message merged behind it still survives.
+                # Substring, since the "[Sent: ...]" stamp block comes before the marked text.
+                if obj.get("type") == "user" and SYNTHETIC_TURN_MARKER.strip("⁣") in text:
                     continue
                 # Bug fix (2026-09-09): this rebuild path is entirely
                 # separate from the live sdk_message stream's own

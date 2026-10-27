@@ -202,7 +202,12 @@ class SmallModelTurnMixin:
             # queued real turn -- an explicit Stop means stop, not run the next thing.
             log_event("engine", "small_model_turn_cancelled", tab_id=self.tab_id)
             self._dr_reset()
-            clear_pending_turn(self.workspace_dir, self.tab_id)
+            # Bug fix (2026-10-26), confirmed live: dispose() (the window closed / the tab's WS dropped)
+            # cancels this task too, and this handler cleared the pending turn as if the user had pressed
+            # Stop -- so the request was gone and nothing was resumed on reconnect. Only an explicit Stop
+            # (session still live) discards it; a disposed session leaves it for main.py's resume.
+            if not self.ended:
+                clear_pending_turn(self.workspace_dir, self.tab_id)
             self.turn_pending = False
             self._end_small_model_turn(start_queued_real_turn=False)
             raise

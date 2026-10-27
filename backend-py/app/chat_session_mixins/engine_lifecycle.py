@@ -1181,7 +1181,10 @@ class EngineLifecycleMixin:
                             # removed.
                             self.pending_user_text = None
                             self.pending_attachments = []
-                            clear_pending_turn(self.workspace_dir, self.tab_id)
+                            # Not for a disposed session (2026-10-26): its turn was interrupted by the
+                            # window closing, not answered -- the pending turn must survive for the resume.
+                            if not self.ended:
+                                clear_pending_turn(self.workspace_dir, self.tab_id)
                             # Per explicit correction (2026-09-13): a real
                             # turn's genuine completion (not this fake/
                             # compaction/hang-recovery ResultMessage, and not
