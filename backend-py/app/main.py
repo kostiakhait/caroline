@@ -97,6 +97,9 @@ from app.visual_mode import (
     BUILTIN_MODEL_NAMES,
     BUILTIN_MODELS_BASE_URL,
     add_pending_builtin_download,
+    background_downloads,
+    builtin_download_message,
+    is_enable_when_ready,
     is_visual_mode_enabled,
     load_pending_builtin_downloads,
     missing_builtin_models,
@@ -104,6 +107,7 @@ from app.visual_mode import (
     profile_supports_visual_mode,
     remove_pending_builtin_download,
     resolve_visual_model,
+    set_enable_when_ready,
     set_visual_mode_enabled,
     trigger_builtin_download_now,
 )
@@ -1478,16 +1482,24 @@ async def _handle_control_request_inner(
             # persona needs (both its A and B day-parity files) is actually
             # on disk, not just this one.
             remove_pending_builtin_download(WORKSPACE_DIR, model_name)
-            if ok and not missing_builtin_models(WORKSPACE_DIR):
-                set_visual_mode_enabled(WORKSPACE_DIR, True)
-                vm_model = resolve_visual_model(WORKSPACE_DIR)
-                if send is not None:
-                    await send({"type": "visual_mode_config", "enabled": True, "modelPath": (vm_model or {}).get("modelPath")})
-            elif not ok and send is not None:
-                # Leave enabled=false (it was never set true for this
-                # attempt) -- just tell the page so an optimistically-checked
-                # checkbox reverts instead of lying about the real state.
-                await send({"type": "visual_mode_config", "enabled": False, "modelPath": None})
+            # The models are also fetched in the background at every start, whether or not Visual Mode is on (see
+            # visual_mode.BackgroundDownloads): the feature is switched on here ONLY when the Settings toggle asked for it
+            # (enableWhenReady), never because a file happened to arrive.
+            next_background = background_downloads.done(model_name, ok)
+            if is_enable_when_ready(WORKSPACE_DIR):
+                if ok and not missing_builtin_models(WORKSPACE_DIR):
+                    set_visual_mode_enabled(WORKSPACE_DIR, True)
+                    vm_model = resolve_visual_model(WORKSPACE_DIR)
+                    if send is not None:
+                        await send({"type": "visual_mode_config", "enabled": True, "modelPath": (vm_model or {}).get("modelPath")})
+                elif not ok and send is not None:
+                    # Leave enabled=false (it was never set true for this
+                    # attempt) -- just tell the page so an optimistically-checked
+                    # checkbox reverts instead of lying about the real state.
+                    await send({"type": "visual_mode_config", "enabled": False, "modelPath": None})
+            if next_background and send is not None:
+                log_event("engine", "visual_model_background_download_next", model_name=next_background)
+                await send(builtin_download_message(next_background))
             return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
         if model_name:
             primary = primary_session()
@@ -1819,8 +1831,14 @@ async def _handle_control_request_inner(
         # needed file actually lands (see that handler below), so a user
         # who closes the app mid-download doesn't end up with the toggle
         # silently "on" over nothing.
+        # (2026-10-27) The same files are also fetched in the background at every start whether or not this toggle is on
+        # (visual_mode.BackgroundDownloads), so what the toggle asks for now may already be on its way: the toggle only
+        # takes over the files of this persona (it wants them first) and records that Visual Mode is to be switched on
+        # when they are all there (enableWhenReady).
         log_event("engine", "visual_mode_builtin_download_needed", missing=missing)
+        set_enable_when_ready(WORKSPACE_DIR, True)
         for name in missing:
+            background_downloads.taken_over(name)
             add_pending_builtin_download(WORKSPACE_DIR, name)
             await trigger_builtin_download_now(name)
         return {
@@ -2059,17 +2077,26 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         # Same flush, for a Settings-toggle-triggered built-in download
         # (visual_mode_set) that was still in flight when the app last
         # closed -- a fresh process is exactly a fresh chance to resume it.
+        started_builtin: set[str] = set()
         for pending_name in list(load_pending_builtin_downloads(WORKSPACE_DIR)):
             if (Path(models_dir()) / f"{pending_name}.xcfa").exists():
                 remove_pending_builtin_download(WORKSPACE_DIR, pending_name)
                 continue
             log_event("engine", "visual_model_builtin_download_flush", model_name=pending_name)
-            await websocket.send_json({
-                "type": "visual_model_download_start",
-                "modelName": pending_name,
-                "url": f"{BUILTIN_MODELS_BASE_URL}/{pending_name}.xcfa",
-                "shaUrl": f"{BUILTIN_MODELS_BASE_URL}/{pending_name}.xcfa.sha256",
-            })
+            # A pending file can only come from the Settings toggle (older versions did not record that Visual Mode
+            # was waiting for it): the feature is switched on when the files have arrived, as it always was.
+            set_enable_when_ready(WORKSPACE_DIR, True)
+            started_builtin.add(pending_name)
+            await websocket.send_json(builtin_download_message(pending_name))
+
+        # (2026-10-27) The four built-in models come to the machine in the background at EVERY start while any of them is
+        # not on disk, whether or not Visual Mode is turned on -- one at a time, the current persona's own two first, each finished file starting the
+        # next (see visual_mode.BackgroundDownloads). Anything already on disk is skipped; a partial file resumes.
+        first_background = background_downloads.begin(WORKSPACE_DIR, started_builtin)
+        if first_background:
+            log_event("engine", "visual_model_background_download_start", model_name=first_background,
+                      queued=list(background_downloads.queue))
+            await websocket.send_json(builtin_download_message(first_background))
 
     # Per explicit instruction: Caroline must never come back up silently.
     # Fires once per backend-process lifetime, tied to the primary tab.

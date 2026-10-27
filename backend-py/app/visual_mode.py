@@ -65,7 +65,26 @@ def is_visual_mode_enabled(workspace_dir: str) -> bool:
 
 def set_visual_mode_enabled(workspace_dir: str, enabled: bool) -> None:
     log_event("engine", "visual_mode_set_enabled", enabled=enabled)
-    _settings_path(workspace_dir).write_text(json.dumps({"enabled": enabled}, indent=2) + "\n", encoding="utf-8")
+    data = _load_settings(workspace_dir)
+    data["enabled"] = enabled
+    data.pop("enableWhenReady", None)  # the choice is made: nothing is waiting for the download any more
+    _settings_path(workspace_dir).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def set_enable_when_ready(workspace_dir: str, waiting: bool) -> None:
+    """The Settings toggle was turned on while the models were still missing: Visual Mode is switched on once they have
+    arrived (see main.py's visual_model_download_done). Kept apart from `enabled`, so that the background download of the
+    models (which runs whether or not Visual Mode is on) never switches the feature on by itself."""
+    data = _load_settings(workspace_dir)
+    if waiting:
+        data["enableWhenReady"] = True
+    else:
+        data.pop("enableWhenReady", None)
+    _settings_path(workspace_dir).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def is_enable_when_ready(workspace_dir: str) -> bool:
+    return bool(_load_settings(workspace_dir).get("enableWhenReady", False))
 
 
 def models_dir() -> str:
@@ -77,7 +96,10 @@ def models_dir() -> str:
     used by visual_models_plugin.py to know where a purchased model's
     downloaded file should land/already exist."""
     from_env = os.environ.get("CAROLINE_MODELS_DIR")
-    if from_env and Path(from_env).exists():
+    # (2026-10-27) Used whether or not the folder exists yet: it is created by the first download, and the models now come in
+    # the background on a fresh install, where it does not exist at the start. Falling back to the dev-tree guess in that case
+    # looked for the finished files in the wrong place, so they were never seen.
+    if from_env:
         return from_env
     return str(Path.cwd() / ".." / "art" / "models")
 
@@ -176,6 +198,72 @@ def missing_builtin_models(workspace_dir: str) -> list[str]:
     see resolve_visual_model's own A/B rotation) aren't on disk yet."""
     base = Path(models_dir())
     return [name for name in _builtin_names_for_profile(workspace_dir) if not (base / f"{name}.xcfa").exists()]
+
+
+def background_download_order(workspace_dir: str) -> list[str]:
+    """All four built-in models, the current persona's own two first (they are the ones Visual Mode needs soonest)."""
+    first = _builtin_names_for_profile(workspace_dir)
+    return first + sorted(BUILTIN_MODEL_NAMES - set(first))
+
+
+def missing_background_models(workspace_dir: str) -> list[str]:
+    """The built-in models that are not on disk yet, in the order they are fetched in."""
+    base = Path(models_dir())
+    return [name for name in background_download_order(workspace_dir) if not (base / f"{name}.xcfa").exists()]
+
+
+def builtin_download_message(name: str) -> dict:
+    """The host message that starts the download of one built-in model (the host's downloader resumes a partial file and
+    checks the sha256)."""
+    return {
+        "type": "visual_model_download_start",
+        "modelName": name,
+        "url": f"{BUILTIN_MODELS_BASE_URL}/{name}.xcfa",
+        "shaUrl": f"{BUILTIN_MODELS_BASE_URL}/{name}.xcfa.sha256",
+    }
+
+
+class BackgroundDownloads:
+    """The built-in models come to the machine on their own, one after the other, whether or not Visual Mode is turned on
+    (they used to come only when the Settings toggle was turned on, so a user who tried it later waited for tens of GB, and
+    a machine that never did had no model at all). Started at every start of the backend (once per process, at the moment
+    the first window connects) for whatever is not on disk yet; each finished file starts the next. A failed file stops the chain (no network, no disk space): the next
+    start of Caroline tries again from where the partial file ended. Files the Settings toggle already started are not
+    started twice."""
+
+    def __init__(self) -> None:
+        self.queue: list[str] = []
+        self.current: str | None = None
+        self.skip: set[str] = set()   # being fetched by the toggle (or a flushed pending download) in this process
+
+    def begin(self, workspace_dir: str, already_started: set[str]) -> str | None:
+        self.skip = set(already_started)
+        self.queue = [n for n in missing_background_models(workspace_dir) if n not in self.skip]
+        self.current = None
+        return self._next()
+
+    def _next(self) -> str | None:
+        self.current = self.queue.pop(0) if self.queue else None
+        return self.current
+
+    def done(self, name: str, ok: bool) -> str | None:
+        """A model finished (or failed). The name of the next one to start, or None."""
+        if name != self.current:
+            return None   # not ours: a purchased model, or one the toggle started
+        if not ok:
+            self.queue.clear()
+            self.current = None
+            return None
+        return self._next()
+
+    def taken_over(self, name: str) -> None:
+        """The Settings toggle asks for this one right now: it is fetched on its own, not twice."""
+        self.skip.add(name)
+        if name in self.queue:
+            self.queue.remove(name)
+
+
+background_downloads = BackgroundDownloads()
 
 
 def _pending_builtin_downloads_path(workspace_dir: str) -> Path:
