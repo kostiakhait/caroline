@@ -678,6 +678,7 @@ class EngineLifecycleMixin:
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
+                    instruction_memory_system_prompt_clause(self.workspace_dir),
                     working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
                     memory_topics_system_prompt_clause(self.workspace_dir, self.tab_id),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],

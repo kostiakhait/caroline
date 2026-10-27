@@ -143,6 +143,7 @@ from app.small_model_engine import (
 from app.task_supervisor import supervise
 from app.persona import get_persona, get_persona_gender, persona_system_prompt_append
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
+from app.instruction_memory import instruction_memory_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app import agent_registry
@@ -1818,6 +1819,7 @@ __all__ = [
     'owner_profile_system_prompt_clause',
     'load_working_memory',
     'working_memory_system_prompt_clause',
+    'instruction_memory_system_prompt_clause',
     'memory_topics_system_prompt_clause',
     'agent_registry',
     'pseudo_tab',

@@ -89,6 +89,7 @@ from app.operations import REGISTRY as OPERATIONS_REGISTRY
 from app.operations import _operation_to_dict, dispatch
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
+from app.instruction_memory import instruction_memory_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app.untrusted_text import web_pages_text
@@ -3282,6 +3283,7 @@ async def run_small_model_turn(
     system = "\n\n".join([
         _persona_system_message(persona),
         owner_profile_system_prompt_clause(get_owner_profile(workspace_dir)),
+        instruction_memory_system_prompt_clause(workspace_dir),
         working_memory_system_prompt_clause(load_working_memory(workspace_dir)),
         memory_topics_system_prompt_clause(workspace_dir, tab_id),
         _engine_instructions(language),

@@ -297,6 +297,16 @@ class PermissionGuardMixin:
             for line in lines:
                 if not deduped or deduped[-1] != line:
                     deduped.append(line)
+            # Bug fix (2026-10-26), confirmed live (a double permission request): the guard is
+            # called from submit() the moment a real user message arrives, but the transcript on
+            # disk only has that message once the CLI dequeues it -- a few seconds later. The
+            # user's "Да, разрешаю" (22:49:52) was not in this dialogue yet, the guard judged the
+            # old question still unanswered, stopped the turn and the model asked again. The
+            # narrator already appends the latest real question (see
+            # _gather_recent_dialogue_for_narration); the guard needs it even more.
+            question = _HISTORY_STAMP_PATTERN.sub("", (self.last_real_user_question or "").strip()).strip()
+            if question and (not deduped or question not in deduped[-1]):
+                deduped.append(f"User: {question}")
             own = "\n".join(deduped[-PERMISSION_GUARD_DIALOGUE_WINDOW:])
         if self.approval_bridge_tab_id:
             bridge = get_recent_real_user_directives(self.approval_bridge_tab_id)
