@@ -77,6 +77,17 @@ an opt-in heartbeat (`heartbeat_timeout_s` + a `touch()` the loop body calls to 
 loops that legitimately run forever (a live messenger connection) where elapsed time alone can't
 tell "healthy" from "stuck."
 
+**Resuming an unfinished request** (`app/durability.py`, `main.py`'s WS handler). A real user
+message is saved to `pending-turn-<tab>.json` the moment it is *received* — including while it
+still waits out the 5-second merge window in `submit_or_try_small_model` — and removed only when its
+turn finishes or the user presses Stop. Closing the window disposes the tab's session and cancels the
+running turn, but deliberately leaves the file: the next connect of that tab finds it and starts the
+resume turn (`resuming_unfinished_turn` in the log). The once-per-process guard
+(`_resumed_unfinished_turn_for_tab`) is re-armed on every disconnect, so this works when the backend
+outlived the window (an app update, a webview reload), not only after a full process restart. History
+recovery (`get_history`, `history.py`) drops Caroline's internal turns (`SYNTHETIC_TURN_MARKER`), so a
+startup nudge never shows up as the user's own bubble.
+
 ## Paying for chat: three sources, one assistant
 
 `app/subscription_mode.py` resolves the Claude path: per explicit policy, Claude is reached
@@ -128,7 +139,10 @@ Rough roster by category:
   server-side microagents — see below); `notes_plugin.py` (direct Notes CRUD); `event_memory_plugin.py`
   (a durable record of things Caroline arranged); `contacts_plugin.py`. `memory_search_plugin.py`,
   `topics_plugin.py`, and `working_memory_plugin.py` are deprecated, superseded by `memory_plugin.py`
-  (`app/deprecated_memory.py`), kept read-only for continuity.
+  (`app/deprecated_memory.py`), kept read-only for continuity. `instruction_memory_plugin.py`
+  (`app/instruction_memory.py`) keeps the owner's standing rules locally and puts them into every
+  system prompt of both engines; entries are ranked by priority, then use count (LFU), then recency,
+  and the lowest rank is evicted when the list is full.
 - **Automation** — `mouse_plugin.py`, `keyboard_plugin.py`, `inspect_plugin.py`, `chain_plugin.py`
   (a linear GUI-automation step interpreter), `screenshot_plugin.py`, `windows_plugin.py` (a
   cross-plugin registry of Caroline's own open windows/tabs) and their window-targeted twins, plus
@@ -250,7 +264,10 @@ usefulness and worth a closer look:
   approval already on record — a general "sure, go ahead" for the task doesn't count. As of
   2026-10-18, that approval is also tracked explicitly, not just re-derived from a dialogue window
   every time (see "Action boundaries" below) — an approval the user already gave can no longer
-  scroll out of view and get re-asked.
+  scroll out of view and get re-asked. The dialogue it judges is read from the transcript on disk, which
+  lacks a real user message until the CLI dequeues it a few seconds later; the latest real user message
+  is therefore appended to it (as the narrator already does), or a "yes" given a moment earlier is
+  invisible and the guard stops the turn and makes the model ask again (seen live, 2026-10-26).
 - **`turn.delivery.completeness`** (2026-10-18) closes the mirror-image gap: Caroline *believing*
   she showed the user something (a draft, a figure, an attachment) that the actual outbound message
   never contained. Checked right after `reply.review`/translation, on every outbound block; never

@@ -1,5 +1,10 @@
 # Working memory: Notes read-cache + a deliberate short-term fact cache
 
+> Status (2026-10-26): the fact cache (Part B) is deprecated and read-only, superseded by `save_info`/
+> `request_info` (see `AGENTIC_MEMORY.md`). Its storage/eviction pattern lives on in
+> `app/instruction_memory.py` (the owner's standing instructions: always in the system prompt, evicted by
+> priority, then LFU, then recency) -- see `AGENTIC_MEMORY.md` section 3.4.1.
+
 ## Context
 
 Two related but separate problems, clarified through discussion with the user:

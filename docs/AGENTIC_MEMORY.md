@@ -167,6 +167,28 @@ DUNS-номер App Store оказались вплетены в один отв
   именно для этого единственного человека, поэтому выбор инструмента отдан модели напрямую, без
   промежуточного классификатора.
 
+### 3.4.1. Инструкции владельца: локальная память с вытеснением
+
+Постоянные правила владельца («всегда…», «никогда…», «впредь…») лежат **не** в `save_info`:
+удалённая память читается поиском по каждому сообщению, и правило, которое поиск не вернул,
+модель просто не видела (2026-10-26: Caroline снова и снова добавляла к отчётам находки, о которых
+её не просили). Поэтому `app/instruction_memory.py` — локальный JSON (`instruction_memory.json`
+в рабочей директории), блок из которого вставляется в системный промпт **каждого** хода обоих
+движков (Claude и small-model), с пометкой, что инструкции главнее её собственных соображений
+о полезности.
+
+Блок в промпте должен оставаться маленьким (та же причина, что у `owner_profile.py` и
+`working_memory.py`: переполнение командной строки `--append-system-prompt`), поэтому у него
+есть предел — 30 записей и 3000 символов самих записей (шапка не считается) — и правило вытеснения
+по явному указанию: **важность, затем LFU, затем давность**. Запись ранжируется по
+`(priority, use_count, last_used_at)`, уходит наименьшая. `priority` — от 1 (пожелание) до 5
+(жёсткое правило). `use_count` растёт, когда владелец повторил ту же инструкцию (дубль не
+создаётся, а поднимает счётчик и приоритет) и когда модель вызвала `instruction_applied`, потому что
+инструкция реально повлияла на ход; сам показ в промпте не считается — иначе у всех записей счётчик был
+бы одинаковый. Если новая запись не поместилась или вытеснила другую, `instruction_add` говорит об
+этом модели, и она сообщает владельцу. Инструменты: `instruction_add`, `instruction_list`,
+`instruction_forget`, `instruction_applied` (`plugins/instruction_memory_plugin.py`).
+
 ### 3.5. Старая память — read-only, не удалена
 
 `recall_memory`, `working_memory_*`, `topic_upsert`/`topics_list`/`topic_close` существовавшие до
@@ -667,7 +689,7 @@ LLM-агент `FactMemory` (и, по всей видимости, больши�
   Camerlengo-как-универсального-сервера, домен `reply:` на клиенте, агентная эволюция.
 - Клиент: `backend-py/app/plugins/memory_plugin.py`, `memory_topics.py`, `memory_save_queue.py`,
   `memory_turns.py`, `memory_nudge.py`, `owner_profile.py`, `deprecated_memory.py`,
-  `plugins/owner_profile_plugin.py`.
+  `plugins/owner_profile_plugin.py`, `instruction_memory.py`, `plugins/instruction_memory_plugin.py`.
 - Сервер (`D:\REPO\reforce`, ветка `microagents`): `apps/microagents/MemoryService.py`,
   `MemoryStore.py`, `FactMemory.py`, `TopicMemory.py`, `DocumentMemory.py`, `AddressBook.py`,
   `NotesAdapter.py`, `Attributes.py`, `Microagent.py`, `MicroagentServer.py`, `settings.py`;
