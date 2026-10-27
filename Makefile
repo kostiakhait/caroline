@@ -68,6 +68,8 @@ WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
 OUT_LINUX := $(SCRIPT_DIR)/dist-linux
 OUT_INTELLICAT := $(SCRIPT_DIR)/dist-intellicat
 PYTHON ?= python
+# the maintainer-only deploy rules (paths of that machine); a build on another host passes DEPLOY_MK=/dev/null
+DEPLOY_MK ?= deploy.mk
 
 .PHONY: help build installer clean dist-linux dist-intellicat appimage-linux
 
@@ -332,4 +334,4 @@ clean:
 #
 # Not part of the public build: deploy.mk is gitignored and exists only on
 # the maintainer's own machine. See deploy.mk's own header comment for why.
--include deploy.mk
+-include $(DEPLOY_MK)
