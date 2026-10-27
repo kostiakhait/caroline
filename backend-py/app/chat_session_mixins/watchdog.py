@@ -499,6 +499,13 @@ class WatchdogMixin:
             "engine", "handle_failure_entered", tab_id=self.tab_id, hang_count=self.hang_count,
             turn_pending=self.turn_pending, error=str(exc), error_chain=_format_exception_chain(exc),
         )
+        # Where the failure was raised: error/error_chain alone could not locate it (a bare
+        # "'str' object has no attribute 'get'" on 2026-10-27 gave no file or line).
+        import traceback as _traceback
+        log_event(
+            "engine", "handle_failure_traceback", tab_id=self.tab_id,
+            traceback="".join(_traceback.format_exception(type(exc), exc, exc.__traceback__))[-6000:],
+        )
         # Bug fix (2026-09-28), confirmed live from a real incident: a crash
         # mid-compaction (ClosedResourceError right after the compaction
         # round-trip's own AssistantMessage) left forced_compaction_result_
