@@ -1650,6 +1650,20 @@ def _states_figure_as_settled(text: str, activity: str, task: str = "") -> bool:
     return figure and not _FOUND_OR_CHECKING.search(said)
 
 
+# 2026-10-28, confirmed live (continuous dialogue, sw): STATUS held a weather result in Fahrenheit and the
+# narrator said "в Праге сейчас пятьдесят один градус" -- the reply itself later said 10 °C. The narrator only
+# sees the raw tool result and is asked not to convert or correct it, so a figure in a unit the user does not
+# live by is left out instead of read out as is. Shared by both narrator prompts.
+_NARRATION_UNITS_RULE = (
+    "A figure with a unit -- any measure: temperature, distance, length, height, speed, weight, volume, area, "
+    "pressure, money -- is said only when that unit is the one the user lives by (metric: Celsius, "
+    "kilometres, metres, centimetres, km/h, kilograms, litres; money: the currency the user's request uses or "
+    "their own). If the result gives it in other units -- Fahrenheit, miles, mph, feet, inches, pounds, ounces, "
+    "gallons, another currency -- or with no unit you can be sure of, do not say the number at all: say that "
+    "you have found it and are checking it. Never convert a figure yourself.\n"
+)
+
+
 def _progress_comment_prompt(
     task: str, activity: str, already_said: list[str] | None, draft_language: str | None, gender_clause: str = "",
 ) -> str:
@@ -1685,6 +1699,7 @@ def _progress_comment_prompt(
         "price, a time. Never read the result out as if it were the reply: say that you have found it, with at "
         "most its one key figure, and that you are checking it. The reply itself comes later and may still "
         "convert or correct the figures.\n"
+        f"{_NARRATION_UNITS_RULE}"
         "A dead end is progress too: a step in STATUS that found nothing or failed is worth telling the user once, "
         "in plain words (what was looked at, that it gave nothing) -- that is concrete, not \"nothing to say\". "
         "Each different place that gave nothing is its own new fact: the web, the notes or memory, the mail -- "
@@ -1917,6 +1932,7 @@ async def generate_progress_comment(
         "If STATUS mentions a specific number or finding from a tool result, that's real data you may mention "
         "-- but it is preliminary, from work still in progress, not yet the final confirmed answer. Say you "
         "found it and are still confirming it, rather than stating it as settled.\n"
+        f"{_NARRATION_UNITS_RULE}"
         "If STATUS has nothing concrete to say about the task, reply with exactly <narration></narration> and "
         "nothing else.\n"
         # Bug fix (2026-10-16), confirmed live: TASK was an already-answered
