@@ -26,7 +26,11 @@ plugins.
   the per-tab core; `app/plugins/` is the tool roster; `app/*_channel.py` own the always-running
   messenger connections. See "Chat session core" and "Plugins & tools" below.
 - **`backend-py/skills-src/`** — the default skills, seeded into the workspace on every start
-  (`app/skills_seed.py`). Every tool, desktop automation included (`app/plugins/_win32*.py` on
+  (`app/skills_seed.py`). Every engine reads skills the same way (`app/skills.py`): the catalog (name and
+  description of each) in the system prompt, `use_skill` / `read_skill_file` to open one
+  (`app/plugins/skills_plugin.py`). Sources: `workspace/Skills/` at any depth (her own
+  `lessons-learned/` too), the folders in `CAROLINE_SKILL_DIRS`, and a host's `skills.register_source()`.
+  Every tool, desktop automation included (`app/plugins/_win32*.py` on
   Windows, `_x11_*.py`/`_linux_chain.py` on Linux), lives in `backend-py`; there is no Node backend,
   MCP server bundle or native helper exe any more (removed 2026-10-24).
 - **The backing SquirrelWisdom/Camerlengo service** (a separate repository, `reforce`) — every

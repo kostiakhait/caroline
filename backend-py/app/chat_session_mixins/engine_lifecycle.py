@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
+from app import skills
 
 
 class EngineLifecycleMixin:
@@ -684,6 +685,8 @@ class EngineLifecycleMixin:
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
                     recent_dialogue_history_instruction(self._recent_24h_dialogue_file_path),
+                    # The skill catalog (app/skills.py): the same text the SW engine gets; use_skill opens one.
+                    skills.catalog_clause(self.workspace_dir),
                     running_agents_pointer_instruction(agent_registry.ensure_status_file(self.workspace_dir, self.tab_id)),
                     pseudo_tab_pointer_instruction(not self.headless),
                     language_hint_instruction(self._system_prompt_language),

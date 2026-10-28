@@ -37,11 +37,9 @@ vaultPolicyInstruction's procedural mechanics became Claude-Code Skills in
 the TS source (skills-src/, seeded into the workspace's Skills/ folder by
 workspace.ts's seedSkills()) -- a DIFFERENT progressive-disclosure
 mechanism than get_tool_instructions (framework-level skill files vs. our
-own plugin-API tool), deliberately not conflated with it here. backend-py
-shares the SAME workspace dir as the still-running Node backend, so those
-skills are already seeded there -- no seeding work needed on this side
-yet (tracked gap: once the Node backend is retired, backend-py will need
-its own seedSkills() port).
+own plugin-API tool), deliberately not conflated with it here. They are
+seeded by skills_seed.py and read by every engine through app/skills.py
+(the catalog in the system prompt, use_skill / read_skill_file to open one).
 """
 
 from __future__ import annotations
@@ -309,7 +307,7 @@ def learn_from_mistakes_instruction() -> str:
         "(e.g. Skills/lessons-learned/<short-topic-name>/SKILL.md, same frontmatter format as your other skills) "
         "covering: what area/situation this was in, what specifically went wrong and why, and what to actually "
         "do differently next time. Before creating a new one, check whether a lessons-learned skill already "
-        "covers the same area (list_skills or just look under Skills/lessons-learned/) -- if so, extend or "
+        "covers the same area (list_skills, then use_skill to read it) -- if so, extend or "
         "sharpen that one instead of creating a near-duplicate. The frontmatter description is the ONLY part of "
         "a skill shown to you before you decide to open it -- write it specific and concrete enough that you'd "
         "actually recognize a matching situation from the description alone; a vague one is as good as no skill "

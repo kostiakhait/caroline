@@ -81,7 +81,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import session_context, sw_tier_stats, tool_groups
+from app import session_context, skills, sw_tier_stats, tool_groups
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
@@ -682,6 +682,9 @@ def _shared_policy_text(workspace_dir: str, tab_id: str) -> str:
     from app.chat_session import _recent_24h_dialogue_path
     dialogue_path = str(_recent_24h_dialogue_path(workspace_dir, tab_id))
     parts.append(recent_dialogue_history_instruction(dialogue_path))
+    # The skill catalog (2026-10-28): what Claude Code's `skills: "all"` gives the full SDK path, which this
+    # engine never had -- see app/skills.py.
+    parts.append(skills.catalog_clause(workspace_dir))
     return "\n\n".join(p for p in parts if p)
 
 

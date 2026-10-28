@@ -58,10 +58,11 @@ left for the target machine to already have.
   `app/plugins/_win32*.py` on Windows, `_x11_*.py`/`_linux_chain.py` on
   Linux); the old Node/TypeScript backend, its MCP servers and native helper
   exes were removed on 2026-10-24.
-- Adding/removing MCP servers or skills after install is just the normal
-  Claude Code mechanism (`claude mcp add/remove`, editing
-  `%LOCALAPPDATA%\Caroline\workspace\Skills\`) -- exposed through Caroline's
-  Settings screen, not a custom config format.
+- Adding/removing MCP servers after install is just the normal Claude Code
+  mechanism (`claude mcp add/remove`) -- exposed through Caroline's Settings
+  screen, not a custom config format. Skills are folders with a `SKILL.md`
+  under `%LOCALAPPDATA%\Caroline\workspace\Skills\` (or in
+  `CAROLINE_SKILL_DIRS`); every engine sees them (`app/skills.py`).
 
 ## Known limitations (v1, not silently solved)
 
