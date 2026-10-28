@@ -2063,6 +2063,25 @@ def _build_verification_prompt(
 # conversation's language on its way out (_finish_small_model_turn_answered).
 _UNAVAILABLE_ANSWER = "I can't answer this right now -- please try again a little later."
 
+# The one text that cannot rely on that translation (2026-10-28, confirmed live): it is produced exactly when the
+# SW server is down, and translating goes through the same server -- so a Russian-speaking user got the English
+# line. A fixed text per language instead; any other language still gets the English one (and the translation).
+# It says what happened and does not promise a retry: nothing retries the request afterwards.
+_UNAVAILABLE_ANSWER_BY_LANGUAGE = {
+    "russian": "Сейчас не могу ответить: сервис временно недоступен. Попробуйте, пожалуйста, ещё раз через минуту.",
+    "ukrainian": "Зараз не можу відповісти: сервіс тимчасово недоступний. Спробуйте, будь ласка, ще раз за хвилину.",
+    "german": "Ich kann gerade nicht antworten: Der Dienst ist vorübergehend nicht erreichbar. Bitte versuchen Sie es in einer Minute noch einmal.",
+    "french": "Je ne peux pas répondre pour le moment : le service est temporairement indisponible. Réessayez dans une minute, s'il vous plaît.",
+    "spanish": "Ahora mismo no puedo responder: el servicio no está disponible temporalmente. Inténtalo de nuevo en un minuto, por favor.",
+    "czech": "Teď nemohu odpovědět: služba je dočasně nedostupná. Zkuste to prosím znovu za minutu.",
+    "hebrew": "כרגע אני לא יכולה לענות: השירות אינו זמין זמנית. נסו שוב בעוד דקה.",
+}
+
+
+def localized_unavailable_answer(language: str | None) -> str | None:
+    """The fixed text for `language` (a name such as "Russian"), or None when there is none."""
+    return _UNAVAILABLE_ANSWER_BY_LANGUAGE.get((language or "").strip().lower())
+
 
 # The verifier is told its reply IS the final message to the user. Seen live
 # (2026-10-10, three turns in a row): the cheap verifier model instead wrote a

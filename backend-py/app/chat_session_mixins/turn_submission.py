@@ -46,7 +46,7 @@ class TurnSubmissionMixin:
             text = self._with_interim_notes(text)
             self.pending_interim_notes = []
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
-            self._route_sw_turn(text, attachments, is_real_user, is_voice)
+            self._route_sw_turn(text, attachments, is_real_user, is_voice, suppress_narration)
             return
         # Bug fix (2026-09-18), per explicit instruction after a real
         # incident: never push straight into the live client while a
@@ -428,7 +428,7 @@ class TurnSubmissionMixin:
         if len(held) > 1:
             log_event("engine", "user_messages_merged", tab_id=self.tab_id, count=len(held), text_len=len(text))
         self.submit(text, attachments, True, is_voice)
-    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
+    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False) -> None:
         """Every turn in "sw" mode goes here, never to the Claude SDK (2026-10-03):
         while a small-model turn runs, new input is live context for it -- UNLESS it's a
         real user message arriving during a PROACTIVE turn, which queues as its own fresh
@@ -443,7 +443,7 @@ class TurnSubmissionMixin:
             log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
             self.small_model_pending_comments.append(text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}")
             return
-        self._start_small_model_turn(text, attachments, is_real_user, is_voice)
+        self._start_small_model_turn(text, attachments, is_real_user, is_voice, suppress_narration)
     def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = True) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth

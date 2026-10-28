@@ -104,19 +104,30 @@ def _post_json_sync(body: dict[str, Any], timeout: float = 30.0, retries: int = 
     copies verbatim. A separate, sync copy because this runs inside
     Microagent.Runtime's own worker thread (see module docstring), never on
     the asyncio event loop _post_json itself assumes."""
+    from app.plugins.sw_api import RETRY_HTTP_STATUSES, status_retry_pauses  # the same gateway-outage retries, see there
+
+    status_pauses = status_retry_pauses(retries)
     with httpx.Client(verify=ssl_context(), timeout=timeout) as client:
-        last_err: Exception | None = None
-        res = None
-        for attempt in range(retries):
-            try:
-                res = client.post(API_URL, json=body)
-                break
-            except httpx.TransportError as exc:
-                last_err = exc
-                if attempt < retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
-        else:
-            raise last_err  # type: ignore[misc]
+        status_retry = 0
+        while True:
+            last_err: Exception | None = None
+            res = None
+            for attempt in range(retries):
+                try:
+                    res = client.post(API_URL, json=body)
+                    break
+                except httpx.TransportError as exc:
+                    last_err = exc
+                    if attempt < retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+            else:
+                raise last_err  # type: ignore[misc]
+            if res.status_code in RETRY_HTTP_STATUSES and status_retry < len(status_pauses):
+                log_event("engine", "microagent_http_status_retry", command=body.get("command"), status=res.status_code, retry=status_retry + 1)
+                time.sleep(status_pauses[status_retry])
+                status_retry += 1
+                continue
+            break
         if res.status_code >= 400:
             raise RuntimeError(f'SquirrelWisdom API HTTP {res.status_code} for command "{body.get("command")}"')
         return res.json()

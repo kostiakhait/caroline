@@ -4,8 +4,17 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 
 class SmallModelTurnMixin:
-    def _start_small_model_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool) -> None:
+    def _start_small_model_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False) -> None:
         self.small_model_turn_is_real_user = is_real_user
+        # Bug fix (2026-10-28), confirmed live ("вкладка 2, нет нарратора", a typed request answered by sw
+        # after the tab switched from claude): submit() hands every sw turn to _route_sw_turn BEFORE it
+        # sets current_turn_suppress_narration, so a proactive nudge from the claude days of the tab
+        # (suppress defaults to True) left the flag stuck and the narrator returned silently, no log line,
+        # for every sw turn after it -- the same incident submit()'s own 2026-10-19 comment describes.
+        # Set per new turn here, where every sw turn starts: a real user's turn is never suppressed.
+        self.current_turn_suppress_narration = suppress_narration and not is_real_user
+        if is_real_user:
+            self.turn_narration_remarks = []
         # Bug fix (2026-10-09): turn_is_voice was only ever set by _input_stream, which an
         # sw-mode turn never goes through -- so every narration remark of an sw turn went
         # out with isVoice=False and was never spoken or animated, voice turn or not.
@@ -216,13 +225,19 @@ class SmallModelTurnMixin:
             self._dr_reset()  # an error answer is not a delivery to check (same as an error result on the SDK path)
             result ={"status": "answered", "text": "I can't answer this right now -- please try again a little later."}
 
-        if not is_real_user and STARTUP_GREETING_NUDGE_TEMPLATE[:60] in text:
-            from app.small_model_engine import _UNAVAILABLE_ANSWER
+        from app.small_model_engine import _UNAVAILABLE_ANSWER, localized_unavailable_answer
 
+        if not is_real_user and STARTUP_GREETING_NUDGE_TEMPLATE[:60] in text:
             if result.get("text") == _UNAVAILABLE_ANSWER:
                 # The startup greeting is the first thing the user sees: when no model could write it, a plain
                 # welcome is a better start than "I can't answer this right now".
                 result["text"] = "Hello! I'm Caroline. I'm still getting ready -- give me a moment."
+        if result.get("text") == _UNAVAILABLE_ANSWER:
+            # See _UNAVAILABLE_ANSWER_BY_LANGUAGE: translating this line needs the very server that is down.
+            fixed_answer = localized_unavailable_answer(language)
+            if fixed_answer:
+                result["text"] = fixed_answer
+                translate_answer = False
         question_text = review_text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{review_text}"
         await self._finish_small_model_turn_answered(
             question_text, result["text"], is_voice, translate=translate_answer, write_result=from_cascade,

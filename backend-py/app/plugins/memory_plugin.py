@@ -68,7 +68,7 @@ from app.memory_topics import cached_topic_detail, is_stale, recent_topics, repl
 from app.operations import REGISTRY as OPERATIONS
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager
-from app.plugins.sw_api import API_URL, CAROLINE_SW_KEY, SessionExpiredError, SwApiError
+from app.plugins.sw_api import API_URL, CAROLINE_SW_KEY, RETRY_HTTP_STATUSES, RETRY_PAUSES_S, SessionExpiredError, SwApiError
 from app.session_context import get_inject_proactive, get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.task_supervisor import supervise
@@ -143,7 +143,18 @@ async def _post(body: dict[str, Any]) -> dict[str, Any]:
     command = body.get("command")
     try:
         async with httpx.AsyncClient(verify=ssl_context(), timeout=REQUEST_TIMEOUT_S) as client:
-            response = await client.post(API_URL, json=body)
+            # A gateway that is down (502/501/503) or throttling (429) is retried with a growing pause,
+            # same numbers as every other SW call (sw_api.RETRY_PAUSES_S); the failure is logged only
+            # once the last try is spent.
+            status_retry = 0
+            while True:
+                response = await client.post(API_URL, json=body)
+                if response.status_code in RETRY_HTTP_STATUSES and status_retry < len(RETRY_PAUSES_S):
+                    log_event("plugin:memory", "http_status_retry", command=command, status=response.status_code, retry=status_retry + 1)
+                    await asyncio.sleep(RETRY_PAUSES_S[status_retry])
+                    status_retry += 1
+                    continue
+                break
     except Exception as exc:  # noqa: BLE001 -- logged here, re-raised for the caller to handle as before
         log_event("plugin:memory", "api_call_failed", command=command, reason=f"transport error: {exc}")
         raise

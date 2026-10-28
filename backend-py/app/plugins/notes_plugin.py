@@ -64,6 +64,13 @@ _index_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
 _note_cache: dict[str, dict[str, tuple[dict[str, Any], float]]] = {}
 
 
+def _folder_filter(folder: str | None) -> str | None:
+    """An empty or blank folder argument means "no folder restriction" (2026-10-28, confirmed live): the
+    tool text tells the model to leave the folder out, and small models pass "" instead -- which used to
+    mean "only the root", so a search over every folder returned [] for a note that existed."""
+    return (folder or "").strip().strip("/") or None
+
+
 def _in_folder_scope(folder: str | None, scope: str) -> bool:
     f = folder or ""
     return f == scope or f.startswith(scope + "/")
@@ -124,6 +131,7 @@ async def _patch_index(session: str, entries: dict[str, dict[str, Any]]) -> None
 
 
 async def list_notes(session: str, folder: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
+    folder = _folder_filter(folder)
     index = await _read_index(session)
     entries = [
         {"id": note_id, **note}
@@ -138,6 +146,7 @@ async def list_notes(session: str, folder: str | None = None, include_deleted: b
 
 async def search_notes(session: str, query: str, folder: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
     q = query.lower()
+    folder = _folder_filter(folder)
     index = await _read_index(session)
     entries = [
         {"id": note_id, **note}

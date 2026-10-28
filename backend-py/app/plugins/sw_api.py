@@ -42,6 +42,21 @@ class SwApiError(Exception):
     pass
 
 
+# 2026-10-28, confirmed live: the SW server's nginx answered 502 (and a proxy 501) for about a minute, and
+# every caller gave up at once -- all four model tiers failed in two seconds and the user got a bare
+# "can't answer". A gateway that is down is the textbook transient failure: retried here, in the one place
+# every SW call goes through (see also microagent_client._post_json_sync and memory_plugin._post, which
+# share these numbers). 500 is left out (the app itself failed, retrying repeats it) and so is 504 (the
+# request may have run, and a long ai call would be waited for again). A caller that asked for a single
+# attempt (`retries=1`, the narrator's short-timeout calls) gets no status retries either.
+RETRY_HTTP_STATUSES = frozenset({429, 501, 502, 503})
+RETRY_PAUSES_S = (1.0, 2.0, 4.0, 8.0)
+
+
+def status_retry_pauses(retries: int) -> tuple[float, ...]:
+    return RETRY_PAUSES_S if retries > 1 else ()
+
+
 # Bug fix (2026-09-16), per explicit instruction: "при исчерпании баланса
 # на клоде или опенроутере эта информация явно прокидывалась в кэролайн и
 # высвечивалась на статус-баре" -- Camerlengo proxies several tiers
@@ -169,19 +184,31 @@ async def _post_json(body: dict[str, Any], timeout: float = 30.0, retries: int =
     network attempt, no hidden multiplication -- the OUTER loop (chat_
     session.py) is where narration's own retrying already happens, on
     purpose, one layer up. Every other caller keeps the default 3."""
+    import asyncio
+
+    status_pauses = status_retry_pauses(retries)
     async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout) as client:
-        last_err: Exception | None = None
-        for attempt in range(retries):
-            try:
-                res = await client.post(API_URL, json=body)
-                break
-            except httpx.TransportError as exc:
-                last_err = exc
-                if attempt < retries - 1:
-                    import asyncio
-                    await asyncio.sleep(0.5 * (attempt + 1))
-        else:
-            raise last_err  # type: ignore[misc]
+        status_retry = 0
+        while True:
+            last_err: Exception | None = None
+            for attempt in range(retries):
+                try:
+                    res = await client.post(API_URL, json=body)
+                    break
+                except httpx.TransportError as exc:
+                    last_err = exc
+                    if attempt < retries - 1:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                raise last_err  # type: ignore[misc]
+            if res.status_code in RETRY_HTTP_STATUSES and status_retry < len(status_pauses):
+                from app.logging_setup import log_event
+
+                log_event("plugin:sw_api", "http_status_retry", command=body.get("command"), status=res.status_code, retry=status_retry + 1)
+                await asyncio.sleep(status_pauses[status_retry])
+                status_retry += 1
+                continue
+            break
         if res.status_code >= 400:
             raise SwApiError(f'SquirrelWisdom API HTTP {res.status_code} for command "{body.get("command")}"')
         result = res.json()

@@ -156,6 +156,10 @@ class TextNarrationMixin:
         # [[NO_UPDATE]] instruction; a user-type one still reports the
         # outcome) -- only this cosmetic mid-task aside is suppressed.
         if self.current_turn_suppress_narration:
+            # Once per turn: this gate used to return without a trace, and a stuck flag looked like a dead narrator.
+            if getattr(self, "_suppress_logged_for", False) != self.turn_pending_since:
+                self._suppress_logged_for = self.turn_pending_since
+                log_event("engine", "progress_narration_suppressed", tab_id=self.tab_id)
             return
         # Reverted (2026-10-03), explicit direct instruction: the 2026-09-15 gate
         # below used to skip narration entirely for a proactive/scheduled turn
