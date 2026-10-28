@@ -105,6 +105,11 @@ public sealed class SupervisorClient : IDisposable
         psi.Environment["CAROLINE_PORT"] = BackendProcess.Port.ToString();
         psi.Environment["CAROLINE_SUPERVISOR_PORT"] = Port.ToString();
 
+        // An orphan from a previous run would hold our ports and make this
+        // supervisor die on Errno 10048 over and over -- clear it first.
+        SupervisorProcessGuard.ReapStaleListeners(
+            Path.GetDirectoryName(pythonwExe)!, new[] { Port, BackendProcess.Port }, line => OutputLine?.Invoke(line));
+
         OutputLine?.Invoke($"[SupervisorClient] calling Process.Start() (elapsed so far: {sw.Elapsed.TotalSeconds:F1}s)...");
         try
         {
@@ -118,6 +123,10 @@ public sealed class SupervisorClient : IDisposable
         OutputLine?.Invoke($"[SupervisorClient] Process.Start() returned after {sw.Elapsed.TotalSeconds:F1}s, pid={_process?.Id.ToString() ?? "null"}");
 
         if (_process == null) return false;
+
+        // If this app dies without running Dispose(), Windows kills the
+        // supervisor and everything under it instead of leaving orphans.
+        SupervisorProcessGuard.Attach(_process, line => OutputLine?.Invoke(line));
 
         _intentionalStop = false;
         _process.EnableRaisingEvents = true;

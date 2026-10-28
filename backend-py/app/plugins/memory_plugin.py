@@ -64,7 +64,7 @@ from app.context_cap import truncate
 from app import memory_save_queue
 from app import memory_turns
 from app.logging_setup import log_event
-from app.memory_topics import cached_topic_detail, is_stale, recent_topics, replace_topics, set_current_topic, topic_description, update_topic
+from app.memory_topics import cached_topic_detail, is_stale, recent_topics, replace_topics, set_current_topic, topic_description, topic_detail_age_s, update_topic
 from app.operations import REGISTRY as OPERATIONS
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.notes_api import SessionManager

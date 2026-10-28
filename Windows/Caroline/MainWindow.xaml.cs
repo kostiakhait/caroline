@@ -200,6 +200,7 @@ public partial class MainWindow : Window
     private readonly HttpClient _statusHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     private int _onLoadedCallCount;
+    private readonly List<DateTime> _supervisorRelaunches = new();
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
@@ -214,6 +215,18 @@ public partial class MainWindow : Window
         _supervisor.Crashed += () => Dispatcher.BeginInvoke(() =>
         {
             Logger.Log("MainWindow: supervisor process exited unexpectedly -- relaunching");
+            // A supervisor that dies at once, again and again, is not fixed
+            // by another try (2026-10-28: 1493 relaunches in 13 minutes
+            // filled caroline.log to 45 MB). Stop after 5 in a minute.
+            var now = DateTime.UtcNow;
+            _supervisorRelaunches.RemoveAll(t => now - t > TimeSpan.FromSeconds(60));
+            if (_supervisorRelaunches.Count >= 5)
+            {
+                Logger.Log("MainWindow: supervisor keeps dying (5 relaunches in 60 s) -- giving up");
+                ShowError("Caroline's backend keeps failing to start. Close Caroline completely and start it again.\n\n" + Logger.LogPath);
+                return;
+            }
+            _supervisorRelaunches.Add(now);
             try
             {
                 if (!_supervisor.Start())
