@@ -81,7 +81,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import session_context, skills, sw_tier_stats, tool_groups
+from app import rung_advice, session_context, skills, sw_tier_stats, tool_groups
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
@@ -2737,6 +2737,16 @@ async def _tier_advice(tags: list[str], tiers: list[str], workspace_dir: str, ta
     return tier if isinstance(tier, int) and 0 <= tier < len(tiers) else None
 
 
+def _raised_by_rung_advice(start_index: int, advised_rung: int | None, tab_id: str | None) -> int:
+    """The start-rung advice (app/rung_advice.py) is a floor, like the tier statistics' advice: the cascade
+    starts from the highest of the fast lane / complexity choice, sw.tier.advice and turn.rung.advice."""
+    if advised_rung is None or advised_rung <= start_index:
+        return start_index
+    log_event("engine", "small_model_start_tier_raised", tab_id=tab_id, from_tier=start_index, to_tier=advised_rung,
+              source="rung_advice")
+    return advised_rung
+
+
 async def _tool_advice(task: str, gap: str, calls: list[str], registry: "ToolRegistry", tried_groups: list[str],
                        tab_id: str | None) -> str | None:
     """The tool advisor for a retry (2026-10-22, explicit instruction: the checker that
@@ -3300,6 +3310,12 @@ async def run_small_model_turn(
         log_event("engine", "small_model_no_key_available", tab_id=tab_id)
         return _answer(_UNAVAILABLE_ANSWER)
     cfg = camerlengo_ai.Config
+    # The start-rung advice (app/rung_advice.py; 2026-10-28, explicit instruction): from the stakes, the
+    # conversation so far and the user's reaction -- run alongside the rest of the setup, a real user's request only.
+    rung_ladder = rung_advice.sw_ladder([cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS])
+    rung_advice_task = asyncio.ensure_future(rung_advice.advise(
+        "sw", rung_ladder, user_text, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
+    )) if formalize_request else None
 
     registry = build_tool_registry()
     system = "\n\n".join([
@@ -3579,6 +3595,9 @@ async def run_small_model_turn(
         if advised is not None and advised > start_index:
             log_event("engine", "small_model_start_tier_raised", tab_id=tab_id, from_tier=start_index, to_tier=advised)
             start_index = advised
+    if rung_advice_task is not None:
+        start_index = _raised_by_rung_advice(start_index, (await rung_advice_task)[0], tab_id)
+    escalation_notes: list[str] = []
     tiers_ran: list[int] = []
     closed_on: int | None = None
     tried_groups: list[str] = []
@@ -3729,6 +3748,7 @@ async def run_small_model_turn(
                 index -= 1
                 continue
             emit(f"The check did not confirm the task was done; escalating to tier {index + 2}.")
+            escalation_notes.append(f"{model}: {verified_text.replace(ESCALATION_SENTINEL, '').strip()[:300]}")
             messages.append({"role": "user", "content": f"[Verifier checked the previous attempt and found it not actually finished: {verified_text.replace(ESCALATION_SENTINEL, '').strip()}]"})
             index += 1
             continue
@@ -3745,6 +3765,9 @@ async def run_small_model_turn(
             sw_tier_stats.record(workspace_dir, task_tags, tiers_ran, closed_on)
         except Exception as exc:  # noqa: BLE001 -- statistics never cost the answer
             log_event("engine", "sw_tier_stats_record_failed", tab_id=tab_id, error=str(exc)[:200])
+    if formalize_request and tiers_ran:
+        rung_advice.record(workspace_dir, tab_id, "sw", user_text, rung_ladder, start_index,
+                           closed_on if closed_on is not None else tiers_ran[-1], escalation_notes)
     if not final_text:
         # No tier ever produced a usable candidate (all stalled/errored/escalated
         # mechanically) -- one last, non-escalating, non-de-escalating verification

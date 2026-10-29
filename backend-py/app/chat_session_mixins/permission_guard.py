@@ -536,7 +536,7 @@ class PermissionGuardMixin:
         self._persist_action_state()
         log_event("engine", "action_closed", tab_id=self.tab_id, action_id=action_id)
 
-    async def _check_reaction_score(self, message: str, previous_turn_id: str | None) -> None:
+    async def _check_reaction_score(self, message: str, previous_turn_id: str | None) -> float | None:
         """The user's reaction (2026-10-19, explicit special order; reworked
         2026-10-24): after every real user message, turn.reaction.score scores
         the user's emotional reaction on a -1 (complete disapproval) to +1
@@ -548,7 +548,10 @@ class PermissionGuardMixin:
         Api2Evolution.apply_reaction). Independent of the tournaments' own judge.
 
         Every run is logged, including the overwhelmingly common no-reaction
-        case, per explicit instruction ("Логировать все это надо")."""
+        case, per explicit instruction ("Логировать все это надо").
+
+        Returns the score (None when there was none) -- the start-rung advice
+        of the same message reads it (app/rung_advice.py)."""
         from app.evolution_client import send_reaction
         from app.memory_topics import get_current_topic
         from app.plugins.voice_api import score_reaction
@@ -564,9 +567,9 @@ class PermissionGuardMixin:
             result = await score_reaction(message, open_actions_wire, candidate_track_ids)
         except Exception as exc:
             log_event("engine", "reaction_score_failed", tab_id=self.tab_id, error=str(exc))
-            return
+            return None
         if result is None:
-            return
+            return None
 
         score = max(-1.0, min(1.0, float(result.get("reaction_score") or 0.0)))
         sent_score = score if abs(score) >= REACTION_SCORE_THRESHOLD else 0.0
@@ -575,6 +578,12 @@ class PermissionGuardMixin:
             turn_id=previous_turn_id, target_action_id=result.get("target_action_id"),
             target_track_id=result.get("target_track_id"), dialogue_window_len=len(message),
         )
-        applied = await send_reaction(previous_turn_id, sent_score)
-        log_event("engine", "reaction_applied", tab_id=self.tab_id, turn_id=previous_turn_id, score=sent_score,
-                  applied=applied, failed=applied is None)
+
+        async def apply() -> None:
+            applied = await send_reaction(previous_turn_id, sent_score)
+            log_event("engine", "reaction_applied", tab_id=self.tab_id, turn_id=previous_turn_id, score=sent_score,
+                      applied=applied, failed=applied is None)
+
+        # Sent on its own: the score is returned as soon as it is known (the start-rung advice waits for it).
+        asyncio.ensure_future(apply())
+        return score

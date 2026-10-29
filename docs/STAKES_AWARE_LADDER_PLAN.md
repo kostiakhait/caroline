@@ -1,7 +1,7 @@
 # Model ladders: the start rung decided by a model, for every engine
 
 - **Author:** Claude (Claude Code), for Konstantin Khait
-- **Version:** 0.1 (draft for approval)
+- **Version:** 0.2 (implemented 2026-10-29, see "Status" at the end)
 - **Date:** 2026-10-28
 - **Company:** Partners Solutions
 - **Project:** Caroline
@@ -120,3 +120,25 @@ Unrelated new topics can and should go back down.
 7. Live check on the 2026-10-28 conversation shape: a request to read documents on a legal matter must
    start above the bottom rung; "you got it wrong" after an escalated turn must not start below it; a
    plain "what's the weather" must still start at the bottom.
+
+## Status (2026-10-29)
+
+Steps 1-6 done: `app/microagents/turn_rung_advice.py`, `app/rung_advice.py` (the advice call, the ladders as the
+microagent sees them, the rung history), wiring in `chat_session_mixins/ladder.py` (Claude and Codex),
+`small_model_engine.run_small_model_turn` (sw) and `engines/codex_engine.py` (`effort` on `turn/start`); tests in
+`test_rung_advice.py`. Step 7 (the live check) is still to do.
+
+Decided while implementing:
+
+- **Only a real user's message is advised.** Internal notes and the Claude ladder's continuations start where they
+  did before.
+- **Codex ladder is `medium -> high -> xhigh`**, not from `low`: step 0 has to be what a turn runs with today, since
+  the advice only raises. Codex keeps an effort set on `turn/start` for the thread's later turns, so a turn back on
+  step 0 sends `medium` again. A model that rejects the effort gets the turn without it.
+- **The user's reaction** is the score of `turn.reaction.score` for the same message, waited for up to 4 s. Its
+  evolution report is now sent separately so the score is available as soon as it is known. The sw path does not
+  run `turn.reaction.score` (it never did), so sw advice works without a reaction.
+- **The rung history** keeps a short excerpt of each request and the engine, so the microagent can tell a turn on
+  the same matter from an unrelated one, and a tab that switched engines still reads sensibly.
+- Not covered: the sw fast lane can still answer a message without the cascade; the advice only decides where the
+  cascade starts.

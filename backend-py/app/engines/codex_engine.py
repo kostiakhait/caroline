@@ -345,6 +345,8 @@ class CodexEngine:
         try:
             async for message in input_stream:
                 await self._turn_idle.wait()
+                # The turn's reasoning effort, when the start-rung advice set one (chat_session_mixins/ladder.py).
+                effort = message.pop("codex_effort", None)
                 items = input_to_turn_items(message)
                 if not items:
                     continue
@@ -353,16 +355,25 @@ class CodexEngine:
                 self._last_turn_items = items
                 self._record("user", (message.get("message") or {}).get("content"))
                 self._context_retry_used = False
-                await self._start_turn(items)
+                await self._start_turn(items, effort)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log_event("engine", "codex_input_pump_failed", error=repr(exc))
 
-    async def _start_turn(self, items: list[dict[str, Any]]) -> None:
+    async def _start_turn(self, items: list[dict[str, Any]], effort: str | None = None) -> None:
+        """effort: turn/start's reasoning-effort override; Codex keeps it for the thread's later turns. A model
+        that does not take that effort is not a failed turn: the turn runs without it."""
         try:
             assert self._rpc
-            await self._rpc.request("turn/start", {"threadId": self._thread_id, "input": items}, timeout=INIT_TIMEOUT_S)
+            params: dict[str, Any] = {"threadId": self._thread_id, "input": items}
+            if effort:
+                try:
+                    await self._rpc.request("turn/start", {**params, "effort": effort}, timeout=INIT_TIMEOUT_S)
+                    return
+                except CodexRpcError as exc:
+                    log_event("engine", "codex_turn_effort_rejected", effort=effort, error=str(exc)[:200])
+            await self._rpc.request("turn/start", params, timeout=INIT_TIMEOUT_S)
         except Exception as exc:
             self._turn_idle.set()
             self._emit_failed_result(f"turn/start failed: {exc}", "")

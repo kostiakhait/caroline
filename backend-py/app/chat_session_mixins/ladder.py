@@ -1,23 +1,78 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
-from app import claude_ladder
+from app import claude_ladder, rung_advice
 
 
 class LadderMixin:
-    """The model ladder of a Claude tab (app/claude_ladder.py): every turn starts on Haiku, an outside verifier
-    decides whether the attempt finished the task, and if not the same session goes on with the next model.
-    Hooks: _ladder_before_yield (_input_stream), _ladder_observe / _ladder_hold (the message loop, per wire message),
-    _ladder_on_result (the loop, on a ResultMessage). Every failure falls back to "no ladder for this turn"."""
+    """The model ladder of a Claude tab (app/claude_ladder.py): a turn starts on Haiku, or on the step the start-rung
+    advice picks (app/rung_advice.py), an outside verifier decides whether the attempt finished the task, and if not
+    the same session goes on with the next model. For Codex the same advice picks the turn's reasoning effort.
+    Hooks: _rung_advice_begin and _ladder_before_yield (_input_stream), _ladder_observe / _ladder_hold (the message
+    loop, per wire message), _ladder_on_result (the loop, on a ResultMessage). Every failure falls back to "no ladder
+    for this turn"."""
 
     _ladder: claude_ladder.LadderTurn | None = None
     _ladder_model: str | None = None     # the model the live client is set to (None: the CLI's own default)
+    _codex_effort: str | None = None     # the effort the live Codex thread was last given (None: Codex's own)
+    _codex_turn: dict[str, Any] | None = None     # a real user's Codex turn waiting for its result (rung history)
+    _reaction_task: "asyncio.Future[Any] | None" = None     # turn.reaction.score of the latest real message (submit())
 
     def _ladder_reset(self) -> None:
         self._ladder = None
         self._ladder_model = None
+        self._codex_effort = None
+        self._codex_turn = None
+
+    def _rung_advice_begin(self, item: dict[str, Any]) -> None:
+        """Starts the start-rung advice for a real user's message as soon as _input_stream takes it, so it runs
+        alongside the memory advisor; _ladder_before_yield waits for it. Internal notes and the ladder's own
+        continuations are not advised."""
+        try:
+            if item.get("ladder_continuation") or not item.get("memory_advice_for"):
+                return
+            kind = getattr(self, "engine_kind", "")
+            if kind == "claude" and self._ladder_active():
+                engine, ladder = "claude", rung_advice.CLAUDE_LADDER
+            elif kind == "openai" and os.environ.get("CAROLINE_NO_LADDER") != "1":
+                engine, ladder = "codex", rung_advice.CODEX_EFFORTS
+            else:
+                return
+            request = claude_ladder.user_text_of(item["message"]) or item["memory_advice_for"]
+            item["rung_advice_task"] = asyncio.ensure_future(rung_advice.advise(
+                engine, ladder, request, self._ladder_recent_dialogue(), self.workspace_dir, self.tab_id,
+                self._reaction_task,
+            ))
+        except Exception as exc:  # noqa: BLE001 -- no advice: the turn starts where it always did
+            log_event("engine", "turn_rung_advice_start_failed", tab_id=self.tab_id, error=str(exc)[:200])
+
+    async def _rung_advice_result(self, item: dict[str, Any]) -> tuple[int | None, str]:
+        task = item.pop("rung_advice_task", None)
+        if task is None:
+            return None, ""
+        try:
+            return await task
+        except Exception:  # noqa: BLE001 -- advise() never raises; a cancelled task is no advice
+            return None, ""
+
+    async def _codex_effort_before_yield(self, item: dict[str, Any]) -> None:
+        """Codex: the advised step of rung_advice.CODEX_EFFORTS goes into this turn's turn/start (CodexEngine reads
+        "codex_effort" off the message). Codex keeps an effort for the thread's later turns, so a turn on step 0
+        after a raised one is given step 0 again."""
+        rung, why = await self._rung_advice_result(item)
+        step = rung or 0
+        effort = rung_advice.CODEX_EFFORTS[step][0]
+        sent = step > 0 or self._codex_effort not in (None, effort)
+        if sent:
+            item["message"]["codex_effort"] = effort
+            self._codex_effort = effort
+        if item.get("memory_advice_for"):
+            self._codex_turn = {"request": claude_ladder.user_text_of(item["message"]) or item["memory_advice_for"], "rung": step}
+        log_event("engine", "codex_turn_effort", tab_id=self.tab_id, effort=effort if sent else None,
+                  advised_rung=rung, why=why[:300])
 
     def _ladder_active(self) -> bool:
         if os.environ.get("CAROLINE_NO_LADDER") == "1":
@@ -46,8 +101,14 @@ class LadderMixin:
                 # A message arrived while the turn is still being judged: it joins that turn. Starting a new one here
                 # would drop the replies held for the verdict.
                 self._ladder.user_text = (self._ladder.user_text + "\n" + (claude_ladder.user_text_of(item["message"]) or "")).strip()
+                task = item.pop("rung_advice_task", None)
+                if task is not None:
+                    task.cancel()
                 return
             self._ladder = None
+            if getattr(self, "engine_kind", "") == "openai":
+                await self._codex_effort_before_yield(item)
+                return
             if not self._ladder_active():
                 # A model pinned in Settings applies from this message on, also to a client the ladder had moved.
                 pinned = get_model_override(self.workspace_dir, "claude")
@@ -55,10 +116,13 @@ class LadderMixin:
                     await self._ladder_set_model(pinned)
                 return
             text = claude_ladder.user_text_of(item["message"]) or item.get("memory_advice_for") or ""
-            turn = claude_ladder.LadderTurn(user_text=text)
+            rung, why = await self._rung_advice_result(item)
+            turn = claude_ladder.LadderTurn(user_text=text, rung=rung or 0, start_rung=rung or 0,
+                                            real_user=bool(item.get("memory_advice_for")))
             if await self._ladder_set_model(turn.model):
                 self._ladder = turn
-                log_event("engine", "claude_ladder_turn_started", tab_id=self.tab_id, model=turn.model)
+                log_event("engine", "claude_ladder_turn_started", tab_id=self.tab_id, model=turn.model,
+                          advised_rung=rung, why=why[:300])
         except Exception as exc:  # noqa: BLE001
             self._ladder = None
             log_event("engine", "claude_ladder_start_failed", tab_id=self.tab_id, error=str(exc)[:200])
@@ -99,11 +163,14 @@ class LadderMixin:
     async def _ladder_on_result(self, message: Any) -> bool:
         """The turn's ResultMessage. True: it is swallowed (the attempt was rejected, the next rung has been
         started); False: handle it as usual (the held replies have been sent)."""
+        fake = (self.hang_interrupt_result_pending or self.ignore_next_result_recovery
+                or self.forced_compaction_result_pending or self.clear_tab_result_pending)
+        if self._codex_turn is not None and not fake:
+            codex_turn, self._codex_turn = self._codex_turn, None
+            rung_advice.record(self.workspace_dir, self.tab_id, "codex", codex_turn["request"], rung_advice.CODEX_EFFORTS,
+                               codex_turn["rung"], codex_turn["rung"])
         turn = self._ladder
-        if turn is None or not turn.active:
-            return False
-        if (self.hang_interrupt_result_pending or self.ignore_next_result_recovery
-                or self.forced_compaction_result_pending or self.clear_tab_result_pending):
+        if turn is None or not turn.active or fake:
             return False
         try:
             usage = getattr(message, "usage", None)
@@ -128,6 +195,9 @@ class LadderMixin:
         except Exception as exc:  # noqa: BLE001 -- the reply must still go out
             log_event("engine", "claude_ladder_result_failed", tab_id=self.tab_id, error=str(exc)[:200])
         turn.active = False
+        if turn.real_user:
+            rung_advice.record(self.workspace_dir, self.tab_id, "claude", turn.user_text, rung_advice.CLAUDE_LADDER,
+                               turn.start_rung, turn.rung, turn.escalations)
         await self._ladder_flush(turn)
         return False
 

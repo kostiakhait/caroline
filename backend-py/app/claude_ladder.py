@@ -1,4 +1,5 @@
-"""The model ladder of a Claude tab: every turn starts on Haiku; when an outside verifier
+"""The model ladder of a Claude tab: a turn starts on Haiku, or higher when the start-rung advice
+(app/rung_advice.py) says the matter needs it; when an outside verifier
 (the cascade's own, small_model_engine.verify_claude_attempt) finds the attempt did not finish
 the task, the same session goes on with Sonnet, and only if that fails too, with Opus.
 
@@ -34,6 +35,10 @@ class LadderTurn:
 
     user_text: str
     rung: int = 0
+    # Where the turn started: the advice of app/rung_advice.py, 0 without one.
+    start_rung: int = 0
+    # A real user's message (not an internal note): only these go to the rung history.
+    real_user: bool = False
     active: bool = True
     held: list[dict[str, Any]] = field(default_factory=list)
     trace: list[str] = field(default_factory=list)

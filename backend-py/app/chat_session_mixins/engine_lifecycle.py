@@ -431,6 +431,7 @@ class EngineLifecycleMixin:
                 continue
             item = self.queue.pop(0)
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
+            self._rung_advice_begin(item)    # runs alongside the memory advisor; _ladder_before_yield waits for it
             if item.get("memory_advice_for"):
                 await self._glue_memory_advice(item)
             self._glue_context_recovery(item)

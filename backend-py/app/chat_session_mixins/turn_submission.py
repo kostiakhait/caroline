@@ -217,8 +217,9 @@ class TurnSubmissionMixin:
             # score goes to the evolution as the reaction to the previous turn --
             # same fire-and-forget shape as the two checks just above. The
             # previous turn's id is taken here, while it is still the one this
-            # message's turn replaced.
-            asyncio.ensure_future(self._check_reaction_score(text, memory_turns.previous_turn_id(self.tab_id)))
+            # message's turn replaced. Kept: the start-rung advice of this message reads the
+            # score when it is ready in time (chat_session_mixins/ladder.py, app/rung_advice.py).
+            self._reaction_task = asyncio.ensure_future(self._check_reaction_score(text, memory_turns.previous_turn_id(self.tab_id)))
             # Bug fix (2026-09-11), per explicit instruction: language must
             # be tracked CONTINUOUSLY, not resolved once and left alone --
             # confirmed live a tab can legitimately switch languages
