@@ -2737,6 +2737,13 @@ async def _tier_advice(tags: list[str], tiers: list[str], workspace_dir: str, ta
     return tier if isinstance(tier, int) and 0 <= tier < len(tiers) else None
 
 
+async def _tags_and_tier_advice(task: str, tiers: list[str], workspace_dir: str, tab_id: str | None) -> tuple[list[str], int | None]:
+    """The task's tags and, from them, the tier statistics' advice -- one task, so that it
+    can run alongside the rest of a turn's setup."""
+    tags = await _task_tags(task, tab_id)
+    return tags, await _tier_advice(tags, tiers, workspace_dir, tab_id)
+
+
 def _raised_by_rung_advice(start_index: int, advised_rung: int | None, tab_id: str | None) -> int:
     """The start-rung advice (app/rung_advice.py) is a floor, like the tier statistics' advice: the cascade
     starts from the highest of the fast lane / complexity choice, sw.tier.advice and turn.rung.advice."""
@@ -3316,6 +3323,13 @@ async def run_small_model_turn(
     rung_advice_task = asyncio.ensure_future(rung_advice.advise(
         "sw", rung_ladder, user_text, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
     )) if formalize_request else None
+    # The tier statistics' advice (tags, then sw.tier.advice), started here alongside the request
+    # spec and the rung advice (2026-10-29): it used to wait for the spec, tagging the formalized
+    # task, so spec, tags and advice ran one after another -- live, 7.6 + 4.6 + 6.0s before the
+    # first tier began. The tags now come from the user's own words.
+    tier_advice_task = asyncio.ensure_future(_tags_and_tier_advice(
+        user_text, [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS], workspace_dir, tab_id,
+    )) if formalize_request else None
 
     registry = build_tool_registry()
     system = "\n\n".join([
@@ -3589,9 +3603,8 @@ async def run_small_model_turn(
     # higher of the choice above and the tier that does not fail too often on tasks with
     # these tags -- see app/sw_tier_stats.py. Real user requests only.
     task_tags: list[str] = []
-    if formalize_request:
-        task_tags = await _task_tags(request_spec or user_text, tab_id)
-        advised = await _tier_advice(task_tags, tiers, workspace_dir, tab_id)
+    if tier_advice_task is not None:
+        task_tags, advised = await tier_advice_task
         if advised is not None and advised > start_index:
             log_event("engine", "small_model_start_tier_raised", tab_id=tab_id, from_tier=start_index, to_tier=advised)
             start_index = advised
