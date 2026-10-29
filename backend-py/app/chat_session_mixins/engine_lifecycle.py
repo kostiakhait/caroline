@@ -111,6 +111,8 @@ class EngineLifecycleMixin:
         so the SW turns written to the old one vanished from the history the
         next turn reads -- "remember 4711" was forgotten one turn later."""
         mode = load_chat_mode(self.workspace_dir, self.tab_id)
+        if mode != "sw" and self._hand_sw_turn_over():
+            return "switching"
         if mode == "sw":
             wanted = "sw"
             if self.client is None:
@@ -150,6 +152,43 @@ class EngineLifecycleMixin:
         self.restart_engine_switch = (self.engine_kind, wanted)
         self.force_restart()
         return "switching"
+    def _hand_sw_turn_over(self) -> bool:
+        """Bug fix (2026-10-29), confirmed live (tab 2, a LinkedIn vacancy): the tab
+        was switched to Claude 7 s after an sw turn had started, and nothing stopped
+        that turn -- switch_engine_if_needed returned "unchanged" (an sw tab has no
+        agent process), so the sw cascade went on for 17 minutes up to Sonnet over
+        OpenRouter ($6.44) while the user's next messages already went to Claude:
+        the same task on two engines at once. A switch away from sw now stops the
+        running sw turn (as Stop does) and gives its task -- the user's request,
+        what they added while it ran, real turns queued behind it -- to the new
+        engine. Returns False when no sw turn is running."""
+        task = self._small_model_task
+        if not self.small_model_active or task is None or task.done():
+            return False
+        handover = []
+        if self.small_model_turn_is_real_user and (self.last_real_user_question or "").strip():
+            handover.append(self.last_real_user_question.strip())
+        handover += [c for c in self.small_model_pending_comments if not c.startswith(_SYNTHETIC_TURN_MARKER)]
+        queued, self.small_model_queued_real_turns = self.small_model_queued_real_turns, []
+        is_voice = self.turn_is_voice
+        log_event("engine", "engine_switch_sw_turn_handed_over", tab_id=self.tab_id, handover_parts=len(handover), queued=len(queued))
+        task.cancel()
+
+        async def resubmit() -> None:
+            await asyncio.wait({task})
+            if self._small_model_task is task:
+                # Cancelled before it ever ran, so its own CancelledError handler never cleaned up.
+                self.turn_pending = False
+                self._end_small_model_turn(start_queued_real_turn=False)
+            if self.ended:
+                return
+            if handover:
+                self.submit(SW_HANDOVER_NOTE + "\n\n" + "\n\n".join(handover), [], True, is_voice)
+            for text, attachments, voice in queued:
+                self.submit(text, attachments, True, voice)
+
+        asyncio.create_task(resubmit())
+        return True
     async def _safe_interrupt(self) -> None:
         try:
             if self.client:

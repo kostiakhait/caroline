@@ -872,6 +872,14 @@ _ATTACHMENT_NOTE_PREFIX_TUPLE = tuple(_ATTACHMENT_NOTE_PREFIXES) + (
 # somewhere unfiltered.
 _SYNTHETIC_TURN_MARKER = SYNTHETIC_TURN_MARKER  # defined in history.py, whose parser drops marked turns
 
+# Heads the task an sw turn hands to the new engine when the tab is switched away from sw
+# mid-turn (engine_lifecycle.py's _hand_sw_turn_over).
+SW_HANDOVER_NOTE = (
+    "[Internal: the tab was switched to you while the previous engine was working on the request below; "
+    "it has been stopped. It may already have done some of the steps (opened pages, filled in forms, even "
+    "sent something) -- check the current state before repeating any action, then finish the request.]"
+)
+
 # Backward-compat only (2026-09-22): a same-day, since-reverted experiment
 # briefly had submit() prepend a "last hour of dialogue" block directly
 # into a real user message's own wire_text (per explicit instruction,
@@ -1939,6 +1947,7 @@ __all__ = [
     '_SYNTHETIC_HISTORY_TEXT_PATTERNS',
     '_ATTACHMENT_NOTE_PREFIX_TUPLE',
     '_SYNTHETIC_TURN_MARKER',
+    'SW_HANDOVER_NOTE',
     '_INLINE_HOUR_CONTEXT_BLOCK_PATTERN',
     '_is_synthetic_history_text',
     '_NO_UPDATE_SENTINEL',
