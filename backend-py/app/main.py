@@ -1195,8 +1195,6 @@ def _ratatosk_stop_session() -> bool:
     _ratatosk_session.stop()
     return True
 
-    asyncio.create_task(_do())
-
 
 # Control ops that change a setting kept in the workspace: after one of them succeeds the settings mirror
 # (settings_mirror.py) writes the change to Notes, so a reinstall picks it up.

@@ -54,7 +54,7 @@ def seed_skills(workspace_dir: str) -> None:
     never touched, so the catalog stays genuinely appendable."""
     skills_src = _resolve_skills_src()
     if skills_src is None:
-        log_event("engine", "seed_skills_source_not_found", checked=[str(_SHIPPED_SKILLS_SRC), str(_DEV_TREE_SKILLS_SRC)])
+        log_event("engine", "seed_skills_source_not_found", checked=[str(_SKILLS_SRC)])
         return
     skills_dir = Path(workspace_dir) / "Skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
