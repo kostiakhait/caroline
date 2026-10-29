@@ -1224,6 +1224,7 @@ _NARRATION_MAX_CHARS = 400
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
 _CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+_NOT_RUSSIAN_LETTER_RE = re.compile(r"[іїєґІЇЄҐ]")  # Ukrainian letters Russian has no use for
 
 
 def _looks_like_narration_garbage(
@@ -1254,6 +1255,11 @@ def _looks_like_narration_garbage(
     if re.search(r"russ|ukrain|belarus|bulgar|serb|macedon", language, re.IGNORECASE):
         if _LATIN_LETTER_RE.search(text) and not _CYRILLIC_RE.search(text):
             return True
+    # Russian text with letters Russian does not have (2026-10-29): reading Ukrainian shop pages,
+    # the narrator said "Перейшла на сторінку Foxtrot ..." and "Сторінка Foxtrot не відкривається"
+    # in a Russian conversation. Cyrillic either way, so the check above let it through.
+    if re.search(r"russ", language, re.IGNORECASE) and _NOT_RUSSIAN_LETTER_RE.search(text):
+        return True
     patterns = _NARRATION_DRAFT_GARBAGE_PATTERNS if draft_only else _GENERAL_GARBAGE_PATTERNS
     return any(p.search(text) for p in patterns)
 
