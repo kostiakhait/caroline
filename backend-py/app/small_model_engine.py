@@ -81,7 +81,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import rung_advice, session_context, skills, sw_tier_stats, tool_groups
+from app import model_billing, rung_advice, session_context, skills, sw_tier_stats, tool_groups
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
@@ -347,7 +347,7 @@ async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], ta
             return result
         mark_funds_exhausted(reason)
         log_event("engine", "small_model_funds_exhausted", tab_id=tab_id, reason=reason, waited_s=round(waited_s))
-        emit(f"OpenRouter balance is insufficient ({reason}) -- waiting for a top-up.")
+        emit(f"The balance is insufficient ({reason}) -- waiting for a top-up.")
         if waited_s >= _FUNDS_EXHAUSTED_MAX_WAIT_S:
             raise _FundsExhaustedGivingUp(reason)
         await asyncio.sleep(_FUNDS_EXHAUSTED_RETRY_INTERVAL_S)
@@ -356,7 +356,7 @@ async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], ta
 
 def _funds_exhausted_final_answer(reason: str) -> str:
     return (
-        f"I can't answer right now -- the OpenRouter balance has run out ({reason}). "
+        f"I can't answer right now -- the balance has run out ({reason}). "
         "Once it is topped up, everything will work as before."
     )
 
@@ -1146,9 +1146,10 @@ async def _model_ai() -> Any | None:
     # base_url points this at Camerlengo's own /v1/chat/completions proxy
     # (not openrouter.ai directly) -- see model_key_provisioning.py's own
     # docstring: api_key here is the composite "<CAROLINE_SW_KEY>.<session>"
-    # token that proxy expects, not a real OpenRouter key.
-    return camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(
-        api_key=api_key, base_url="https://www.squirrelwisdom.com/v1"))
+    # token that proxy expects, not a real OpenRouter key. The proxy charges no
+    # wallet, so every call is checked and charged here (app/model_billing.py).
+    return camerlengo_ai.AI(adapter=model_billing.ChargingAdapter(camerlengo_ai.OpenRouterAdapter(
+        api_key=api_key, base_url="https://www.squirrelwisdom.com/v1"), api_key))
 
 
 async def prewarm_model_access() -> None:
@@ -1176,6 +1177,9 @@ def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[s
         ).choices[0].message
         found = [a.get("url_citation") or {} for a in (via_server.annotations or []) if isinstance(a, dict) and a.get("type") == "url_citation"]
         return str(via_server.content or "").strip(), [s for s in found if s.get("url")]
+    charging = isinstance(ai.adapter, model_billing.ChargingAdapter)
+    if charging:
+        model_billing.ensure_funds(ai.adapter.session)
     response = ai.adapter.client.with_options(timeout=WEB_SEARCH_TIMEOUT_S, max_retries=0).chat.completions.create(
         model=cfg.AI_MODEL_SMALL,
         messages=[
@@ -1186,8 +1190,11 @@ def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[s
         extra_body={
             "plugins": [{"id": "web", "engine": WEB_SEARCH_ENGINE, "max_results": WEB_SEARCH_MAX_RESULTS}],
             "reasoning": WEB_SEARCH_REASONING,
+            "usage": {"include": True},
         },
     )
+    if charging:
+        ai.adapter.charge(cfg.AI_MODEL_SMALL, response)
     message = response.model_dump()["choices"][0]["message"]
     sources = [a.get("url_citation") or {} for a in (message.get("annotations") or []) if a.get("type") == "url_citation"]
     return str(message.get("content") or "").strip(), [s for s in sources if s.get("url")]
@@ -3290,6 +3297,16 @@ async def run_small_model_turn(
     if camerlengo_ai is None:
         log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
         return _answer(_UNAVAILABLE_ANSWER)
+    # The wallet, read fresh: an empty one starts no turn at all (app/model_billing.py).
+    model_billing.mark_stale()
+    if not MODEL_CALLS_VIA_SQUIRRELWISDOM:
+        api_key = await get_model_provider_key()
+        if api_key:
+            try:
+                await asyncio.to_thread(model_billing.ensure_funds, model_billing.session_of(api_key))
+            except RuntimeError as exc:
+                log_event("engine", "small_model_turn_refused_no_funds", tab_id=tab_id)
+                return _answer(_funds_exhausted_final_answer(str(exc)))
     # The formalized task (app/sw_request_spec.py), drafted while the rest is set up --
     # for a real user's request only: an internal note (a permission-guard stop, a
     # finished background operation) was "formalized" into a task of its own on the
