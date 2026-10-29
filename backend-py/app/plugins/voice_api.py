@@ -440,21 +440,28 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     # words the reviewer made up. Nothing to check when the text is unchanged or the
     # reviewer dropped it whole ([[NO_UPDATE]]).
     if revised.strip() != text.strip() and revised.strip() != "[[NO_UPDATE]]":
-        if await _review_invented(text, revised, timeout - (time.monotonic() - started)):
+        # None: the check ran out of the caller's time. The review is not complete until its
+        # check has answered, and a review that has not answered in time lets the text go as
+        # it was drafted (VOICE_NARRATION_REVIEW_TIMEOUT_S) -- live 2026-10-29 the check of a
+        # voice remark got the 1-2s the review left of the 6s and timed out 3 times of 4,
+        # so the unchecked rewrite went out each time.
+        invented = await _review_invented(text, revised, timeout - (time.monotonic() - started))
+        if invented is None or invented:
             return text
     return revised
 
 
-async def _review_invented(original: str, revised: str, time_left_s: float) -> bool:
+async def _review_invented(original: str, revised: str, time_left_s: float) -> bool | None:
     """reply.review.check on the local microagent ladder (not an evolvable role):
-    True when the revision adds something the original does not say. Fail-open --
-    an error, a timeout or no time left keeps the revision as before (logged)."""
+    True when the revision adds something the original does not say. None when the
+    caller's time ran out before the check could answer (see review_reply). Fail-open
+    otherwise -- an error keeps the revision as before (logged)."""
     from app.microagent_client import build_local_runtime, new_budget
     from app.microagents import reply_review_check
 
     if time_left_s <= 0:
         log_event("plugin:voice", "review_check_skipped", reason="no_time_left")
-        return False
+        return None
     runtime = build_local_runtime()
     if runtime is None:
         log_event("plugin:voice", "review_check_skipped", reason="no_runtime")
@@ -468,6 +475,10 @@ async def _review_invented(original: str, revised: str, time_left_s: float) -> b
         result = await asyncio.wait_for(asyncio.to_thread(
             run_timed, runtime, reply_review_check.REVIEW_CHECK, {"original": original, "revised": revised},
             runtime.new_context(budget=new_budget()), time.monotonic()), time_left_s)
+    except asyncio.TimeoutError:
+        log_event("plugin:voice", "review_check_failed", error="TimeoutError: no time left of the review's",
+                  ms=int((time.monotonic() - started) * 1000))
+        return None
     except Exception as exc:  # noqa: BLE001 -- fail-open
         log_event("plugin:voice", "review_check_failed", error=f"{type(exc).__name__}: {exc}"[:300],
                   ms=int((time.monotonic() - started) * 1000))
