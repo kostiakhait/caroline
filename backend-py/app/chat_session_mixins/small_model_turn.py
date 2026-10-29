@@ -128,17 +128,14 @@ class SmallModelTurnMixin:
         # another ~30s, and its failures landed in the NEXT turn's facts -- the narrator
         # then told the user about a search the new request never made.
         turn_activity = self.small_model_activity
+        # on_activity is also called from the worker thread the tier's tool loop runs in (a
+        # tool call's "started"/result facts). There asyncio.create_task has no running loop:
+        # it raised, so the status was never republished (the RuntimeWarning "coroutine
+        # '_publish_status' was never awaited", 2026-10-29), and asyncio.Event.set from
+        # another thread is not safe either. Both go to this loop instead.
+        own_loop = asyncio.get_running_loop()
 
-        def on_activity(line: str) -> None:
-            if self.small_model_activity is not turn_activity:
-                return
-            # Ported from a teammate's branch (23665f1): a multi-line tool
-            # result (e.g. web_search) could otherwise smuggle a fact past
-            # line-based processing elsewhere -- one fact is one line.
-            self.small_model_activity.append(" ".join(line.split())[:300])
-            del self.small_model_activity[:-20]
-            if self._lines_since_answer_candidate is not None:
-                self._lines_since_answer_candidate += 1
+        def wake_and_publish() -> None:
             # A new fact is what the narrator waits for: drafting starts now, not at the
             # loop's next tick (up to a second later).
             self._voice_narration_wake.set()
@@ -152,7 +149,26 @@ class SmallModelTurnMixin:
             # still happening. Republish on every real operation -- same content each
             # time ("working"), but keeps a long-running turn's status visibly fresh
             # until the turn itself actually ends, not just until the first tick.
-            asyncio.create_task(self._publish_status())
+            asyncio.ensure_future(self._publish_status())
+
+        def on_activity(line: str) -> None:
+            if self.small_model_activity is not turn_activity:
+                return
+            # Ported from a teammate's branch (23665f1): a multi-line tool
+            # result (e.g. web_search) could otherwise smuggle a fact past
+            # line-based processing elsewhere -- one fact is one line.
+            self.small_model_activity.append(" ".join(line.split())[:300])
+            del self.small_model_activity[:-20]
+            if self._lines_since_answer_candidate is not None:
+                self._lines_since_answer_candidate += 1
+            try:
+                on_own_loop = asyncio.get_running_loop() is own_loop
+            except RuntimeError:
+                on_own_loop = False
+            if on_own_loop:
+                wake_and_publish()
+            else:
+                own_loop.call_soon_threadsafe(wake_and_publish)
 
         translate_answer = True
         from_cascade = False
