@@ -36,6 +36,7 @@ from app.logging_setup import log_event
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import CAROLINE_SW_KEY, SwApiError, call_v2
 from app.secret_store import decrypt_text_from_file, encrypt_text_to_file
+from app.untrusted_text import calendar_text
 from app.workspace_dir import WORKSPACE_DIR
 
 ACCOUNTS = ("self", "owner")
@@ -93,7 +94,7 @@ async def calendar_read_ics(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
                "PUBLISH": "a published event"}.get(str(method or "").upper(), "a calendar file")
     log_event("plugin:calendar", "ics_read", path=str(path), method=method, events=len(parsed["events"]))
     return {"text": f"{path} is {meaning}" + (f" (METHOD:{method})" if method else "") + f", {len(parsed['events'])} event(s):\n"
-                    + json.dumps(parsed["events"], ensure_ascii=False, indent=1)}
+                    + calendar_text(json.dumps(parsed["events"], ensure_ascii=False, indent=1))}
 
 
 # --- CalDAV credentials -------------------------------------------------------------
@@ -270,7 +271,8 @@ async def calendar_events(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     events.sort(key=lambda e: str((e.get("start") or {}).get("datetime") or (e.get("start") or {}).get("date") or ""))
     events, _cut = cap_count(events)
     log_event("plugin:calendar", "events_read", account=args.get("account") or "self", count=len(events))
-    return {"text": f"{len(events)} event(s) from {args['start']} to {args['end']}:\n" + json.dumps(events, ensure_ascii=False, indent=1)}
+    return {"text": f"{len(events)} event(s) from {args['start']} to {args['end']}:\n"
+                    + calendar_text(json.dumps(events, ensure_ascii=False, indent=1))}
 
 
 async def calendar_add_event(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
