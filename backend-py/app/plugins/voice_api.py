@@ -2235,6 +2235,7 @@ async def synthesize_speech(
     if not guess:
         guess = await detect_language(text)
         detected = True
+    retry_voice: str | None = None  # the local voice to keep trying alongside the fallback
     while True:
         edge_voice = await _edge_voice_for_language(voice, guess)
         if edge_voice is None:
@@ -2252,6 +2253,7 @@ async def synthesize_speech(
         except Exception as exc:
             log_event("plugin:voice", "tts_local_failed_falling_back", edge_voice=edge_voice, error=str(exc), guessed=not detected)
             if detected:
+                retry_voice = edge_voice
                 break
             detected = True
             named = await detect_language(text)
@@ -2263,7 +2265,52 @@ async def synthesize_speech(
     # so a caller can hand over how to get one instead of minting it for every request.
     if session is None and session_provider is not None:
         session = await session_provider()
-    return await _synthesize_speech_via_camerlengo(text, voice, session)
+    if retry_voice is None:
+        return await _synthesize_speech_via_camerlengo(text, voice, session)
+    return await _race_fallback_with_local_retries(text, voice, session, retry_voice)
+
+
+# After the local voice fails without refusing (no 403), how long to wait before each
+# further try of it, alongside the Camerlengo fallback (2026-10-29): live, edge-tts gave
+# "No audio was received" for a 97-char answer three times running, was answering again
+# 14s later, and the fallback took 98s -- the answer of a voice turn, heard a minute and
+# a half late, in silence. Three more tries over ~21s; whichever audio comes first is used.
+TTS_LOCAL_RETRY_DELAYS_S = (3.0, 6.0, 12.0)
+
+
+async def _race_fallback_with_local_retries(text: str, voice: str, session: str | None, edge_voice: str) -> str:
+    from app.local_edge_tts import EdgeTtsRefused
+
+    async def local_retries() -> str:
+        for delay in TTS_LOCAL_RETRY_DELAYS_S:
+            await asyncio.sleep(delay)
+            try:
+                audio = await _synthesize_speech_locally(text, edge_voice, retries=0)
+                log_event("plugin:voice", "tts_local_ok", edge_voice=edge_voice, text_len=len(text), after_fallback_started=True)
+                return audio
+            except EdgeTtsRefused:
+                break
+            except Exception:  # noqa: BLE001 -- the next delay, or the fallback's audio
+                continue
+        raise VoiceApiError("local edge-tts did not recover")
+
+    started = time.monotonic()
+    local = asyncio.ensure_future(local_retries())
+    pending = {asyncio.ensure_future(_synthesize_speech_via_camerlengo(text, voice, session)), local}
+    error: BaseException | None = None
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.exception() is None:
+                    log_event("plugin:voice", "tts_fallback_race_won", by="local" if task is local else "camerlengo",
+                              s=round(time.monotonic() - started, 1))
+                    return task.result()
+                error = task.exception()
+        raise error or VoiceApiError("speech synthesis failed")
+    finally:
+        for task in pending:
+            task.cancel()
 
 
 # Skip the LLM cleanup call entirely when the text plainly has nothing for
