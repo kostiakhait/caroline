@@ -93,7 +93,7 @@ from app.instruction_memory import instruction_memory_system_prompt_clause
 from app.working_memory import load_working_memory, working_memory_system_prompt_clause
 from app.memory_topics import memory_topics_system_prompt_clause
 from app.untrusted_text import web_pages_text
-from app.plugins.loader import PluginTool, discover_plugins, to_openai_tool_def
+from app.plugins.loader import PluginTool, discover_plugins, missing_required, to_openai_tool_def
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json, clear_funds_exhausted, mark_funds_exhausted
 from app import policies
 from app.policies import (
@@ -1736,7 +1736,16 @@ def _make_executor_fn(
             # handed the model an internal operation to narrate to the user.
             return await dispatch(plugin_name, plugin_tool.name, plugin_tool.handler, args, wait_to_end=True)
 
-        envelope = asyncio.run_coroutine_threadsafe(_run(), main_loop).result()
+        # A required argument the model left out (2026-10-29): the handler used to fail on it with a
+        # bare KeyError -- the model was told only "'text'" (app_browser_find) or "'label'"
+        # (open_app_browser), four and two times today, and could not tell what was wrong.
+        missing = missing_required(plugin_tool, args)
+        if missing:
+            log_event("engine", "small_model_tool_missing_args", tab_id=tab_id, tool=name, missing=missing)
+            envelope = {"operation_id": "", "status": "error",
+                        "error": f"{name} was called without its required argument(s) {', '.join(missing)}; call it again with them."}
+        else:
+            envelope = asyncio.run_coroutine_threadsafe(_run(), main_loop).result()
         log_event("engine", "small_model_tool_result", tab_id=tab_id, tool=name, status=envelope.get("status"))
         note = f"\n{envelope['memory_note']}" if envelope.get("memory_note") else ""
         if envelope.get("status") == "error":

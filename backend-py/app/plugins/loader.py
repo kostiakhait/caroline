@@ -50,6 +50,20 @@ def optional_keys(input_schema: Any) -> list[str]:
     return [name for name, annotation in input_schema.items() if _is_optional_type(annotation)]
 
 
+def missing_required(plugin_tool: "PluginTool", args: dict[str, Any]) -> list[str]:
+    """The required parameters of a tool that a call left out or passed as null -- from a
+    `{name: type}` schema (the ones not declared `X | None`) or a JSON Schema's "required"."""
+    schema = plugin_tool.input_schema
+    if not isinstance(schema, dict):
+        return []
+    if "type" in schema and "properties" in schema:
+        required = list(schema.get("required") or [])
+    else:
+        optional = set(optional_keys(schema))
+        required = [name for name in schema if name not in optional]
+    return [name for name in required if args.get(name) is None]
+
+
 def schema_with_optionals(input_schema: Any) -> Any:
     """The JSON Schema of a tool whose optional parameters are really optional.
 
