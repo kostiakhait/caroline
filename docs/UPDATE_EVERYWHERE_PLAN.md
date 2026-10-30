@@ -133,8 +133,19 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    `docs/CAROLINE_SW_SESSION_PLAN.md` records O8 as implemented. The persistent home is never touched, as decided on 2026-10-27. **Left:** a desktop built from the image and started against a published release
    (T-checks of the Xopek plan); an update of a **running** desktop (it would need the shell to restart Caroline; not planned, since desktops are short-lived); the release still rebuilds and pushes
    `:selkies-<date>` (the image carries the newest at its build, the start-time update covers the gap until the next build).
-6. **OS Beroun:** `shelld`'s updater, the folder beside the firmware's copy, the fallback, the notification, Caroline's tools; tried on the local simulator and the hosted one.
-7. **Android:** comes with the shell of `android-plan.md`; tried there.
+6. **Done (2026-10-30), tried live on a local simulator of its own (instance `upd`, since removed).** In IntelliCat (`Simulator/runtime/caroline_update.py`, `caroline.py`, `shelld.py`; `docs/caroline-updates.md`, commit ca27809).
+   Her backend (platform `beroun`, `CAROLINE_RUNTIME` = the device's runtime number, `CAROLINE_UPDATE_DIR` in the owner's data) finds, downloads and verifies the artifact; the `Updater` in `shelld` polls her
+   `/api/update/status` every 30 s and installs by the rule: `install` stops her, applies the overlay, starts her again; `ask` puts a line in the notification panel and a MessageBox ("Install now" / "Later", asked
+   again after 4 h) and the yes is `POST /api/update/confirm`. The firmware's `dist-intellicat` is read-only and never touched; the update is applied to a writable copy (`<data>/caroline-code/current`, hard-linked
+   where possible) which runs only while its `VERSION` is newer than the firmware's. **The way back:** an updated tree must answer on her port within 150 s and her supervisor must not die twice within a minute;
+   otherwise its version is marked failed, the copy from before it (or the firmware's) runs again and the version is not tried or announced again; a tree that answered deletes the copy from before.
+   Her tools `beroun_update_status|check|now` (`/api/caroline/sys/update/*`; the audit test passes). `tests/caroline_update_test.py`, 22 checks without a simulator. **Live, with the real signing key and a local
+   release server:** 1.1.0 installed by itself 10 s after the start and ran from the copy (firmware stayed 1.0.0); a deliberately broken 1.2.0 was applied, never answered, and the device went back to 1.1.0 and
+   left 1.2.0 alone; 1.3.0 then installed over it. The pin of `Simulator/caroline` moved to 34ff9da (the first with the update client). **Found on the way:** her `CAROLINE_RUNTIME` clashed with the shell's variable of
+   the same name (the runtime's folder), so the backend gets the number explicitly; and a supervisor lives on while its backend crashes, so "the supervisor exited" alone cannot detect a broken update (hence the probation).
+   **Left:** the "in use, so ask" path was not run live (a chat session must be open in her window on that instance; the rule is unit-tested and the MessageBox checked on its own); the hosted simulator (the same
+   code runs at a visitor's machine start, but the image must be rebuilt with the new pin and tried); a first real release published (the maintainer's token) so the shipped devices find something.
+7. **Android:** comes with the shell of `android-plan.md` (the same `CodeLayer`/`Updater` logic in the APK's shell: the overlay applied to a copy in the app's files directory, the dialog through the app's own UI); tried there.
 
 Each stage: a release with a raised version published to a test path, installed while she is inactive (by itself) and while she is in use (the notice, then by itself once idle), a wrong
 signature and a wrong sha256 refused, the data and the SW login kept.
