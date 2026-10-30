@@ -84,6 +84,7 @@ import base64
 import hashlib
 import json
 import re
+import shutil
 import time
 import traceback
 import uuid
@@ -903,6 +904,10 @@ def save_visible_transcript(workspace_dir: str, tab_id: str, entries: "list[Any]
         path = _visible_transcript_path(workspace_dir, tab_id)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+        if path.exists():
+            # 2026-10-30: the version being replaced stays as .prev.json -- a window that lost entries must not
+            # leave this file as the only copy (the full record is app/transcript_journal.py's journal)
+            shutil.copyfile(path, path.with_suffix(".prev.json"))
         tmp.replace(path)
     except Exception as exc:  # noqa: BLE001
         log_event("plugin:companion", "visible_transcript_save_failed", tab_id=tab_id, error=str(exc))

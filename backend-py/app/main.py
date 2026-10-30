@@ -37,7 +37,7 @@ from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 # edition:end
 from app.history import read_archived_entries, read_recent_history_for_session
-from app import settings_mirror, vault_backup, wizard
+from app import settings_mirror, transcript_journal, vault_backup, wizard
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
@@ -1266,8 +1266,34 @@ async def _handle_control_request_inner(
     if op == "visible_transcript_set":
         entries = parsed.get("entries")
         if isinstance(entries, list) and session is not None:
+            transcript_journal.append_entries(WORKSPACE_DIR, session.tab_id, entries)
             save_visible_transcript(WORKSPACE_DIR, session.tab_id, entries)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "transcript_reconcile":
+        # 2026-10-30: the window's own transcript (localStorage) is a cache that can lose entries; the journal
+        # and the session file are not. Sends back what the window lacks -- see app/transcript_journal.py.
+        history_tab = (session.tab_id if session is not None else None) or parsed.get("tabId") or PRIMARY_TAB_ID
+        client_entries = parsed.get("entries")
+        client_entries = client_entries if isinstance(client_entries, list) else []
+        history_session_id = (session.last_saved_session_id if session is not None else None) or load_tab_session_id(WORKSPACE_DIR, history_tab)
+        try:
+            transcript_journal.append_entries(WORKSPACE_DIR, history_tab, client_entries)
+            if history_session_id:
+                # only what came after the window's newest entry: the session file also holds lines the window
+                # never showed as bubbles (progress notes, command echoes), and those must not flood back in
+                newest = max((transcript_journal._ts_ms(e) for e in client_entries if isinstance(e, dict)), default=0)
+                transcript_journal.append_entries(
+                    WORKSPACE_DIR, history_tab,
+                    [h for h in read_recent_history_for_session(WORKSPACE_DIR, history_session_id, limit=600) if transcript_journal._ts_ms(h) > newest],
+                )
+            missing = transcript_journal.missing_for_client(
+                transcript_journal.read_entries(WORKSPACE_DIR, history_tab), client_entries
+            )
+        except Exception as exc:  # noqa: BLE001 -- recovery must never break the chat
+            log_event("engine", "transcript_reconcile_failed", tab_id=history_tab, error=str(exc)[:200])
+            return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc)[:200], "requestId": request_id}
+        log_event("engine", "transcript_reconcile", tab_id=history_tab, client=len(client_entries), missing=len(missing))
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(missing), "requestId": request_id}
     if op == "tab_list_set":
         # WPF's MainWindow.xaml.cs's own SyncTabListToBackend() -- tab id +
         # display name are otherwise known ONLY there (a WebView2 connects

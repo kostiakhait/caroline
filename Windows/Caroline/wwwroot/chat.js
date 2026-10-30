@@ -1652,6 +1652,10 @@
       if (!historyRequested) {
         historyRequested = true;
         if (loadTranscript().length === 0) sendControl("get_history", {});
+        // 2026-10-30: a transcript that is not empty can still have lost entries (the day's messages vanished
+        // after an update while the older ones stayed); the backend's journal and the session file say what
+        // is missing -- see transcript_journal.py. Runs once per page, like get_history.
+        else sendControl("transcript_reconcile", { entries: loadTranscript().slice(-TRANSCRIPT_MAX).map((e) => ({ role: e.role, text: e.text, ts: e.ts })) });
       }
       scheduleVisibleTranscriptSync();
     });
@@ -1929,7 +1933,26 @@
     if (evt.ok === false) {
       clog(`control_response FAILED: op=${evt.op} stderr=${evt.stderr || "(none)"}`);
     }
-    if (evt.op === "get_history") {
+    if (evt.op === "transcript_reconcile") {
+      if (evt.ok) {
+        try {
+          const missing = JSON.parse(evt.stdout || "[]").filter((e) => e && e.text && !isLeakedInternalText(e.text));
+          if (missing.length > 0) {
+            clog(`transcript_reconcile: taking back ${missing.length} entries`);
+            const list = loadTranscript();
+            for (const e of missing) list.push({ role: e.role, text: e.text, attachments: e.attachments || [], ts: e.ts });
+            list.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+            while (list.length > TRANSCRIPT_MAX) list.shift();
+            localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(list));
+            // draw the page again from the repaired transcript, so the entries stand in time order
+            messagesEl.innerHTML = "";
+            lastBubbleDateKey = null;
+            void replayTranscript();
+            scheduleVisibleTranscriptSync();
+          }
+        } catch { /* the window keeps what it has */ }
+      }
+    } else if (evt.op === "get_history") {
       if (evt.ok) {
         try {
           const entries = JSON.parse(evt.stdout || "[]").filter((e) => !isLeakedInternalText(e && e.text));
