@@ -22,7 +22,7 @@ from typing import Any
 # The public half of the release key, hex. Made once by `tools/release.py keygen`; the private half never enters a repository.
 RELEASE_PUBLIC_KEY = "7c347b8cb521198c71f4e83cc4430e03764c788258fa2c185fbbdbdde16d3f97"
 
-PLATFORMS = ("windows", "linux-x86_64", "beroun")
+PLATFORMS = ("windows", "linux-x86_64", "beroun", "xopek")
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 

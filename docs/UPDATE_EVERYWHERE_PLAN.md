@@ -120,7 +120,19 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    shell is unchanged. The earlier Yes/No dialog and the earlier download/sha256 code are gone (the backend does them). `backend-py/test_linux_update_client.py`, 7 tests against a fake HTTP backend (nothing ready,
    progress once per value, inactive installs, in use only offers, the yes installs, a failed copy retries, an unreachable backend is quiet); 28 update tests pass together. **Left:** the real run on Linux
    (an AppImage from `build_appimage.sh` updated over an older one: O1-O5 of the Xopek plan's section 6.1, now against the new flow) once a release is published.
-5. **Xopek:** the update at the desktop's start and inside a running desktop; the release rebuilds the image.
+5. **Done in the code (2026-10-30), tested on this machine, the image not built (no docker here).** A new platform in the manifest, **`xopek`**, and a new kind of artifact, **the code layer**: a zip of only the paths the
+   update owns (`backend-py/app`, `backend-py/skills-src`, `wwwroot`, `linux-shell`, a few files, the sidecars' JS), no runtime and no `node_modules`. `backend-py/app/overlay_install.py` builds it
+   (`tools/release.py overlay DIST OUT.zip`) and applies it: it refuses, before touching anything, a path that leaves the root, a link, anything not owned, a missing `backend-py/app/main.py`, or an unpacking
+   past 600 MB; it swaps the directories one by one with the old one aside (**whole directories**, so a module the new version dropped is dropped too: plugins are found by listing their folder), puts
+   everything back if any step fails, and repairs a crash in the middle at the next call (`recover`). `backend-py/app/update_cli.py` (`python -m app.update_cli apply`) is the start-time update: look, download,
+   verify, apply, and **never fail the start** (offline, no release, a refused file: exit 0, Caroline stays as she is). `test_overlay_install.py`, 12 tests (build then apply keeps the runtime and
+   `node_modules`, no caches in the zip, five kinds of bad overlay and a link refused with the dist unchanged, a failure in the middle rolls back, a crash is repaired, and the start-time update end to end
+   against a real local server: a newer release installs, no release or a bad one leaves the old); 30 update tests pass with the earlier ones.
+   **In the Xopek repo** (`desktop-image/`): `Dockerfile.selkies` gives the code folders of `/opt/caroline/dist-linux` to the session user (the runtime stays root's); `entrypoint-selkies.sh` runs the
+   update before it starts the shell and turns the running backend's own update loop off (`CAROLINE_UPDATE_DISABLE=1`: an ephemeral desktop is not updated while it runs, the next one starts with the newest);
+   `docs/CAROLINE_SW_SESSION_PLAN.md` records O8 as implemented. The persistent home is never touched, as decided on 2026-10-27. **Left:** a desktop built from the image and started against a published release
+   (T-checks of the Xopek plan); an update of a **running** desktop (it would need the shell to restart Caroline; not planned, since desktops are short-lived); the release still rebuilds and pushes
+   `:selkies-<date>` (the image carries the newest at its build, the start-time update covers the gap until the next build).
 6. **OS Beroun:** `shelld`'s updater, the folder beside the firmware's copy, the fallback, the notification, Caroline's tools; tried on the local simulator and the hosted one.
 7. **Android:** comes with the shell of `android-plan.md`; tried there.
 

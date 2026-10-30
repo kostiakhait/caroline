@@ -9,6 +9,10 @@
       Writes DIR/release.json and DIR/release.json.sig for the given artifact files (their names, sha256 and sizes). The files themselves are
       not copied: upload them from their paths together with the two files of DIR, all of them or none. Platforms: windows, linux-x86_64, beroun.
 
+  release.py overlay DIST OUT.zip
+      Makes the code-layer artifact (the platforms `xopek` and `beroun`) from a dist: `make dist-linux` for xopek, `make dist-intellicat` for beroun. Only the
+      paths the update owns (backend-py/app, wwwroot, ...); what is built is exactly what app/overlay_install.py applies.
+
   release.py verify DIR
       Checks DIR/release.json against its signature and the artifacts found next to it by name (the public key as built in, or
       CAROLINE_RELEASE_PUBLIC_KEY). Run it on the folder that was uploaded, or on what was downloaded.
@@ -97,6 +101,19 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_overlay(args: argparse.Namespace) -> int:
+    oi_spec = importlib.util.spec_from_file_location("overlay_install", HERE.parent / "backend-py" / "app" / "overlay_install.py")
+    oi = importlib.util.module_from_spec(oi_spec)
+    sys.modules["overlay_install"] = oi
+    oi_spec.loader.exec_module(oi)
+    try:
+        entries = oi.build_overlay(args.dist, args.out)
+    except oi.OverlayError as exc:
+        raise SystemExit(str(exc))
+    print(f"{args.out}: {len(entries)} files from {args.dist}")
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     folder = Path(args.dir)
     try:
@@ -124,10 +141,13 @@ def main() -> int:
     p.add_argument("--artifact", action="append", required=True)
     p.add_argument("--commit")
     p.add_argument("--date")
+    p = sub.add_parser("overlay")
+    p.add_argument("dist")
+    p.add_argument("out")
     p = sub.add_parser("verify")
     p.add_argument("dir")
     args = ap.parse_args()
-    return {"keygen": cmd_keygen, "build": cmd_build, "verify": cmd_verify}[args.cmd](args)
+    return {"keygen": cmd_keygen, "build": cmd_build, "overlay": cmd_overlay, "verify": cmd_verify}[args.cmd](args)
 
 
 if __name__ == "__main__":
