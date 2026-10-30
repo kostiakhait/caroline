@@ -86,7 +86,7 @@ from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
 from app.operations import REGISTRY as OPERATIONS_REGISTRY
-from app.operations import _operation_to_dict, dispatch
+from app.operations import CHECK_OPERATION_WAIT_S, _operation_to_dict, dispatch, wait_for_operation
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.instruction_memory import instruction_memory_system_prompt_clause
@@ -778,7 +778,9 @@ _OPERATIONS_TOOL_DEFS: list[dict[str, Any]] = [
             "name": "check_operation_status",
             "description": (
                 "Checks the status of a previously started long-running tool operation (one whose start "
-                "returned status=\"running\" instead of \"done\"). Returns the current status "
+                "returned status=\"running\" instead of \"done\"). Waits for it to finish, up to "
+                f"{int(CHECK_OPERATION_WAIT_S)} seconds, so one call gets the final result as soon as there is "
+                "one -- no need to call it again right away. Returns the current status "
                 "(running/done/error/cancelled), any partial/intermediate data reported so far, and the final "
                 "result once done."
             ),
@@ -1566,6 +1568,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
         op = OPERATIONS_REGISTRY.get(args["operation_id"])
         if op is None:
             return "Unknown or already-completed operation_id."
+        await wait_for_operation(op)
         body = _operation_to_dict(op)
         if op.status in ("done", "error", "cancelled"):
             op.collected = True  # no completion notice repeating it (operations._notify_unless_collected)
