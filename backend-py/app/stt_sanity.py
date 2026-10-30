@@ -12,7 +12,11 @@ returns is itself checked before it is trusted:
 2. The cheapest model, for what code cannot see: is this a meaningful, connected
    utterance in this conversation, and if one word is plainly a mishearing ("по лохе"
    for "по логике"), which word was meant. It answers OK, FIX with the corrected
-   text, or GARBAGE.
+   text, or GARBAGE. Only code ever drops a transcript: per explicit instruction
+   (2026-10-30), a GARBAGE from the model is logged and the transcript passes as heard
+   -- confirmed live, gpt-5-nano called "Кэролайн, напомни мне в понедельник, что мне
+   нужно съездить и отослать документы ..." GARBAGE over one misheard word, and the
+   user's voice input silently did nothing.
 3. Code again. A FIX is taken only if it stays close to what was heard: the model is
    there to repair a word, not to rewrite what the user said.
 
@@ -176,8 +180,9 @@ async def check_transcript(
     ms = int((time.monotonic() - started) * 1000)
     upper = raw.upper()
     if upper.startswith("GARBAGE"):
-        log_event("engine", "stt_sanity", verdict="garbage", by="model", ms=ms, heard=heard[:200])
-        return SanityResult("", "garbage", "model")
+        # Never dropped on the model's word alone -- see the module docstring.
+        log_event("engine", "stt_sanity", verdict="ok", by="model", ms=ms, reason="model said garbage, kept", heard=heard[:200])
+        return SanityResult(heard, "ok", "model", "model said garbage, kept")
     if upper.startswith("FIX"):
         fixed = raw.split(":", 1)[1].strip().strip("\"«»") if ":" in raw else ""
         if fixed and fixed != heard and _accept_fix(heard, fixed):
