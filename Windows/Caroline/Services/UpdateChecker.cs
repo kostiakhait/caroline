@@ -181,7 +181,7 @@ public sealed class UpdateChecker
         _retryTimer.Stop();
         Logger.Log($"[UpdateChecker] launching {installerPath} (manual, via tray)");
         Process.Start(new ProcessStartInfo(installerPath) { UseShellExecute = true });
-        System.Windows.Application.Current.Shutdown();
+        App.RequestShutdown($"update: installer {installerPath} launched");
     }
 
     /// <summary>Downloads and verifies the installer (see InstallerFetcher), publishing progress to

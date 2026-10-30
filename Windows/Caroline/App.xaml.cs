@@ -52,7 +52,7 @@ public partial class App : System.Windows.Application
         {
             System.Windows.MessageBox.Show("Caroline is already running.", "Caroline",
                 MessageBoxButton.OK, MessageBoxImage.Information);
-            Shutdown();
+            RequestShutdown("second instance started while Caroline is already running");
             return;
         }
 
@@ -60,7 +60,7 @@ public partial class App : System.Windows.Application
         _settings = _settingsService.Load();
 
         _mainWindow = new MainWindow(_settings, _settingsService);
-        _mainWindow.ExitRequested += (_, _) => Shutdown();
+        _mainWindow.ExitRequested += (_, _) => RequestShutdown("tray menu: Exit");
         // "Update to ..." stays available from the tray even after the user
         // dismisses the one-time MessageBox prompt (see UpdateChecker) --
         // clicking it is itself the go-ahead, no second confirmation dialog.
@@ -299,9 +299,33 @@ public partial class App : System.Windows.Application
         };
     }
 
+    private static string? _shutdownReason;
+
+    /// <summary>
+    /// The only way Caroline should shut itself down: logs who asked and why,
+    /// with the caller's stack, before calling Shutdown(). Confirmed live
+    /// (2026-10-29 23:55): the app closed mid-work with nothing in
+    /// caroline.log but "exiting (code 0)" -- the tray Exit path logged
+    /// nothing, and Shutdown() is posted to the dispatcher, so OnExit itself
+    /// can't see who called it.
+    /// </summary>
+    public static void RequestShutdown(string reason)
+    {
+        _shutdownReason ??= reason;
+        Logger.Log($"[App] shutdown requested: {reason}\n{Environment.StackTrace}");
+        Current.Dispatcher.Invoke(() => Current.Shutdown());
+    }
+
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        _shutdownReason ??= $"Windows session ending ({e.ReasonSessionEnding})";
+        Logger.Log($"[App] {_shutdownReason}");
+        base.OnSessionEnding(e);
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
-        Logger.Log($"=== Caroline exiting (code {e.ApplicationExitCode}) ===");
+        Logger.Log($"=== Caroline exiting (code {e.ApplicationExitCode}, reason: {_shutdownReason ?? "UNKNOWN -- Shutdown() called directly, not via App.RequestShutdown"}) ===");
         if (_isFirstInstance)
         {
             _mainWindow?.Cleanup();
