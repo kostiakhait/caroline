@@ -113,7 +113,13 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    **Left for Windows:** (a) `CarolineInstaller` still takes `Caroline.zip` and its hash from the old unsigned `Caroline.zip.sha256` / `.version`; it should read the zip's hash from the signed manifest (add a
    `windows-zip` entry) so the whole install, not only the installer, is covered by the signature; (b) the first release has to be published (stage 1, "Left") and the updater tried by hand on this machine
    (a 1.0.1 over an installed 1.0.0, in use and inactive); (c) the old files stay on the server until installed builds have this updater.
-4. **Linux:** the same for the AppImage, then O1-O5 of the Xopek plan tried live at last.
+4. **Done in the code (2026-10-30), tested against a fake backend on Windows, not tried on a real Linux AppImage.** `linux-shell/update_checker.py` is rewritten the same way as Windows': thin, no GTK in its core. `UpdateClient`
+   polls `GET /api/update/status` every 30 s; `install` → copy the verified file beside the running AppImage, `os.replace` it (Linux lets a running file be replaced), tell the backend (`/api/update/installing`),
+   start the new AppImage, ask the shell to exit; `ask` → the tray item and a status-bar line, **no dialog**; the tray click is the yes (`update_now` → `/api/update/confirm`). A failed copy leaves the old
+   AppImage, says so in the status bar and tries again on the next poll. `UpdateChecker` is the GTK adapter with the interface `caroline_shell.py` already uses (`start`, `update_now`, the three callbacks), so the
+   shell is unchanged. The earlier Yes/No dialog and the earlier download/sha256 code are gone (the backend does them). `backend-py/test_linux_update_client.py`, 7 tests against a fake HTTP backend (nothing ready,
+   progress once per value, inactive installs, in use only offers, the yes installs, a failed copy retries, an unreachable backend is quiet); 28 update tests pass together. **Left:** the real run on Linux
+   (an AppImage from `build_appimage.sh` updated over an older one: O1-O5 of the Xopek plan's section 6.1, now against the new flow) once a release is published.
 5. **Xopek:** the update at the desktop's start and inside a running desktop; the release rebuilds the image.
 6. **OS Beroun:** `shelld`'s updater, the folder beside the firmware's copy, the fallback, the notification, Caroline's tools; tried on the local simulator and the hosted one.
 7. **Android:** comes with the shell of `android-plan.md`; tried there.
