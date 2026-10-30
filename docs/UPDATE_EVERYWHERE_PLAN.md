@@ -91,7 +91,11 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    cannot be remade: every installed Caroline will hold its public half), and the public half is `RELEASE_PUBLIC_KEY` in `release_manifest.py`. **Left:** building every artifact from one commit
    (the Windows installer and the Beroun zip here, the AppImage on Linux), the first real `release.json` and its upload to `downloader.multi-portal.org/apps/caroline/` next to the old files
    (they stay until the installed Windows builds have the new updater, stage 3). The upload needs the maintainer's uploader token; it waits for stage 3 so that a release has something that reads it.
-2. **The activity** in `backend-py`: `GET /api/update/activity` and its reasons; tests.
+2. **Done (2026-10-30).** `backend-py/app/update_activity.py` and `GET /api/update/activity` → `{ok, busy, reasons, idle_s}` (loopback only, like the rest of the backend). Reasons: `turn:<tab>` (a turn is running in any
+   session, headless and Agent Bus ones too), `task:<tab>:<n>` (a background task or agent still running, from `agent_registry`), `dialogue` (the continuous-dialogue switch is on **and** the owner was active in the last 30
+   minutes: the switch alone can stay on for weeks, so it does not block for ever), `user` (the owner sent something in the last 10 minutes; headless sessions have no owner). No session at all, or all ended, is inactive.
+   An unreadable task file does not hold an update back. `idle_s` is the owner's idle time (null without a session). `test_update_activity.py`, 10 tests including the endpoint; with the release tests 24 pass.
+   Not counted: a window that is open and touched but nothing sent (the backend does not see it); the shells of stages 3-6 may add that on their side.
 3. **Windows:** the updater reads `release.json`, checks the signature, follows the rule; the MessageBox goes; the update at the start.
 4. **Linux:** the same for the AppImage, then O1-O5 of the Xopek plan tried live at last.
 5. **Xopek:** the update at the desktop's start and inside a running desktop; the release rebuilds the image.

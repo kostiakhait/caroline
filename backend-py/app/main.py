@@ -708,6 +708,14 @@ async def get_status() -> JSONResponse:
     return JSONResponse(body)
 
 
+@app.get("/api/update/activity")
+async def get_update_activity() -> JSONResponse:
+    """{busy, reasons[], idle_s}: whether Caroline is in use, for the updaters of every platform (app/update_activity.py)."""
+    from app.continuous_dialogue import is_enabled as continuous_dialogue_enabled
+    from app.update_activity import snapshot
+    return JSONResponse({"ok": True, **snapshot(list(sessions.values()), WORKSPACE_DIR, continuous_dialogue_enabled(WORKSPACE_DIR))})
+
+
 class MessageBody(BaseModel):
     text: str
     attachments: list[dict[str, Any]] = []
