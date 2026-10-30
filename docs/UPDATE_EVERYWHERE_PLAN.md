@@ -84,7 +84,13 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
 
 ## 4. Stages
 
-1. **The release:** `tools/release.sh` (every artifact from one commit), `release.json`, the signing key (made once, kept out of the repository), the upload, the old Windows files beside it.
+1. **Done in the code (2026-10-30), no release published yet.** `backend-py/app/release_manifest.py` (the shared module every platform's updater uses: pure-Python Ed25519 checked against the RFC 8032 vector,
+   `verify_manifest`, the shape rules, `is_newer` so a version never goes down, `artifact_for` with the `runtime` rule, `check_file` for the sha256 and the size) and `tools/release.py`
+   (`keygen`, `build --artifact PLATFORM=PATH[,runtime=N]`, `verify`); `backend-py/test_release_manifest.py`, 8 tests, all pass, including the tool end to end. The tool is Python, not `release.sh`, so the
+   maintainer's Windows machine runs it too. **The release key** was made on 2026-10-30 at `~/.caroline/release-signing.key` on the maintainer's machine (outside every repository; **to be backed up**, it
+   cannot be remade: every installed Caroline will hold its public half), and the public half is `RELEASE_PUBLIC_KEY` in `release_manifest.py`. **Left:** building every artifact from one commit
+   (the Windows installer and the Beroun zip here, the AppImage on Linux), the first real `release.json` and its upload to `downloader.multi-portal.org/apps/caroline/` next to the old files
+   (they stay until the installed Windows builds have the new updater, stage 3). The upload needs the maintainer's uploader token; it waits for stage 3 so that a release has something that reads it.
 2. **The activity** in `backend-py`: `GET /api/update/activity` and its reasons; tests.
 3. **Windows:** the updater reads `release.json`, checks the signature, follows the rule; the MessageBox goes; the update at the start.
 4. **Linux:** the same for the AppImage, then O1-O5 of the Xopek plan tried live at last.
