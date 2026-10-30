@@ -96,7 +96,7 @@ class UpdateService:
         self.public_key = public_key
         self._lock = threading.RLock()
         self._confirmed = False
-        self._state: dict[str, Any] = {"status": "idle", "error": None, "checked_at": None, "version": None, "path": None, "progress": None}
+        self._state: dict[str, Any] = {"status": "idle", "error": None, "checked_at": None, "version": None, "path": None, "progress": None, "payload": None}
         self._artifact: rm.Artifact | None = None
 
     # ---- state --------------------------------------------------------------------------------------------------------------
@@ -158,7 +158,7 @@ class UpdateService:
         else:
             if self._artifact != artifact or self._state["status"] not in ("ready", "downloading"):
                 self._artifact = artifact
-                self._set(status="available", error=None, checked_at=time.time(), version=version, path=None)
+                self._set(status="available", error=None, checked_at=time.time(), version=version, path=None, payload=artifact.payload)
             log_event("updater", "update_available", version=version, installed=self.version, platform=self.platform)
         return self.status()
 

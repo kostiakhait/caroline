@@ -160,6 +160,7 @@ class Artifact:
     sha256: str
     size: int
     runtime: int
+    payload: dict | None = None  # Windows: the Caroline.zip the installer downloads ({file, sha256, size}); its hash is signed with the rest
 
 
 def verify_manifest(manifest_bytes: bytes, signature_b64: str | bytes, public_key: bytes | None = None) -> dict[str, Any]:
@@ -202,6 +203,13 @@ def check_manifest(manifest: Any) -> None:
             raise ReleaseError(f"{platform}: size is not a number")
         if "runtime" in art and (not isinstance(art["runtime"], int) or art["runtime"] < 0):
             raise ReleaseError(f"{platform}: runtime is not a number")
+        if "payload" in art:
+            pay = art["payload"]
+            pname = pay.get("file") if isinstance(pay, dict) else None
+            if not isinstance(pname, str) or not pname or pname != Path(pname).name or pname.startswith("."):
+                raise ReleaseError(f"{platform}: the payload must name a plain file")
+            if not _SHA256.match(str(pay.get("sha256", ""))) or not isinstance(pay.get("size"), int) or pay["size"] < 0:
+                raise ReleaseError(f"{platform}: the payload needs a sha256 and a size")
 
 
 def artifact_for(manifest: dict[str, Any], platform: str, have_runtime: int = 0) -> tuple[Artifact | None, str]:
@@ -210,7 +218,7 @@ def artifact_for(manifest: dict[str, Any], platform: str, have_runtime: int = 0)
     art = (manifest.get("artifacts") or {}).get(platform)
     if art is None:
         return None, "absent"
-    found = Artifact(platform, art["file"], art["sha256"], art["size"], art.get("runtime", 0))
+    found = Artifact(platform, art["file"], art["sha256"], art["size"], art.get("runtime", 0), art.get("payload"))
     if found.runtime > have_runtime:
         return found, "needs_runtime"
     return found, "ok"

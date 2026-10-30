@@ -276,7 +276,7 @@ internal static class Program
         {
             window.SetStatus("Downloading Caroline…");
             await WithStepAsync(ErrorCodes.Download, "Downloading Caroline", () => downloader.DownloadAsync(
-                DownloadsInfo.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
+                info.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
                 progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct));
 
             Logger.Log("Stopping any running instance before extraction");

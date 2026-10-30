@@ -90,7 +90,13 @@ public sealed class UpdateChecker
         var confirmed = s.TryGetProperty("confirmed", out var c) && c.ValueKind == JsonValueKind.True;
         if (action == "install" && path is not null && File.Exists(path))
         {
-            await LaunchInstallerAsync(path, version, silent: !confirmed);
+            string? payloadFile = null, payloadSha256 = null;
+            if (s.TryGetProperty("payload", out var pl) && pl.ValueKind == JsonValueKind.Object)
+            {
+                payloadFile = pl.TryGetProperty("file", out var pf) ? pf.GetString() : null;
+                payloadSha256 = pl.TryGetProperty("sha256", out var ph) ? ph.GetString() : null;
+            }
+            await LaunchInstallerAsync(path, version, silent: !confirmed, payloadFile, payloadSha256);
             return;
         }
         if (action == "ask")
@@ -121,7 +127,7 @@ public sealed class UpdateChecker
         await PollAsync();
     }
 
-    private async Task LaunchInstallerAsync(string path, string version, bool silent)
+    private async Task LaunchInstallerAsync(string path, string version, bool silent, string? payloadFile = null, string? payloadSha256 = null)
     {
         _launched = true;
         _timer.Stop();
@@ -134,7 +140,11 @@ public sealed class UpdateChecker
         {
             Logger.Log($"[UpdateChecker] could not tell the backend the install started (not fatal): {ex.Message}");
         }
-        Process.Start(new ProcessStartInfo(path, silent ? "--silent-update" : "") { UseShellExecute = true });
+        // the Caroline.zip the installer downloads comes with its sha256 from the signed manifest (the backend verified it): the installer takes no hash from an unsigned file
+        var args = silent ? "--silent-update" : "";
+        if (!string.IsNullOrEmpty(payloadFile) && !string.IsNullOrEmpty(payloadSha256))
+            args = $"{args} --zip-file \"{payloadFile}\" --zip-sha256 {payloadSha256}".Trim();
+        Process.Start(new ProcessStartInfo(path, args) { UseShellExecute = true });
         App.RequestShutdown($"update: installer {path} launched");
     }
 

@@ -82,10 +82,14 @@ def cmd_build(args: argparse.Namespace) -> int:
             raise SystemExit(f"{file}: no such file")
         entry = {"file": file.name, "sha256": rm.file_sha256(file), "size": file.stat().st_size}
         if rest:
-            key, _, value = rest.partition("=")
-            if key != "runtime" or not value.isdigit():
-                raise SystemExit(f'--artifact "{item}": the only option is runtime=N')
-            entry["runtime"] = int(value)
+            for opt in rest.split(","):
+                key, _, value = opt.partition("=")
+                if key == "runtime" and value.isdigit():
+                    entry["runtime"] = int(value)
+                elif key == "payload" and Path(value).is_file():  # a file the artifact downloads by itself (the Windows installer's Caroline.zip): signed with it
+                    entry["payload"] = {"file": Path(value).name, "sha256": rm.file_sha256(value), "size": Path(value).stat().st_size}
+                else:
+                    raise SystemExit(f'--artifact "{item}": the options are runtime=N and payload=PATH')
         artifacts[platform] = entry
     commit = args.commit or subprocess.run(["git", "-C", str(HERE.parent), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     manifest = {"version": args.version, "commit": commit, "date": args.date or date.today().isoformat(), "artifacts": artifacts}
@@ -122,6 +126,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
             art, _ = rm.artifact_for(manifest, platform, have_runtime=10 ** 9)
             rm.check_file(folder / art.file, art)
             print(f"  {platform}: {art.file} ok")
+            if art.payload:
+                rm.check_file(folder / art.payload["file"], rm.Artifact(platform, art.payload["file"], art.payload["sha256"], art.payload["size"], 0))
+                print(f"  {platform}: payload {art.payload['file']} ok")
     except (rm.ReleaseError, OSError) as exc:
         print(f"NOT OK: {exc}", file=sys.stderr)
         return 1

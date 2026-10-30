@@ -114,3 +114,27 @@ def test_the_tool_makes_a_key_a_release_and_verifies_it(tmp_path):
     assert bad.returncode == 1 and "NOT OK" in bad.stderr
     (out / win.name).write_bytes(b"installer")
     assert run_tool("verify", out, env={"CAROLINE_RELEASE_PUBLIC_KEY": rm.ed25519_public_key(b"\x02" * 32).hex()}).returncode == 1
+
+
+def test_a_windows_payload_is_signed_with_the_installer(tmp_path):
+    key = tmp_path / "release.key"
+    public = run_tool("keygen", key).stdout.split("public key:")[1].strip()
+    win, zipf = tmp_path / "CarolineInstaller-1.2.3.exe", tmp_path / "Caroline-1.2.3.zip"
+    win.write_bytes(b"installer")
+    zipf.write_bytes(b"the app")
+    out = tmp_path / "out"
+    assert run_tool("build", "--version", "1.2.3", "--key", key, "--out", out, "--artifact", f"windows={win},payload={zipf}", "--commit", "abc").returncode == 0
+    manifest = json.loads((out / "release.json").read_text())
+    pay = manifest["artifacts"]["windows"]["payload"]
+    assert pay["file"] == zipf.name and pay["size"] == 7 and len(pay["sha256"]) == 64
+    art, why = rm.artifact_for(manifest, "windows", 0)
+    assert why == "ok" and art.payload == pay
+    (out / win.name).write_bytes(b"installer")
+    (out / zipf.name).write_bytes(b"the app")
+    env = {"CAROLINE_RELEASE_PUBLIC_KEY": public}
+    assert run_tool("verify", out, env=env).returncode == 0
+    (out / zipf.name).write_bytes(b"swapped")  # the payload is checked against the signed hash too
+    assert run_tool("verify", out, env=env).returncode == 1
+    bad = manifest_bytes(artifacts={"windows": {"file": "x.exe", "sha256": "a" * 64, "size": 1, "payload": {"file": "../z.zip", "sha256": "a" * 64, "size": 1}}})
+    with pytest.raises(rm.ReleaseError):
+        rm.check_manifest(json.loads(bad))
