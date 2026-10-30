@@ -342,7 +342,9 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # sessions): a recurring reminder reuses its own id every firing, so
     # each firing's pseudo-session is a fresh instance of "this reminder's
     # own thread" -- never shared with a DIFFERENT reminder or sub-agent.
-    pseudo = pseudo_tab.get_or_create_pseudo_session_sync(real_tab_id, reminder["id"], sessions.get)
+    # fresh=True (2026-10-29): every firing is a new conversation, not the next turn of all
+    # the earlier ones; lastReport below is what it keeps of them.
+    pseudo = pseudo_tab.get_or_create_pseudo_session_sync(real_tab_id, reminder["id"], sessions.get, fresh=True)
     if pseudo is None:
         return False  # still starting up -- the scheduler retries on its own next tick
     # Bug fix (2026-09-11), per explicit instruction: used to pass
@@ -393,8 +395,14 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
         f"a firing interrupted by the usage cap at {reminder['awaitingRetry']}, resumed now"
         if reminder.get("awaitingRetry") else f"you scheduled this for {reminder.get('dueAtIso')}"
     )
+    last_report = reminder.get("lastReport") or {}
+    previous = (
+        f"\n\nWhat you reported for this reminder last time ({last_report.get('atIso')}) -- for telling what is new "
+        f"since then; check everything fresh, as of now:\n{last_report['text']}"
+        if last_report.get("text") else ""
+    )
     delivered = pseudo.inject_proactive(
-        f"⏰ Reminder due ({when}): {reminder.get('note')}\n\n{instruction}",
+        f"⏰ Reminder due ({when}): {reminder.get('note')}{previous}\n\n{instruction}",
         suppress_narration=True,
     )
     if delivered:

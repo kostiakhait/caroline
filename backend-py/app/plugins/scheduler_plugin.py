@@ -274,6 +274,23 @@ def set_reminder_awaiting_retry(reminder_id: str, waiting: bool) -> None:
         return
 
 
+LAST_REPORT_MAX_CHARS = 2000
+
+
+def set_reminder_last_report(reminder_id: str, text: str) -> None:
+    """Keeps what a reminder's firing last reported to the user (2026-10-29): every
+    firing now starts a fresh session (main.py's _on_reminder_due), and this is all
+    of the earlier firings it is given -- enough to tell what is new since then. An
+    activity that is not a reminder has no record here and is left alone."""
+    reminders = _load_reminders()
+    for r in reminders:
+        if r.get("id") != reminder_id:
+            continue
+        r["lastReport"] = {"atIso": datetime.now().astimezone().isoformat(timespec="seconds"), "text": text[:LAST_REPORT_MAX_CHARS]}
+        _save_reminders(reminders)
+        return
+
+
 def start_due_check_loop(on_due: Callable[[dict[str, Any]], bool], interval_s: float = 20.0) -> asyncio.Task[None]:
     """Polls workspace/schedule.json and delivers every pending reminder whose
     time has passed. on_due returns whether it was actually delivered; an

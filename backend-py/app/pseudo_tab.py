@@ -51,7 +51,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from app.durability import load_chat_mode, save_chat_mode
+from app.durability import clear_tab_session_id, load_chat_mode, save_chat_mode
 from app.logging_setup import log_event
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -89,6 +89,16 @@ def _mark_awaiting_retry(pseudo_id: str, waiting: bool) -> None:
         set_reminder_awaiting_retry(activity_id_from_pseudo(pseudo_id), waiting)
     except Exception as exc:  # noqa: BLE001
         log_event("engine", "reminder_awaiting_retry_set_failed", pseudo_id=pseudo_id, waiting=waiting, error=str(exc))
+
+
+def _remember_last_report(pseudo_id: str, text: str) -> None:
+    """A reminder's report goes into its own record (scheduler_plugin.set_reminder_last_report),
+    for the next firing's fresh session. Never raises, same as _mark_awaiting_retry."""
+    from app.plugins.scheduler_plugin import set_reminder_last_report  # local: keeps this module's imports light
+    try:
+        set_reminder_last_report(activity_id_from_pseudo(pseudo_id), text)
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "reminder_last_report_save_failed", pseudo_id=pseudo_id, error=str(exc))
 
 
 def is_pseudo_tab_id(tab_id: str) -> bool:
@@ -188,6 +198,7 @@ def _make_pseudo_session_send(real_tab_id: str, pseudo_id: str, get_target_sessi
             _dispose_pseudo_session(pseudo_id)
             if not text:
                 return
+            _remember_last_report(pseudo_id, text)
             target = get_target_session(real_tab_id)
             if target is None:
                 log_event("engine", "pseudo_reply_dropped_no_real_tab", real_tab_id=real_tab_id, pseudo_id=pseudo_id, text_len=len(text))
@@ -257,7 +268,7 @@ async def _start_pseudo_session(real_tab_id: str, pseudo_id: str, get_target_ses
     return session
 
 
-def get_or_create_pseudo_session_sync(real_tab_id: str, activity_id: str, get_target_session: GetTargetSession) -> "ChatSession | None":
+def get_or_create_pseudo_session_sync(real_tab_id: str, activity_id: str, get_target_session: GetTargetSession, fresh: bool = False) -> "ChatSession | None":
     """Lazily creates one background activity's own pseudo-session --
     synchronous and non-blocking, because this caller (main.py's
     _on_reminder_due, scheduler_plugin.start_due_check_loop's own sync
@@ -275,13 +286,24 @@ def get_or_create_pseudo_session_sync(real_tab_id: str, activity_id: str, get_ta
     completely separate session, never sharing turn-state or conversation
     history with another activity. Disposed automatically once its one
     turn's result relays out (see _dispose_pseudo_session) -- the same
-    activity_id's next occurrence creates a fresh session again."""
+    activity_id's next occurrence creates a fresh session again.
+
+    `fresh` (2026-10-29, per explicit instruction): the new session object
+    still RESUMED the conversation saved under its tab id, so a recurring
+    reminder's every firing continued one ever-growing conversation -- the
+    2-hourly mail report ran on ~740k tokens of context per call after four
+    days. With fresh=True the saved conversation is dropped before the
+    session is created; a session that already exists (waiting out a usage
+    cap) is returned as it is."""
     pseudo_id = pseudo_tab_id(real_tab_id, activity_id)
     sync_pseudo_tab_engine(WORKSPACE_DIR, real_tab_id, pseudo_id)
     existing = _pseudo_sessions.get(pseudo_id)
     if existing is not None:
         return existing
     if pseudo_id not in _pseudo_sessions_starting:
+        if fresh:
+            clear_tab_session_id(WORKSPACE_DIR, pseudo_id, engine=None)
+            log_event("engine", "pseudo_session_fresh_start", pseudo_id=pseudo_id)
         _pseudo_sessions_starting.add(pseudo_id)
 
         async def _create() -> None:
