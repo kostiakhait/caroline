@@ -118,7 +118,7 @@ def main() -> int:
     p = sub.add_parser("keygen")
     p.add_argument("keyfile")
     p = sub.add_parser("build")
-    p.add_argument("--version", required=True)
+    p.add_argument("--version", default=(HERE.parent / "backend-py" / "VERSION").read_text(encoding="utf-8").strip(), help="default: backend-py/VERSION, the version every platform ships")
     p.add_argument("--key", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--artifact", action="append", required=True)

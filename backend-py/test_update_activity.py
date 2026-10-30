@@ -9,7 +9,7 @@ from app import update_activity as ua
 
 
 def session(tab="1", *, ended=False, headless=False, turn=False, idle=10_000.0, now=100_000.0):
-    return SimpleNamespace(tab_id=tab, ended=ended, headless=headless, turn_pending=turn, last_user_activity=now - idle)
+    return SimpleNamespace(tab_id=tab, ended=ended, headless=headless, turn_pending=turn, last_real_user_turn_at=None if idle is None else now - idle)
 
 
 def snap(sessions, dialogue=False, tasks=None, now=100_000.0):
@@ -22,6 +22,10 @@ def test_no_session_means_inactive():
 
 def test_a_long_idle_window_is_inactive():
     assert snap([session(idle=3_600)]) == {"busy": False, "reasons": [], "idle_s": 3_600}
+
+
+def test_a_freshly_started_process_is_inactive_until_the_owner_sends_something():
+    assert snap([session(idle=None)]) == {"busy": False, "reasons": [], "idle_s": None}
 
 
 def test_a_running_turn_is_in_use_even_when_the_owner_is_idle():
@@ -63,7 +67,14 @@ def test_the_endpoint_reports_the_snapshot(monkeypatch):
     pytest.importorskip("claude_agent_sdk")
     from fastapi.testclient import TestClient
     from app import main
-    monkeypatch.setattr(main, "sessions", {"1": SimpleNamespace(tab_id="1", ended=False, headless=False, turn_pending=True, last_user_activity=0.0)})
+    monkeypatch.setattr(main, "sessions", {"1": SimpleNamespace(tab_id="1", ended=False, headless=False, turn_pending=True, last_real_user_turn_at=0.0)})
     monkeypatch.setattr(ua, "snapshot", lambda s, w, d: {"busy": True, "reasons": ["turn:1"], "idle_s": 0})
-    body = TestClient(main.app, base_url="http://127.0.0.1").get("/api/update/activity").json()  # the backend answers loopback only
-    assert body == {"ok": True, "busy": True, "reasons": ["turn:1"], "idle_s": 0}
+    client = TestClient(main.app, base_url="http://127.0.0.1")  # the backend answers loopback only
+    assert client.get("/api/update/activity").json() == {"ok": True, "busy": True, "reasons": ["turn:1"], "idle_s": 0}
+    # the update endpoints put the rule on top: a ready update while in use asks, the owner's yes installs, the install spends it
+    svc = main.update_service
+    monkeypatch.setattr(svc, "_state", {**svc._state, "status": "ready", "version": "9.9.9", "path": "x"})
+    monkeypatch.setattr(svc, "_confirmed", False)
+    assert client.get("/api/update/status").json()["action"] == "ask"
+    assert client.post("/api/update/confirm").json()["action"] == "install"
+    assert client.post("/api/update/installing").json()["action"] == "none"

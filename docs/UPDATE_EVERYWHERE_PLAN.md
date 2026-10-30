@@ -96,7 +96,23 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    minutes: the switch alone can stay on for weeks, so it does not block for ever), `user` (the owner sent something in the last 10 minutes; headless sessions have no owner). No session at all, or all ended, is inactive.
    An unreadable task file does not hold an update back. `idle_s` is the owner's idle time (null without a session). `test_update_activity.py`, 10 tests including the endpoint; with the release tests 24 pass.
    Not counted: a window that is open and touched but nothing sent (the backend does not see it); the shells of stages 3-6 may add that on their side.
-3. **Windows:** the updater reads `release.json`, checks the signature, follows the rule; the MessageBox goes; the update at the start.
+3. **Done in the code (2026-10-30), compiled, not tried on a screen.** Found on the way: Caroline had **no version number** (the Windows build is a timestamp plus the sha256 of `Caroline.zip`), so "never a
+   downgrade" had nothing to compare. Now **`backend-py/VERSION`** (`1.0.0`) is the one source: every platform ships backend-py, so every platform knows its version; the Windows and Linux recipes of the
+   `Makefile` copy it, `tools/release.py build` takes it as the default `--version`. A release is: raise `VERSION`, commit, build every artifact from that commit.
+   **The shared client moved into the backend**, not into each shell: `backend-py/app/update_service.py` (look at `release.json` + `.sig` 10 s after the start and every 30 min, flat 5 min retry after a failure,
+   a 404 means "no release yet" and is quiet; download to a `.part`, check size and sha256 against the **signed** manifest, only then `ready`; a verified file is not downloaded twice; leftovers of older
+   versions are removed; a release needing a newer `runtime` waits as `needs_runtime`). Endpoints: `GET /api/update/status` (state + `busy` + `action`: `install` | `ask` | `none`), `POST /api/update/check`,
+   `POST /api/update/confirm` (the owner's yes), `POST /api/update/installing` (the platform started the install). The rule is `action`: inactive → `install`; in use → `ask` until the yes; a ready update
+   therefore installs by itself at the first inactive moment. `CAROLINE_UPDATE_URL`, `_DIR`, `_PLATFORM`, `_DISABLE` and `CAROLINE_RUNTIME` are the knobs. A freshly started process is inactive (the
+   activity now counts the owner's last **real turn**, `last_real_user_turn_at`, not the session's creation), so a waiting update is the first thing a started Caroline does.
+   Tests: `test_update_service.py`, 10 tests against a **real local HTTP server** serving a signed release (newer / same / older, a wrong key, a tampered file, `needs_runtime`, another platform, no second
+   download, the rule, leftovers); with the other update tests 29 pass.
+   **Windows:** `Windows/Caroline/Services/UpdateChecker.cs` is now thin: it asks `/api/update/status` every 30 s and does the one thing only Windows can: `install` → start the installer (`--silent-update`
+   when nobody asked, visible when the owner chose "Update to X" in the tray) and exit; `ask` → the tray item and a line in every tab's status bar, **no dialog**; the tray click is the yes
+   (`UpdateNowAsync` → `/api/update/confirm`). The MessageBox is gone, so is `InstallerFetcher.cs` (the backend downloads and verifies now). `dotnet build` of `Caroline.csproj`: 0 errors.
+   **Left for Windows:** (a) `CarolineInstaller` still takes `Caroline.zip` and its hash from the old unsigned `Caroline.zip.sha256` / `.version`; it should read the zip's hash from the signed manifest (add a
+   `windows-zip` entry) so the whole install, not only the installer, is covered by the signature; (b) the first release has to be published (stage 1, "Left") and the updater tried by hand on this machine
+   (a 1.0.1 over an installed 1.0.0, in use and inactive); (c) the old files stay on the server until installed builds have this updater.
 4. **Linux:** the same for the AppImage, then O1-O5 of the Xopek plan tried live at last.
 5. **Xopek:** the update at the desktop's start and inside a running desktop; the release rebuilds the image.
 6. **OS Beroun:** `shelld`'s updater, the folder beside the firmware's copy, the fallback, the notification, Caroline's tools; tried on the local simulator and the hosted one.

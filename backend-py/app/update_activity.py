@@ -9,7 +9,8 @@ In use means any of:
   * a turn of a conversation is running in any session (a person's chat, the voice, an Agent Bus chain, a background agent's);
   * a background task or agent of a session is still running;
   * the continuous voice dialogue is on and the owner has been active in the last 30 minutes (the switch alone can stay on for weeks);
-  * the owner sent something in the last 10 minutes (headless sessions have no owner and do not count).
+  * the owner sent something in the last 10 minutes (headless sessions have no owner and do not count; a process that has just started, with nothing
+    sent yet, is inactive: the update is the first thing a freshly started Caroline does).
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ DIALOGUE_IDLE_AFTER_S = 1800
 
 def snapshot(sessions: Iterable[Any], workspace_dir: str, dialogue_on: bool, now: float | None = None,
              running_tasks=None) -> dict[str, Any]:
-    """`sessions`: ChatSession-like objects (tab_id, ended, headless, turn_pending, last_user_activity as time.monotonic()).
+    """`sessions`: ChatSession-like objects (tab_id, ended, headless, turn_pending, last_real_user_turn_at as time.monotonic() or None).
     `running_tasks(workspace_dir, tab_id)` -> dict of running tasks (agent_registry.running)."""
     if running_tasks is None:
         from app.agent_registry import running as running_tasks
@@ -41,8 +42,9 @@ def snapshot(sessions: Iterable[Any], workspace_dir: str, dialogue_on: bool, now
             tasks = {}
         if tasks:
             reasons.append(f"task:{session.tab_id}:{len(tasks)}")
-        if not getattr(session, "headless", False):
-            since = max(0.0, clock - session.last_user_activity)
+        said = getattr(session, "last_real_user_turn_at", None)  # None: the owner has sent nothing since this process started (a fresh start is inactive)
+        if not getattr(session, "headless", False) and said is not None:
+            since = max(0.0, clock - said)
             idle = since if idle is None else min(idle, since)
     if dialogue_on and idle is not None and idle < DIALOGUE_IDLE_AFTER_S:
         reasons.append("dialogue")

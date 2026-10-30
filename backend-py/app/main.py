@@ -74,6 +74,7 @@ from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, transcribe_audio, voice_for_gender
 from app import akinakes_channel, akinakes_org_settings
+from app.update_service import UpdateService
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
@@ -224,6 +225,7 @@ async def _websocket_rejection(websocket: WebSocket) -> str | None:
 
 
 sessions: dict[str, ChatSession] = {}
+update_service = UpdateService()
 # Per explicit instruction (2026-10-19): lets chat_session_mixins/watchdog.py
 # (a ChatSession mixin, which cannot import main.py -- see pseudo_tab.py's
 # own module docstring) resolve a background activity's owning real tab back
@@ -561,6 +563,9 @@ async def _start_ratatosk_background_loops() -> None:
     asyncio.create_task(settings_mirror.run_forever(WORKSPACE_DIR))
     # The memory backup to Notes, by code, no model (app/vault_backup.py): restore after a login, then hourly.
     asyncio.create_task(vault_backup.run_forever(WORKSPACE_DIR))
+    # The update client (app/update_service.py): looks for a signed release, downloads and verifies it; the platform installs it. CAROLINE_UPDATE_DISABLE=1: off.
+    if os.environ.get("CAROLINE_UPDATE_DISABLE") != "1":
+        asyncio.create_task(update_service.run_forever())
     # Agent Bus channel (akinakes): active only when BUS_URL and AGENT_UID are set. Role persona and the organization's
     # settings are applied first so the first task already runs as that agent.
     if akinakes_channel.load_config() is not None:
@@ -708,12 +713,48 @@ async def get_status() -> JSONResponse:
     return JSONResponse(body)
 
 
+def _update_activity() -> dict[str, Any]:
+    from app.continuous_dialogue import is_enabled as continuous_dialogue_enabled
+    from app.update_activity import snapshot
+    return snapshot(list(sessions.values()), WORKSPACE_DIR, continuous_dialogue_enabled(WORKSPACE_DIR))
+
+
 @app.get("/api/update/activity")
 async def get_update_activity() -> JSONResponse:
     """{busy, reasons[], idle_s}: whether Caroline is in use, for the updaters of every platform (app/update_activity.py)."""
-    from app.continuous_dialogue import is_enabled as continuous_dialogue_enabled
-    from app.update_activity import snapshot
-    return JSONResponse({"ok": True, **snapshot(list(sessions.values()), WORKSPACE_DIR, continuous_dialogue_enabled(WORKSPACE_DIR))})
+    return JSONResponse({"ok": True, **_update_activity()})
+
+
+def _update_body() -> dict[str, Any]:
+    activity = _update_activity()
+    return {"ok": True, **update_service.status(), **activity, "action": update_service.action(activity["busy"])}
+
+
+@app.get("/api/update/status")
+async def get_update_status() -> JSONResponse:
+    """The update client's state and what the platform does with it now (`action`: install | ask | none), app/update_service.py."""
+    return JSONResponse(_update_body())
+
+
+@app.post("/api/update/check")
+async def post_update_check() -> JSONResponse:
+    """Looks for a release now (and downloads it); the same answer as /api/update/status."""
+    await asyncio.to_thread(update_service.run_once)
+    return JSONResponse(_update_body())
+
+
+@app.post("/api/update/confirm")
+async def post_update_confirm() -> JSONResponse:
+    """The owner said yes to an update while Caroline was in use: the platform may install it now."""
+    update_service.confirm()
+    return JSONResponse(_update_body())
+
+
+@app.post("/api/update/installing")
+async def post_update_installing() -> JSONResponse:
+    """The platform is about to start the install (Caroline restarts): the verified file is spent."""
+    update_service.mark_installed()
+    return JSONResponse(_update_body())
 
 
 class MessageBody(BaseModel):
