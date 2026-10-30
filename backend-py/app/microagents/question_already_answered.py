@@ -64,7 +64,10 @@ _PROMPT = (
     "already_answered=false and leave answer empty.\n\n"
     "If it matches, set already_answered=true and write `answer` as one short, plain sentence stating "
     "exactly what the user already decided/said -- in your own words is fine, but it must accurately reflect "
-    "what they actually said, never an inference or a guess beyond it.\n\n"
+    "what they actually said, never an inference or a guess beyond it. Also copy, character for character, "
+    "the question sentence itself from the message into `question` (it must contain the question mark) and "
+    "the user's own earlier words that answered it from the dialogue into `user_answer`. A match without "
+    "both exact quotes is discarded.\n\n"
     "Decide using ONLY what is actually said in the dialogue below -- never guess or assume.\n\n"
     "RECENT DIALOGUE (oldest first, last line is the newest):\n{recent_dialogue}\n\n"
     "MESSAGE ABOUT TO BE SENT:\n---\n{final_text}\n---\n\n"
@@ -74,6 +77,28 @@ _PROMPT = (
 
 def prompt_already_answered(input: Any, context: Any) -> str:
     return _PROMPT.format(recent_dialogue=input.get("recent_dialogue") or "(empty)", final_text=input["final_text"])
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").split()).casefold()
+
+
+def unconfirmed_reason(output: dict, final_text: str, recent_dialogue: str) -> Optional[str]:
+    """2026-10-30, after a real incident: the nano model judged a finished report (100 outgoing emails sorted
+    by grant, no question in it at all) "already answered" -- by the request to check the mail -- and the
+    whole report was hidden; almost all of the 23 hits since 2026-10-26 were reports and status lines like
+    that. A match now stands only when both quotes are really there: a question with a question mark from
+    the message, and the user's answer from the dialogue. Returns why a claimed match is discarded, None
+    when it is confirmed."""
+    question = _norm(output.get("question") or "")
+    user_answer = _norm(output.get("user_answer") or "")
+    if "?" not in question:
+        return "no question quoted"
+    if question not in _norm(final_text):
+        return "quoted question is not in the message"
+    if not user_answer or user_answer not in _norm(recent_dialogue):
+        return "quoted answer is not in the dialogue"
+    return None
 
 
 def verify_already_answered(input: Any, output: Any) -> Optional[str]:
@@ -93,7 +118,8 @@ def llm_agents() -> List["M.Agent"]:
             "the model the answer instead of asking again.",
             input_schema=_object({"recent_dialogue": _STRING, "final_text": _STRING}, required=["final_text"]),
             output_schema=_object(
-                {"already_answered": {"type": "boolean"}, "answer": _STRING}, required=["already_answered", "answer"],
+                {"already_answered": {"type": "boolean"}, "answer": _STRING, "question": _STRING, "user_answer": _STRING},
+                required=["already_answered", "answer"],
             ),
             build_prompt=prompt_already_answered, verify=verify_already_answered,
         ),

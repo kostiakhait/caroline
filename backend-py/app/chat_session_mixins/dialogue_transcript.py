@@ -3,6 +3,22 @@ from __future__ import annotations
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
 
 DELIVERY_CORRECTION_COOLDOWN_S = 300.0
+# What is left of a message after its repeated question is cut is shown only when it says something on its own.
+MIN_REMAINDER_CHARS = 40
+
+
+def _cut_question(text: str, question: str) -> str:
+    """The message without its already answered question (2026-10-30); "" when what is left is too short to show.
+    The question is matched the way unconfirmed_reason matched it: any whitespace, any case."""
+    import re
+
+    words = question.split()
+    if not words:
+        return ""
+    pattern = re.compile(r"\s+".join(re.escape(w) for w in words), re.IGNORECASE)
+    remainder = pattern.sub("", text, count=1)
+    remainder = re.sub(r"\n{3,}", "\n\n", remainder).strip()
+    return remainder if len(remainder) >= MIN_REMAINDER_CHARS else ""
 
 
 class DialogueTranscriptMixin:
@@ -270,8 +286,13 @@ class DialogueTranscriptMixin:
             # BEFORE delivery-completeness (and suppresses it if it fires):
             # a message about to be hidden from the user has nothing worth
             # checking for completeness.
-            if not is_silent and await self._check_question_already_answered(text):
-                is_silent = True
+            if not is_silent:
+                remainder = await self._check_question_already_answered(text)
+                if remainder == "":
+                    is_silent = True
+                elif remainder:
+                    text = remainder
+                    block["text"] = text
             # Per explicit instruction (2026-10-18), after a real incident:
             # also check that THIS message actually delivers everything it
             # claims to -- see _check_delivery_completeness's own docstring.
@@ -299,7 +320,7 @@ class DialogueTranscriptMixin:
         return wire
     # edition:end
     # edition:cut claude-session code no longer reached
-    async def _check_question_already_answered(self, final_text: str) -> bool:
+    async def _check_question_already_answered(self, final_text: str) -> str | None:
         """Per explicit instruction (2026-10-20), after a real incident:
         Caroline asked which Facebook account to connect, the user
         answered, and when they later said "go ahead", she asked the exact
@@ -319,7 +340,13 @@ class DialogueTranscriptMixin:
         _on_permission_block_checked already uses, so the model picks the
         turn back up with the answer in hand instead of just going silent.
 
-        Fail-open on any error: False (never already answered) -- an
+        2026-10-30, after a real incident (a finished mail report hidden
+        whole, and the model then answered the note with [[NO_UPDATE]],
+        believing the report was out): only the quoted question is cut. Returns
+        None when nothing is suppressed, otherwise the text still to deliver
+        -- "" when nothing worth showing is left, and the message is dropped.
+
+        Fail-open on any error: None (never already answered) -- an
         infrastructure hiccup must never itself suppress a real question
         the user hasn't actually answered yet."""
         from app.plugins.voice_api import check_question_already_answered
@@ -329,17 +356,28 @@ class DialogueTranscriptMixin:
             result = await check_question_already_answered(final_text, dialogue)
         except Exception as exc:
             log_event("engine", "check_question_already_answered_failed", tab_id=self.tab_id, error=str(exc))
-            return False
+            return None
         if result is None or not result["already_answered"]:
-            return False
+            return None
         answer = result["answer"]
-        log_event("engine", "question_already_answered_suppressed", tab_id=self.tab_id, answer=answer, suppressed_text=final_text)
-        self.inject_proactive(
-            f"[Internal: you just started to ask the user a question they already answered earlier in this "
-            f"conversation -- {answer} That question was suppressed, the user never saw it. Proceed using "
-            f"that answer now; do not ask it again.]"
+        remainder = _cut_question(final_text, result.get("question") or "")
+        log_event(
+            "engine", "question_already_answered_suppressed", tab_id=self.tab_id, answer=answer,
+            suppressed_text=final_text, delivered_text=remainder,
         )
-        return True
+        if remainder:
+            self.inject_proactive(
+                f"[Internal: your last message repeated a question the user already answered earlier in this "
+                f"conversation -- {answer} Only that question was cut; the rest of the message reached the user. "
+                f"Proceed using that answer now; do not ask it again.]"
+            )
+        else:
+            self.inject_proactive(
+                f"[Internal: you just started to ask the user a question they already answered earlier in this "
+                f"conversation -- {answer} That message was suppressed, the user never saw it. Proceed using "
+                f"that answer now; do not ask it again.]"
+            )
+        return remainder
     async def _check_delivery_completeness(self, final_text: str) -> None:
         """Per explicit instruction (2026-10-18), after a real incident:
         Caroline narrated having shown the user a Chinese email draft for

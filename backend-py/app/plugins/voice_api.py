@@ -1025,11 +1025,14 @@ async def check_question_already_answered(final_text: str, recent_dialogue: str)
     dialogue_transcript.py on EVERY outbound text block, same pipeline
     check_delivery_completeness runs on.
 
-    Returns {"already_answered": bool, "answer": str}, or None on any
-    error/malformed response -- fail-open: the caller treats None as "not
-    already answered" (an infrastructure hiccup must never itself suppress
-    a real question the user hasn't actually answered yet)."""
-    from app.microagents.question_already_answered import ALREADY_ANSWERED
+    Returns {"already_answered": bool, "answer": str, "question": str}, or
+    None on any error/malformed response -- fail-open: the caller treats
+    None as "not already answered" (an infrastructure hiccup must never
+    itself suppress a real question the user hasn't actually answered yet).
+    A claimed match whose quotes are not really in the message and the
+    dialogue becomes "not already answered" here (2026-10-30, see
+    unconfirmed_reason)."""
+    from app.microagents.question_already_answered import ALREADY_ANSWERED, unconfirmed_reason
 
     try:
         result = await _run_local_microagent(
@@ -1046,7 +1049,15 @@ async def check_question_already_answered(final_text: str, recent_dialogue: str)
     if not isinstance(output, dict) or not isinstance(output.get("already_answered"), bool):
         log_event("plugin:voice", "check_question_already_answered_failed", reason="malformed")
         return None
-    return {"already_answered": output["already_answered"], "answer": str(output.get("answer") or "")}
+    if output["already_answered"]:
+        reason = unconfirmed_reason(output, final_text, recent_dialogue)
+        if reason:
+            log_event("plugin:voice", "question_already_answered_unconfirmed", reason=reason, answer=output.get("answer"))
+            return {"already_answered": False, "answer": "", "question": ""}
+    return {
+        "already_answered": output["already_answered"], "answer": str(output.get("answer") or ""),
+        "question": str(output.get("question") or ""),
+    }
 
 
 async def score_reaction(
