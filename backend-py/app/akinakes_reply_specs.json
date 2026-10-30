@@ -1,0 +1,10 @@
+{
+  "task.write_section": {
+    "payload_type": "result.section_draft",
+    "required": ["doc_id", "section_name", "content"]
+  },
+  "task.write_sections_batch": {
+    "payload_type": "result.article_draft",
+    "required": ["doc_id", "sections"]
+  }
+}

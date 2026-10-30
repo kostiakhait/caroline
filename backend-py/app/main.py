@@ -15,7 +15,7 @@ import mimetypes
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
@@ -73,6 +73,7 @@ from app.plugins.scheduler_plugin import BACKUP_KIND, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, transcribe_audio, voice_for_gender
+from app import akinakes_channel, akinakes_org_settings
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
@@ -560,6 +561,15 @@ async def _start_ratatosk_background_loops() -> None:
     asyncio.create_task(settings_mirror.run_forever(WORKSPACE_DIR))
     # The memory backup to Notes, by code, no model (app/vault_backup.py): restore after a login, then hourly.
     asyncio.create_task(vault_backup.run_forever(WORKSPACE_DIR))
+    # Agent Bus channel (akinakes): active only when BUS_URL and AGENT_UID are set. Role persona and the organization's
+    # settings are applied first so the first task already runs as that agent.
+    if akinakes_channel.load_config() is not None:
+        akinakes_org_settings.apply_persona_from_env(WORKSPACE_DIR)
+        try:
+            await _akinakes_before_task()
+        except Exception as exc:  # noqa: BLE001 -- applied again before every task
+            log_event("engine", "akinakes_org_settings_startup_failed", error=str(exc))
+        akinakes_channel.start_akinakes_channel(_inject_from_akinakes, _akinakes_before_task)
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _inject_from_ratatosk_owner_account, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
@@ -1110,6 +1120,47 @@ async def get_or_create_ratatosk_session() -> ChatSession:
     await session.start()
     _ratatosk_session = session
     return session
+
+
+def akinakes_tab_id(chain_id: str) -> str:
+    return f"akinakes-{chain_id}"
+
+
+def _akinakes_session_send_for(chain_id: str) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    async def _send(event: dict[str, Any]) -> None:
+        """`send` for one chain's headless session: nothing renders it. The only event that matters is a turn's
+        `result`: if the chain has no published result by then, akinakes_channel publishes system.skill_blocked."""
+        if event.get("type") != "sdk_message":
+            return
+        message = event.get("message") or {}
+        if message.get("type") == "result" and not event.get("wasInternalCheckReply"):
+            await akinakes_channel.on_turn_end(chain_id)
+    return _send
+
+
+async def get_or_create_akinakes_session(chain_id: str) -> ChatSession:
+    """One headless ChatSession per Agent Bus chainId, all sharing this agent's workspace (and so its memory).
+    Kept for the process lifetime: a later message of the same chain continues the same conversation."""
+    tab_id = akinakes_tab_id(chain_id)
+    existing = sessions.get(tab_id)
+    if existing is not None and not existing.ended:
+        return existing
+    session = ChatSession(tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=_akinakes_session_send_for(chain_id), headless=True)
+    sessions[tab_id] = session
+    await session.start()
+    return session
+
+
+def _inject_from_akinakes(chain_id: str, text: str) -> None:
+    async def _do() -> None:
+        session = await get_or_create_akinakes_session(chain_id)
+        session.inject_proactive(text)
+
+    asyncio.create_task(_do())
+
+
+async def _akinakes_before_task() -> None:
+    await akinakes_org_settings.apply_org_settings(WORKSPACE_DIR)
 
 
 def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
