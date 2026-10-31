@@ -8,15 +8,22 @@ agent reads each result of the turn whole -- a long one in parts, all in paralle
 bear on the statements sw.content.extract took out of the call. sw.content.grounding then judges the statements
 against those quotes.
 
-A quote counts only when it occurs in the part word for word (whitespace aside), and the code checks it
-(kept_quotes): a paraphrased or made-up passage is dropped, so nothing the agent says can turn into support that is
-not in the result. Dropped, not refused: on the second real run one part kept paraphrasing until the ladder gave
-up, and the whole check failed open -- the batch went out unchecked.
+A quote counts only when it occurs in the part word for word, and the code checks it (kept_quotes), so nothing
+the agent says can turn into support that is not in the result. Not refused by verify: on the second real run one
+part kept "paraphrasing" until the ladder gave up, and the whole check failed open -- the batch went out unchecked.
+Instead (2026-10-31, per explicit instruction) the caller asks once more with the misses named (input "rejected"),
+then keeps what matched and drops the rest, logging the dropped text. What counts as word for word (_norm) ignores
+what a model copying faithfully still changes: whitespace, case, typographic quotes and dashes, an ellipsis,
+Markdown emphasis, and the escapes of a JSON result -- the results are JSON text, a line break inside a string
+reads as backslash-n, and a correct quote across it could not match. readable() unwraps that JSON for the agent
+in the first place.
 
 Client-side only: run through the local microagent ladder."""
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 from typing import Any, List, Optional
 
@@ -51,7 +58,7 @@ _PROMPT = (
     "sentences, never paraphrased, never shortened inside. A statement the RESULT says nothing about gets no "
     "passage; most results bear on few statements or none.\n\n"
     "STATEMENTS:\n{statements}\n\n"
-    "RESULT of {tool}:\n{result}\n\n"
+    "RESULT of {tool}:\n{result}\n\n{rejected}"
     'Reply with a JSON object: {{"found": [{{"statement": <its number>, "quote": "<passage copied from the '
     'RESULT>"}}, ...]}} -- an empty list when the RESULT bears on none of them.'
 )
@@ -59,10 +66,55 @@ _PROMPT = (
 
 def prompt_result_facts(input: Any, context: Any) -> str:
     statements = "\n".join(f"{i}. {s}" for i, s in enumerate(input.get("statements") or [], 1))
-    return _PROMPT.format(statements=statements or "(none)", tool=input.get("tool") or "", result=input.get("result") or "")
+    rejected = "".join(f"- {q}\n" for q in input.get("rejected") or [])
+    if rejected:
+        rejected = ("Your previous answer gave these passages, and they are NOT in the RESULT word for word -- copy "
+                    "the real wording of the RESULT instead, or leave them out:\n" + rejected + "\n")
+    return _PROMPT.format(statements=statements or "(none)", tool=input.get("tool") or "", result=input.get("result") or "",
+                          rejected=rejected)
 
 
-def _squash(text: str) -> str:
+def readable(value: Any, _depth: int = 0) -> str:
+    """A tool result as text a model can quote from: JSON (or a Python literal) unwrapped into "key: value" lines,
+    nested JSON strings too, so a line break is a line break and not backslash-n. Anything else is left as it is."""
+    if _depth > 6:
+        return str(value)
+    if isinstance(value, dict):
+        return "\n".join(f"{k}: {readable(v, _depth + 1)}" for k, v in value.items())
+    if isinstance(value, list):
+        return "\n".join(readable(v, _depth + 1) for v in value)
+    if not isinstance(value, str):
+        return str(value)
+    text = value.strip()
+    if text[:1] in ("{", "[", '"'):
+        try:
+            parsed, end = json.JSONDecoder(strict=False).raw_decode(text)  # a raw line break in a string is fine
+        except ValueError:
+            try:
+                parsed, end = ast.literal_eval(text), len(text)
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                return value
+        if isinstance(parsed, (dict, list, str)) and parsed != text:
+            rest = text[end:].strip()
+            return readable(parsed, _depth + 1) + (("\n" + rest) if rest else "")
+    return value
+
+
+# A JSON escape as it reads in the text, and what a model copying it writes instead.
+_ESCAPES = {"\\n": " ", "\\r": " ", "\\t": " ", '\\"': '"', "\\'": "'", "\\/": "/", "\\\\": "\\"}
+_TYPOGRAPHY = str.maketrans({
+    "“": '"', "”": '"', "„": '"', "«": '"', "»": '"', "‘": "'", "’": "'",
+    "‚": "'", "′": "'", "–": "-", "—": "-", "−": "-", "‐": "-", "‑": "-",
+    " ": " ", " ": " ", "*": None, "_": None, "`": None,
+})
+
+
+def _norm(text: str) -> str:
+    """What "word for word" compares: see the module docstring."""
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+    for escape, plain in _ESCAPES.items():
+        text = text.replace(escape, plain)
+    text = text.translate(_TYPOGRAPHY).replace("…", "...")
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
@@ -79,12 +131,12 @@ def verify_result_facts(input: Any, output: Any) -> Optional[str]:
     return None
 
 
-def kept_quotes(input: Any, output: Any) -> tuple[list[str], int]:
-    """The quotes that really are in the part, and how many were dropped because they are not."""
-    result = _squash(str(input.get("result") or ""))
-    quotes = [str(item.get("quote") or "") for item in output.get("found") or []]
-    kept = [q for q in quotes if q.strip() and _squash(q) in result]
-    return kept, len(quotes) - len(kept)
+def kept_quotes(input: Any, output: Any) -> tuple[list[str], list[str]]:
+    """The quotes that really are in the part, and the ones that are not."""
+    result = _norm(str(input.get("result") or ""))
+    quotes = [str(item.get("quote") or "") for item in output.get("found") or [] if str(item.get("quote") or "").strip()]
+    kept = [q for q in quotes if _norm(q) in result]
+    return kept, [q for q in quotes if q not in kept]
 
 
 def llm_agents() -> List["M.Agent"]:
@@ -93,7 +145,8 @@ def llm_agents() -> List["M.Agent"]:
             RESULT_FACTS, "3",
             "Quotes, word for word, the passages of one tool result (or one part of it) that state the given "
             "statements or the data they are based on.",
-            input_schema=_object({"tool": _STRING, "result": _STRING, "statements": {"type": "array", "items": _STRING}}),
+            input_schema=_object({"tool": _STRING, "result": _STRING, "statements": {"type": "array", "items": _STRING},
+                                  "rejected": {"type": "array", "items": _STRING}}, ["tool", "result", "statements"]),
             output_schema=_object({"found": {"type": "array", "items": _object({"statement": {"type": "integer"}, "quote": _STRING})}}),
             build_prompt=prompt_result_facts, verify=verify_result_facts,
         ),

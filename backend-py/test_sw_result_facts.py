@@ -27,7 +27,7 @@ def test_only_word_for_word_quotes_are_kept():
     output = {"found": [{"statement": 1, "quote": "We deployed 40 capacitive sensors"},
                         {"statement": 1, "quote": "We used 40 sensors"}]}
     assert rf.verify_result_facts(given, output) is None  # a paraphrase is dropped, not refused
-    assert rf.kept_quotes(given, output) == (["We deployed 40 capacitive sensors"], 1)
+    assert rf.kept_quotes(given, output) == (["We deployed 40 capacitive sensors"], ["We used 40 sensors"])
     assert rf.verify_result_facts(given, {"found": []}) is None
     assert "statement" in rf.verify_result_facts(given, {"found": [{"statement": 2, "quote": "We deployed"}]})
 
@@ -100,3 +100,39 @@ def test_a_fact_no_result_states_is_invented(runtime):
         [('document_get({"doc_id": "d1"})', "A document about soil moisture, no place named.")], None,
     )
     assert not grounded and "Kisumu" in invented
+
+
+def test_a_faithful_copy_matches_despite_escapes_and_typography():
+    # The result as it reaches the check: JSON text, its line break an escape, plain quotes and a hyphen.
+    given = {"statements": ["x"], "result": '{"text": "The plots \\"North-1\\" and\nSouth used 40 sensors..."}'}
+    output = {"found": [{"statement": 1, "quote": "The plots «North–1» and South used **40** sensors…"}]}
+    assert rf.kept_quotes(given, output) == (["The plots «North–1» and South used **40** sensors…"], [])
+
+
+def test_readable_unwraps_json_and_keeps_the_rest():
+    raw = '{"status": "done", "result": {"text": "{\\"title\\": \\"Methods\\", \\"body\\": \\"Line one.\\nLine two.\\"}"}}\n[Memory: save it]'
+    text = rf.readable(raw)
+    assert "Line one.\nLine two." in text and "title: Methods" in text and text.endswith("[Memory: save it]")
+    assert rf.readable("plain text, not JSON") == "plain text, not JSON"
+    assert rf.readable("{broken json") == "{broken json"
+
+
+def test_a_missed_quote_gets_one_more_try_with_the_miss_named(runtime, monkeypatch):
+    real_run = FakeRuntime.run
+    tries = []
+
+    def paraphrase_first(self, name, agent_input, context):
+        if name == rf.RESULT_FACTS and "Kisumu" in agent_input["result"]:
+            tries.append(list(agent_input.get("rejected") or []))
+            quote = "sensors went to Kisumu" if len(tries) == 1 else "on 20 maize plots in Kisumu county"
+            return {"status": "ok", "output": {"found": [{"statement": 1, "quote": quote}]}}
+        return real_run(self, name, agent_input, context)
+
+    monkeypatch.setattr(FakeRuntime, "run", paraphrase_first)
+    grounded, invented = sme._content_grounded(
+        "write the Introduction", "akinakes_publish_result", {"content": "Sensors were deployed in Kisumu county."},
+        [('document_get({"doc_id": "d1"})', "We deployed 40 sensors on 20 maize plots in Kisumu county.")], None,
+    )
+    assert tries == [[], ["sensors went to Kisumu"]]
+    assert "the RESULT word for word" in rf.prompt_result_facts({"statements": ["x"], "result": "r", "rejected": ["q"]}, None)
+    assert grounded and invented == ""

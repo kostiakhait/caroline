@@ -2658,21 +2658,38 @@ def _content_grounded(task: str, tool_name: str, args: dict[str, Any], results: 
             gives nothing; None (the check fails open) only when no part could be read at all."""
             inputs = [{"tool": label, "result": part, "statements": facts}
                       for label, result in results for part in sw_result_facts.parts(result) if part.strip()]
+            def read(given: dict[str, Any]) -> tuple[list[str], list[str]] | None:
+                # A quote not in the part word for word gets one more try, named (2026-10-31, per explicit
+                # instruction); what still does not match is dropped, the matched quotes of both tries kept.
+                out = run(sw_result_facts, sw_result_facts.RESULT_FACTS, given)
+                if out is None:
+                    return None
+                kept, missed = sw_result_facts.kept_quotes(given, out)
+                if missed:
+                    again = run(sw_result_facts, sw_result_facts.RESULT_FACTS, {**given, "rejected": missed})
+                    if again is not None:
+                        more, missed = sw_result_facts.kept_quotes(given, again)
+                        kept += [q for q in more if q not in kept]
+                return kept, missed
+
             with ThreadPoolExecutor(max_workers=GROUNDING_WORKERS) as pool:
-                found = list(pool.map(lambda given: run(sw_result_facts, sw_result_facts.RESULT_FACTS, given), inputs))
+                found = list(pool.map(read, inputs))
             failed = sum(out is None for out in found)
             if inputs and failed == len(inputs):
                 return None
             lines: list[str] = []
-            dropped = 0
+            dropped: list[str] = []
             for given, out in zip(inputs, found):
                 if out is None:
                     continue
-                kept, lost = sw_result_facts.kept_quotes(given, out)
-                dropped += lost
+                kept, missed = out
+                dropped += missed
                 lines += [f"- {given['tool']} says: {quote}" for quote in kept]
             log_event("engine", "sw_result_facts", tab_id=tab_id, tool=tool_name, results=len(results), parts=len(inputs),
-                      failed=failed, quotes=len(lines), dropped=dropped)
+                      failed=failed, quotes=len(lines), dropped=len(dropped))
+            if dropped:
+                log_event("engine", "sw_result_facts_dropped", tab_id=tab_id, tool=tool_name,
+                          quotes=[q[:300] for q in dropped[:10]])
             return list(dict.fromkeys(lines))
 
         def judge_facts() -> list[str] | None:
@@ -3479,7 +3496,9 @@ async def run_small_model_turn(
             tier_trace.append(_trace_line(evt.get("name"), args, evt.get("result", "")))
             tracker.recent_calls.append(_trace_line(evt.get("name"), args, str(evt.get("result", ""))[:200]))
             del tracker.recent_calls[:-20]
-            tracker.call_results.append((f"{evt.get('name')}({args})", str(evt.get("result", ""))))
+            # Readable, not the raw JSON text: what sw.result.facts quotes from (see its own docstring).
+            from app.microagents.sw_result_facts import readable
+            tracker.call_results.append((f"{evt.get('name')}({args})", readable(evt.get("result", ""))))
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
             if ESCALATION_SENTINEL not in text:
