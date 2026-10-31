@@ -110,3 +110,4 @@ def test_task_text_names_the_chain_and_the_expected_reply():
     text = ch.render_task_text(task("c9", "task.write_sections_batch"))
     assert 'chainId="c9"' in text
     assert 'payload_type="result.article_draft"' in text and "doc_id, sections" in text
+    assert "not found" in text and "report it blocked at once" in text

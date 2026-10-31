@@ -351,7 +351,7 @@ def _build_group_tools_server(plugins: list[Plugin]) -> McpServerConfig:
         if refusal:
             log_event("engine", "tool_groups_call_refused", tool=name, reason=refusal[:200])
             return reply(refusal, error=True)
-        plugin, plugin_tool = tool_groups.find_tool(plugins, name)  # type: ignore[misc]
+        plugin, plugin_tool = tool_groups.find_callable_tool(plugins, name)  # type: ignore[misc]
         if name not in wrapped:
             wrapped[name] = wrap_tool(plugin.name, plugin_tool)
         return await wrapped[name].handler(inner)

@@ -1298,6 +1298,9 @@ class _TurnTracker:
     # user's words) and the latest calls of the turn, for the same check.
     task_text: str = ""
     recent_calls: list[str] = field(default_factory=list)
+    # Every call of the turn with its whole result, for sw.result.facts (2026-10-31): recent_calls cuts each
+    # result to 200 chars, and a document_get showed the id and title but not the text the facts came from.
+    call_results: list[tuple[str, str]] = field(default_factory=list)
 
     def touch_progress(self) -> None:
         self.last_progress_at = time.monotonic()
@@ -1723,7 +1726,7 @@ def _make_executor_fn(
                         f"Use the same one ({use_account}) -- an answer goes out from the identity that received the "
                         "message -- unless the task itself says to act as the other."
                     )
-            grounded, invented = _content_grounded(task_text, name, args, list(tracker.recent_calls), tab_id)
+            grounded, invented = _content_grounded(task_text, name, args, list(tracker.call_results), tab_id)
             if not grounded:
                 return (
                     f"NOT DONE: the content of this {name} call states things the task and your results do not "
@@ -2602,13 +2605,22 @@ def _account_consistent(task: str, tool_name: str, args: dict[str, Any], calls: 
     return consistent, use, why
 
 
-def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: list[str], tab_id: str | None) -> tuple[bool, str]:
+# How many microagent calls of one content-grounding check run at once (the parts of the call, the parts of the
+# turn's results).
+GROUNDING_WORKERS = 8
+
+
+def _content_grounded(task: str, tool_name: str, args: dict[str, Any], results: list[tuple[str, str]], tab_id: str | None) -> tuple[bool, str]:
     """The content-grounding check, run synchronously on the tool-call worker thread for the
     changing call just checked by sw.action.scope: sw.content.extract takes the statements
-    of fact out of what the call writes or sends, sw.content.grounding judges that list.
-    Fail-open (logged)."""
+    of fact out of what the call writes or sends, sw.result.facts quotes what the turn's
+    results say about them, sw.content.grounding judges the statements against the quotes.
+    Nothing is cut (2026-10-31): the call and every result are read whole, a long one in
+    parts, in parallel. Fail-open (logged)."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from app.microagent_client import build_local_runtime, new_budget
-    from app.microagents import sw_content_extract, sw_content_grounding
+    from app.microagents import sw_content_extract, sw_content_grounding, sw_result_facts
 
     shown = {k: v for k, v in (args or {}).items() if k not in ("password", "imapHost", "imapPort", "smtpHost", "smtpPort")}
     started = time.monotonic()
@@ -2629,20 +2641,38 @@ def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: li
         return (result or {}).get("output") or {}
 
     try:
-        extracted = run(sw_content_extract, sw_content_extract.CONTENT_EXTRACT, {
-            "tool": tool_name, "args": json.dumps(shown, ensure_ascii=False, default=str)[:6000],
-        })
-        facts = [str(f) for f in (extracted or {}).get("facts") or []]
-        requests = [str(r) for r in (extracted or {}).get("requests") or []][:8]
+        call_parts = sw_result_facts.parts(json.dumps(shown, ensure_ascii=False, default=str))
+        with ThreadPoolExecutor(max_workers=GROUNDING_WORKERS) as pool:
+            extracted = list(pool.map(lambda part: run(sw_content_extract, sw_content_extract.CONTENT_EXTRACT, {
+                "tool": tool_name, "args": part,
+            }), call_parts))
+        facts = list(dict.fromkeys(str(f) for out in extracted for f in (out or {}).get("facts") or []))
+        requests = list(dict.fromkeys(str(r) for out in extracted for r in (out or {}).get("requests") or []))[:8]
         if not facts and not requests:
             log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=True, facts=0,
                       ms=int((time.monotonic() - started) * 1000))
             return True, ""
 
+        def quotes() -> list[str] | None:
+            """What the turn's results say about the facts, quoted; None when a part could not be read."""
+            jobs = [(label, part) for label, result in results for part in sw_result_facts.parts(result) if part.strip()]
+            with ThreadPoolExecutor(max_workers=GROUNDING_WORKERS) as pool:
+                found = list(pool.map(lambda job: run(sw_result_facts, sw_result_facts.RESULT_FACTS, {
+                    "tool": job[0], "result": job[1], "statements": facts,
+                }), jobs))
+            if any(out is None for out in found):
+                return None
+            lines = [f"- {label} says: {item['quote']}" for (label, _), out in zip(jobs, found) for item in out.get("found") or []]
+            log_event("engine", "sw_result_facts", tab_id=tab_id, tool=tool_name, results=len(results), parts=len(jobs), quotes=len(lines))
+            return list(dict.fromkeys(lines))
+
         def judge_facts() -> list[str] | None:
             if not facts:
                 return []
-            judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": calls[-15:]})
+            quoted = quotes()
+            if quoted is None:
+                return None
+            judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": quoted})
             if judged is None or sw_content_grounding.verify_content_grounding({}, judged) is not None:
                 return None
             return [str(x) for x in judged["invented"]]
@@ -3440,6 +3470,7 @@ async def run_small_model_turn(
             tier_trace.append(_trace_line(evt.get("name"), args, evt.get("result", "")))
             tracker.recent_calls.append(_trace_line(evt.get("name"), args, str(evt.get("result", ""))[:200]))
             del tracker.recent_calls[:-20]
+            tracker.call_results.append((f"{evt.get('name')}({args})", str(evt.get("result", ""))))
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
             if ESCALATION_SENTINEL not in text:

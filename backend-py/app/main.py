@@ -1198,7 +1198,7 @@ async def get_or_create_ratatosk_session() -> ChatSession:
 
 
 def akinakes_tab_id(chain_id: str) -> str:
-    return f"akinakes-{chain_id}"
+    return f"{akinakes_channel.TAB_PREFIX}{chain_id}"
 
 
 def _akinakes_session_send_for(chain_id: str) -> Callable[[dict[str, Any]], Awaitable[None]]:
@@ -1223,6 +1223,7 @@ async def get_or_create_akinakes_session(chain_id: str) -> ChatSession:
     if not has_chat_mode(WORKSPACE_DIR, tab_id):
         save_chat_mode(WORKSPACE_DIR, tab_id, akinakes_channel.chat_mode())
     session = ChatSession(tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=_akinakes_session_send_for(chain_id), headless=True)
+    session.proactive_turns_are_tasks = True
     sessions[tab_id] = session
     await session.start()
     return session

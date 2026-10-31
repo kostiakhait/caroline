@@ -193,7 +193,7 @@ class SmallModelTurnMixin:
                     start_tier=start_tier, is_voice=is_voice,
                     history_messages=history_messages, history_summary=history_summary,
                     recorder=self._sw_turn_recorder,
-                    formalize_request=is_real_user,
+                    formalize_request=is_real_user or self.proactive_turns_are_tasks,
                     # Review of a tier's answer runs alongside its verification (_review_ahead);
                     # the voice narrator holds back meanwhile (_answer_being_checked).
                     on_candidate=(

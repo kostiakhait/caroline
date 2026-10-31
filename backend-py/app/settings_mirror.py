@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.akinakes_channel import TAB_PREFIX as AKINAKES_TAB_PREFIX
 from app.logging_setup import log_event
 
 SETTINGS_FOLDER = os.environ.get("CAROLINE_SETTINGS_FOLDER", "Caroline:Settings")
@@ -76,11 +77,15 @@ def vault_title(name: str) -> str:
 
 def _items(workspace_dir: str, extra_names: tuple[str, ...] = ()) -> list[Item]:
     """The fixed items, plus one per chat-mode-<tab>.json (a tab's engine choice), found on disk and, when
-    restoring, in the notes."""
+    restoring, in the notes. An akinakes chain's tab is left out both ways (2026-10-31, explicit instruction): an
+    agent makes one per bus task, and in the organization's account they would pile up and reach its other
+    machines (seen on the second real run: the owner's desktop tabs restored into the agent, its chains pushed)."""
     items = list(STATIC_ITEMS)
     seen = {i.name for i in items}
     names = [p.stem for p in sorted(Path(workspace_dir).glob("chat-mode-*.json"))] + list(extra_names)
     for name in names:
+        if name.startswith("chat-mode-" + AKINAKES_TAB_PREFIX):
+            continue
         if name.startswith("chat-mode-") and _SAFE_NAME.match(name) and name not in seen:
             seen.add(name)
             items.append(Item(name, f"{name}.json"))

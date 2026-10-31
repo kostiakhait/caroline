@@ -87,6 +87,18 @@ def find_tool(plugins: list[Any], name: str) -> tuple[Any, Any] | None:
     return None
 
 
+def find_callable_tool(plugins: list[Any], name: str) -> tuple[Any, Any] | None:
+    """(plugin, tool) of any tool call_tool can make: a grouped one, or one of an always-loaded plugin. The model
+    sometimes wraps a direct tool in call_tool too (2026-10-31, akinakes writer: call_tool("akinakes_publish_result")
+    was refused with "no tool in the groups", and the turn spent rounds finding out why); the call is the same."""
+    wanted = (name or "").strip()
+    for plugin in plugins:
+        for tool in plugin.tools:
+            if tool.name == wanted:
+                return plugin, tool
+    return None
+
+
 def list_tools_text(plugins: list[Any], group: str) -> str:
     plugin = find_group(plugins, group)
     if plugin is None:
@@ -130,7 +142,7 @@ def refusal_for_call(plugins: list[Any], name: str, args: Any) -> str | None:
     """A reason the call cannot be made (unknown tool, args not an object), written so the model can fix its next call; else None."""
     if not isinstance(args, dict):
         return 'call_tool needs "args": an object with the tool\'s parameters (use {} for a tool without parameters).'
-    if find_tool(plugins, name) is None:
+    if find_callable_tool(plugins, name) is None:
         return f'No tool "{name}" in the groups. Use list_groups, then list_tools(group) for the exact names.'
     # Missing parameters are NOT checked here: the schema lists every parameter as required, while the tools
     # fill in what they know themselves (a saved mailbox's password and servers, say) -- dispatch() reports

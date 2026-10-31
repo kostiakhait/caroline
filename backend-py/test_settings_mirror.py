@@ -113,6 +113,18 @@ def test_fresh_install_gets_everything_back(tmp_path, notes):
     assert read(new, "ratatosk-own-account.json")["password"] == "pw-3"
 
 
+def test_akinakes_chain_tabs_are_not_mirrored_either_way(tmp_path, notes):
+    write(tmp_path, "chat-mode-akinakes-c1.json", {"mode": "sw"})
+    write(tmp_path, "chat-mode-1.json", {"mode": "sw"})
+    run(sm.push_all(str(tmp_path)))
+    assert notes.writes == ["settings:chat-mode-1"]
+    run(notes_plugin.create_note("S", 'settings:chat-mode-akinakes-c2\n{"mode": "claude"}', folder=sm.SETTINGS_FOLDER))
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert run(sm.restore_missing(str(fresh)))["restored"] == ["chat-mode-1"]
+    assert not (fresh / "chat-mode-akinakes-c2.json").exists()
+
+
 def test_restore_never_overwrites_a_local_value_but_fills_gaps(tmp_path, notes):
     old, new = tmp_path / "old", tmp_path / "new"
     old.mkdir(), new.mkdir()

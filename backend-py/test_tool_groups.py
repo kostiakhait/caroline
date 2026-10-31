@@ -51,6 +51,8 @@ def test_refusal(plugins):
     assert tool_groups.refusal_for_call(plugins, "greet", {}) is None
     assert tool_groups.refusal_for_call(plugins, "greet", "x")
     assert tool_groups.refusal_for_call(plugins, "unknown", {})
+    # A direct (always-loaded) tool wrapped in call_tool is the same call, not an unknown tool.
+    assert tool_groups.refusal_for_call(plugins, "save", {}) is None
 
 
 def test_flat_switch(plugins, monkeypatch):

@@ -33,6 +33,8 @@ POLL_LIMIT = 10
 HEARTBEAT_S = 30
 ERROR_BACKOFF_S = 2.0
 DEFAULT_TTL_S = 600
+# Tab ids of the chains' sessions (main.akinakes_tab_id); settings_mirror leaves these tabs out.
+TAB_PREFIX = "akinakes-"
 
 InjectFn = Callable[[str, str], None]  # (chain_id, text)
 BeforeTaskFn = Callable[[], Awaitable[None]]
@@ -270,7 +272,9 @@ def render_task_text(msg: dict[str, Any]) -> str:
         f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         "Do the task with your tools. Finish by calling akinakes_publish_result with this exact chainId and "
         f"{expected_reply_text(task_type)}. If you cannot do it, call akinakes_report_blocked with the chainId and the "
-        "reason. Nobody reads this conversation, only the published result is delivered.]"
+        "reason. A document, section or other item of the task that Document Service reports as not found is such a "
+        "case: report it blocked at once, do not look for it anywhere else. Nobody reads this conversation, only the "
+        "published result is delivered.]"
     )
 
 

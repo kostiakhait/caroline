@@ -91,6 +91,12 @@ class ChatSession(
         # None for every ordinary user-facing tab (no bridging -- a real tab
         # already sees its own real dialogue directly).
         self.approval_bridge_tab_id = approval_bridge_tab_id
+        # A session whose proactive turns are tasks to do (2026-10-31): an akinakes chain, where a bus task arrives
+        # through inject_proactive(). Its turns are formalized like a real user's request, so the task text reaches
+        # the checks of changing calls (sw.action.scope, sw.content.grounding) and the tier advice. Without it the
+        # writer's sections went out with invented results unchecked (second real run). Off for every other session:
+        # a reminder or a messenger note is not the user's task.
+        self.proactive_turns_are_tasks = False
         # Per explicit instruction (2026-10-13): pure in-process, time-pruned
         # memory of this tab's own real user messages -- (epoch_ms, text)
         # pairs, appended once per genuinely-new real submit() (see that
