@@ -78,6 +78,8 @@ if [ ! -x "$APPIMAGETOOL" ]; then
     chmod +x "$APPIMAGETOOL"
 fi
 
+# npm leaves some files 0744 (owner-only execute); the AppImage is run by other users, and appimagetool refuses such an AppDir
+chmod -R a+rX "$APPDIR"
 echo "--- running appimagetool ---"
 mkdir -p "$OUTPUT_DIR"
 # Per docs/LINUX_PORT_PLAN.md's own test-box finding: FUSE is available on
