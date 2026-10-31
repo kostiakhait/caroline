@@ -148,6 +148,8 @@ class CompactionMixin:
             reason = "post_limit"
         elif self.last_forced_compaction_at is not None and now - self.last_forced_compaction_at < FORCED_COMPACTION_MIN_INTERVAL_MS / 1000:
             return
+        elif self._context_over_size_limit():
+            reason = "size"
         elif self.needs_startup_compaction:
             reason = "startup"
         elif self.last_forced_compaction_at is None or now - self.last_forced_compaction_at >= FORCED_COMPACTION_HOURLY_MS / 1000:
@@ -162,7 +164,7 @@ class CompactionMixin:
         if reason is None:
             return
 
-        # Nothing to compact -> don't (except "growth", which by definition
+        # Nothing to compact -> don't (except "growth" and "size", which by definition
         # already measured real growth). Measured live: every hourly/startup
         # compaction on an idle tab ran with 3.5K-7K tokens in context and
         # came out the same size, yet each one still cost a full transcript
@@ -171,7 +173,7 @@ class CompactionMixin:
         # transcript itself (read_last_context_tokens) -- a fresh process
         # has no usage report yet, which is precisely when the startup
         # compaction fires. Unknown (None) keeps the old behavior: compact.
-        if reason != "growth":
+        if reason not in ("growth", "size"):
             context_tokens = self.last_known_context_tokens
             if context_tokens is None:
                 try:
@@ -197,7 +199,7 @@ class CompactionMixin:
         # runs on a later tick, once that turn is over (turn_pending gates
         # this whole method). Not for "startup" (nothing was learned in this
         # process yet) nor "post_limit" (the turn would hit the cap again).
-        if reason in ("hourly", "growth") and memory_nudge.has_unsaved_work(self.tab_id) and not self._memory_flushed_for_compaction:
+        if reason in ("hourly", "growth", "size") and memory_nudge.has_unsaved_work(self.tab_id) and not self._memory_flushed_for_compaction:
             self._memory_flushed_for_compaction = True
             log_event("engine", "memory_flush_before_compaction", tab_id=self.tab_id, reason=reason)
             from app import action_ledger
@@ -230,6 +232,11 @@ class CompactionMixin:
             return
         self.forced_compaction_result_pending = True
         asyncio.create_task(self._run_forced_compaction())     # a strong model, with the summarization instruction
+    def _context_over_size_limit(self) -> bool:
+        tokens, baseline = self.last_known_context_tokens, self.tokens_at_last_forced_compaction
+        if tokens is None or tokens < FORCED_COMPACTION_SIZE_TOKENS:
+            return False
+        return baseline is None or tokens - baseline >= FORCED_COMPACTION_SIZE_MIN_GROWTH_TOKENS
     def _check_compaction_stuck(self) -> None:
         """Per explicit instruction (2026-10-19), after a real incident:
         the CLI's own native "/compact" can simply never finish -- confirmed

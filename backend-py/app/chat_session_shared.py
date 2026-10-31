@@ -677,6 +677,12 @@ FORCED_COMPACTION_LIMIT_PAUSE_MS = 30 * 60_000
 # that did real work started at 52K-99K. This sits clearly between the two.
 # Own choice of value, not a specified one.
 FORCED_COMPACTION_MIN_CONTEXT_TOKENS = 150_000   # raised from 20 000 (2026-10-26): compacting a small context saves nothing and loses state
+# Per explicit instruction (2026-10-30): the context is compacted once it is this large, at the first idle moment, and not
+# only on the hour or after 400k of growth. Every model call re-reads the whole context (a tab reached 270k within hours),
+# and an idle moment right after a turn is also when the cache is still warm and the compaction's own read is cheapest.
+# Needs SIZE_MIN_GROWTH_TOKENS of growth since the last compaction, so a summary that is itself large cannot loop.
+FORCED_COMPACTION_SIZE_TOKENS = 170_000
+FORCED_COMPACTION_SIZE_MIN_GROWTH_TOKENS = 40_000
 # Fallback-compaction threshold (2026-10-17): native/forced compaction (the
 # "/compact" sent above) is confirmed to sometimes achieve only a weak
 # reduction (observed live: ~14%, once even negative) on a badly bloated
@@ -1936,6 +1942,8 @@ __all__ = [
     'FORCED_COMPACTION_MIN_INTERVAL_MS',
     'FORCED_COMPACTION_LIMIT_PAUSE_MS',
     'FORCED_COMPACTION_MIN_CONTEXT_TOKENS',
+    'FORCED_COMPACTION_SIZE_TOKENS',
+    'FORCED_COMPACTION_SIZE_MIN_GROWTH_TOKENS',
     'FALLBACK_COMPACTION_THRESHOLD_TOKENS',
     'AUTH_RETRY_ESCALATION_THRESHOLD',
     'CONTINUE_OR_SILENT_NUDGE_TEMPLATE',
