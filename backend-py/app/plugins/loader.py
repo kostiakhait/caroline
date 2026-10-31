@@ -21,6 +21,7 @@ logging or their own polling/cancellation plumbing.
 from __future__ import annotations
 
 import importlib
+import os
 import pkgutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -202,6 +203,7 @@ def discover_plugins() -> list[Plugin]:
     Called fresh on every query() build -- see this module's own doc
     comment for why that alone is enough for hot-plugging."""
     plugins: list[Plugin] = []
+    excluded = excluded_plugin_names()
     package_dir = Path(__file__).parent
     for module_info in pkgutil.iter_modules([str(package_dir)]):
         if module_info.name in ("loader",) or module_info.name.startswith("_"):
@@ -231,9 +233,20 @@ def discover_plugins() -> list[Plugin]:
         if plugin is None:
             log_event("engine", "plugin_skipped", module=module_info.name, reason="no PLUGIN object")
             continue
+        if plugin.name in excluded:
+            log_event("engine", "plugin_excluded", plugin=plugin.name)
+            continue
         plugins.append(plugin)
         log_event("engine", "plugin_loaded", plugin=plugin.name, tool_count=len(plugin.tools))
     return plugins
+
+
+def excluded_plugin_names() -> set[str]:
+    """Plugin names this deployment leaves out, from CAROLINE_EXCLUDED_PLUGINS (comma separated, plugin.name values).
+    Unset means nothing is left out, so the desktop app is unaffected. A headless deployment (the akinakes agent
+    containers) lists what cannot work without a display, e.g. "voice-playback,visual-models"."""
+    raw = os.environ.get("CAROLINE_EXCLUDED_PLUGINS", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
 
 
 def build_mcp_servers() -> dict[str, McpServerConfig]:
