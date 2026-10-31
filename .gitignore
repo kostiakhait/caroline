@@ -73,3 +73,4 @@ backend-py/test_roundtrip.py
 dist-linux/
 dist-intellicat/
 Claude outputs/
+dist_release/

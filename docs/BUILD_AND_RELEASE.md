@@ -80,6 +80,14 @@ older hash-compare path described there).
   runs before the shell starts and never fails the start (offline, no release or a bad file just
   leaves things as they are).
 
+* **`make deploy` is a release (2026-10-30).** In order: `release-version` (`tools/release.py next-version --write`: `backend-py/VERSION` := the
+  published version with the patch raised, or the owner's own higher VERSION; it refuses to guess when the published manifest cannot be read), the build,
+  `deploy-legacy` (the old Windows files `Caroline.zip`, `CarolineInstaller.exe`, which installed Windows copies still read), then `release-publish`: the
+  versioned Windows installer and payload, the `xopek` overlay (with `sw_service_keys_local.py`) and the `beroun` overlay (without it) are uploaded, and
+  `release.json` with its signature goes up last. The key is `RELEASE_KEY` (default `~/.caroline/release-signing.key`). `make release-stage` does everything
+  up to and including `release.py verify` in `dist_release/` and uploads nothing. The AppImage needs a Linux host: pass `APPIMAGE=path` (built for that same
+  version) to include `linux-x86_64`; without it the release has no entry for Linux. `VERSION` is changed in the working tree, not committed.
+
 ## Versioning notes
 
 * The app's own version is `backend-py/VERSION`; the Windows installer still compares the zip hash.

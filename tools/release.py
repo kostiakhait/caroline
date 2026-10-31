@@ -13,6 +13,11 @@
       Makes the code-layer artifact (the platforms `xopek` and `beroun`) from a dist: `make dist-linux` for xopek, `make dist-intellicat` for beroun. Only the
       paths the update owns (backend-py/app, wwwroot, ...); what is built is exactly what app/overlay_install.py applies.
 
+  release.py next-version [--base-url URL] [--write]
+      The version the next release has: the published one with the patch number raised, or backend-py/VERSION when the owner has already put it
+      ahead of the published one. `make deploy` runs it with --write BEFORE the build, so the build carries the version it is released under.
+      Refuses to guess when the published manifest cannot be read.
+
   release.py verify DIR
       Checks DIR/release.json against its signature and the artifacts found next to it by name (the public key as built in, or
       CAROLINE_RELEASE_PUBLIC_KEY). Run it on the folder that was uploaded, or on what was downloaded.
@@ -26,6 +31,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import urllib.request
 from datetime import date
 from pathlib import Path
 
@@ -118,6 +124,24 @@ def cmd_overlay(args: argparse.Namespace) -> int:
     return 0
 
 
+VERSION_FILE = HERE.parent / "backend-py" / "VERSION"
+
+
+def cmd_next_version(args: argparse.Namespace) -> int:
+    local = VERSION_FILE.read_text(encoding="utf-8").strip()
+    try:
+        with urllib.request.urlopen(args.base_url.rstrip("/") + "/release.json", timeout=30) as response:
+            published = json.loads(response.read().decode("utf-8"))["version"]
+        have = rm.parse_version(published)
+    except Exception as exc:  # noqa: BLE001 -- a wrong guess would publish a version clients treat as old
+        raise SystemExit(f"cannot read the published version from {args.base_url}: {exc}. Pass the version by hand.")
+    nxt = local if rm.parse_version(local) > have else "%d.%d.%d" % (have[0], have[1], have[2] + 1)
+    if args.write and nxt != local:
+        VERSION_FILE.write_text(nxt + "\n", encoding="utf-8")
+    print(nxt)
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     folder = Path(args.dir)
     try:
@@ -151,10 +175,13 @@ def main() -> int:
     p = sub.add_parser("overlay")
     p.add_argument("dist")
     p.add_argument("out")
+    p = sub.add_parser("next-version")
+    p.add_argument("--base-url", default="https://downloader.multi-portal.org/apps/caroline")
+    p.add_argument("--write", action="store_true")
     p = sub.add_parser("verify")
     p.add_argument("dir")
     args = ap.parse_args()
-    return {"keygen": cmd_keygen, "build": cmd_build, "overlay": cmd_overlay, "verify": cmd_verify}[args.cmd](args)
+    return {"keygen": cmd_keygen, "build": cmd_build, "overlay": cmd_overlay, "next-version": cmd_next_version, "verify": cmd_verify}[args.cmd](args)
 
 
 if __name__ == "__main__":
