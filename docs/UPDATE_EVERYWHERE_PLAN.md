@@ -88,9 +88,10 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    `verify_manifest`, the shape rules, `is_newer` so a version never goes down, `artifact_for` with the `runtime` rule, `check_file` for the sha256 and the size) and `tools/release.py`
    (`keygen`, `build --artifact PLATFORM=PATH[,runtime=N]`, `verify`); `backend-py/test_release_manifest.py`, 8 tests, all pass, including the tool end to end. The tool is Python, not `release.sh`, so the
    maintainer's Windows machine runs it too. **The release key** was made on 2026-10-30 at `~/.caroline/release-signing.key` on the maintainer's machine (outside every repository; **to be backed up**, it
-   cannot be remade: every installed Caroline will hold its public half), and the public half is `RELEASE_PUBLIC_KEY` in `release_manifest.py`. **Left:** building every artifact from one commit
-   (the Windows installer and the Beroun zip here, the AppImage on Linux), the first real `release.json` and its upload to `downloader.multi-portal.org/apps/caroline/` next to the old files
-   (they stay until the installed Windows builds have the new updater, stage 3). The upload needs the maintainer's uploader token; it waits for stage 3 so that a release has something that reads it.
+   cannot be remade: every installed Caroline will hold its public half), and the public half is `RELEASE_PUBLIC_KEY` in `release_manifest.py`. **Published (2026-10-30): release 1.0.0 with all four platforms** (`windows`, `linux-x86_64`, `xopek`, `beroun`), built from one commit (99c9ba8), signed with the one key, at
+   `downloader.multi-portal.org/apps/caroline/` next to the old files (they stay: installed Windows builds read them). Names are versioned (`CarolineInstaller-1.0.0.exe`, `Caroline-1.0.0.zip`, `Caroline-1.0.0-x86_64.AppImage`,
+   `caroline-xopek-1.0.0.zip`, `caroline-beroun-1.0.0.zip`). The Xopek overlay carries `sw_service_keys_local.py` (it replaces the whole `app` folder); Beroun's does not (its keys come from `sitecustomize`).
+   Each platform was checked from outside with the repository's own client pretending to be 0.9.0 (see `docs/RELEASE_1_0_0_PLAN.md`).
 2. **Done (2026-10-30).** `backend-py/app/update_activity.py` and `GET /api/update/activity` → `{ok, busy, reasons, idle_s}` (loopback only, like the rest of the backend). Reasons: `turn:<tab>` (a turn is running in any
    session, headless and Agent Bus ones too), `task:<tab>:<n>` (a background task or agent still running, from `agent_registry`), `dialogue` (the continuous-dialogue switch is on **and** the owner was active in the last 30
    minutes: the switch alone can stay on for weeks, so it does not block for ever), `user` (the owner sent something in the last 10 minutes; headless sessions have no owner). No session at all, or all ended, is inactive.
@@ -110,8 +111,7 @@ firmware, the APK or the image catches up. Windows and Linux carry everything in
    **Windows:** `Windows/Caroline/Services/UpdateChecker.cs` is now thin: it asks `/api/update/status` every 30 s and does the one thing only Windows can: `install` → start the installer (`--silent-update`
    when nobody asked, visible when the owner chose "Update to X" in the tray) and exit; `ask` → the tray item and a line in every tab's status bar, **no dialog**; the tray click is the yes
    (`UpdateNowAsync` → `/api/update/confirm`). The MessageBox is gone, so is `InstallerFetcher.cs` (the backend downloads and verifies now). `dotnet build` of `Caroline.csproj`: 0 errors.
-   **Left for Windows:** (a) `CarolineInstaller` still takes `Caroline.zip` and its hash from the old unsigned `Caroline.zip.sha256` / `.version`; it should read the zip's hash from the signed manifest (add a
-   `windows-zip` entry) so the whole install, not only the installer, is covered by the signature; (b) the first release has to be published (stage 1, "Left") and the updater tried by hand on this machine
+   **Done later (659d258):** the installer takes the zip's name and hash from the signed manifest (`payload`), so the whole install is covered by the signature; the first release is published. **Left for Windows:** (b) the updater tried by hand on this machine
    (a 1.0.1 over an installed 1.0.0, in use and inactive); (c) the old files stay on the server until installed builds have this updater.
 4. **Done in the code (2026-10-30), tested against a fake backend on Windows, not tried on a real Linux AppImage.** `linux-shell/update_checker.py` is rewritten the same way as Windows': thin, no GTK in its core. `UpdateClient`
    polls `GET /api/update/status` every 30 s; `install` → copy the verified file beside the running AppImage, `os.replace` it (Linux lets a running file be replaced), tell the backend (`/api/update/installing`),
