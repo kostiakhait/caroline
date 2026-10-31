@@ -572,6 +572,14 @@ class DialogueTranscriptMixin:
             "session_id": None, "parent_tool_use_id": None,
         }
         await self.send({"type": "sdk_message", "message": wire, "isVoice": is_voice})
+    def _identical_note_queued(self, text: str) -> bool:
+        for item in self.queue:
+            if item.get("memory_advice_for") is not None:
+                continue
+            blocks = ((item.get("message") or {}).get("message") or {}).get("content")
+            if isinstance(blocks, list) and blocks and isinstance(blocks[-1], dict) and blocks[-1].get("text") == text:
+                return True
+        return False
     def _push_message(self, text: str, attachments: list[Any], is_voice: bool, memory_advice_for: str | None = None) -> None:
         """memory_advice_for: the user's own words, for a REAL user message -- _input_stream then glues the memory
         advisor's block to the message (app/memory_advisor.py)."""
@@ -587,6 +595,11 @@ class DialogueTranscriptMixin:
             content.extend(_attachment_to_blocks(attachment))
         if text:
             content.append({"type": "text", "text": text})
+        if memory_advice_for is None and text and not attachments and self._identical_note_queued(text):
+            # An internal note (a completion check, late memory facts, ...) that is already waiting for the model is
+            # not queued twice: each copy is a turn that re-reads the whole context.
+            log_event("engine", "internal_note_deduplicated", tab_id=self.tab_id, text_len=len(text))
+            return
         self.queue.append({
             "message": {"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": None},
             "is_voice": is_voice,
