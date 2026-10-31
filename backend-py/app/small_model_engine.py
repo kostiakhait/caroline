@@ -1918,6 +1918,11 @@ def _build_verification_prompt(
             "knowledge or from the conversation itself needs no tool"
             + (", and neither does a reply that only reports on, summarizes or refers to work the person was already "
                "shown." if recent_dialogue else ".")
+            + " But a reply that states steps the assistant itself will do next (\"дальше\", \"потом я\", \"следующий "
+            "шаг\", \"next I will\", \"I will then\") -- even beside a report of finished work, and even when the "
+            "person's own request is met -- is NOT finished: those steps were not done in this attempt. Escalate it "
+            "and name the steps. Only a step that needs the user's approval or answer first (sending, paying, "
+            "deleting, publishing) may stay unsaid-done."
         )
     elif not tier_trace and not tracker.branch_trace:
     # edition:end

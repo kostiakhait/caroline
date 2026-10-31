@@ -56,3 +56,44 @@ def test_a_failing_microagent_sends_nothing(monkeypatch):
     verdict(monkeypatch, RuntimeError("down"))
     run(tab)
     assert tab.injected == []
+
+
+def _fire(tab, monkeypatch):
+    seen = {}
+
+    async def fake_verdict(nudge, task, reply, trace):
+        seen["trace"] = trace
+
+    monkeypatch.setattr(tab, "_post_turn_microagent_verdict", fake_verdict, raising=False)
+    tab._post_turn_check_rounds = 0
+    tab.last_real_user_question = "task"
+    tab._turn_last_visible_text = "reply"
+    tab.turn_tool_outcomes = {"Bash": SimpleNamespace(name="Bash", is_error=False, result_preview="")}
+    tab._turn_outcomes_summary = lambda: ""
+
+    async def go():
+        tab._fire_post_turn_completion_check()
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    return seen["trace"]
+
+
+def test_a_turn_without_its_own_tool_calls_is_checked_with_an_empty_trace(monkeypatch):
+    tab = Tab()
+    tab._turn_tool_call_count = 0
+    assert _fire(tab, monkeypatch) == []
+
+
+def test_a_turn_with_tool_calls_keeps_the_trace(monkeypatch):
+    tab = Tab()
+    tab._turn_tool_call_count = 2
+    assert _fire(tab, monkeypatch) == ["- Bash -> ok"]
+
+
+def test_announced_next_steps_are_unfinished_work_for_the_verifier():
+    prompt = sme._build_verification_prompt(
+        sme._TurnTracker(), "Готово. Дальше проставлю дату.", True, [], False, False, "", claude_attempt=True,
+        recent_dialogue="x",
+    )
+    assert "NOT finished" in prompt and "next I will" in prompt

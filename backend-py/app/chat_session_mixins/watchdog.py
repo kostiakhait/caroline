@@ -165,6 +165,7 @@ class WatchdogMixin:
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
+                    self._turn_tool_call_count = getattr(self, "_turn_tool_call_count", 0) + 1
                     call_name, call_input = normalize_call(block.name, block.input)    # call_tool -> the real tool (app/tool_groups.py)
                     args_preview = json.dumps(call_input, ensure_ascii=False, default=str)[:120] if isinstance(call_input, dict) else str(call_input)[:120]
                     self._pending_tool_calls[block.id] = (call_name, args_preview)
@@ -286,7 +287,14 @@ class WatchdogMixin:
         # (small_model_engine.verify_claude_attempt), never by asking the main model -- that is a turn which re-reads
         # the whole context, and almost always answered [[NO_UPDATE]]. The model is told only when the microagent
         # finds the work unfinished. The values are taken now: the turn's state is reset right after this call.
-        trace = [f"- {o.name} -> {'ERROR (' + o.result_preview + ')' if o.is_error else 'ok'}" for o in self.turn_tool_outcomes.values()]
+        # The outcomes are scoped to the whole real-user episode, so a follow-up turn (a background result arriving) would
+        # carry the earlier turns' calls and hide that THIS reply did no work: with no call in this turn the trace is empty,
+        # which is what makes the verifier treat the reply's own announced next steps as not done (2026-10-31, live: "Дальше
+        # по плану: проставлю дату, подготовлю письмо" was passed as finished).
+        if getattr(self, "_turn_tool_call_count", 1) > 0:
+            trace = [f"- {o.name} -> {'ERROR (' + o.result_preview + ')' if o.is_error else 'ok'}" for o in self.turn_tool_outcomes.values()]
+        else:
+            trace = []
         asyncio.ensure_future(self._post_turn_microagent_verdict(
             nudge, (self.last_real_user_question or "").strip(), self._turn_last_visible_text or "", trace,
         ))

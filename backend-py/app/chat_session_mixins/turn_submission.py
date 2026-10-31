@@ -121,6 +121,7 @@ class TurnSubmissionMixin:
         if is_real_user or not self.turn_pending:
             self.pending_is_real_user = is_real_user
             self._turn_last_visible_text = None
+            self._turn_tool_call_count = 0
         # Same "only a genuinely new turn" guard as pending_is_real_user
         # just above -- see current_turn_suppress_narration's own __init__
         # comment for why this must never retroactively silence narration
