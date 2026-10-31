@@ -55,6 +55,8 @@ mkdir -p "$APPDIR"
 # needs no AppImage-specific changes to work inside the AppDir.
 cp -r "$INSTALL_ROOT/." "$APPDIR/"
 find "$APPDIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+# the downloaded appimagetool (HERE/.cache) is a build tool, not part of the app: it is 14 MB, and a second build in the same tree would ship it
+rm -rf "$APPDIR/linux-shell/.cache"
 
 cp "$HERE/AppRun" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"

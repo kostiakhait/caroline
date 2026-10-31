@@ -32,7 +32,7 @@ DEPLOY_PORT ?= 41981
 MODELS_DIR := $(SCRIPT_DIR)/art/models
 MODEL_FILES := CarolineA.xcfa CarolineB.xcfa PeterA.xcfa PeterB.xcfa
 
-.PHONY: deploy deploy-legacy upload deploy-models release-version release-stage release-publish
+.PHONY: deploy deploy-legacy upload deploy-models release-version appimage-wsl release-stage release-publish
 
 # --- Deploy (was deploy.bat) -------------------------------------------------
 #
@@ -67,14 +67,14 @@ MODEL_FILES := CarolineA.xcfa CarolineB.xcfa PeterA.xcfa PeterB.xcfa
 #   release-version  backend-py/VERSION := published version + 0.0.1 (or the owner's own higher VERSION)
 #   deploy-legacy    the old deploy: Caroline.zip(+.sha256,.version), CarolineInstaller.exe(+.sha256)
 #   release-publish  artifacts of every platform built here, then release.json and release.json.sig
-# The Linux AppImage needs a Linux host (make appimage-linux): pass APPIMAGE=path to include one built for this very
-# version; without it the manifest has no linux-x86_64 entry and those clients simply see nothing new.
+# The Linux AppImage is built in WSL (appimage-wsl; the runtime is provisioned once and cached). APPIMAGE=path takes one made elsewhere
+# for this very version, NO_APPIMAGE=1 leaves Linux out of the release.
 # The signing key stays outside the repository (RELEASE_KEY). `make release-stage` builds and verifies everything
 # without uploading anything.
 deploy:
-	$(MAKE) release-version
-	$(MAKE) deploy-legacy
-	$(MAKE) release-publish
+	"$(MAKE)" release-version
+	"$(MAKE)" deploy-legacy
+	"$(MAKE)" release-publish
 
 deploy-legacy: $(INSTALLER_OUT)/CarolineInstaller.exe $(INSTALLER_OUT)/CarolineInstaller.exe.sha256 upload
 
@@ -112,10 +112,21 @@ upload: $(UPLOADER_EXE)
 RELEASE_KEY ?= ~/.caroline/release-signing.key
 RELEASE_DIR := $(SCRIPT_DIR)/dist_release
 OVERLAY_RUNTIME ?= 1
+# An AppImage made elsewhere for this very version; empty: it is built in WSL (appimage-wsl). NO_APPIMAGE=1: none, the
+# release then has no linux-x86_64 entry.
 APPIMAGE ?=
+NO_APPIMAGE ?=
 
 release-version:
 	@$(PYTHON) "$(SCRIPT_DIR)/tools/release.py" next-version --write | sed 's/^/Releasing version /'
+
+# The AppImage in WSL (appimagetool is a Linux ELF): OUT is the file to make, as a Windows path. Only the code is copied each
+# time; the runtime is provisioned once and again when its definition changes (linux-shell/build_appimage_wsl.sh).
+# make appimage-wsl OUT=D:/somewhere/Caroline-1.0.1-x86_64.AppImage
+appimage-wsl: dist-linux
+	@test -n "$(OUT)" || { echo "usage: make appimage-wsl OUT=<path of the .AppImage to make>"; exit 1; }
+	@mkdir -p "$$(dirname "$(OUT)")"
+	MSYS_NO_PATHCONV=1 wsl.exe -e bash -lc 'bash "$$(wslpath -a "$(OUT_LINUX)")/linux-shell/build_appimage_wsl.sh" "$$(wslpath -a "$(OUT_LINUX)")" "$$(wslpath -a "$(OUT)")"'
 
 # Builds what the manifest names, signs it and checks the result, in $(RELEASE_DIR); uploads nothing. Names are
 # versioned. xopek is the overlay of the Linux tree WITH sw_service_keys_local.py (its desktops have no other source of
@@ -131,12 +142,17 @@ release-stage: dist-linux dist-intellicat $(INSTALLER_OUT)/CarolineInstaller.exe
 	rm -f "$(RELEASE_DIR)/_beroun_tree/backend-py/app/sw_service_keys_local.py" && \
 	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" overlay "$(RELEASE_DIR)/_beroun_tree" "$(RELEASE_DIR)/caroline-beroun-$$V.zip" && \
 	rm -rf "$(RELEASE_DIR)/_beroun_tree" && \
-	$(if $(APPIMAGE),cp "$(APPIMAGE)" "$(RELEASE_DIR)/" &&) \
+	LINUX_ART="" && \
+	if [ -n "$(APPIMAGE)" ]; then \
+	  cp "$(APPIMAGE)" "$(RELEASE_DIR)/" && LINUX_ART="$(RELEASE_DIR)/$(notdir $(APPIMAGE))"; \
+	elif [ "$(NO_APPIMAGE)" != "1" ]; then \
+	  "$(MAKE)" appimage-wsl OUT="$(RELEASE_DIR)/Caroline-$$V-x86_64.AppImage" && LINUX_ART="$(RELEASE_DIR)/Caroline-$$V-x86_64.AppImage"; \
+	fi && \
 	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" build --version "$$V" --key "$(RELEASE_KEY)" --out "$(RELEASE_DIR)" \
 	  --artifact "windows=$(RELEASE_DIR)/CarolineInstaller-$$V.exe,payload=$(RELEASE_DIR)/Caroline-$$V.zip" \
 	  --artifact "xopek=$(RELEASE_DIR)/caroline-xopek-$$V.zip,runtime=$(OVERLAY_RUNTIME)" \
 	  --artifact "beroun=$(RELEASE_DIR)/caroline-beroun-$$V.zip,runtime=$(OVERLAY_RUNTIME)" \
-	  $(if $(APPIMAGE),--artifact "linux-x86_64=$(RELEASE_DIR)/$(notdir $(APPIMAGE))") && \
+	  $${LINUX_ART:+--artifact "linux-x86_64=$$LINUX_ART"} && \
 	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" verify "$(RELEASE_DIR)"
 
 # Every artifact first, the manifest and its signature last: a client never sees a manifest whose files are missing.

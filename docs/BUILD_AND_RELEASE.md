@@ -85,8 +85,10 @@ older hash-compare path described there).
   `deploy-legacy` (the old Windows files `Caroline.zip`, `CarolineInstaller.exe`, which installed Windows copies still read), then `release-publish`: the
   versioned Windows installer and payload, the `xopek` overlay (with `sw_service_keys_local.py`) and the `beroun` overlay (without it) are uploaded, and
   `release.json` with its signature goes up last. The key is `RELEASE_KEY` (default `~/.caroline/release-signing.key`). `make release-stage` does everything
-  up to and including `release.py verify` in `dist_release/` and uploads nothing. The AppImage needs a Linux host: pass `APPIMAGE=path` (built for that same
-  version) to include `linux-x86_64`; without it the release has no entry for Linux. `VERSION` is changed in the working tree, not committed.
+  up to and including `release.py verify` in `dist_release/` and uploads nothing. The AppImage is built in WSL by `make appimage-wsl OUT=path` (`linux-shell/build_appimage_wsl.sh`): only the code is copied each time, the runtime
+  (Python with its packages, Chromium, codex, node, signal-cli, the sidecars' node_modules) is provisioned in `~/.intellicat/lin-build/appimage/root` once and again only
+  when `requirements-linux.txt`, `provision_runtime.sh` or a sidecar `package.json` changes (first build about 8 minutes, later ones about 2). `APPIMAGE=path` takes an
+  AppImage made elsewhere for that same version; `NO_APPIMAGE=1` leaves `linux-x86_64` out of the release. `VERSION` is changed in the working tree, not committed.
 
 ## Versioning notes
 
