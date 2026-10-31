@@ -44,7 +44,9 @@ def test_list_and_describe(plugins):
     assert "No tool group" in tool_groups.list_tools_text(plugins, "nope")
     d = tool_groups.describe_tool_text(plugins, "greet")
     assert "Be polite." in d and "call_tool" in d
-    assert "No tool" in tool_groups.describe_tool_text(plugins, "save")  # always-loaded: not behind the groups
+    # always-loaded: not behind the groups, but still described (as a direct tool)
+    assert "call it directly" in tool_groups.describe_tool_text(plugins, "save")
+    assert "No tool" in tool_groups.describe_tool_text(plugins, "nope")
 
 
 def test_refusal(plugins):

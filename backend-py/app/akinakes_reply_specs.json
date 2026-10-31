@@ -1,74 +1,93 @@
 {
   "task.write_section": {
-    "replies": [{"payload_type": "result.section_draft", "required": ["doc_id", "section_name", "content"]}]
+    "replies": [
+      {"payload_type": "result.section_draft", "required": ["doc_id", "section_name", "content"], "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "section_name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["doc_id", "section_name", "content"]}}
+    ]
   },
   "task.write_sections_batch": {
-    "replies": [{"payload_type": "result.article_draft", "required": ["doc_id", "sections"]}]
+    "replies": [
+      {"payload_type": "result.article_draft", "required": ["doc_id", "sections"], "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "sections": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["name", "content"]}}}, "required": ["doc_id", "sections"]}}
+    ]
   },
-
   "task.edit_section": {
     "replies": [
-      {"payload_type": "result.edit_section_done", "required": ["doc_id", "section_id", "section_address"],
-       "when": "the task names the section by section_address: apply the edit_instruction to that section in Document Service (document_patch_section)"},
-      {"payload_type": "result.edit_proposed", "required": ["doc_id", "section_id", "edit_id", "content"],
-       "when": "the task gives section_id and content: post the improved text as an edit suggestion (document_propose_edit)"}
+      {"payload_type": "result.edit_section_done", "required": ["doc_id", "section_id", "section_address"], "when": "the task names the section by section_address: apply the edit_instruction to that section in Document Service (document_patch_section)"},
+      {"payload_type": "result.edit_proposed", "required": ["doc_id", "section_id", "edit_id", "content"], "when": "the task gives section_id and content: post the improved text as an edit suggestion (document_propose_edit)", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "section_id": {"type": "string", "minLength": 1}, "edit_id": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["doc_id", "section_id", "edit_id", "content"]}}
     ],
     "blocked": {"payload_type": "result.edit_section_done", "reason_field": "error"},
     "echo": ["room_id"]
   },
   "task.format_section": {
-    "replies": [{"payload_type": "result.edit_proposed", "required": ["doc_id", "section_id", "edit_id", "content"],
-                 "when": "the content is reformatted in the given style, with no change of substance, and posted as an edit suggestion (document_propose_edit)"}],
+    "replies": [
+      {"payload_type": "result.edit_proposed", "required": ["doc_id", "section_id", "edit_id", "content"], "when": "the content is reformatted in the given style, with no change of substance, and posted as an edit suggestion (document_propose_edit)", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "section_id": {"type": "string", "minLength": 1}, "edit_id": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["doc_id", "section_id", "edit_id", "content"]}}
+    ],
     "blocked": {"payload_type": "result.editor_error", "reason_field": "reason"}
   },
-
   "task.create_experiment_plan": {
-    "replies": [{"payload_type": "result.plan_draft", "required": ["title", "objective", "hypothesis", "methodology"]}]
+    "replies": [
+      {"payload_type": "result.plan_draft", "required": ["title", "objective", "hypothesis", "methodology"], "schema": {"type": "object", "properties": {"title": {"type": "string", "minLength": 1}, "objective": {"type": "string", "minLength": 1}, "hypothesis": {"type": "string", "minLength": 1}, "methodology": {"type": "string", "minLength": 1}}, "required": ["title", "objective", "hypothesis", "methodology"]}}
+    ]
   },
   "task.create_experiment_plan_doc": {
-    "replies": [{"payload_type": "result.plan_doc_created", "required": ["doc_id", "objective", "hypothesis", "methodology"],
-                 "when": "the plan is stored as a Document Service document of type experiment-plan (tag experiment-plan; project_id and parent_doc_id of the task) with the sections Objective, Hypothesis, Methodology"}],
+    "replies": [
+      {"payload_type": "result.plan_doc_created", "required": ["doc_id", "objective", "hypothesis", "methodology"], "when": "the plan is stored as a Document Service document of type experiment-plan (tag experiment-plan; project_id and parent_doc_id of the task) with the sections Objective, Hypothesis, Methodology", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "objective": {"type": "string", "minLength": 1}, "hypothesis": {"type": "string", "minLength": 1}, "methodology": {"type": "string", "minLength": 1}}, "required": ["doc_id", "objective", "hypothesis", "methodology"]}}
+    ],
     "blocked": {"payload_type": "result.plan_error", "reason_field": "reason"}
   },
-
   "task.analyze_results": {
-    "replies": [{"payload_type": "result.analysis_draft", "required": ["doc_id", "section_name", "content", "run_id"],
-                 "when": "the run and its plan are read from Experiment Service"}]
+    "replies": [
+      {"payload_type": "result.analysis_draft", "required": ["doc_id", "section_name", "content", "run_id"], "when": "the run and its plan are read from Experiment Service", "schema": {"type": "object", "properties": {"section_name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["section_name", "content"]}}
+    ]
   },
   "task.analyze_experiment_doc": {
-    "replies": [{"payload_type": "result.analysis_doc_draft", "required": ["run_doc_id", "output_doc_id", "section_name", "content"],
-                 "when": "the run document and its parent plan document are read from Document Service; with an output_doc_id, the analysis is also added there as a section"}],
+    "replies": [
+      {"payload_type": "result.analysis_doc_draft", "required": ["run_doc_id", "output_doc_id", "section_name", "content"], "when": "the run document and its parent plan document are read from Document Service; with an output_doc_id, the analysis is also added there as a section", "schema": {"type": "object", "properties": {"run_doc_id": {"type": "string", "minLength": 1}, "section_name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["run_doc_id", "section_name", "content"]}}
+    ],
     "blocked": {"payload_type": "result.analysis_error", "reason_field": "reason"}
   },
-
   "task.project_set_objective": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["project_id", "objective"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["project_id", "objective"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.project_add_decision": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["project_id", "decision"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["project_id", "decision"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.project_assign": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["project_id", "task_title", "assignee"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["project_id", "task_title", "assignee"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "query.project_state": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["project_id", "doc_id", "state"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["project_id", "doc_id", "state"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.bureau_capture_decision": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.bureau_summarize": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "query.bureau_decisions": {
-    "replies": [{"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id", "decisions"]}],
+    "replies": [
+      {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id", "decisions"]}
+    ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
-
-  "chat.message": {"chat": true}
+  "chat.message": {
+    "chat": true
+  }
 }

@@ -118,6 +118,10 @@ def test_task_text_names_the_chain_and_the_expected_reply():
     assert 'chainId="c9"' in text
     assert 'payload_type="result.article_draft"' in text and "doc_id, sections" in text
     assert "not found" in text and "report it blocked at once" in text
+    # ...but only for what has to exist already: a section to write is new (the second real run's batch was refused).
+    assert "A section the task asks you to write may not exist yet" in text
+    # The task's type is not a tool (the formalized request once read "invoke task.write_sections_batch").
+    assert '"task.write_sections_batch" is the kind of task, not a tool' in text
 
 
 def edit_task(chain_id: str = "e1", **payload) -> dict:
@@ -131,8 +135,9 @@ def test_a_task_with_two_kinds_of_reply_accepts_either_and_echoes_the_room(chann
     assert channel.posted[0][1]["payload"]["room_id"] == "ws-default/r1"
     ch._pending["e2"] = edit_task("e2", section_id="s1", content="old")
     run(ch.publish_result("e2", "result.edit_proposed", {"doc_id": "d1", "section_id": "s1", "edit_id": "x", "content": "new"}))
+    ch._pending["e3"] = edit_task("e3", section_id="s1", content="old")
     with pytest.raises(ValueError, match="one of: result.edit_section_done, result.edit_proposed"):
-        run(ch.publish_result("e2", "result.section_draft", {}))
+        run(ch.publish_result("e3", "result.section_draft", {}))
     text = ch.render_task_text(edit_task())
     assert "one of:" in text and "section_address" in text and "document_propose_edit" in text
 
@@ -195,3 +200,25 @@ def test_scope_from_env(monkeypatch):
     assert ch._scope_from_env() == [{"room_id": "ws-default", "recursive": True}]
     monkeypatch.setenv("AGENT_SCOPE", "not json")
     assert ch._scope_from_env() == []
+
+
+def test_fields_must_follow_the_reply_schema(channel):
+    # The second real run published bare section names; Human Gate reads section["name"] and section["content"].
+    ch._pending["c1"] = task("c1", "task.write_sections_batch")
+    with pytest.raises(ValueError, match="sections/[01]: .* is not of type .object."):
+        run(ch.publish_result("c1", "result.article_draft", {"doc_id": "d1", "sections": ["Introduction", "Discussion"]}))
+    with pytest.raises(ValueError, match="'name' is a required property"):
+        run(ch.publish_result("c1", "result.article_draft", {"doc_id": "d1", "sections": [{"title": "Intro", "content": "x"}]}))
+    assert channel.posted == []
+    run(ch.publish_result("c1", "result.article_draft", {"doc_id": "d1", "sections": [{"name": "Intro", "content": "Text"}]}))
+    assert "fields JSON schema" in ch.render_task_text(task("c2", "task.write_sections_batch"))
+
+
+def test_a_task_is_answered_once(channel):
+    ch._pending["c1"] = task()
+    run(ch.publish_result("c1", "result.section_draft", {"doc_id": "d1", "section_name": "Intro", "content": "Text"}))
+    with pytest.raises(ValueError, match="already answered"):
+        run(ch.publish_blocked("c1", "no tool"))
+    with pytest.raises(ValueError, match="already answered"):
+        run(ch.publish_result("c1", "result.section_draft", {"doc_id": "d1", "section_name": "Intro", "content": "Again"}))
+    assert len(channel.posted) == 1

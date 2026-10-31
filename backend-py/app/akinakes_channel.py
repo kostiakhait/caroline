@@ -203,8 +203,11 @@ def make_agent(config: ChannelConfig) -> dict[str, Any]:
 def load_reply_specs() -> dict[str, dict[str, Any]]:
     """message payload type -> what it expects in reply. From AKINAKES_REPLY_SPECS (a path), else the file next to this
     module. A spec has:
-      replies  -- [{payload_type, required, when}]: the replies allowed, "when" says which fits (several for one task:
-                  editor's task.edit_section answers one way for a section_address, another for a section_id);
+      replies  -- [{payload_type, required, when, schema}]: the replies allowed, "when" says which fits (several for
+                  one task: editor's task.edit_section answers one way for a section_address, another for a
+                  section_id); "schema" is a JSON schema of the fields, shown to the model and checked on publish
+                  (the second real run published article_draft sections as bare names, and Human Gate reads
+                  section["name"] and section["content"]);
       blocked  -- {payload_type, reason_field}: the reply when the task cannot be done (result.plan_error with "reason",
                   say), as the old agent sent it; without it, system.skill_blocked;
       echo     -- task payload fields copied into every reply (room_id, which chatSecretary relays by);
@@ -226,6 +229,7 @@ def expected_reply_text(task_type: str) -> str:
     if not replies:
         return "payload_type: a result.* type that fits this task, fields: its result"
     lines = [f'payload_type="{r["payload_type"]}", fields with: {", ".join(r.get("required") or [])}'
+             + (f' (fields JSON schema: {json.dumps(r["schema"], ensure_ascii=False)})' if r.get("schema") else "")
              + (f' -- when {r["when"]}' if r.get("when") else "") for r in replies]
     return lines[0] if len(lines) == 1 else "one of:\n" + "\n".join(f"- {line}" for line in lines) + "\n"
 
@@ -259,6 +263,7 @@ async def publish_result(chain_id: str, payload_type: str, fields: dict[str, Any
     original = _pending.get(chain_id)
     if original is None:
         raise ValueError(f'No task is in progress for chainId "{chain_id}". Use the exact chainId from the task message.')
+    _refuse_second_answer(chain_id)
     task_type = pending_task_type(chain_id) or ""
     spec = reply_spec(task_type)
     if spec.get("chat"):
@@ -270,6 +275,7 @@ async def publish_result(chain_id: str, payload_type: str, fields: dict[str, Any
         missing = [k for k in replies[payload_type].get("required") or [] if k not in fields]
         if missing:
             raise ValueError(f"Missing fields for {payload_type}: {', '.join(missing)}.")
+        _check_schema(payload_type, replies[payload_type].get("schema"), fields)
     elif not payload_type.startswith("result."):
         raise ValueError('payload_type must start with "result.".')
     ack = await _publish(make_reply(original, _config.agent_uid, payload_type, **{**_echoed(original, spec), **fields}))
@@ -279,11 +285,32 @@ async def publish_result(chain_id: str, payload_type: str, fields: dict[str, Any
     return ack
 
 
+def _refuse_second_answer(chain_id: str) -> None:
+    """One reply per task. On the second real run a turn published its result, its closing reply then failed
+    verification, and the retry -- not knowing -- reported the same task blocked as well."""
+    if chain_id in _answered:
+        raise ValueError(f'The task with chainId "{chain_id}" is already answered; nothing more is published for it.')
+
+
+def _check_schema(payload_type: str, schema: dict[str, Any] | None, fields: dict[str, Any]) -> None:
+    if not schema:
+        return
+    import jsonschema
+
+    try:
+        jsonschema.validate(fields, schema)
+    except jsonschema.ValidationError as exc:
+        where = "/".join(str(p) for p in exc.absolute_path) or "fields"
+        raise ValueError(f"{payload_type}: {where}: {exc.message}. The fields must follow: "
+                         f"{json.dumps(schema, ensure_ascii=False)}") from None
+
+
 async def publish_blocked(chain_id: str, reason: str) -> dict[str, Any]:
     assert _config is not None
     original = _pending.get(chain_id)
     if original is None:
         raise ValueError(f'No task is in progress for chainId "{chain_id}".')
+    _refuse_second_answer(chain_id)
     spec = reply_spec(pending_task_type(chain_id) or "")
     if spec.get("chat"):
         return await publish_pass(chain_id)
@@ -436,11 +463,13 @@ def render_task_text(msg: dict[str, Any]) -> str:
     return (
         f'[Agent Bus task. chainId="{env["chainId"]}" type="{task_type}" from="{env.get("senderUid", "")}".\n'
         f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        f'"{task_type}" is the kind of task, not a tool: there is no tool by that name. '
         "Do the task with your tools. Finish by calling akinakes_publish_result with this exact chainId and "
         f"{expected_reply_text(task_type)}. If you cannot do it, call akinakes_report_blocked with the chainId and the "
-        "reason. A document, section or other item of the task that Document Service reports as not found is such a "
-        "case: report it blocked at once, do not look for it anywhere else. Nobody reads this conversation, only the "
-        "published result is delivered.]"
+        "reason. Something the task needs to exist already -- the document, a run, a section to read or to change -- "
+        "that Document Service reports as not found is such a case: report it blocked at once, do not look for it "
+        "anywhere else. A section the task asks you to write may not exist yet; that is no reason to stop. Nobody reads "
+        "this conversation, only the published result is delivered.]"
     )
 
 

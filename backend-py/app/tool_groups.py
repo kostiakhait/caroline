@@ -123,10 +123,18 @@ def _schema(tool: Any) -> Any:
 def describe_tool_text(plugins: list[Any], name: str) -> str:
     import json
 
-    found = find_tool(plugins, name)
+    found = find_callable_tool(plugins, name)
     if found is None:
         return f'No tool "{name}" in the groups. Use list_groups, then list_tools(group).'
     plugin, tool = found
+    if not is_grouped(plugin):
+        # A direct tool is described too (2026-10-31, akinakes writer: "no tool akinakes_publish_result" here made the
+        # model decide it could not publish, and it reported the task blocked).
+        return "\n\n".join([
+            f"{tool.name} (always available: call it directly, by its own name)",
+            (tool.description or "").strip(),
+            "Parameters (JSON schema): " + json.dumps(_schema(tool), ensure_ascii=False, default=str),
+        ])
     parts = [
         f"{tool.name} (group {plugin.name})",
         (tool.description or "").strip(),
