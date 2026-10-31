@@ -151,7 +151,12 @@ class TurnSubmissionMixin:
         # _handle_failure's replay needs the real ones still there.
         if is_real_user or not self.turn_pending:
             self.pending_attachments = attachments
+        # Joins a turn still running (the CLI queues it behind that work): see
+        # turn_joined_running's own __init__ comment.
+        joins_running_turn = self.turn_pending
         self.turn_pending = True
+        if joins_running_turn:
+            self.turn_joined_running = True
         self.last_activity = time.monotonic()
         if is_real_user:
             self.last_user_activity = time.monotonic()

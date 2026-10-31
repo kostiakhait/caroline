@@ -382,6 +382,31 @@ class ChatSession(
         self.last_tool_use_started_at: float | None = None
         self.hang_interrupted_tool_name: str | None = None
         self.hang_interrupted_tool_elapsed_s: float | None = None
+        # Bug fix (2026-10-30), confirmed live (tab 1, 23:17 and 23:26): tool
+        # calls the CLI started and has not answered yet, id -> (name, started),
+        # for _check_hang only. _pending_tool_calls can't serve: a real user
+        # message clears it, and the process-activity mode never looked at any
+        # of it, so a 10-minute PowerShell call counted as "no tool running".
+        # Emptied only when a new stream starts (nothing can be open there).
+        self._open_tool_calls: dict[str, tuple[str, float]] = {}
+        # True once a message joins a turn that was already pending (the CLI
+        # queues it behind the running work): such a turn is not "empty" --
+        # see _check_hang's turn_is_empty. Cleared whenever turn_pending flips.
+        self.turn_joined_running = False
+        # Why the watchdog last interrupted, in words the model is told -- see
+        # _hang_interrupt_note.
+        self.hang_interrupt_reason: str | None = None
+        # Which CLI turn a ResultMessage belongs to (2026-10-30, confirmed live, tab 1
+        # 23:19:18 and 23:20:54): the CLI announces each turn it starts with an init
+        # message. _cli_turn_running: between that init and the turn's result.
+        # _input_preparing: an input taken off the queue but not yet handed to the
+        # CLI (the memory advisor can hold it ~25s). _input_awaiting_init: handed to
+        # an idle CLI, whose turn has not announced itself yet. While either holds,
+        # or the queue still has input, a result is the end of an EARLIER turn and
+        # must not close the pending one -- see result_is_stale in _run_loop.
+        self._cli_turn_running = False
+        self._input_preparing = False
+        self._input_awaiting_init = False
 
         # Bug fix (2026-09-15, "Стоп должен срабатывать ВСЕГДА"): the real
         # OS pid of the currently-live CLI subprocess, captured directly at
