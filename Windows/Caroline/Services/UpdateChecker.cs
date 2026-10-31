@@ -131,9 +131,33 @@ public sealed class UpdateChecker
         await PollAsync();
     }
 
+    // The installer holds this for its whole run (CarolineInstaller/Program.cs, RunAsync). Per explicit instruction (2026-10-31): while an
+    // install that has started is not finished, no new one is started, under any circumstances -- confirmed live, 1.0.1 started a second
+    // installer every time it was relaunched during the first one's download.
+    private const string InstallerRunMutexName = "Global\\CarolineInstallerRun";
+    private bool _installerRunningLogged;
+
+    private static bool InstallerRunning()
+    {
+        if (!Mutex.TryOpenExisting(InstallerRunMutexName, out var m)) return false;
+        m.Dispose();
+        return true;
+    }
+
     private async Task LaunchInstallerAsync(string path, string version, bool silent, string? payloadFile = null, string? payloadSha256 = null,
         string? payloadPath = null)
     {
+        if (InstallerRunning())
+        {
+            if (!_installerRunningLogged)
+            {
+                _installerRunningLogged = true;
+                Logger.Log($"[UpdateChecker] an install is already running -- not starting another one for {version}");
+            }
+            Say("Caroline: An update is being installed -- Caroline restarts when it is ready");
+            return;
+        }
+        _installerRunningLogged = false;
         _launched = true;
         _timer.Stop();
         Logger.Log($"[UpdateChecker] launching {path} for {version} ({(silent ? "silent, Caroline was inactive" : "visible, the owner confirmed")})");

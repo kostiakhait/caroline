@@ -14,6 +14,7 @@ Her own version is `backend-py/VERSION`: every platform ships backend-py, so eve
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -34,6 +35,12 @@ RETRY_S = 300
 DOWNLOAD_ATTEMPTS = 3
 HTTP_TIMEOUT_S = 30
 APP_ROOT = Path(__file__).resolve().parent.parent  # backend-py
+# No update loop (see UpdateService._install_blocked). While an install runs, the platform itself refuses a second one (Windows: the
+# installer's run lock, Services/UpdateChecker.cs); this covers the seconds before the installer holds that lock, and stops the
+# same version from being started by itself again and again when it never takes.
+INSTALL_START_GRACE_S = 300
+MAX_AUTO_INSTALLS = 2
+LEDGER_FILE = "install_attempts.json"
 
 
 def current_version() -> str:
@@ -87,7 +94,7 @@ def _fetch_to(url: str, dest: Path, progress: Callable[[int], None] | None) -> N
 
 class UpdateService:
     def __init__(self, *, base_url: str | None = None, platform: str | None = None, version: str | None = None, runtime: int | None = None,
-                 download_dir: str | Path | None = None, public_key: bytes | None = None) -> None:
+                 download_dir: str | Path | None = None, public_key: bytes | None = None, ledger_path: str | Path | None = None) -> None:
         self.base_url = (base_url or os.environ.get("CAROLINE_UPDATE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.platform = platform or detect_platform()
         self.version = version or current_version()
@@ -98,6 +105,9 @@ class UpdateService:
         self._confirmed = False
         self._state: dict[str, Any] = {"status": "idle", "error": None, "checked_at": None, "version": None, "path": None, "progress": None, "payload": None, "payload_path": None}
         self._artifact: rm.Artifact | None = None
+        self.ledger_path = Path(ledger_path or self.download_dir / LEDGER_FILE)
+        self._blocked_logged: str | None = None
+        self._settle_ledger()
 
     # ---- state --------------------------------------------------------------------------------------------------------------
     def status(self) -> dict[str, Any]:
@@ -108,12 +118,69 @@ class UpdateService:
         with self._lock:
             self._state.update(changes)
 
+    # ---- the install ledger: no update loop ------------------------------------------------------------------------------------
+    # Confirmed live (2026-10-31): 1.0.1 started the installer for 1.0.2 and exited; the installer was still downloading when
+    # Caroline was started again, she was "inactive" a minute later, started a second installer (which backed off) and exited
+    # again -- over and over, still on 1.0.1. Every install start is now written to disk (it survives the restart it causes):
+    # the same version is not started by itself again within INSTALL_START_GRACE_S, and after MAX_AUTO_INSTALLS starts that did
+    # not end in it being installed, only the owner's own yes (the tray) starts it.
+    def _read_ledger(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_ledger(self, data: dict[str, Any]) -> None:
+        try:
+            self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            self.ledger_path.write_text(json.dumps(data), encoding="utf-8")
+        except OSError as exc:
+            log_event("updater", "ledger_write_failed", error=str(exc))
+
+    def _settle_ledger(self) -> None:
+        """At start: an install the ledger remembers that did take (this version is it or newer) is done with."""
+        ledger = self._read_ledger()
+        wanted = ledger.get("version")
+        if not wanted:
+            return
+        try:
+            took = not rm.is_newer(str(wanted), self.version)
+        except rm.ReleaseError:
+            took = True  # an unreadable ledger entry holds nothing back
+        if took:
+            log_event("updater", "install_succeeded", version=self.version, attempts=ledger.get("attempts"))
+            try:
+                self.ledger_path.unlink()
+            except OSError:
+                pass
+
+    def _install_blocked(self, version: str | None) -> str | None:
+        """Why the update must not install by itself now, or None."""
+        ledger = self._read_ledger()
+        if not version or ledger.get("version") != version:
+            return None
+        attempts = int(ledger.get("attempts") or 0)
+        if attempts >= MAX_AUTO_INSTALLS:
+            return f"{attempts} install starts of {version} did not take"
+        if time.time() - float(ledger.get("last_at") or 0) < INSTALL_START_GRACE_S:
+            return f"an install of {version} started less than {INSTALL_START_GRACE_S // 60} minutes ago"
+        return None
+
     def action(self, busy: bool) -> str:
         """"install" | "ask" | "none": what the platform does with the update right now."""
         with self._lock:
             if self._state["status"] != "ready":
                 return "none"
-            return "install" if (self._confirmed or not busy) else "ask"
+            if self._confirmed:
+                return "install"
+            blocked = self._install_blocked(self._state["version"])
+            if blocked:
+                if blocked != self._blocked_logged:
+                    self._blocked_logged = blocked
+                    log_event("updater", "auto_install_held", version=self._state["version"], reason=blocked)
+                return "ask"
+            return "install" if not busy else "ask"
 
     def confirm(self) -> None:
         """The owner said yes while Caroline was in use."""
@@ -123,6 +190,12 @@ class UpdateService:
     def mark_installed(self) -> None:
         """The platform started the install (the process is about to restart): forget the verified file's state."""
         with self._lock:
+            version = self._state["version"]
+            if version:
+                ledger = self._read_ledger()
+                attempts = int(ledger.get("attempts") or 0) + 1 if ledger.get("version") == version else 1
+                self._write_ledger({"version": version, "attempts": attempts, "last_at": time.time()})
+                log_event("updater", "install_started", version=version, attempt=attempts)
             self._confirmed = False
             self._state.update(status="idle", path=None, payload_path=None, progress=None)
 
@@ -176,7 +249,7 @@ class UpdateService:
             pay = artifact.payload
             files.append(rm.Artifact(artifact.platform, pay["file"], pay["sha256"], pay["size"], 0))
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        keep = {f.file for f in files} | {f.file + ".part" for f in files}
+        keep = {f.file for f in files} | {f.file + ".part" for f in files} | {LEDGER_FILE}
         for old in self.download_dir.iterdir():  # leftovers of earlier versions and half downloads
             if old.name not in keep:
                 old.unlink(missing_ok=True)

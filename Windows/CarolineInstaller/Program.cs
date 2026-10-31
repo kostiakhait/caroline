@@ -108,7 +108,18 @@ internal static class Program
         }
 
         using var runMutex = new Mutex(initiallyOwned: false, InstallerRunMutexName);
-        if (!runMutex.WaitOne(0))
+        bool owned;
+        try
+        {
+            owned = runMutex.WaitOne(0);
+        }
+        catch (AbandonedMutexException)
+        {
+            // The previous installer died holding it: this one owns it now, and its Step 0 cleans up after that one.
+            Logger.Log("RunAsync: the previous installer ended without releasing the run lock -- taking it over");
+            owned = true;
+        }
+        if (!owned)
         {
             Logger.Log("RunAsync: another installer instance is already running this exact critical section -- backing off");
             window.SetStatus("An update is already in progress in another window…");
@@ -135,8 +146,10 @@ internal static class Program
     // Order (2026-10-31, per explicit instruction, confirmed live with 1.0.1: Caroline closed first and the installer then downloaded
     // 515 MB and ran npm for ~40 s, two minutes with nothing on the screen): everything that does not touch what a running Caroline uses
     // comes FIRST, while she keeps working -- the zip (already downloaded and verified by her, --zip-path), its extraction into a new,
-    // not yet active app folder, that folder's npm installs. Only then is she stopped; the shared runtimes, the switch to the new folder
-    // and the launch follow, a few seconds, with the progress window showing even in a silent update.
+    // not yet active app folder, that folder's npm installs. Only then is she stopped; the switch to the new folder and the launch follow,
+    // a few seconds, with the progress window showing even in a silent update.
+    // Per explicit instruction (2026-10-31): NOTHING is downloaded after the stop -- every dependency download (runtimes, Python
+    // packages, the speech model) is in PrepareDependenciesAsync, before it; after it only local steps run.
     private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts, bool silent, Action showWindow)
     {
         var ct = cts.Token;
@@ -196,6 +209,9 @@ internal static class Program
         var alreadyInstalled = File.Exists(AppPaths.ClientExe)
             && string.Equals(installState.InstalledSha256, info.Sha256Hex, StringComparison.OrdinalIgnoreCase);
 
+        // Everything that downloads happens here, while Caroline still runs (see the order above).
+        await PrepareDependenciesAsync(downloader, http, window, ct);
+
         string? newDirName = null, zipPath = null;
         if (alreadyInstalled)
         {
@@ -206,19 +222,16 @@ internal static class Program
         {
             zipPath = await ObtainZipAsync(downloader, info, window, ct);
             newDirName = await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, zipPath, ct));
-            if (NodeInstaller.IsInstalled())
+            var newDir = Path.Combine(AppPaths.Root, newDirName);
+            try
             {
-                var newDir = Path.Combine(AppPaths.Root, newDirName);
-                try
-                {
-                    await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct, newDir));
-                    await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct, newDir));
-                }
-                catch
-                {
-                    TryDeleteUnactivated(newDir);
-                    throw;
-                }
+                await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct, newDir));
+                await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct, newDir));
+            }
+            catch
+            {
+                TryDeleteUnactivated(newDir);
+                throw;
             }
         }
 
@@ -238,136 +251,20 @@ internal static class Program
         window.SetStatus("Cleaning up old data…");
         await WithStepAsync(ErrorCodes.WorkspaceCleanup, "Cleaning up old data", () => WorkspaceCleanup.RunAsync(ct));
 
-        // Step 1: isolated runtimes. Node first -- Playwright's install step
-        // later needs it, and neither install touches the system otherwise,
-        // so order between Node/Python doesn't matter beyond that.
-        if (!NodeInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.NodeInstall, "Installing Node.js", () => NodeInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading Node.js…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("Node.js already present, skipping");
-        }
-
-        // Always called, not gated behind IsInstalled() -- PythonInstaller checks the
-        // runtime and its own required pip packages separately internally, so an
-        // existing install that already has the Python runtime but predates a newly
-        // added package still gets that package installed here instead of the whole
-        // step being skipped just because python.exe already exists.
-        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Downloading Python…", p),
-            ct));
-
-        if (!GitBashInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.GitBashInstall, "Installing Git Bash", () => GitBashInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading Git Bash…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("Git Bash already present, skipping");
-        }
-
-        if (!FfmpegInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.FfmpegInstall, "Installing ffmpeg", () => FfmpegInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading ffmpeg…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("ffmpeg already present, skipping");
-        }
-
-        // Bug fix (2026-09-22), per explicit instruction: a step that fails must
-        // stop the whole install with a clear, coded message box -- never continue
-        // silently into a partial install. (An earlier version of this step made
-        // Codex's own failure non-fatal, reasoning it was an "optional feature";
-        // that was my own unilateral call and the user overruled it: nothing
-        // installs partially, ever -- same WithStepAsync/ErrorCodes contract as
-        // every other dependency below.)
-        if (!CodexInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading OpenAI support…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("Codex already present, skipping");
-        }
-
-        // Caroline's own window is a WebView2 host -- without the Runtime present,
-        // the app fails to show a window (or crashes) on first launch, AFTER this
-        // installer would otherwise have already reported success. See
-        // WebView2Installer's own doc comment.
-        await WithStepAsync(ErrorCodes.WebView2Install, "Installing the WebView2 Runtime",
-            () => WebView2Installer.InstallAsync(downloader, s => window.SetStatus(s), ct));
+        // Python packages PrepareDependenciesAsync downloaded for the runtime Caroline was running on: installed now, offline.
+        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.FinishPreparedAsync(s => window.SetStatus(s), ct));
 
         if (newDirName is not null)
         {
             await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => Task.Run(() => ActivateAppDir(newDirName, info.Sha256Hex, zipPath!), ct));
         }
+        // Put in place after the stop, from what was downloaded before it (never a download here): a newer speech model.
+        await WhisperModelInstaller.FinishPreparedAsync(s => window.SetStatus(s), ct);
 
-        // Step 3 used to install Chromium through the Node browser MCP server's
-        // playwright-core. Gone (2026-10-24): that server no longer exists, and the
-        // Chromium Caroline uses ships inside Caroline.zip (dist/browsers, see the
-        // Makefile's .browsers.stamp and backend-py/app/web_browser.py).
-
-        // Step 4 used to fetch Visual Mode's talking-head models here,
-        // unconditionally, on every install -- tens of GB, ~90% of a fresh
-        // install's disk footprint, even for the large majority of users
-        // who never turn Visual Mode on. Per explicit instruction
-        // (2026-10-05), removed: those models now download on demand, the
-        // first time the Settings toggle is turned on for a profile (see
-        // backend-py/app/visual_mode.py's BUILTIN_MODELS_BASE_URL and
-        // main.py's visual_mode_set), reusing the exact same resumable/
-        // verified downloader Windows/Caroline/Native/
-        // VisualModelDownloader.cs already had for a purchased model.
-
-        // Step 4b: local speech-recognition model (~1.5GB, best-effort, unconditional --
-        // explicit instruction, 2026-09-26: ships with every install regardless of the
-        // Settings toggle, which stays off by default. See WhisperModelInstaller's own
-        // doc comment.
-        // Step 4c: Node.js runtime + the WhatsApp sidecar's own npm dependencies
-        // (app/whatsapp_channel.py, docs/MESSENGER_INTEGRATIONS_PLAN.md, 2026-10-06).
-        // NodeInstaller was unused since the legacy Node backend was removed --
-        // reactivated here for Baileys, which has no Python equivalent.
-        await WithStepAsync(ErrorCodes.NodeInstall, "Setting up Node.js", () => NodeInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Setting up Node.js…", p),
-            ct));
+        // The sidecars of the now active app folder. For a new version they were set up in that folder before the stop (Node is
+        // provisioned before it, PrepareDependenciesAsync) -- these find them in place and do nothing.
         await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct));
-        // Step 4c-2: the Messenger sidecar's own npm dependencies
-        // (app/messenger_channel.py, docs/MESSENGER_INTEGRATIONS_PLAN.md) --
-        // same Node runtime provisioned just above, no separate runtime step.
         await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct));
-
-        // Step 4d: Java runtime + signal-cli (app/signal_channel.py, same plan
-        // as the WhatsApp sidecar above -- Signal has no official bot API at
-        // all, signal-cli is the standard way every such integration talks to it).
-        await WithStepAsync(ErrorCodes.JavaRuntimeInstall, "Setting up Java runtime", () => JavaRuntimeInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Setting up Java runtime…", p),
-            ct));
-        await WithStepAsync(ErrorCodes.SignalCliInstall, "Setting up Signal support", () => SignalCliInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Setting up Signal support…", p),
-            ct));
-
-        await WithStepAsync(ErrorCodes.WhisperModelInstall, "Downloading local speech-recognition model", () => WhisperModelInstaller.InstallAsync(downloader, http,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Downloading local speech-recognition model…", p),
-            ct));
 
         window.SetStatus("Creating shortcut…");
         await WithStepAsync(ErrorCodes.ShortcutOrAutostart, "Creating the desktop shortcut", () => Task.Run(ShortcutManager.CreateDesktopShortcut, ct));
@@ -432,6 +329,66 @@ internal static class Program
     /// itself, e.g. WebView2Installer's own "bootstrapper exit code"
     /// check) passes through unchanged rather than getting double-wrapped.
     /// </summary>
+    /// <summary>
+    /// Every dependency that has to be downloaded, while Caroline still runs (2026-10-31, per explicit instruction: nothing is
+    /// downloaded after she is stopped, she is stopped only for the switch). Each of these installs only what is not there yet --
+    /// and what is not there, a running Caroline is not using. The two that can replace something she does use only download here
+    /// and finish after the stop, offline: Python packages for her runtime (PythonInstaller.FinishPreparedAsync) and a newer
+    /// speech model (WhisperModelInstaller.FinishPreparedAsync). A failure here fails the install before Caroline was touched.
+    /// </summary>
+    private static async Task PrepareDependenciesAsync(Downloader downloader, HttpClient http, ProgressWindow window, CancellationToken ct)
+    {
+        // Node first -- the app folder's sidecars (npm) need it.
+        await WithStepAsync(ErrorCodes.NodeInstall, "Installing Node.js", () => NodeInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading Node.js…", p),
+            ct));
+
+        // Always called: PythonInstaller checks the runtime and its required packages separately, so a runtime that predates a
+        // newly added package still gets it.
+        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.PrepareAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading Python…", p),
+            ct));
+
+        await WithStepAsync(ErrorCodes.GitBashInstall, "Installing Git Bash", () => GitBashInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading Git Bash…", p),
+            ct));
+
+        await WithStepAsync(ErrorCodes.FfmpegInstall, "Installing ffmpeg", () => FfmpegInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading ffmpeg…", p),
+            ct));
+
+        // Bug fix (2026-09-22), per explicit instruction: a step that fails must stop the whole install with a clear, coded
+        // message box -- nothing installs partially, ever, Codex included.
+        await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading OpenAI support…", p),
+            ct));
+
+        // Caroline's own window is a WebView2 host -- without the Runtime she fails to show a window on first launch.
+        await WithStepAsync(ErrorCodes.WebView2Install, "Installing the WebView2 Runtime",
+            () => WebView2Installer.InstallAsync(downloader, s => window.SetStatus(s), ct));
+
+        // Java runtime + signal-cli (app/signal_channel.py: Signal has no official bot API, signal-cli is the standard way).
+        await WithStepAsync(ErrorCodes.JavaRuntimeInstall, "Setting up Java runtime", () => JavaRuntimeInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Java runtime…", p),
+            ct));
+        await WithStepAsync(ErrorCodes.SignalCliInstall, "Setting up Signal support", () => SignalCliInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Signal support…", p),
+            ct));
+
+        // Local speech-recognition model (~1.5GB, best-effort, unconditional -- explicit instruction, 2026-09-26).
+        await WithStepAsync(ErrorCodes.WhisperModelInstall, "Downloading local speech-recognition model", () => WhisperModelInstaller.InstallAsync(downloader, http,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading local speech-recognition model…", p),
+            ct));
+    }
+
     private static async Task WithStepAsync(string code, string stepDescription, Func<Task> step)
     {
         try

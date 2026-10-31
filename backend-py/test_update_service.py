@@ -165,3 +165,44 @@ def test_a_payload_that_differs_from_the_signed_hash_is_never_ready(server, tmp_
     (root / "release.json.sig").write_text(base64.b64encode(rm.ed25519_sign(SEED, body)).decode())
     state = service(base, tmp_path).run_once()
     assert state["status"] == "failed" and state["payload_path"] is None
+
+
+def test_no_update_loop_the_same_version_is_not_started_again_while_its_install_may_be_running(server, tmp_path, monkeypatch):
+    # 2026-10-31, confirmed live: relaunched during the first install, 1.0.1 started 1.0.2's installer again a minute later, over and over
+    root, base = server
+    publish(root)
+    s = service(base, tmp_path)
+    s.run_once()
+    assert s.action(busy=False) == "install"
+    s.mark_installed()
+    again = service(base, tmp_path)  # the restart the install causes, still on 1.0.0: the ledger is on disk
+    again.run_once()
+    assert again.status()["status"] == "ready"  # the ledger survives the download's sweep of the folder
+    assert again.action(busy=False) == "ask"
+
+
+def test_no_update_loop_after_two_starts_that_did_not_take_only_the_owner_starts_it(server, tmp_path, monkeypatch):
+    import app.update_service as us
+    root, base = server
+    publish(root)
+    for _ in range(us.MAX_AUTO_INSTALLS):
+        s = service(base, tmp_path)
+        s.run_once()
+        s.mark_installed()
+        monkeypatch.setattr(us.time, "time", lambda t=us.time.time() + us.INSTALL_START_GRACE_S + 1: t)  # past the start grace
+    s = service(base, tmp_path)
+    s.run_once()
+    assert s.action(busy=False) == "ask"
+    s.confirm()
+    assert s.action(busy=False) == "install"
+
+
+def test_an_install_that_took_clears_the_ledger(server, tmp_path):
+    root, base = server
+    publish(root)
+    s = service(base, tmp_path)
+    s.run_once()
+    s.mark_installed()
+    assert (tmp_path / "dl" / "install_attempts.json").exists()
+    service(base, tmp_path, version="1.1.0")  # started as the new version
+    assert not (tmp_path / "dl" / "install_attempts.json").exists()

@@ -31,6 +31,13 @@ internal static class WhisperModelInstaller
     /// download -- mirrors ModelsInstaller's own per-file marker reasoning.</summary>
     private static string InstalledMarkerPath => Path.Combine(AppPaths.WhisperModelDir, FileName + ".installed-sha256");
 
+    // A newer model downloaded while Caroline still runs and may have the current one loaded (2026-10-31, per explicit instruction:
+    // nothing is downloaded after Caroline is stopped). It waits here, verified, and FinishPreparedAsync puts it in place after the stop.
+    private static string PreparedZipPath => Path.Combine(AppPaths.Root, "whisper-model.prepared.zip");
+    private static string PreparedShaPath => PreparedZipPath + ".sha256";
+
+    /// <summary>Runs while Caroline is still running: downloads and verifies. A model that is not there yet (nothing uses it) is
+    /// installed at once; a newer one for a model already in place is only downloaded and left for FinishPreparedAsync.</summary>
     public static async Task InstallAsync(Downloader downloader, HttpClient http,
         Action<string> onStatus, Action<DownloadProgress> onProgress, CancellationToken ct)
     {
@@ -96,6 +103,14 @@ internal static class WhisperModelInstaller
             onStatus("Downloading local speech-recognition model (~1.5GB, one time)…");
             await downloader.DownloadAsync(Url, zipPath, sha256Hex, onProgress, ct);
 
+            if (File.Exists(Path.Combine(AppPaths.WhisperModelDir, "model.bin")))
+            {
+                File.Move(zipPath, PreparedZipPath, overwrite: true);
+                await File.WriteAllTextAsync(PreparedShaPath, sha256Hex, ct);
+                Logger.Log("WhisperModelInstaller: newer model downloaded and verified -- put in place after Caroline stops.");
+                return;
+            }
+
             onStatus("Installing local speech-recognition model…");
             await Task.Run(() =>
             {
@@ -124,6 +139,42 @@ internal static class WhisperModelInstaller
         finally
         {
             try { File.Delete(zipPath); } catch (Exception ex) { Logger.Log($"WhisperModelInstaller: cleanup of {zipPath} failed (ignored): {ex.Message}"); }
+        }
+    }
+
+    /// <summary>After Caroline is stopped: puts a model InstallAsync downloaded in place. Local only, never downloads; best-effort.</summary>
+    public static async Task FinishPreparedAsync(Action<string> onStatus, CancellationToken ct)
+    {
+        if (!File.Exists(PreparedZipPath) || !File.Exists(PreparedShaPath)) return;
+        try
+        {
+            var sha256Hex = (await File.ReadAllTextAsync(PreparedShaPath, ct)).Trim();
+            if (!await Downloader.HashMatchesAsync(PreparedZipPath, sha256Hex, ct))
+            {
+                Logger.Log("WhisperModelInstaller: the prepared model no longer matches its sha256 -- dropped, the next update downloads it again.");
+                return;
+            }
+            onStatus("Installing local speech-recognition model…");
+            await Task.Run(() =>
+            {
+                if (Directory.Exists(AppPaths.WhisperModelDir)) Directory.Delete(AppPaths.WhisperModelDir, recursive: true);
+                Directory.CreateDirectory(AppPaths.WhisperModelDir);
+                ZipFile.ExtractToDirectory(PreparedZipPath, AppPaths.WhisperModelDir);
+            }, ct);
+            if (File.Exists(Path.Combine(AppPaths.WhisperModelDir, "model.bin")))
+            {
+                await File.WriteAllTextAsync(InstalledMarkerPath, sha256Hex, ct);
+                Logger.Log("WhisperModelInstaller: prepared model installed.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"WhisperModelInstaller: installing the prepared model failed ({ex.Message}) -- skipping (local STT will just be unavailable).");
+        }
+        finally
+        {
+            try { File.Delete(PreparedZipPath); File.Delete(PreparedShaPath); }
+            catch (Exception ex) { Logger.Log($"WhisperModelInstaller: cleanup of the prepared model failed (ignored): {ex.Message}"); }
         }
     }
 
