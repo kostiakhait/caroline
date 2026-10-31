@@ -13,6 +13,7 @@ import re
 import webbrowser
 import mimetypes
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -281,6 +282,31 @@ _ratatosk_turn_replied_group_ids: set[str] = set()
 # since which tabs existed last run isn't known until each one's WS
 # connection arrives and says its own tabId.
 _has_greeted = False
+
+# Per explicit instruction (2026-10-30): the startup greeting is a whole model turn that rewrites the cold context to
+# the cache (~100k+ tokens), and most restarts happen in the middle of the day with nobody waiting for a "hello".
+# It is said only after the owner has been away this long, and never when anything is waiting to be resumed after the
+# restart -- those notes (the interrupted turn, background operations, an API retry) are the model's way back into
+# the work and a greeting next to them is a second, competing thing to answer.
+STARTUP_GREETING_MIN_ABSENCE_S = 3600
+
+
+def _startup_greeting_wanted(tab_id: str) -> bool:
+    try:
+        if peek_pending_operations(WORKSPACE_DIR, tab_id) or peek_pending_api_retry(WORKSPACE_DIR, tab_id)                 or peek_pending_one_shot_followup(WORKSPACE_DIR, tab_id):
+            log_event("engine", "startup_greeting_skipped", tab_id=tab_id, why="work to resume")
+            return False
+        from app import dialogue_log
+
+        entries = dialogue_log.read_entries(WORKSPACE_DIR, tab_id)
+        if entries and time.time() - entries[-1].get("ms", 0) / 1000 < STARTUP_GREETING_MIN_ABSENCE_S:
+            log_event("engine", "startup_greeting_skipped", tab_id=tab_id, why="recent conversation")
+            return False
+    except Exception as exc:  # noqa: BLE001 -- on any doubt, greet as before
+        log_event("engine", "startup_greeting_check_failed", tab_id=tab_id, error=str(exc)[:200])
+    return True
+
+
 _has_sent_visual_mode_config = False
 _resumed_unfinished_turn_for_tab: set[str] = set()
 # Same "once per process, not per reconnect" shape -- see
@@ -2266,7 +2292,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # share that single result, so there is no second read left to disagree
     # with the first.
     pending_turn_for_primary = peek_pending_turn(WORKSPACE_DIR, PRIMARY_TAB_ID) if tab_id == PRIMARY_TAB_ID else None
-    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not pending_turn_for_primary:
+    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not pending_turn_for_primary and _startup_greeting_wanted(tab_id):
         _has_greeted = True
 
         lang = current_language_name(PRIMARY_TAB_ID)
