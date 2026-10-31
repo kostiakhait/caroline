@@ -3,7 +3,8 @@ using System.Net.Http;
 
 namespace CarolineInstaller;
 
-internal sealed record WindowsDownloadInfo(bool Available, string Version, string Sha256Hex, string ZipUrl);
+/// <param name="LocalZip">The zip already downloaded and verified by the running Caroline (<c>--zip-path</c>), or null: then it is downloaded.</param>
+internal sealed record WindowsDownloadInfo(bool Available, string Version, string Sha256Hex, string ZipUrl, string? LocalZip = null);
 
 /// <summary>
 /// Distribution is a plain directory on the multi-portal downloader, same
@@ -30,6 +31,8 @@ internal static class DownloadsInfo
     /// <summary>
     /// An update started by the running Caroline passes the zip it was told about by the signed release manifest
     /// (<c>--zip-file NAME --zip-sha256 HEX</c>, docs/UPDATE_EVERYWHERE_PLAN.md): then no hash is taken from the unsigned checksum file.
+    /// With <c>--zip-path FILE</c> (2026-10-31) the running Caroline has already downloaded that zip: the installer checks its hash and
+    /// installs from it instead of downloading it again -- after Caroline had closed, as it used to.
     /// </summary>
     private static WindowsDownloadInfo? FromSignedManifest()
     {
@@ -42,7 +45,9 @@ internal static class DownloadsInfo
         var file = Arg("--zip-file");
         var sha = ExtractHex64(Arg("--zip-sha256") ?? "");
         if (file is null || sha is null || file != Path.GetFileName(file) || file.StartsWith('.')) return null;
-        return new WindowsDownloadInfo(true, Path.GetFileNameWithoutExtension(file), sha, BaseUrl + "/" + Uri.EscapeDataString(file));
+        var local = Arg("--zip-path");
+        return new WindowsDownloadInfo(true, Path.GetFileNameWithoutExtension(file), sha, BaseUrl + "/" + Uri.EscapeDataString(file),
+            local is not null && Path.IsPathFullyQualified(local) ? local : null);
     }
 
     public static async Task<WindowsDownloadInfo> FetchAsync(HttpClient http, CancellationToken ct)

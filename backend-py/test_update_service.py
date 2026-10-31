@@ -134,3 +134,34 @@ def test_leftovers_of_an_older_version_are_removed(server, tmp_path):
     (tmp_path / "dl" / "CarolineInstaller-1.0.5.exe").write_bytes(b"old")
     service(base, tmp_path).run_once()
     assert [p.name for p in (tmp_path / "dl").iterdir()] == ["CarolineInstaller-1.1.0.exe"]
+
+
+def test_the_windows_payload_is_downloaded_and_verified_before_ready(server, tmp_path):
+    # The installer used to fetch Caroline.zip only after Caroline had closed (2026-10-31): now `ready` means both files are here.
+    root, base = server
+    (root / "CarolineInstaller-1.1.0.exe").write_bytes(b"installer-bytes")
+    (root / "Caroline-1.1.0.zip").write_bytes(b"zip-bytes" * 1000)
+    entry = {"file": "CarolineInstaller-1.1.0.exe", "sha256": rm.file_sha256(root / "CarolineInstaller-1.1.0.exe"), "size": 15,
+             "payload": {"file": "Caroline-1.1.0.zip", "sha256": rm.file_sha256(root / "Caroline-1.1.0.zip"), "size": 9000}}
+    body = json.dumps({"version": "1.1.0", "commit": "abc", "date": "2026-10-31", "artifacts": {"windows": entry}}).encode()
+    (root / "release.json").write_bytes(body)
+    (root / "release.json.sig").write_text(base64.b64encode(rm.ed25519_sign(SEED, body)).decode())
+    svc = service(base, tmp_path)
+    state = svc.run_once()
+    assert state["status"] == "ready" and state["progress"] == 100
+    assert Path(state["payload_path"]).read_bytes() == b"zip-bytes" * 1000
+    assert Path(state["path"]).read_bytes() == b"installer-bytes"
+
+
+def test_a_payload_that_differs_from_the_signed_hash_is_never_ready(server, tmp_path):
+    root, base = server
+    (root / "CarolineInstaller-1.1.0.exe").write_bytes(b"installer-bytes")
+    (root / "Caroline-1.1.0.zip").write_bytes(b"zip-bytes")
+    entry = {"file": "CarolineInstaller-1.1.0.exe", "sha256": rm.file_sha256(root / "CarolineInstaller-1.1.0.exe"), "size": 15,
+             "payload": {"file": "Caroline-1.1.0.zip", "sha256": rm.file_sha256(root / "Caroline-1.1.0.zip"), "size": 9}}
+    (root / "Caroline-1.1.0.zip").write_bytes(b"EVIL-byte")  # the manifest describes the genuine zip, the server serves another
+    body = json.dumps({"version": "1.1.0", "commit": "abc", "date": "2026-10-31", "artifacts": {"windows": entry}}).encode()
+    (root / "release.json").write_bytes(body)
+    (root / "release.json.sig").write_text(base64.b64encode(rm.ed25519_sign(SEED, body)).decode())
+    state = service(base, tmp_path).run_once()
+    assert state["status"] == "failed" and state["payload_path"] is None

@@ -11,7 +11,10 @@ namespace Caroline.Services;
 /// <summary>
 /// The Windows end of the update (docs/UPDATE_EVERYWHERE_PLAN.md, "The rule"). The looking, the downloading and the checking of the signature and of the
 /// sha256 are the backend's (backend-py/app/update_service.py, one code for every platform); this class only asks it what to do and does the one
-/// thing only Windows can: start the installer and let Caroline exit.
+/// thing only Windows can: start the installer. Caroline keeps working while it prepares the new version (2026-10-31): the backend has
+/// already downloaded and verified the app zip too (`payload_path`, passed as --zip-path), and the installer stops her through
+/// AppControlHost's /shutdown only when it is ready to switch -- before, she exited at once and the installer then spent two minutes
+/// downloading and setting up with nothing on the screen.
 ///
 ///   action "install"  Caroline is inactive (or the owner said yes): the installer starts at once, invisibly (--silent-update) when nobody asked,
 ///                     with its own progress window when the owner chose "Update to ..." in the tray.
@@ -96,7 +99,8 @@ public sealed class UpdateChecker
                 payloadFile = pl.TryGetProperty("file", out var pf) ? pf.GetString() : null;
                 payloadSha256 = pl.TryGetProperty("sha256", out var ph) ? ph.GetString() : null;
             }
-            await LaunchInstallerAsync(path, version, silent: !confirmed, payloadFile, payloadSha256);
+            var payloadPath = s.TryGetProperty("payload_path", out var pp) && pp.ValueKind == JsonValueKind.String ? pp.GetString() : null;
+            await LaunchInstallerAsync(path, version, silent: !confirmed, payloadFile, payloadSha256, payloadPath);
             return;
         }
         if (action == "ask")
@@ -127,7 +131,8 @@ public sealed class UpdateChecker
         await PollAsync();
     }
 
-    private async Task LaunchInstallerAsync(string path, string version, bool silent, string? payloadFile = null, string? payloadSha256 = null)
+    private async Task LaunchInstallerAsync(string path, string version, bool silent, string? payloadFile = null, string? payloadSha256 = null,
+        string? payloadPath = null)
     {
         _launched = true;
         _timer.Stop();
@@ -144,8 +149,11 @@ public sealed class UpdateChecker
         var args = silent ? "--silent-update" : "";
         if (!string.IsNullOrEmpty(payloadFile) && !string.IsNullOrEmpty(payloadSha256))
             args = $"{args} --zip-file \"{payloadFile}\" --zip-sha256 {payloadSha256}".Trim();
+        if (!string.IsNullOrEmpty(payloadPath) && File.Exists(payloadPath))
+            args = $"{args} --zip-path \"{payloadPath}\"";
+        Say($"Caroline: Installing update {version} -- Caroline restarts in a moment");
         Process.Start(new ProcessStartInfo(path, args) { UseShellExecute = true });
-        App.RequestShutdown($"update: installer {path} launched");
+        // No exit here: the installer stops Caroline itself (AppControlHost /shutdown) once the new version is ready -- see the class comment.
     }
 
     private void Say(string line)

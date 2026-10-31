@@ -118,7 +118,13 @@ internal static class Program
         }
         try
         {
-            await RunCriticalSectionAsync(http, window, cts, silent);
+            // A silent update shows its window once the running Caroline is stopped: from then on nothing else is on the screen.
+            await RunCriticalSectionAsync(http, window, cts, silent, () =>
+            {
+                if (window.IsVisible) return;
+                window.Show();
+                app.MainWindow = window;
+            });
         }
         finally
         {
@@ -126,7 +132,12 @@ internal static class Program
         }
     }
 
-    private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts, bool silent)
+    // Order (2026-10-31, per explicit instruction, confirmed live with 1.0.1: Caroline closed first and the installer then downloaded
+    // 515 MB and ran npm for ~40 s, two minutes with nothing on the screen): everything that does not touch what a running Caroline uses
+    // comes FIRST, while she keeps working -- the zip (already downloaded and verified by her, --zip-path), its extraction into a new,
+    // not yet active app folder, that folder's npm installs. Only then is she stopped; the shared runtimes, the switch to the new folder
+    // and the launch follow, a few seconds, with the progress window showing even in a silent update.
+    private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts, bool silent, Action showWindow)
     {
         var ct = cts.Token;
         var downloader = new Downloader(http);
@@ -145,19 +156,6 @@ internal static class Program
 
         AppPaths.EnsureRootExists();
 
-        // Size-cap sweep of workspace\dehydrated\ -- runs on every install/update,
-        // silent mode included, no UAC needed (the user's own per-user folder).
-        // See WorkspaceCleanup.cs for why this is the one piece of workspace\ the
-        // installer touches at all.
-        window.SetStatus("Cleaning up old data…");
-        await WithStepAsync(ErrorCodes.WorkspaceCleanup, "Cleaning up old data", () => WorkspaceCleanup.RunAsync(ct));
-
-        // Windows Defender exclusion for Caroline's own folders -- one UAC prompt, once, never
-        // in a --silent-update run, never fails the install. Placed before the heavy
-        // downloads/extraction so this very install benefits. See DefenderExclusion.cs.
-        window.SetStatus("Configuring Windows Defender…");
-        await DefenderExclusion.EnsureAsync(silent, ct);
-
         // Per explicit instruction (2026-09-18): check free disk space up
         // front, before spending any time downloading anything -- a full
         // drive used to only surface as a confusing late IOException deep
@@ -171,6 +169,74 @@ internal static class Program
         // install over an optional, best-effort feature would be wrong.
         const long RequiredBaseFreeBytes = 6L * 1024 * 1024 * 1024;
         DiskSpace.RequireFreeSpace(AppPaths.Root, RequiredBaseFreeBytes, "install Caroline");
+
+        // Windows Defender exclusion for Caroline's own folders -- one UAC prompt, once, never
+        // in a --silent-update run, never fails the install. Placed before the heavy
+        // downloads/extraction so this very install benefits. See DefenderExclusion.cs.
+        window.SetStatus("Configuring Windows Defender…");
+        await DefenderExclusion.EnsureAsync(silent, ct);
+
+        // Step 2: the Caroline app itself.
+        window.SetStatus("Checking for the latest version…");
+        var info = await WithStepAsync(ErrorCodes.VersionCheck, "Checking for the latest version", async () =>
+        {
+            var result = await DownloadsInfo.FetchAsync(http, ct);
+            if (!result.Available)
+            {
+                throw new InvalidOperationException("Caroline isn't currently available for download. Please try again later.");
+            }
+            return result;
+        });
+        window.SetVersionInfo(info.Version);
+        Logger.Log($"Target version: {info.Version}, sha256={info.Sha256Hex}");
+
+        var installState = InstallStateStore.Load();
+        InstallStateStore.TryCleanupPending(installState); // sweep whatever a previous run couldn't clean up
+
+        var alreadyInstalled = File.Exists(AppPaths.ClientExe)
+            && string.Equals(installState.InstalledSha256, info.Sha256Hex, StringComparison.OrdinalIgnoreCase);
+
+        string? newDirName = null, zipPath = null;
+        if (alreadyInstalled)
+        {
+            Logger.Log($"Already up to date (sha256={info.Sha256Hex}) -- skipping download and extraction entirely.");
+            window.SetStatus("Already up to date…");
+        }
+        else
+        {
+            zipPath = await ObtainZipAsync(downloader, info, window, ct);
+            newDirName = await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, zipPath, ct));
+            if (NodeInstaller.IsInstalled())
+            {
+                var newDir = Path.Combine(AppPaths.Root, newDirName);
+                try
+                {
+                    await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct, newDir));
+                    await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct, newDir));
+                }
+                catch
+                {
+                    TryDeleteUnactivated(newDir);
+                    throw;
+                }
+            }
+        }
+
+        // Only now the running Caroline stops (see the order above) -- and only for a new version, as before: already installed, she is left alone.
+        if (newDirName is not null)
+        {
+            Logger.Log("Stopping any running instance");
+            await Autostart.StopRunningClientAsync();
+            showWindow();
+            window.SetStatus("Updating Caroline…");
+        }
+
+        // Size-cap sweep of workspace\dehydrated\ -- runs on every install/update,
+        // silent mode included, no UAC needed (the user's own per-user folder).
+        // See WorkspaceCleanup.cs for why this is the one piece of workspace\ the
+        // installer touches at all.
+        window.SetStatus("Cleaning up old data…");
+        await WithStepAsync(ErrorCodes.WorkspaceCleanup, "Cleaning up old data", () => WorkspaceCleanup.RunAsync(ct));
 
         // Step 1: isolated runtimes. Node first -- Playwright's install step
         // later needs it, and neither install touches the system otherwise,
@@ -247,41 +313,9 @@ internal static class Program
         await WithStepAsync(ErrorCodes.WebView2Install, "Installing the WebView2 Runtime",
             () => WebView2Installer.InstallAsync(downloader, s => window.SetStatus(s), ct));
 
-        // Step 2: the Caroline app itself.
-        window.SetStatus("Checking for the latest version…");
-        var info = await WithStepAsync(ErrorCodes.VersionCheck, "Checking for the latest version", async () =>
+        if (newDirName is not null)
         {
-            var result = await DownloadsInfo.FetchAsync(http, ct);
-            if (!result.Available)
-            {
-                throw new InvalidOperationException("Caroline isn't currently available for download. Please try again later.");
-            }
-            return result;
-        });
-        window.SetVersionInfo(info.Version);
-        Logger.Log($"Target version: {info.Version}, sha256={info.Sha256Hex}");
-
-        var installState = InstallStateStore.Load();
-        InstallStateStore.TryCleanupPending(installState); // sweep whatever a previous run couldn't clean up
-
-        var alreadyInstalled = File.Exists(AppPaths.ClientExe)
-            && string.Equals(installState.InstalledSha256, info.Sha256Hex, StringComparison.OrdinalIgnoreCase);
-
-        if (alreadyInstalled)
-        {
-            Logger.Log($"Already up to date (sha256={info.Sha256Hex}) -- skipping download and extraction entirely.");
-            window.SetStatus("Already up to date…");
-        }
-        else
-        {
-            window.SetStatus("Downloading Caroline…");
-            await WithStepAsync(ErrorCodes.Download, "Downloading Caroline", () => downloader.DownloadAsync(
-                info.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
-                progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct));
-
-            Logger.Log("Stopping any running instance before extraction");
-            await Autostart.StopRunningClientAsync();
-            await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, info.Sha256Hex, ct));
+            await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => Task.Run(() => ActivateAppDir(newDirName, info.Sha256Hex, zipPath!), ct));
         }
 
         // Step 3 used to install Chromium through the Node browser MCP server's
@@ -427,8 +461,8 @@ internal static class Program
     }
 
     /// <summary>
-    /// Extracts into a brand-new, uniquely-named directory under AppPaths.Root and, once
-    /// verified good, switches state.json's ActiveAppDir to it -- replacing the previous
+    /// Extracts into a brand-new, uniquely-named directory under AppPaths.Root (ActivateAppDir then
+    /// switches state.json's ActiveAppDir to it) -- replacing the previous
     /// approach of deleting AppDir and re-extracting directly into one fixed "app" folder.
     /// Confirmed live (2026-09-06), TWICE in one day including once after the
     /// graceful-shutdown-retry fix in StopRunningClientAsync had already run and confirmed
@@ -443,54 +477,93 @@ internal static class Program
     /// previous install until the swap below -- cannot hit this failure mode at all. No
     /// retry loop is needed here any more: the one operation that used to need one
     /// (touching the previously-occupied AppDir) no longer happens on this path.
+    ///
+    /// Split in two (2026-10-31): this extracts and verifies only, returning the new folder's name; ActivateAppDir switches to it.
+    /// The extraction now runs while the old Caroline is still working, and only the switch waits for her to stop.
     /// </summary>
-    private static async Task ExtractWithRetryAsync(ProgressWindow window, string newSha256, CancellationToken ct)
+    private static async Task<string> ExtractWithRetryAsync(ProgressWindow window, string zipPath, CancellationToken ct)
     {
-        var state = InstallStateStore.Load();
-        var previousAppDir = state.ActiveAppDir;
         var newDirName = "app-" + Guid.NewGuid().ToString("N")[..8];
         var newDir = Path.Combine(AppPaths.Root, newDirName);
 
         try
         {
             await Task.Run(() =>
-                ExtractWithProgress(AppPaths.DownloadZipPath, newDir,
+                ExtractWithProgress(zipPath, newDir,
                     progress => window.SetDownloadProgress("Installing…", progress), ct), ct);
 
             if (!File.Exists(Path.Combine(newDir, "Caroline.exe")))
             {
                 throw new InvalidOperationException($"Install verification failed: Caroline.exe not found in {newDir} after extracting.");
             }
-
-            // Only flipped once the new build is verified good -- a marker written before
-            // that could make a future run wrongly skip a broken install. Nothing above
-            // this point has touched the previously active directory at all, so any
-            // failure leaves the existing install completely untouched and still active.
-            state.ActiveAppDir = newDirName;
-            state.InstalledSha256 = newSha256;
-            if (previousAppDir != newDirName && !state.PendingDeletion.Contains(previousAppDir))
-            {
-                state.PendingDeletion.Add(previousAppDir);
-            }
-            InstallStateStore.Save(state);
-
-            File.Delete(AppPaths.DownloadZipPath);
-
-            // Quick, non-blocking best-effort attempt right away (most of the time the old
-            // process's files are already free by now) -- if this one doesn't clear it,
-            // TryCleanupPending's next caller (this installer's next run, or Caroline's own
-            // periodic retry once it's running) will keep trying for as long as it takes.
-            InstallStateStore.TryCleanupPending(state);
+            return newDirName;
         }
         catch
         {
-            try { if (Directory.Exists(newDir)) Directory.Delete(newDir, recursive: true); }
-            catch (Exception cleanupEx)
-            {
-                Logger.Log($"ExtractWithRetryAsync: cleanup of half-extracted {newDir} failed (ignored, harmless leftover): {cleanupEx.Message}");
-            }
+            TryDeleteUnactivated(newDir);
             throw;
         }
+    }
+
+    private static void TryDeleteUnactivated(string newDir)
+    {
+        try { if (Directory.Exists(newDir)) Directory.Delete(newDir, recursive: true); }
+        catch (Exception cleanupEx)
+        {
+            Logger.Log($"ExtractWithRetryAsync: cleanup of half-installed {newDir} failed (ignored, harmless leftover): {cleanupEx.Message}");
+        }
+    }
+
+    /// <summary>Makes the extracted, verified folder the active one (state.json), once the old Caroline has stopped.</summary>
+    private static void ActivateAppDir(string newDirName, string newSha256, string zipPath)
+    {
+        var state = InstallStateStore.Load();
+        var previousAppDir = state.ActiveAppDir;
+
+        // Only flipped once the new build is verified good -- a marker written before
+        // that could make a future run wrongly skip a broken install. Nothing before
+        // this point has touched the previously active directory at all, so any
+        // failure leaves the existing install completely untouched and still active.
+        state.ActiveAppDir = newDirName;
+        state.InstalledSha256 = newSha256;
+        if (previousAppDir != newDirName && !state.PendingDeletion.Contains(previousAppDir))
+        {
+            state.PendingDeletion.Add(previousAppDir);
+        }
+        InstallStateStore.Save(state);
+
+        // Our own download, or the one the running Caroline made (--zip-path): installed, it is not needed any more.
+        try { File.Delete(zipPath); }
+        catch (Exception ex) { Logger.Log($"ActivateAppDir: could not delete {zipPath} (ignored): {ex.Message}"); }
+
+        // Quick, non-blocking best-effort attempt right away (most of the time the old
+        // process's files are already free by now) -- if this one doesn't clear it,
+        // TryCleanupPending's next caller (this installer's next run, or Caroline's own
+        // periodic retry once it's running) will keep trying for as long as it takes.
+        InstallStateStore.TryCleanupPending(state);
+    }
+
+    /// <summary>
+    /// The verified zip to install: the one the running Caroline already downloaded (--zip-path) when its sha256 is the signed one,
+    /// else downloaded here as before.
+    /// </summary>
+    private static async Task<string> ObtainZipAsync(Downloader downloader, WindowsDownloadInfo info, ProgressWindow window, CancellationToken ct)
+    {
+        if (info.LocalZip is not null)
+        {
+            window.SetStatus("Checking the downloaded update…");
+            if (File.Exists(info.LocalZip) && await Downloader.HashMatchesAsync(info.LocalZip, info.Sha256Hex, ct))
+            {
+                Logger.Log($"Using the zip the running Caroline already downloaded: {info.LocalZip}");
+                return info.LocalZip;
+            }
+            Logger.Log($"{info.LocalZip} is missing or its sha256 differs from the signed one -- downloading it here");
+        }
+        window.SetStatus("Downloading Caroline…");
+        await WithStepAsync(ErrorCodes.Download, "Downloading Caroline", () => downloader.DownloadAsync(
+            info.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
+            progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct));
+        return AppPaths.DownloadZipPath;
     }
 
     /// <summary>

@@ -96,7 +96,7 @@ class UpdateService:
         self.public_key = public_key
         self._lock = threading.RLock()
         self._confirmed = False
-        self._state: dict[str, Any] = {"status": "idle", "error": None, "checked_at": None, "version": None, "path": None, "progress": None, "payload": None}
+        self._state: dict[str, Any] = {"status": "idle", "error": None, "checked_at": None, "version": None, "path": None, "progress": None, "payload": None, "payload_path": None}
         self._artifact: rm.Artifact | None = None
 
     # ---- state --------------------------------------------------------------------------------------------------------------
@@ -124,7 +124,7 @@ class UpdateService:
         """The platform started the install (the process is about to restart): forget the verified file's state."""
         with self._lock:
             self._confirmed = False
-            self._state.update(status="idle", path=None, progress=None)
+            self._state.update(status="idle", path=None, payload_path=None, progress=None)
 
     # ---- check and download (blocking: run them in a thread) ----------------------------------------------------------------
     def check(self) -> dict[str, Any]:
@@ -158,43 +158,69 @@ class UpdateService:
         else:
             if self._artifact != artifact or self._state["status"] not in ("ready", "downloading"):
                 self._artifact = artifact
-                self._set(status="available", error=None, checked_at=time.time(), version=version, path=None, payload=artifact.payload)
+                self._set(status="available", error=None, checked_at=time.time(), version=version, path=None, payload=artifact.payload, payload_path=None)
             log_event("updater", "update_available", version=version, installed=self.version, platform=self.platform)
         return self.status()
 
     def download(self, progress: Callable[[int], None] | None = None) -> dict[str, Any]:
-        """Downloads the artifact of the last check and verifies it against the signed manifest. `ready` only for a file that matches exactly."""
+        """Downloads the artifact of the last check and verifies it against the signed manifest. `ready` only for a file that matches exactly.
+
+        The payload too (Windows' Caroline.zip), per explicit instruction (2026-10-31, confirmed live with 1.0.1): the installer used to download
+        it only after Caroline had closed -- 515 MB with nothing on the screen. Now `ready` means both files are here and verified
+        (`payload_path`), and the installer is handed the local zip."""
         artifact = self._artifact
         if artifact is None or self._state["status"] not in ("available", "failed", "ready"):
             return self.status()
+        files = [artifact]
+        if artifact.payload:
+            pay = artifact.payload
+            files.append(rm.Artifact(artifact.platform, pay["file"], pay["sha256"], pay["size"], 0))
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        keep = {f.file for f in files} | {f.file + ".part" for f in files}
         for old in self.download_dir.iterdir():  # leftovers of earlier versions and half downloads
-            if old.name not in (artifact.file, artifact.file + ".part"):
+            if old.name not in keep:
                 old.unlink(missing_ok=True)
-        final = self.download_dir / artifact.file
+        total = sum(f.size for f in files) or 1
+        done = 0
+        paths: list[Path] = []
+        for f in files:
+            def report(pct: int, base: int = done, size: int = f.size) -> None:
+                overall = (base + size * pct // 100) * 100 // total
+                self._set(progress=overall)
+                if progress:
+                    progress(overall)
+            path = self._obtain(f, report)
+            if path is None:
+                return self.status()
+            paths.append(path)
+            done += f.size
+        self._set(status="ready", path=str(paths[0]), payload_path=str(paths[1]) if len(paths) > 1 else None, error=None, progress=100)
+        log_event("updater", "update_ready", version=self._state["version"], path=str(paths[0]), payload_path=self._state["payload_path"])
+        return self.status()
+
+    def _obtain(self, art: rm.Artifact, report: Callable[[int], None]) -> Path | None:
+        """One file of the release, here and verified: the path, or None with the state `failed`."""
+        final = self.download_dir / art.file
         try:
-            rm.check_file(final, artifact)  # already here and verified: no second download
-            self._set(status="ready", path=str(final), error=None, progress=100)
-            return self.status()
+            rm.check_file(final, art)  # already here and verified: no second download
+            return final
         except (rm.ReleaseError, OSError):
             final.unlink(missing_ok=True)
-        part = self.download_dir / (artifact.file + ".part")
-        self._set(status="downloading", error=None, progress=0)
+        part = self.download_dir / (art.file + ".part")
+        self._set(status="downloading", error=None)
         last_error = ""
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
             try:
-                _fetch_to(f"{self.base_url}/{artifact.file}", part, lambda p: self._set(progress=p) or (progress(p) if progress else None))
-                rm.check_file(part, artifact)
+                _fetch_to(f"{self.base_url}/{art.file}", part, report)
+                rm.check_file(part, art)
                 os.replace(part, final)
-                self._set(status="ready", path=str(final), error=None, progress=100)
-                log_event("updater", "update_ready", version=self._state["version"], path=str(final))
-                return self.status()
+                return final
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
-                log_event("updater", "download_failed", attempt=attempt, error=last_error)
+                log_event("updater", "download_failed", file=art.file, attempt=attempt, error=last_error)
                 part.unlink(missing_ok=True)
         self._set(status="failed", error=last_error, progress=None)
-        return self.status()
+        return None
 
     def run_once(self) -> dict[str, Any]:
         state = self.check()
