@@ -7,7 +7,13 @@ does around the poll (Registry registration and the 30 s heartbeat), to async ht
 A delivered task becomes a proactive turn on a headless ChatSession, one session per chainId (main.py). The model
 answers through the akinakes_publish_result tool (plugins/akinakes_bus_plugin.py), which calls publish_result() here.
 The original message is kept by chainId, so the model never builds routing itself. A turn that ends with nothing
-published produces system.skill_blocked (on_turn_end).
+published produces the task's "blocked" reply, system.skill_blocked by default (on_turn_end).
+
+A chat.message (a role that talks in chat rooms) passes AgentLoop._intake()'s gate first (scope, then ACL). The model
+answers in the room (plugins/akinakes_chat_plugin.py) or passes; a turn that does neither publishes agent.pass, so
+chatSecretary moves on at once.
+
+What each message type expects in reply is configuration, not code: akinakes_reply_specs.json (load_reply_specs).
 
 Active only when BUS_URL and AGENT_UID are set.
 """
@@ -17,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -48,6 +54,11 @@ class ChannelConfig:
     specialization: list[str]
     description: str
     registry_url: str
+    # chat.message intake (AgentLoop._intake): the agent.toml scope as JSON, and ACL Service; empty = no check.
+    scope: list[dict[str, Any]] = field(default_factory=list)
+    acl_url: str = ""
+    chat_url: str = ""
+    chat_key: str = ""
 
 
 @dataclass
@@ -81,7 +92,23 @@ def load_config() -> ChannelConfig | None:
         specialization=[s.strip() for s in (os.environ.get("AGENT_SPECIALIZATION") or "").split(",") if s.strip()],
         description=(os.environ.get("AGENT_DESCRIPTION") or "").strip(),
         registry_url=(os.environ.get("AGENT_REGISTRY_URL") or "").strip().rstrip("/"),
+        scope=_scope_from_env(),
+        acl_url=(os.environ.get("ACL_SERVICE_URL") or "").strip().rstrip("/"),
+        chat_url=(os.environ.get("CHAT_SERVICE_URL") or "").strip().rstrip("/"),
+        chat_key=(os.environ.get("CHAT_INTERNAL_KEY") or "").strip(),
     )
+
+
+def _scope_from_env() -> list[dict[str, Any]]:
+    raw = (os.environ.get("AGENT_SCOPE") or "").strip()
+    if not raw:
+        return []
+    try:
+        scope = json.loads(raw)
+    except ValueError:
+        log_event("plugin:akinakes-channel", "agent_scope_unreadable", value=raw[:200])
+        return []
+    return [entry for entry in scope if isinstance(entry, dict)] if isinstance(scope, list) else []
 
 
 def get_akinakes_channel_status() -> ChannelStatus:
@@ -174,7 +201,14 @@ def make_agent(config: ChannelConfig) -> dict[str, Any]:
 # --- reply specs -----------------------------------------------------------------------------------------------------
 
 def load_reply_specs() -> dict[str, dict[str, Any]]:
-    """task payload type -> {payload_type, required}. From AKINAKES_REPLY_SPECS (a path), else the file next to this module."""
+    """message payload type -> what it expects in reply. From AKINAKES_REPLY_SPECS (a path), else the file next to this
+    module. A spec has:
+      replies  -- [{payload_type, required, when}]: the replies allowed, "when" says which fits (several for one task:
+                  editor's task.edit_section answers one way for a section_address, another for a section_id);
+      blocked  -- {payload_type, reason_field}: the reply when the task cannot be done (result.plan_error with "reason",
+                  say), as the old agent sent it; without it, system.skill_blocked;
+      echo     -- task payload fields copied into every reply (room_id, which chatSecretary relays by);
+      chat     -- true for chat.message: answered in the chat room, or passed (agent.pass)."""
     path = Path(os.environ.get("AKINAKES_REPLY_SPECS") or Path(__file__).with_name("akinakes_reply_specs.json"))
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -183,11 +217,26 @@ def load_reply_specs() -> dict[str, dict[str, Any]]:
         return {}
 
 
+def reply_spec(message_type: str) -> dict[str, Any]:
+    return load_reply_specs().get(message_type) or {}
+
+
 def expected_reply_text(task_type: str) -> str:
-    spec = load_reply_specs().get(task_type)
-    if not spec:
+    replies = reply_spec(task_type).get("replies") or []
+    if not replies:
         return "payload_type: a result.* type that fits this task, fields: its result"
-    return f'payload_type="{spec["payload_type"]}", fields with: {", ".join(spec.get("required") or [])}'
+    lines = [f'payload_type="{r["payload_type"]}", fields with: {", ".join(r.get("required") or [])}'
+             + (f' -- when {r["when"]}' if r.get("when") else "") for r in replies]
+    return lines[0] if len(lines) == 1 else "one of:\n" + "\n".join(f"- {line}" for line in lines) + "\n"
+
+
+def is_chat(chain_id: str) -> bool:
+    return bool(reply_spec(pending_task_type(chain_id) or "").get("chat"))
+
+
+def _echoed(original: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    payload = original.get("payload") or {}
+    return {k: payload[k] for k in spec.get("echo") or [] if k in payload}
 
 
 # --- publishing ------------------------------------------------------------------------------------------------------
@@ -211,16 +260,19 @@ async def publish_result(chain_id: str, payload_type: str, fields: dict[str, Any
     if original is None:
         raise ValueError(f'No task is in progress for chainId "{chain_id}". Use the exact chainId from the task message.')
     task_type = pending_task_type(chain_id) or ""
-    spec = load_reply_specs().get(task_type)
-    if spec:
-        if payload_type != spec["payload_type"]:
-            raise ValueError(f'For {task_type} the payload_type must be "{spec["payload_type"]}", not "{payload_type}".')
-        missing = [k for k in spec.get("required") or [] if k not in fields]
+    spec = reply_spec(task_type)
+    if spec.get("chat"):
+        raise ValueError("A chat message is answered in its room (chat_post_message), or passed (akinakes_pass).")
+    replies = {r["payload_type"]: r for r in spec.get("replies") or []}
+    if replies:
+        if payload_type not in replies:
+            raise ValueError(f'For {task_type} the payload_type must be one of: {", ".join(replies)}; not "{payload_type}".')
+        missing = [k for k in replies[payload_type].get("required") or [] if k not in fields]
         if missing:
             raise ValueError(f"Missing fields for {payload_type}: {', '.join(missing)}.")
     elif not payload_type.startswith("result."):
         raise ValueError('payload_type must start with "result.".')
-    ack = await _publish(make_reply(original, _config.agent_uid, payload_type, **fields))
+    ack = await _publish(make_reply(original, _config.agent_uid, payload_type, **{**_echoed(original, spec), **fields}))
     _answered.add(chain_id)
     status.results_published += 1
     log_event("plugin:akinakes-channel", "result_published", chain_id=chain_id, payload_type=payload_type)
@@ -232,25 +284,129 @@ async def publish_blocked(chain_id: str, reason: str) -> dict[str, Any]:
     original = _pending.get(chain_id)
     if original is None:
         raise ValueError(f'No task is in progress for chainId "{chain_id}".')
-    routing = (original["envelope"].get("routing") or {})
-    skill = ((original.get("payload") or {}).get("type") or "").removeprefix("task.")
-    ack = await _publish(make_message(
-        sender_uid=_config.agent_uid,
-        payload_type="system.skill_blocked",
-        chain_id=chain_id,
-        target_agent_uids=[routing.get("returnTo") or "chatGateway"],
-        ttl_seconds=DEFAULT_TTL_S,
-        reason=reason,
-        skill=skill,
-    ))
+    spec = reply_spec(pending_task_type(chain_id) or "")
+    if spec.get("chat"):
+        return await publish_pass(chain_id)
+    blocked = spec.get("blocked") or {}
+    if blocked.get("payload_type"):
+        reply = make_reply(original, _config.agent_uid, blocked["payload_type"],
+                           **{**_echoed(original, spec), blocked.get("reason_field") or "reason": reason})
+    else:
+        routing = (original["envelope"].get("routing") or {})
+        skill = ((original.get("payload") or {}).get("type") or "").removeprefix("task.")
+        reply = make_message(
+            sender_uid=_config.agent_uid,
+            payload_type="system.skill_blocked",
+            chain_id=chain_id,
+            target_agent_uids=[routing.get("returnTo") or "chatGateway"],
+            ttl_seconds=DEFAULT_TTL_S,
+            reason=reason,
+            skill=skill,
+        )
+    ack = await _publish(reply)
     _answered.add(chain_id)
     status.blocked_published += 1
     log_event("plugin:akinakes-channel", "blocked_published", chain_id=chain_id, reason=reason[:200])
     return ack
 
 
+# --- chat rooms (a chat.message in progress) -------------------------------------------------------------------------
+
+CHAT_SECRETARY_UID = "chatSecretary"
+CHAT_HISTORY_LIMIT = 200
+
+
+def _chat_message(chain_id: str) -> dict[str, Any]:
+    original = _pending.get(chain_id)
+    if original is None or not is_chat(chain_id):
+        raise ValueError(f'No chat message is in progress for chainId "{chain_id}". Use the exact chainId from the message.')
+    return original
+
+
+async def post_chat(chain_id: str, text: str) -> None:
+    """Answers the chat message of this chain in its room, as agent_lib's agents do (Chat Service's agent_message)."""
+    assert _config is not None and _http is not None
+    room_id = (_chat_message(chain_id).get("payload") or {}).get("room_id") or ""
+    if not text.strip():
+        raise ValueError("The message text is empty.")
+    resp = await _http.post(
+        f"{_config.chat_url}/internal/rooms/{room_id}/agent_message",
+        json={"sender_uid": _config.agent_uid, "sender_type": "agent", "msg_type": "agent_message", "payload": {"text": text}},
+        headers={"x-internal-key": _config.chat_key},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    _answered.add(chain_id)
+    status.results_published += 1
+    log_event("plugin:akinakes-channel", "chat_posted", chain_id=chain_id, room_id=room_id, text_len=len(text))
+
+
+async def chat_history(chain_id: str) -> list[dict[str, Any]]:
+    """The room's messages, oldest first (Chat Service GET /rooms/{room_id}/messages, all pages)."""
+    assert _config is not None and _http is not None
+    room_id = (_chat_message(chain_id).get("payload") or {}).get("room_id") or ""
+    messages: list[dict[str, Any]] = []
+    after_seq = 0
+    while True:
+        resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/messages",
+                               params={"after_seq": after_seq, "limit": CHAT_HISTORY_LIMIT}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        page = data if isinstance(data, list) else data.get("messages") or []
+        messages += page
+        if len(page) < CHAT_HISTORY_LIMIT:
+            return messages
+        after_seq = max(int(m.get("seq") or 0) for m in page)
+
+
+async def publish_pass(chain_id: str) -> dict[str, Any]:
+    """This chat message is not for this agent: agent.pass to chatSecretary (agent_lib/agent_pass.py)."""
+    assert _config is not None
+    room_id = (_chat_message(chain_id).get("payload") or {}).get("room_id") or ""
+    message = make_message(_config.agent_uid, "agent.pass", chain_id=chain_id, ttl_seconds=60,
+                           target_agent_uids=[CHAT_SECRETARY_UID], room_id=room_id, agent_uid=_config.agent_uid)
+    ack = await _publish(message)
+    _answered.add(chain_id)
+    log_event("plugin:akinakes-channel", "passed", chain_id=chain_id, room_id=room_id)
+    return ack
+
+
+async def admits_chat_message(msg: dict[str, Any], config: ChannelConfig, client: httpx.AsyncClient) -> bool:
+    """AgentLoop._intake(): stage 1 the agent's scope (skipped when the message is addressed to this agent), stage 2
+    ACL Service (always; fail-open when it is unreachable). Also drops the agent's own messages and empty ones."""
+    payload = msg.get("payload") or {}
+    room_id, sender_uid = payload.get("room_id") or "", payload.get("sender_uid") or ""
+    if not (payload.get("text") or "").strip() or not room_id or sender_uid == config.agent_uid:
+        return False
+    routing = (msg.get("envelope") or {}).get("routing") or {}
+    if config.agent_uid not in (routing.get("targetAgentUids") or []) and config.scope and not match_scope(config.scope, room_id):
+        log_event("plugin:akinakes-channel", "intake_scope_rejected", room_id=room_id)
+        return False
+    if sender_uid and config.acl_url:
+        try:
+            resp = await client.post(f"{config.acl_url}/check", json={
+                "subject": sender_uid, "object_type": "agent", "object_id": config.agent_uid, "operation": "use",
+            }, timeout=3)
+            if not bool(resp.json().get("allowed", True)):
+                log_event("plugin:akinakes-channel", "intake_acl_rejected", sender=sender_uid)
+                return False
+        except Exception as exc:  # noqa: BLE001 -- fail-open, as AgentLoop._acl_allows
+            log_event("plugin:akinakes-channel", "intake_acl_unreachable", error=str(exc))
+    return True
+
+
+def match_scope(scope: list[dict[str, Any]], room_id: str) -> bool:
+    """agent_lib/scope.py: "all", the room itself, or (recursive) a room under it."""
+    for entry in scope:
+        entry_room = entry.get("room_id", "")
+        if entry_room in ("all", room_id) or (entry.get("recursive") and room_id.startswith(entry_room + "/")):
+            return True
+    return False
+
+
 async def on_turn_end(chain_id: str) -> None:
-    """Call when a session's turn ended. No result published for the chain -> system.skill_blocked."""
+    """Call when a session's turn ended. Nothing published for the chain -> the task's blocked reply (agent.pass for a
+    chat message)."""
     if chain_id in _pending and chain_id not in _answered:
         try:
             await publish_blocked(chain_id, "The agent's turn ended without publishing a result.")
@@ -267,6 +423,16 @@ def render_task_text(msg: dict[str, Any]) -> str:
     env = msg["envelope"]
     payload = msg.get("payload") or {}
     task_type = payload.get("type", "")
+    if reply_spec(task_type).get("chat"):
+        return (
+            f'[Agent Bus chat message. chainId="{env["chainId"]}" room="{payload.get("room_id", "")}" '
+            f'from="{payload.get("sender_uid", "")}".\n'
+            f"Text:\n{payload.get('text', '')}\n\n"
+            "Every agent of the room receives it. If it is for you -- addressed to you, or what your role does -- "
+            "do it with your tools (chat_history shows the conversation so far) and answer in the room with "
+            "chat_post_message and this exact chainId. If it is not for you, call akinakes_pass with the chainId and "
+            "do nothing else. Nobody reads this conversation, only what you post in the room.]"
+        )
     return (
         f'[Agent Bus task. chainId="{env["chainId"]}" type="{task_type}" from="{env.get("senderUid", "")}".\n'
         f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
@@ -325,6 +491,8 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                     continue
                 status.tasks_received += 1
                 status.last_task_at_iso = datetime.now(timezone.utc).isoformat()
+                if reply_spec(((msg.get("payload") or {}).get("type")) or "").get("chat") and not await admits_chat_message(msg, config, client):
+                    continue
                 _pending[chain_id] = msg
                 _answered.discard(chain_id)
                 if before_task is not None:

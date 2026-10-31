@@ -1,6 +1,7 @@
 """Read access to akinakes' Document Service (DOCUMENT_SERVICE_URL), for the Agent Bus agents: the document's own
-description, plan and synopsis, its sections, and full-text search. Read only: an agent proposes text through
-akinakes_publish_result, it does not edit documents. Not loaded when DOCUMENT_SERVICE_URL is not set."""
+description, plan and synopsis, its sections, documents by project or tags, and full-text search. Read only; writing
+is document_write_plugin.py, left out of the roles that only propose text. Not loaded when DOCUMENT_SERVICE_URL is not
+set."""
 
 from __future__ import annotations
 
@@ -67,6 +68,16 @@ async def document_get_section(args: dict[str, Any], _report_progress: Any) -> d
         return _failure(exc)
 
 
+async def document_list(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
+    params = {k: str(args[k]) for k in ("project_id", "tags", "parent_id") if args.get(k)}
+    try:
+        docs = await _get("/documents", params)
+    except Exception as exc:  # noqa: BLE001
+        return _failure(exc)
+    keep = ("id", "type", "title", "project_id", "parent_id", "tags", "created_by", "synopsis")
+    return _reply([{k: d[k] for k in keep if k in d} for d in docs])
+
+
 async def document_search(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
         return _reply(await _get("/documents/search", {"q": args["query"], "limit": int(args.get("limit") or 10)}))
@@ -91,6 +102,9 @@ PLUGIN = None if not _base() else Plugin(
               _DOC_ID, ["doc_id"], document_list_sections),
         _tool("document_get_section", "One section of a document in full, with its content.",
               {**_DOC_ID, "section_id": {"type": "string"}}, ["doc_id", "section_id"], document_get_section),
+        _tool("document_list", "Documents by project, tags (comma separated, all must match) or parent document: ids, types, "
+              "titles, tags.", {"project_id": {"type": "string"}, "tags": {"type": "string"}, "parent_id": {"type": "string"}},
+              [], document_list),
         _tool("document_search", "Full-text search across the sections of all documents.",
               {"query": {"type": "string"}, "limit": {"type": "integer"}}, ["query"], document_search),
     ],
