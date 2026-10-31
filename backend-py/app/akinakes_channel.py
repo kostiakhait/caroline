@@ -86,6 +86,20 @@ def get_akinakes_channel_status() -> ChannelStatus:
     return status
 
 
+CHAT_MODES = ("sw", "claude", "openai")
+
+
+def chat_mode() -> str:
+    """The engine a chain's session runs on: AKINAKES_CHAT_MODE, else sw. main.py writes it into a new chain tab before
+    the session starts, because the session's own default-to-sw rule runs later, in its run loop: the task injected
+    right after start() was read in the "claude" default and went to a Claude CLI that a container cannot run (the
+    silent turn of the 2026-10-31 run). An unknown value falls back to sw."""
+    mode = (os.environ.get("AKINAKES_CHAT_MODE") or "").strip().lower()
+    if mode and mode not in CHAT_MODES:
+        log_event("engine", "akinakes_chat_mode_unknown", value=mode)
+    return mode if mode in CHAT_MODES else "sw"
+
+
 # --- envelope builders, ported from agent_lib/builders.py -------------------------------------------------------------
 
 def make_message(

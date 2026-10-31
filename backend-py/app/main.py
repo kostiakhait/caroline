@@ -29,7 +29,7 @@ from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear
 # edition:cut claude cli
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 # edition:end
-from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
+from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, has_chat_mode, load_chat_mode,load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app.stt_adaptation import apply_adaptation, observe_user_message
 from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcript
@@ -1220,6 +1220,8 @@ async def get_or_create_akinakes_session(chain_id: str) -> ChatSession:
     existing = sessions.get(tab_id)
     if existing is not None and not existing.ended:
         return existing
+    if not has_chat_mode(WORKSPACE_DIR, tab_id):
+        save_chat_mode(WORKSPACE_DIR, tab_id, akinakes_channel.chat_mode())
     session = ChatSession(tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=_akinakes_session_send_for(chain_id), headless=True)
     sessions[tab_id] = session
     await session.start()

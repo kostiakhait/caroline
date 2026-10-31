@@ -57,6 +57,15 @@ def test_load_config_needs_bus_and_uid(monkeypatch):
     assert config is not None and config.bus_url == "http://bus" and config.role == "writer"
 
 
+def test_chat_mode_defaults_to_sw_and_can_be_chosen(monkeypatch):
+    monkeypatch.delenv("AKINAKES_CHAT_MODE", raising=False)
+    assert ch.chat_mode() == "sw"
+    monkeypatch.setenv("AKINAKES_CHAT_MODE", "Claude")
+    assert ch.chat_mode() == "claude"
+    monkeypatch.setenv("AKINAKES_CHAT_MODE", "gpt")
+    assert ch.chat_mode() == "sw"
+
+
 def test_result_is_a_reply_in_the_same_chain(channel):
     ch._pending["c1"] = task()
     run(ch.publish_result("c1", "result.section_draft", {"doc_id": "d1", "section_name": "Intro", "content": "Text"}))
