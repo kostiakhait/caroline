@@ -22,11 +22,13 @@ def test_parts_cover_the_whole_text_with_overlap():
     assert rf.parts("short") == ["short"]
 
 
-def test_a_quote_must_be_in_the_result_word_for_word():
+def test_only_word_for_word_quotes_are_kept():
     given = {"statements": ["40 sensors were used"], "result": "We deployed 40 capacitive\n sensors at 10 cm."}
-    assert rf.verify_result_facts(given, {"found": [{"statement": 1, "quote": "We deployed 40 capacitive sensors"}]}) is None
+    output = {"found": [{"statement": 1, "quote": "We deployed 40 capacitive sensors"},
+                        {"statement": 1, "quote": "We used 40 sensors"}]}
+    assert rf.verify_result_facts(given, output) is None  # a paraphrase is dropped, not refused
+    assert rf.kept_quotes(given, output) == (["We deployed 40 capacitive sensors"], 1)
     assert rf.verify_result_facts(given, {"found": []}) is None
-    assert "word for word" in rf.verify_result_facts(given, {"found": [{"statement": 1, "quote": "We used 40 sensors"}]})
     assert "statement" in rf.verify_result_facts(given, {"found": [{"statement": 2, "quote": "We deployed"}]})
 
 
@@ -74,6 +76,22 @@ def test_grounding_finds_a_fact_far_into_a_long_result(runtime):
     assert grounded and invented == ""
     assert len(runtime[rf.RESULT_FACTS]) == len(rf.parts(document)) > 1
     assert any("Kisumu" in line for line in runtime["sw.content.grounding"][0]["calls"])
+
+
+def test_a_part_that_cannot_be_read_does_not_switch_the_check_off(runtime, monkeypatch):
+    real_run = FakeRuntime.run
+
+    def flaky(self, name, agent_input, context):
+        if name == rf.RESULT_FACTS and "broken" in agent_input["result"]:
+            return {"status": "error", "error": {"code": "ladder_exhausted"}}
+        return real_run(self, name, agent_input, context)
+
+    monkeypatch.setattr(FakeRuntime, "run", flaky)
+    grounded, invented = sme._content_grounded(
+        "write the Introduction", "akinakes_publish_result", {"content": "Sensors were deployed in Kisumu county."},
+        [("save_info({})", "broken"), ('document_get({"doc_id": "d1"})', "No place is named here.")], None,
+    )
+    assert not grounded and "Kisumu" in invented
 
 
 def test_a_fact_no_result_states_is_invented(runtime):

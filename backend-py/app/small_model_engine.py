@@ -2654,16 +2654,25 @@ def _content_grounded(task: str, tool_name: str, args: dict[str, Any], results: 
             return True, ""
 
         def quotes() -> list[str] | None:
-            """What the turn's results say about the facts, quoted; None when a part could not be read."""
-            jobs = [(label, part) for label, result in results for part in sw_result_facts.parts(result) if part.strip()]
+            """What the turn's results say about the facts, quoted word for word. A part that could not be read
+            gives nothing; None (the check fails open) only when no part could be read at all."""
+            inputs = [{"tool": label, "result": part, "statements": facts}
+                      for label, result in results for part in sw_result_facts.parts(result) if part.strip()]
             with ThreadPoolExecutor(max_workers=GROUNDING_WORKERS) as pool:
-                found = list(pool.map(lambda job: run(sw_result_facts, sw_result_facts.RESULT_FACTS, {
-                    "tool": job[0], "result": job[1], "statements": facts,
-                }), jobs))
-            if any(out is None for out in found):
+                found = list(pool.map(lambda given: run(sw_result_facts, sw_result_facts.RESULT_FACTS, given), inputs))
+            failed = sum(out is None for out in found)
+            if inputs and failed == len(inputs):
                 return None
-            lines = [f"- {label} says: {item['quote']}" for (label, _), out in zip(jobs, found) for item in out.get("found") or []]
-            log_event("engine", "sw_result_facts", tab_id=tab_id, tool=tool_name, results=len(results), parts=len(jobs), quotes=len(lines))
+            lines: list[str] = []
+            dropped = 0
+            for given, out in zip(inputs, found):
+                if out is None:
+                    continue
+                kept, lost = sw_result_facts.kept_quotes(given, out)
+                dropped += lost
+                lines += [f"- {given['tool']} says: {quote}" for quote in kept]
+            log_event("engine", "sw_result_facts", tab_id=tab_id, tool=tool_name, results=len(results), parts=len(inputs),
+                      failed=failed, quotes=len(lines), dropped=dropped)
             return list(dict.fromkeys(lines))
 
         def judge_facts() -> list[str] | None:

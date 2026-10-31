@@ -8,8 +8,10 @@ agent reads each result of the turn whole -- a long one in parts, all in paralle
 bear on the statements sw.content.extract took out of the call. sw.content.grounding then judges the statements
 against those quotes.
 
-A quote must occur in the part word for word (whitespace aside), and the code checks it: an agent that paraphrases
-or makes a passage up is refused and retried, so nothing it says can turn into support that is not in the result.
+A quote counts only when it occurs in the part word for word (whitespace aside), and the code checks it
+(kept_quotes): a paraphrased or made-up passage is dropped, so nothing the agent says can turn into support that is
+not in the result. Dropped, not refused: on the second real run one part kept paraphrasing until the ladder gave
+up, and the whole check failed open -- the batch went out unchecked.
 
 Client-side only: run through the local microagent ladder."""
 
@@ -69,16 +71,20 @@ def verify_result_facts(input: Any, output: Any) -> Optional[str]:
     if not isinstance(found, list):
         return '"found" must be a list (empty when the result bears on none of the statements)'
     count = len(input.get("statements") or [])
-    result = _squash(str(input.get("result") or ""))
     for item in found:
         if not isinstance(item, dict) or not isinstance(item.get("statement"), int) or not 1 <= item["statement"] <= count:
             return f'each item needs "statement": a number from 1 to {count}'
-        quote = str(item.get("quote") or "")
-        if not quote.strip():
+        if not str(item.get("quote") or "").strip():
             return 'each item needs a non-empty "quote"'
-        if _squash(quote) not in result:
-            return f'this quote is not in the RESULT word for word: "{quote[:120]}" -- copy the passage exactly, or leave it out'
     return None
+
+
+def kept_quotes(input: Any, output: Any) -> tuple[list[str], int]:
+    """The quotes that really are in the part, and how many were dropped because they are not."""
+    result = _squash(str(input.get("result") or ""))
+    quotes = [str(item.get("quote") or "") for item in output.get("found") or []]
+    kept = [q for q in quotes if q.strip() and _squash(q) in result]
+    return kept, len(quotes) - len(kept)
 
 
 def llm_agents() -> List["M.Agent"]:
