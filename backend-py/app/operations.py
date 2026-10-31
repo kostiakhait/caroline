@@ -71,7 +71,11 @@ def _guarded_action(tool_name: str) -> bool:
     request_info, before anything was drafted, and the user got nothing)."""
     return _SEND_TOOL_NAME_MARKER in tool_name.lower() or tool_name in _FINANCIAL_TOOLS
 
-FAST_PATH_TIMEOUT_S = 0.5
+# Per explicit instruction (2026-10-30): a call waits this long for its own result before answering "running".
+# It was 0.5 s, so every tool that took a little longer cost a second model call (check_operation_status) that
+# re-read the whole context: 142 of 482 tool calls in one tab over two days, 94 of them answering "done" at
+# once. The wait is under CHECK_OPERATION_WAIT_S and the sw engine's STALL_TIMEOUT_S (120 s of no progress).
+FAST_PATH_TIMEOUT_S = 30.0
 # A completion notice for an operation the caller walked away from waits
 # this long first; if the model has meanwhile collected the result itself
 # with check_operation_status, the notice is not sent (see
