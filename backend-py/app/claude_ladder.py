@@ -26,6 +26,11 @@ RUNGS: tuple[str, ...] = ("haiku", "sonnet", "opus")
 TRACE_RESULT_CHARS = 4500
 TRACE_LINES_KEPT = 40
 NO_UPDATE_SENTINEL = "[[NO_UPDATE]]"
+# A model switch makes the whole context be written to the cache again at the new model's price (~12x a cache
+# read), so a hot cache is not given up for a short turn. The cache lives about this long without a request.
+CACHE_TTL_S = 300
+# Calls made on the raised rungs after which going back down pays for the rewrite (a turn is ~12 calls).
+DESCEND_MIN_CALLS = 6
 
 
 @dataclass
@@ -44,6 +49,8 @@ class LadderTurn:
     trace: list[str] = field(default_factory=list)
     open_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     escalations: list[str] = field(default_factory=list)
+    # Model calls made in this turn (all rungs), for may_descend.
+    calls: int = 0
 
     @property
     def model(self) -> str:
@@ -58,6 +65,8 @@ class LadderTurn:
         content = (wire.get("message") or {}).get("content")
         if not isinstance(content, list) or wire.get("parent_tool_use_id"):
             return
+        if wire.get("type") == "assistant":
+            self.calls += 1
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -84,6 +93,18 @@ class LadderTurn:
         self.held = []
         self.trace = []
         self.open_calls = {}
+
+
+def rung_index(model: str | None) -> int | None:
+    return RUNGS.index(model) if model in RUNGS else None
+
+
+def may_descend(cache_cold: bool, real_user: bool, raised_calls: int) -> bool:
+    """Whether a turn may start on a cheaper rung than the one the session is on. When the cache has gone cold
+    the rewrite is due anyway, so the cheapest rung is free. On a hot cache only a real user's message goes down,
+    and only after the raised rungs did a turn's worth of work; internal notes (a check, a reminder, a
+    greeting: one or two calls) keep the model they find."""
+    return cache_cold or (real_user and raised_calls >= DESCEND_MIN_CALLS)
 
 
 def visible_text(wire: dict[str, Any]) -> str:
