@@ -58,6 +58,16 @@ public class TrayIconManager : IDisposable
         _contextMenu.Items.Insert(index, _updateItem);
     }
 
+    /// <summary>A one-off balloon with a message (e.g. "restarted after an unexpected exit").</summary>
+    public void ShowBalloon(string text)
+    {
+        Logger.Log($"[TrayIconManager] ShowBalloon: {text}");
+        _notifyIcon.BalloonTipIcon = ToolTipIcon.Warning;
+        _notifyIcon.BalloonTipTitle = "Caroline";
+        _notifyIcon.BalloonTipText = text;
+        _notifyIcon.ShowBalloonTip(15_000);
+    }
+
     /// <summary>One-time balloon popup shown when a download actually starts -- per explicit
     /// instruction (2026-09-06): a 2+ minute download with literally nothing visible anywhere
     /// (confirmed live) reads as "did my click even do anything?". This fires once per download;
