@@ -280,8 +280,29 @@ class WatchdogMixin:
         if outcomes_summary:
             nudge = f"{nudge}\n\n{outcomes_summary}"
         log_event("engine", "post_turn_completion_check", tab_id=self.tab_id, has_tool_outcomes=bool(outcomes_summary))
+        # Per explicit instruction (2026-10-30): whether the work is finished is decided ONLY by the microagent
+        # (small_model_engine.verify_claude_attempt), never by asking the main model -- that is a turn which re-reads
+        # the whole context, and almost always answered [[NO_UPDATE]]. The model is told only when the microagent
+        # finds the work unfinished. The values are taken now: the turn's state is reset right after this call.
+        trace = [f"- {o.name} -> {'ERROR (' + o.result_preview + ')' if o.is_error else 'ok'}" for o in self.turn_tool_outcomes.values()]
+        asyncio.ensure_future(self._post_turn_microagent_verdict(
+            nudge, (self.last_real_user_question or "").strip(), self._turn_last_visible_text or "", trace,
+        ))
+    async def _post_turn_microagent_verdict(self, nudge: str, task: str, reply: str, trace: list[str]) -> None:
+        try:
+            from app.small_model_engine import verify_claude_attempt
+
+            action, note = await verify_claude_attempt(task, reply, trace, True, self.tab_id, self._ladder_recent_dialogue())
+        except Exception as exc:  # noqa: BLE001 -- no verdict is "finished": nothing is sent to the model
+            log_event("engine", "post_turn_microagent_check_failed", tab_id=self.tab_id, error=str(exc)[:200])
+            return
+        if self.ended or self._post_turn_checks_halted:
+            return
+        log_event("engine", "post_turn_microagent_verdict", tab_id=self.tab_id, action=action, note=note[:200])
+        if action != "up":
+            return
         self._awaiting_post_turn_check_reply = True
-        self.inject_proactive(nudge)
+        self.inject_proactive(f"{nudge}\n\nAn independent check found: {note or 'the work is not finished'}.")
     # edition:end
     async def _check_hang(self) -> None:
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
