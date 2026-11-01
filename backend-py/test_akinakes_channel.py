@@ -195,6 +195,81 @@ def test_the_intake_gate_checks_scope_then_acl(monkeypatch):
     assert acl.posted[0][1] == {"subject": "alice", "object_type": "agent", "object_id": "editorAgent", "operation": "use"}
 
 
+def orchestrator(monkeypatch, answers: dict | None = None) -> FakeHttp:
+    http = FakeHttp(answers)
+    monkeypatch.setattr(ch, "_config", ch.ChannelConfig("http://bus", "chatSecretary", "chat_secretary", [], "", "", chat_url="http://chat", chat_key="k", orchestrator=True))
+    monkeypatch.setattr(ch, "_http", http)
+    monkeypatch.setattr(ch, "_pending", {"m1": chat()})
+    monkeypatch.setattr(ch, "_answered", set())
+    monkeypatch.setattr(ch, "_asked", {})
+    monkeypatch.setattr(ch, "_passes", {})
+    monkeypatch.setattr(ch, "_relay_keys", set())
+    return http
+
+
+def test_orchestrator_tools_refuse_a_role_that_is_not_the_coordinator(channel):
+    with pytest.raises(ValueError, match="chat coordinator only"):
+        run(ch.room_agents("m1"))
+
+
+def test_room_agents_lists_agent_members_except_itself(monkeypatch):
+    members = [{"uid": "alice", "ptype": "human"}, {"uid": "editorAgent", "ptype": "agent"}, {"uid": "chatSecretary", "ptype": "agent"}]
+    orchestrator(monkeypatch, {"http://chat/rooms/ws-default/r1/members": members})
+    assert [a["uid"] for a in run(ch.room_agents("m1"))] == ["editorAgent"]
+
+
+def test_hand_to_agents_publishes_the_message_addressed_to_each(monkeypatch):
+    http = orchestrator(monkeypatch)
+    sent = run(ch.hand_to_agents("m1", ["editorAgent", "researchAgent"], None))
+    assert sent == ["editorAgent", "researchAgent"]
+    first, second = (body for _url, body in http.posted)
+    assert first["envelope"]["routing"]["targetAgentUids"] == ["editorAgent"]
+    assert second["envelope"]["routing"]["targetAgentUids"] == ["researchAgent"]
+    assert first["payload"]["type"] == "chat.message" and first["payload"]["room_id"] == "ws-default/r1"
+    assert first["payload"]["sender_uid"] == "alice" and first["payload"]["text"] == "Shorten the intro"
+    assert ch._asked["m1"] == {"editorAgent", "researchAgent"} and "m1" in ch._answered
+    with pytest.raises(ValueError, match="empty"):
+        run(ch.hand_to_agents("m1", [], None))
+
+
+def test_a_bus_task_must_be_a_task_or_query(monkeypatch):
+    http = orchestrator(monkeypatch)
+    with pytest.raises(ValueError, match="task_type must start"):
+        run(ch.publish_bus_task("m1", "result.x", {}))
+    run(ch.publish_bus_task("m1", "task.project_set_objective", {"project_id": "p1", "objective": "Ship it"}))
+    payload = http.posted[0][1]["payload"]
+    assert payload["type"] == "task.project_set_objective" and payload["objective"] == "Ship it" and payload["room_id"] == "ws-default/r1"
+
+
+def test_wait_for_agent_replies_reports_replies_passes_and_silence(monkeypatch):
+    reply = {"sender_type": "agent", "sender_uid": "editorAgent", "payload": {"text": "Done"}}
+    orchestrator(monkeypatch, {"http://chat/rooms/ws-default/r1/messages": [reply]})
+    ch._asked["m1"] = {"editorAgent", "researchAgent"}
+    ch._passes["m1"] = {"researchAgent"}
+    result = run(ch.wait_for_agent_replies("m1", 1))
+    assert [m["sender_uid"] for m in result["replies"]] == ["editorAgent"]
+    assert result["passed"] == ["researchAgent"] and result["silent"] == []
+
+
+def test_the_coordinator_ignores_messages_agents_sent(monkeypatch):
+    orchestrator(monkeypatch)
+    agent_msg = chat()
+    agent_msg["payload"]["sender_type"] = "agent"
+    config = ch._config
+    assert not run(ch.admits_chat_message(agent_msg, config, FakeHttp()))
+    assert run(ch.admits_chat_message(chat(), config, FakeHttp()))
+
+
+def test_a_coordinator_turn_without_an_answer_tells_the_room_and_a_relay_turn_does_not(monkeypatch):
+    http = orchestrator(monkeypatch)
+    run(ch.on_turn_end("m1"))
+    assert http.posted[0][0] == "http://chat/internal/rooms/ws-default/r1/agent_message"
+    ch._pending["m1-relay-ab"] = chat("m1-relay-ab")
+    ch._relay_keys.add("m1-relay-ab")
+    run(ch.on_turn_end("m1-relay-ab"))
+    assert len(http.posted) == 1
+
+
 def test_scope_from_env(monkeypatch):
     monkeypatch.setenv("AGENT_SCOPE", '[{"room_id": "ws-default", "recursive": true}]')
     assert ch._scope_from_env() == [{"room_id": "ws-default", "recursive": True}]

@@ -60,6 +60,11 @@ _CHAIN = {"chain_id": {"type": "string", "description": "The chainId from the ch
 
 # Only in an akinakes agent that has Chat Service (BUS_URL, AGENT_UID and CHAT_SERVICE_URL set).
 _config = akinakes_channel.load_config()
+# chatSecretary is the one the others pass to, so it has no pass of its own.
+_PASS_TOOLS = [] if _config is not None and _config.orchestrator else [
+    PluginTool(name="akinakes_pass", description="The chat message with this chainId is not for you: pass it, and do nothing else.",
+               input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=akinakes_pass),
+]
 PLUGIN = None if _config is None or not _config.chat_url else Plugin(
     name="akinakes_chat",
     description="Answer a chat message in its room, or pass it",
@@ -70,7 +75,6 @@ PLUGIN = None if _config is None or not _config.chat_url else Plugin(
                    handler=chat_post_message),
         PluginTool(name="chat_history", description="The conversation so far in the room of the chat message with this chainId.",
                    input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=chat_history),
-        PluginTool(name="akinakes_pass", description="The chat message with this chainId is not for you: pass it, and do nothing else.",
-                   input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=akinakes_pass),
+        *_PASS_TOOLS,
     ],
 )
