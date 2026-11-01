@@ -204,7 +204,20 @@ def orchestrator(monkeypatch, answers: dict | None = None) -> FakeHttp:
     monkeypatch.setattr(ch, "_asked", {})
     monkeypatch.setattr(ch, "_passes", {})
     monkeypatch.setattr(ch, "_relay_keys", set())
+    monkeypatch.setattr(ch, "_posted", set())
     return http
+
+
+def test_the_coordinator_says_one_thing_per_request(monkeypatch):
+    http = orchestrator(monkeypatch)
+    run(ch.post_chat("m1", "Hello!"))
+    with pytest.raises(ValueError, match="already has your answer"):
+        run(ch.post_chat("m1", "Hello again!"))
+    assert len(http.posted) == 1
+    run(ch.on_turn_end("m1"))
+    assert "m1" not in ch._posted
+    text = ch.render_task_text(chat())
+    assert "wrote in the chat room" in text and "Shorten the intro" in text and 'chainId "m1"' in text
 
 
 def test_orchestrator_tools_refuse_a_role_that_is_not_the_coordinator(channel):
@@ -230,6 +243,9 @@ def test_hand_to_agents_publishes_the_message_addressed_to_each(monkeypatch):
     assert ch._asked["m1"] == {"editorAgent", "researchAgent"} and "m1" in ch._answered
     with pytest.raises(ValueError, match="empty"):
         run(ch.hand_to_agents("m1", [], None))
+    with pytest.raises(ValueError, match="already handed"):
+        run(ch.hand_to_agents("m1", ["editorAgent"], None))
+    assert len(http.posted) == 2
 
 
 def test_a_bus_task_must_be_a_task_or_query(monkeypatch):

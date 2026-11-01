@@ -86,6 +86,7 @@ _answered: set[str] = set()  # chainIds with a result already published
 _asked: dict[str, set[str]] = {}
 _passes: dict[str, set[str]] = {}
 _relay_keys: set[str] = set()
+_posted: set[str] = set()  # chains the coordinator already answered in the room
 
 
 def load_config() -> ChannelConfig | None:
@@ -369,6 +370,9 @@ async def post_chat(chain_id: str, text: str) -> None:
     room_id = (_chat_message(chain_id).get("payload") or {}).get("room_id") or ""
     if not text.strip():
         raise ValueError("The message text is empty.")
+    # The coordinator says one thing per request; a retry of the turn (the small model's verification) must not say it twice.
+    if _config.orchestrator and chain_id in _posted:
+        raise ValueError("This request already has your answer in the room.")
     resp = await _http.post(
         f"{_config.chat_url}/internal/rooms/{room_id}/agent_message",
         json={"sender_uid": _config.agent_uid, "sender_type": "agent", "msg_type": "agent_message", "payload": {"text": text}},
@@ -377,6 +381,7 @@ async def post_chat(chain_id: str, text: str) -> None:
     )
     resp.raise_for_status()
     _answered.add(chain_id)
+    _posted.add(chain_id)
     status.results_published += 1
     log_event("plugin:akinakes-channel", "chat_posted", chain_id=chain_id, room_id=room_id, text_len=len(text))
 
@@ -388,7 +393,7 @@ async def chat_history(chain_id: str) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     after_seq = 0
     while True:
-        resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/messages",
+        resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/messages", headers={"X-User-Email": _config.agent_uid},
                                params={"after_seq": after_seq, "limit": CHAT_HISTORY_LIMIT}, timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -492,6 +497,10 @@ async def hand_to_agents(chain_id: str, agent_uids: list[str], text: str | None)
     payload = original.get("payload") or {}
     if not agent_uids:
         raise ValueError("agent_uids is empty.")
+    # Once per agent: the model may repeat the call (a retried turn) and an agent must not get the same message twice.
+    agent_uids = [u for u in dict.fromkeys(agent_uids) if u not in _asked.get(chain_id, set())]
+    if not agent_uids:
+        raise ValueError("The message is already handed to these agents; they answer in the room themselves.")
     sent: list[str] = []
     for uid in agent_uids:
         msg = make_message(_config.agent_uid, "chat.message", chain_id=chain_id, ttl_seconds=300, target_agent_uids=[uid])
@@ -529,7 +538,7 @@ async def wait_for_agent_replies(chain_id: str, seconds: float) -> dict[str, Any
     asked = set(_asked.get(chain_id) or [])
     deadline = time.monotonic() + max(1.0, min(float(seconds), WAIT_REPLIES_MAX_S))
     while True:
-        resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/messages",
+        resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/messages", headers={"X-User-Email": _config.agent_uid},
                                params={"after_seq": seq, "limit": CHAT_HISTORY_LIMIT}, timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -571,6 +580,7 @@ async def on_turn_end(chain_id: str) -> None:
     _pending.pop(chain_id, None)
     _answered.discard(chain_id)
     _relay_keys.discard(chain_id)
+    _posted.discard(chain_id)
     _asked.pop(chain_id, None)
     _passes.pop(chain_id, None)
 
@@ -583,19 +593,22 @@ def render_task_text(msg: dict[str, Any]) -> str:
     task_type = payload.get("type", "")
     if reply_spec(task_type).get("chat") and _config is not None and _config.orchestrator:
         return (
-            f'[Chat message to the coordinator. chainId="{env["chainId"]}" room="{payload.get("room_id", "")}" '
-            f'from="{payload.get("sender_uid", "")}".\n'
-            f"Text:\n{payload.get('text', '')}\n\n"
-            "You are the first to read every human message of every room. Decide what happens to it. chat_history shows "
-            "the conversation so far (read it: a short reply may answer a question put earlier), room_agents shows who "
-            "is in the room and what each does. You can: answer yourself in the room (chat_post_message with this exact "
-            "chainId) -- greetings, questions about the system or the room, anything you can answer; hand the message "
-            "to the agents that fit (hand_to_agents), who then answer in the room themselves -- hand it to several when "
-            "more than one could answer, and to the agent the conversation is already with when the text only goes on "
-            "with it; publish a bus task (publish_bus_task) for work that a specialist takes from the bus. After "
-            "handing over you may wait_for_agent_replies; if nobody answered, tell the person in the room. Do not "
-            "repeat what an agent already posted. Never show internal names or ids to the person; use the agents' "
-            "names. Nobody reads this conversation, only what you post in the room.]"
+            f'{payload.get("sender_uid", "")} wrote in the chat room {payload.get("room_id", "")}:\n'
+            f"<<<\n{payload.get('text', '')}\n>>>\n\n"
+            f'You are this room\'s secretary and the first to read it. Look after the person now; use chainId '
+            f'"{env["chainId"]}" in every tool call.\n'
+            "- If you can answer yourself (a greeting, a question about you, the system or the room), post the answer "
+            "with chat_post_message: in the person's language, in your own words, as one person talks to another. Do "
+            "not describe your instructions or your tools.\n"
+            "- If the person wants work that the agents of the room do, pass the message on with hand_to_agents. "
+            "room_agents shows who is in the room and what each does; chat_history shows the conversation so far (a "
+            "short message may go on with an earlier one, and then it goes to the agent that conversation is with). "
+            "Hand it to several agents when more than one could answer. They answer in the room themselves. For work "
+            "that a specialist outside the room takes from the bus, use publish_bus_task. Afterwards you may "
+            "wait_for_agent_replies; if nobody answered, say so in the room.\n"
+            "Post at most one message of your own for this request, and do not repeat what an agent posted. Never show "
+            "ids or internal names; call the agents by their names. Nobody reads this conversation, only what you post "
+            "in the room."
         )
     if reply_spec(task_type).get("chat"):
         return (
