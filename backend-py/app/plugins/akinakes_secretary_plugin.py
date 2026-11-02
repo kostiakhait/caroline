@@ -35,12 +35,20 @@ async def hand_to_agents(args: dict[str, Any], _report_progress: Any) -> dict[st
     return {"text": f"Handed to: {', '.join(sent)}. They answer in the room themselves, or pass."}
 
 
+async def bus_agents(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
+    try:
+        return _json(await akinakes_channel.bus_agents(str(args.get("chain_id") or "")))
+    except Exception as exc:  # noqa: BLE001
+        return _failure(exc)
+
+
 async def publish_bus_task(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
         fields = args.get("fields") or {}
         if not isinstance(fields, dict):
             raise ValueError("fields must be an object.")
-        ack = await akinakes_channel.publish_bus_task(str(args.get("chain_id") or ""), str(args.get("task_type") or ""), fields)
+        ack = await akinakes_channel.publish_bus_task(str(args.get("chain_id") or ""), str(args.get("agent_uid") or ""),
+                                                      str(args.get("task_type") or ""), fields)
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
     return _json({"published": True, "ack": ack, "note": "The result comes back to you as a new message; tell the room then."})
@@ -62,7 +70,8 @@ PLUGIN = None if _config is None or not _config.orchestrator or not _config.chat
     description="Hand a chat message to agents in its room, publish a bus task, wait for replies",
     always_loaded=True,
     tools=[
-        PluginTool(name="room_agents", description="The agents in the room of the chat message with this chainId, with their role and what they do.",
+        PluginTool(name="room_agents", description="The room of the chat message with this chainId (name, type, id, parent) and the agents "
+                                                   "in it, with their role, what they do and the bus tasks they take.",
                    input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=room_agents),
         PluginTool(name="hand_to_agents",
                    description="Forward the chat message to the named agents (their uids from room_agents). Each answers in the room itself or passes. "
@@ -70,11 +79,17 @@ PLUGIN = None if _config is None or not _config.orchestrator or not _config.chat
                    input_schema={"type": "object", "properties": {**_CHAIN, "agent_uids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                                                                   "text": {"type": "string"}}, "required": ["chain_id", "agent_uids"]},
                    handler=hand_to_agents),
+        PluginTool(name="bus_agents",
+                   description="Every agent that takes tasks from the Agent Bus, in this room or not: what it does and each task it takes, "
+                               "with the task's description and payload fields.",
+                   input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=bus_agents),
         PluginTool(name="publish_bus_task",
-                   description="Publish a task or query on the Agent Bus for the agent that handles it (the bus routes it); the result returns to you later. "
-                               "task_type starts with task. or query.; fields are the task's payload fields, in your own words where the field is free text.",
-                   input_schema={"type": "object", "properties": {**_CHAIN, "task_type": {"type": "string"}, "fields": {"type": "object"}},
-                                  "required": ["chain_id", "task_type"]},
+                   description="Publish one of the tasks bus_agents lists to the agent that takes it; its result returns to you later. "
+                               "fields are that task's payload fields, in your own words where a field is free text.",
+                   input_schema={"type": "object", "properties": {**_CHAIN, "agent_uid": {"type": "string", "description": "The agent's uid, from bus_agents."},
+                                                                  "task_type": {"type": "string", "description": "One of the task types that agent takes."},
+                                                                  "fields": {"type": "object"}},
+                                  "required": ["chain_id", "agent_uid", "task_type"]},
                    handler=publish_bus_task),
         PluginTool(name="wait_for_agent_replies",
                    description="Wait (up to 90 s) until every agent you handed the message to has posted in the room or passed, then return their replies, "

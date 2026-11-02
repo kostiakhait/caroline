@@ -10,6 +10,13 @@ the strongest tier drafted "we plan to pay on [date]" -- "I don't have a date"
 
 On nano (explicit choice). Any failure leaves the turn as it was before: the
 request goes to the models in the user's own words only.
+
+The "report" field describes what to report, never the report itself (2026-11-01,
+live akinakes chat secretary): asked to set a project's objective, nano wrote
+"What to tell the user: Confirmed: Set the objective ..." before anything was
+done. The model posted "Objective confirmed" without setting it, and
+sw.content.grounding and the verifier, which check against this text as the
+task, took the false claim for wording the user asked for.
 """
 
 from __future__ import annotations
@@ -32,7 +39,7 @@ FIELDS = (
     ("targets", "Who or what it is about"),
     ("content", "Content"),
     ("outgoing", "Messages to send (to whom: exactly what it says)"),
-    ("report", "What to tell the user"),
+    ("report", "What to report to the user"),
     ("dates", "Dates and deadlines"),
     ("deliverable", "What the user should end up with"),
     ("constraints", "Conditions and limits"),
@@ -49,12 +56,16 @@ _PROMPT = (
     '- "content": what has to be written or produced -- the substance, with every value the user gave\n'
     '- "outgoing": each message to be sent to someone other than the user, as "<recipient>: <what that '
     'message says>" (list) -- only what is meant for that recipient\n'
-    '- "report": what the assistant tells the user at the end (a summary, a finding, a confirmation) -- '
-    "this goes to the user, never into a message to someone else\n"
+    '- "report": what the user should learn at the end -- name the information the answer must give them, never '
+    "write the answer itself; this goes to the user, never into a message to someone else\n"
     '- "dates": dates, deadlines, times the user named, exactly as named ("до пятницы", "15:00")\n'
     '- "deliverable": what the user should have when it is done\n'
     '- "constraints": conditions the user set (list)\n'
-    "Rules: take everything from the request and the conversation, invent nothing. Copy names, numbers, "
+    "Rules: the assistant has done nothing yet -- every field describes work still to do, so never write that the "
+    "assistant has done, set, confirmed, sent or saved anything. This is about the assistant's own work only: a "
+    "message to send still says what the user wants it to say. Take everything from the request and the "
+    "conversation, invent nothing. "
+    "Copy names, numbers, "
     "dates, quoted wording and any value the user gave EXACTLY, in their original language. Resolve "
     "\"him\"/\"that mailbox\"/\"the same\" from the conversation when it says who or what is meant. Write the "
     "rest in the request's language.\n\n"

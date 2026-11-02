@@ -136,3 +136,57 @@ def test_a_missed_quote_gets_one_more_try_with_the_miss_named(runtime, monkeypat
     assert tries == [[], ["sensors went to Kisumu"]]
     assert "the RESULT word for word" in rf.prompt_result_facts({"statements": ["x"], "result": "r", "rejected": ["q"]}, None)
     assert grounded and invented == ""
+
+
+def _asking_runtime(monkeypatch, answers: list[str], matches: bool = True) -> list:
+    """The text asks its reader to do something; sw.request.asked answers with each quote of `answers` in turn, and
+    sw.request.matches says whether the quoted words ask for that request."""
+    tries = []
+
+    def run(self, name, agent_input, context):
+        if name == "sw.content.extract":
+            return {"status": "ok", "output": {"facts": [], "requests": ["asks the reader to set the objective to: soil moisture"]}}
+        if name == "sw.request.asked":
+            tries.append(agent_input.get("rejected"))
+            return {"status": "ok", "output": {"quote": answers[min(len(tries), len(answers)) - 1]}}
+        if name == "sw.request.matches":
+            return {"status": "ok", "output": {"asks": matches}}
+        return {"status": "error", "error": "unexpected agent " + name}
+
+    monkeypatch.setattr(FakeRuntime, "run", run)
+    return tries
+
+
+def test_a_request_quote_not_in_the_task_gets_one_more_try_with_the_miss_named(runtime, monkeypatch):
+    """Live 2026-11-01: nano quoted the task's words with the colon dropped, and the hand-off was refused."""
+    from app.microagents import sw_content_grounding as g
+    tries = _asking_runtime(monkeypatch, ["set the objective to soil moisture", "Set the objective to: soil moisture"])
+    grounded, invented = sme._content_grounded(
+        "- Goal: Set the objective to: soil moisture", "hand_to_agents", {"text": "Set the objective to: soil moisture"}, [], None,
+    )
+    assert tries == [None, "set the objective to soil moisture"]
+    assert "NOT in the TASK word for word" in g.prompt_request_asked({"task": "t", "request": "r", "rejected": "q"}, None)
+    assert grounded and invented == ""
+
+
+def test_an_empty_request_quote_is_not_retried_and_the_request_is_refused(runtime, monkeypatch):
+    tries = _asking_runtime(monkeypatch, [""])
+    grounded, invented = sme._content_grounded(
+        "- Goal: write the Introduction", "hand_to_agents", {"text": "Please set the objective."}, [], None,
+    )
+    assert tries == [None]
+    assert not grounded and "the task does not ask for this" in invented
+
+
+def test_words_that_are_in_the_task_but_ask_for_something_else_do_not_count(runtime, monkeypatch):
+    """Live 2026-11-01: after the retry nano quoted any sentence of the task ("Do you need a lift?" for "promises to
+    pick her up"); the quote is in the task, so only sw.request.matches can refuse it."""
+    from app.microagents import sw_content_grounding as g
+    _asking_runtime(monkeypatch, ["Set the objective to: soil moisture"], matches=False)
+    grounded, invented = sme._content_grounded(
+        "- Goal: Set the objective to: soil moisture", "hand_to_agents", {"text": "Set the objective to: soil moisture"}, [], None,
+    )
+    assert not grounded and "the task does not ask for this" in invented
+    prompt = g.prompt_request_matches({"request": "promises to pick her up", "quote": "Do you need a lift?"}, None)
+    assert prompt.index("Do you need a lift?") < prompt.index("promises to pick her up")  # the request last
+    assert g.verify_request_matches({}, {"asks": "yes"}) and g.verify_request_matches({}, {"asks": True}) is None

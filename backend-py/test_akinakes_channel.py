@@ -205,6 +205,7 @@ def orchestrator(monkeypatch, answers: dict | None = None) -> FakeHttp:
     monkeypatch.setattr(ch, "_passes", {})
     monkeypatch.setattr(ch, "_relay_keys", set())
     monkeypatch.setattr(ch, "_posted", set())
+    monkeypatch.setattr(ch, "_bus_tasks", {})
     return http
 
 
@@ -227,8 +228,11 @@ def test_orchestrator_tools_refuse_a_role_that_is_not_the_coordinator(channel):
 
 def test_room_agents_lists_agent_members_except_itself(monkeypatch):
     members = [{"uid": "alice", "ptype": "human"}, {"uid": "editorAgent", "ptype": "agent"}, {"uid": "chatSecretary", "ptype": "agent"}]
-    orchestrator(monkeypatch, {"http://chat/rooms/ws-default/r1/members": members})
-    assert [a["uid"] for a in run(ch.room_agents("m1"))] == ["editorAgent"]
+    room = {"id": "ws-default/r1", "name": "Thermal Research", "room_type": "project", "parent_id": "ws-default"}
+    orchestrator(monkeypatch, {"http://chat/rooms/ws-default/r1/members": members, "http://chat/rooms/ws-default/r1": room})
+    result = run(ch.room_agents("m1"))
+    assert [a["uid"] for a in result["agents"]] == ["editorAgent"]
+    assert result["room"] == {"id": "ws-default/r1", "name": "Thermal Research", "type": "project", "parent_id": "ws-default"}
 
 
 def test_hand_to_agents_publishes_the_message_addressed_to_each(monkeypatch):
@@ -248,13 +252,115 @@ def test_hand_to_agents_publishes_the_message_addressed_to_each(monkeypatch):
     assert len(http.posted) == 2
 
 
+REGISTRY = [
+    {"uid": "projectSecretary", "role": "secretary", "accepts": [{"type": "task.project_set_objective", "description": "Set a project's objective.",
+                                                                  "fields": {"project_id": "the project (its room id)", "objective": "the objective"}}]},
+    {"uid": "editorAgent", "role": "editor", "accepts": []},
+    {"uid": "chatSecretary", "role": "chat_secretary", "accepts": [{"type": "task.x", "fields": {}}]},
+]
+
+
+def with_registry(monkeypatch) -> FakeHttp:
+    http = orchestrator(monkeypatch, {"http://registry/agents": REGISTRY})
+    ch._config.registry_url = "http://registry"
+    return http
+
+
 def test_a_bus_task_must_be_a_task_or_query(monkeypatch):
     http = orchestrator(monkeypatch)
     with pytest.raises(ValueError, match="task_type must start"):
-        run(ch.publish_bus_task("m1", "result.x", {}))
-    run(ch.publish_bus_task("m1", "task.project_set_objective", {"project_id": "p1", "objective": "Ship it"}))
+        run(ch.publish_bus_task("m1", "projectSecretary", "result.x", {}))
+    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_set_objective", {"project_id": "p1", "objective": "Ship it"}))
     payload = http.posted[0][1]["payload"]
     assert payload["type"] == "task.project_set_objective" and payload["objective"] == "Ship it" and payload["room_id"] == "ws-default/r1"
+
+
+def test_a_bus_task_goes_to_the_chosen_agent_and_comes_back_here(monkeypatch):
+    """Without a route the bus lets any poller claim the task, the coordinator itself included."""
+    http = with_registry(monkeypatch)
+    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_set_objective", {"project_id": "ws-default/r1", "objective": "Ship it"}))
+    routing = http.posted[0][1]["envelope"]["routing"]
+    assert routing["route"] == ["projectSecretary"] and routing["returnTo"] == "chatSecretary"
+    assert http.posted[0][1]["envelope"]["chainId"] == "m1"
+    assert ch._bus_tasks == {"m1": "ws-default/r1"}
+
+
+def test_a_bus_task_is_checked_against_what_the_agent_declares(monkeypatch):
+    http = with_registry(monkeypatch)
+    with pytest.raises(ValueError, match="does not take task.write_section; it takes: task.project_set_objective"):
+        run(ch.publish_bus_task("m1", "projectSecretary", "task.write_section", {}))
+    with pytest.raises(ValueError, match='No agent "ghostAgent"'):
+        run(ch.publish_bus_task("m1", "ghostAgent", "task.project_set_objective", {}))
+    with pytest.raises(ValueError, match="agent_uid must be"):
+        run(ch.publish_bus_task("m1", "chatSecretary", "task.x", {}))
+    assert http.posted == []
+
+
+def test_bus_agents_lists_the_agents_that_declare_tasks_except_itself(monkeypatch):
+    with_registry(monkeypatch)
+    agents = run(ch.bus_agents("m1"))
+    assert [a["uid"] for a in agents] == ["projectSecretary"]
+    assert agents[0]["accepts"][0]["fields"]["project_id"] == "the project (its room id)"
+
+
+class PollOnce(FakeHttp):
+    """Answers the first bus poll with these messages, then stops the loop."""
+
+    def __init__(self, messages: list[dict]) -> None:
+        super().__init__()
+        self.messages = messages
+
+    async def post(self, url: str, json: dict | None = None, **_kw) -> FakeResponse:
+        if url.endswith("/messages/poll"):
+            if self.messages is None:
+                raise asyncio.CancelledError
+            batch, self.messages = self.messages, None
+            return FakeResponse({"messages": [{"message": m} for m in batch]})
+        return await super().post(url, json)
+
+
+def test_the_result_of_a_published_task_is_told_in_its_room_even_without_room_id(monkeypatch):
+    """The secretaries' result.secretary_ok carries no room_id; the room comes from the published task."""
+    orchestrator(monkeypatch)
+    ch._bus_tasks["m1"] = "ws-default/r1"
+    result = ch.make_message("projectSecretary", "result.secretary_ok", chain_id="m1", project_id="ws-default/r1", objective="Ship it")
+    injected = []
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text: injected.append((key, text)), None))
+    (key, text), = injected
+    assert key.startswith("m1-relay-") and key in ch._relay_keys
+    assert ch._pending[key]["payload"]["room_id"] == "ws-default/r1" and "result.secretary_ok" in text
+    assert ch._bus_tasks == {}
+
+
+def test_a_role_declares_its_tasks_from_the_reply_specs(monkeypatch):
+    config = ch.ChannelConfig("http://bus", "projectSecretary", "secretary", [], "", "http://registry",
+                              accepts=["task.project_set_objective", "query.project_state"])
+    declared = ch.accepted_messages(config)
+    assert [a["type"] for a in declared] == ["task.project_set_objective", "query.project_state"]
+    assert declared[0]["description"] and "project_id" in declared[0]["fields"]
+
+    class Registry(FakeHttp):
+        def __init__(self, code: int) -> None:
+            super().__init__()
+            self.code, self.patched = code, []
+
+        async def post(self, url, json=None, **_kw):
+            self.posted.append((url, json))
+            resp = FakeResponse({"token": "t"})
+            resp.status_code = self.code
+            return resp
+
+        async def patch(self, url, json=None, **_kw):
+            self.patched.append((url, json))
+            return FakeResponse()
+
+    fresh = Registry(201)
+    run(ch._register(fresh, config))
+    assert fresh.posted[0][1]["accepts"] == declared and fresh.patched == []
+    again = Registry(409)  # the old agent of this uid registered it first
+    run(ch._register(again, config))
+    assert again.patched == [("http://registry/agents/projectSecretary", {"accepts": declared})]
 
 
 def test_wait_for_agent_replies_reports_replies_passes_and_silence(monkeypatch):

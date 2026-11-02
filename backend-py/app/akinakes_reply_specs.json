@@ -1,15 +1,21 @@
 {
   "task.write_section": {
+    "description": "Write one section of an existing document, using the document's own text.",
+    "fields": {"doc_id": "the document", "section_name": "the section to write", "context": "anything the writer should know"},
     "replies": [
       {"payload_type": "result.section_draft", "required": ["doc_id", "section_name", "content"], "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "section_name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["doc_id", "section_name", "content"]}}
     ]
   },
   "task.write_sections_batch": {
+    "description": "Write several sections of an existing document.",
+    "fields": {"doc_id": "the document", "sections": "list of section names to write"},
     "replies": [
       {"payload_type": "result.article_draft", "required": ["doc_id", "sections"], "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "sections": {"type": "array", "minItems": 1, "items": {"type": "object", "properties": {"name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["name", "content"]}}}, "required": ["doc_id", "sections"]}}
     ]
   },
   "task.edit_section": {
+    "description": "Edit a section of a document as instructed.",
+    "fields": {"doc_id": "the document", "section_address": "which section, in plain words", "edit_instruction": "what to change", "room_id": "the room to answer in"},
     "replies": [
       {"payload_type": "result.edit_section_done", "required": ["doc_id", "section_id", "section_address"], "when": "the task names the section by section_address: apply the edit_instruction to that section in Document Service (document_patch_section)"},
       {"payload_type": "result.edit_proposed", "required": ["doc_id", "section_id", "edit_id", "content"], "when": "the task gives section_id and content: post the improved text as an edit suggestion (document_propose_edit)", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "section_id": {"type": "string", "minLength": 1}, "edit_id": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["doc_id", "section_id", "edit_id", "content"]}}
@@ -18,70 +24,94 @@
     "echo": ["room_id"]
   },
   "task.format_section": {
+    "description": "Reformat a section of a document in a style.",
+    "fields": {"doc_id": "the document", "section_id": "the section", "style": "the style, e.g. academic"},
     "replies": [
       {"payload_type": "result.edit_proposed", "required": ["doc_id", "section_id", "edit_id", "content"], "when": "the content is reformatted in the given style, with no change of substance, and posted as an edit suggestion (document_propose_edit)", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "section_id": {"type": "string", "minLength": 1}, "edit_id": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["doc_id", "section_id", "edit_id", "content"]}}
     ],
     "blocked": {"payload_type": "result.editor_error", "reason_field": "reason"}
   },
   "task.create_experiment_plan": {
+    "description": "Draft an experiment plan (hypothesis, methodology) for an objective; it goes to a human for approval.",
+    "fields": {"objective": "what the experiment should find out", "title": "plan title"},
     "replies": [
       {"payload_type": "result.plan_draft", "required": ["title", "objective", "hypothesis", "methodology"], "schema": {"type": "object", "properties": {"title": {"type": "string", "minLength": 1}, "objective": {"type": "string", "minLength": 1}, "hypothesis": {"type": "string", "minLength": 1}, "methodology": {"type": "string", "minLength": 1}}, "required": ["title", "objective", "hypothesis", "methodology"]}}
     ]
   },
   "task.create_experiment_plan_doc": {
+    "description": "Draft an experiment plan and save it as a document in a project.",
+    "fields": {"objective": "what the experiment should find out", "project_id": "the project (its room id)", "parent_doc_id": "document to attach the plan under, if any"},
     "replies": [
       {"payload_type": "result.plan_doc_created", "required": ["doc_id", "objective", "hypothesis", "methodology"], "when": "the plan is stored as a Document Service document of type experiment-plan (tag experiment-plan; project_id and parent_doc_id of the task) with the sections Objective, Hypothesis, Methodology", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "objective": {"type": "string", "minLength": 1}, "hypothesis": {"type": "string", "minLength": 1}, "methodology": {"type": "string", "minLength": 1}}, "required": ["doc_id", "objective", "hypothesis", "methodology"]}}
     ],
     "blocked": {"payload_type": "result.plan_error", "reason_field": "reason"}
   },
   "task.analyze_results": {
+    "description": "Analyze an experiment run's results against its plan and write the analysis into a document.",
+    "fields": {"run_id": "the experiment run", "doc_id": "the document to write into", "section_name": "section for the analysis"},
     "replies": [
       {"payload_type": "result.analysis_draft", "required": ["doc_id", "section_name", "content", "run_id"], "when": "the run and its plan are read from Experiment Service", "schema": {"type": "object", "properties": {"section_name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["section_name", "content"]}}
     ]
   },
   "task.analyze_experiment_doc": {
+    "description": "Analyze an experiment run described in a document and write the analysis into another.",
+    "fields": {"run_doc_id": "the document of the run", "output_doc_id": "the document to write into", "section_name": "section for the analysis"},
     "replies": [
       {"payload_type": "result.analysis_doc_draft", "required": ["run_doc_id", "output_doc_id", "section_name", "content"], "when": "the run document and its parent plan document are read from Document Service; with an output_doc_id, the analysis is also added there as a section", "schema": {"type": "object", "properties": {"run_doc_id": {"type": "string", "minLength": 1}, "section_name": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}}, "required": ["run_doc_id", "section_name", "content"]}}
     ],
     "blocked": {"payload_type": "result.analysis_error", "reason_field": "reason"}
   },
   "task.project_set_objective": {
+    "description": "Set or update a project's objective in its project-state record.",
+    "fields": {"project_id": "the project (its room id)", "objective": "the objective, in plain words", "set_by": "who set it"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["project_id", "objective"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.project_add_decision": {
+    "description": "Record a decision in a project's decision log.",
+    "fields": {"project_id": "the project (its room id)", "decision": "the decision, in plain words", "decided_by": "who decided"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["project_id", "decision"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.project_assign": {
+    "description": "Record that a task in a project is assigned to a participant.",
+    "fields": {"project_id": "the project (its room id)", "task_title": "the task", "assignee": "who it is assigned to"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["project_id", "task_title", "assignee"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "query.project_state": {
+    "description": "Return a project's state: objectives, decisions, assignments.",
+    "fields": {"project_id": "the project (its room id)"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["project_id", "doc_id", "state"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.bureau_capture_decision": {
+    "description": "Save a decision from a bureau's discussion into the bureau's documents.",
+    "fields": {"bureau_id": "the bureau (its room id)", "decision": "the decision, in plain words", "context": "what led to it"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "task.bureau_summarize": {
+    "description": "Save a summary of a bureau's discussion as a document.",
+    "fields": {"bureau_id": "the bureau (its room id)", "summary": "the summary text", "title": "document title"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
   "query.bureau_decisions": {
+    "description": "List the decisions recorded for a bureau.",
+    "fields": {"bureau_id": "the bureau (its room id)"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id", "decisions"]}
     ],

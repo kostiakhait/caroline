@@ -2709,11 +2709,27 @@ def _content_grounded(task: str, tool_name: str, args: dict[str, Any], results: 
             return [str(x) for x in judged["invented"]]
 
         def judge_request(request: str) -> str | None:
-            # A request is invented unless the agent quotes words that really are in the task.
-            quoted = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, {"task": task, "request": request})
+            # A request is invented unless the agent quotes words that really are in the task. A quote that is not
+            # in the task gets one more try, named, as sw.result.facts does (2026-11-01, akinakes chat secretary: on
+            # the same input nano quoted the outgoing text itself, or the task's words with a colon dropped, about
+            # half the time, and each miss refused the whole call).
+            given = {"task": task, "request": request}
+            quoted = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, given)
             if quoted is None or sw_content_grounding.verify_request_asked({}, quoted) is not None:
                 return None
-            return None if sw_content_grounding.asked(task, quoted) else f"the task does not ask for this: {request}"
+            if not sw_content_grounding.asked(task, quoted) and str(quoted.get("quote") or "").strip():
+                again = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, {**given, "rejected": quoted["quote"]})
+                if again is not None and sw_content_grounding.verify_request_asked({}, again) is None:
+                    quoted = again
+            if not sw_content_grounding.asked(task, quoted):
+                return f"the task does not ask for this: {request}"
+            # The quote is in the task; do those words ask for *this* request? (2026-11-01: with the retry, nano
+            # quoted any sentence of the task -- "Do you need a lift?" for "promises to pick her up" -- and invented
+            # requests passed 25/84.)
+            judged = run(sw_content_grounding, sw_content_grounding.REQUEST_MATCHES, {"request": request, "quote": quoted["quote"]})
+            if judged is None or sw_content_grounding.verify_request_matches({}, judged) is not None:
+                return None
+            return None if judged["asks"] else f"the task does not ask for this: {request}"
 
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1 + len(requests)) as pool:

@@ -63,6 +63,9 @@ class ChannelConfig:
     # chatSecretary: sees every human chat.message of every room and decides itself what happens to it (see the
     # "orchestrator" section below). AKINAKES_CHAT_ORCHESTRATOR=1.
     orchestrator: bool = False
+    # task./query. types this role takes, declared to the Registry with their description and fields from the reply
+    # specs, so chatSecretary (and any other caller) can find the agent and fill the task. AGENT_ACCEPTS, comma separated.
+    accepts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +90,9 @@ _asked: dict[str, set[str]] = {}
 _passes: dict[str, set[str]] = {}
 _relay_keys: set[str] = set()
 _posted: set[str] = set()  # chains the coordinator already answered in the room
+# chains the coordinator published a bus task for -> the room to tell. Kept past the turn: the result comes later, and
+# not every agent echoes room_id in its result (the secretaries' result.secretary_ok does not).
+_bus_tasks: dict[str, str] = {}
 
 
 def load_config() -> ChannelConfig | None:
@@ -106,6 +112,7 @@ def load_config() -> ChannelConfig | None:
         chat_url=(os.environ.get("CHAT_SERVICE_URL") or "").strip().rstrip("/"),
         chat_key=(os.environ.get("CHAT_INTERNAL_KEY") or "").strip(),
         orchestrator=(os.environ.get("AKINAKES_CHAT_ORCHESTRATOR") or "").strip().lower() in ("1", "true", "yes"),
+        accepts=[t.strip() for t in (os.environ.get("AGENT_ACCEPTS") or "").split(",") if t.strip()],
     )
 
 
@@ -221,7 +228,9 @@ def load_reply_specs() -> dict[str, dict[str, Any]]:
       blocked  -- {payload_type, reason_field}: the reply when the task cannot be done (result.plan_error with "reason",
                   say), as the old agent sent it; without it, system.skill_blocked;
       echo     -- task payload fields copied into every reply (room_id, which chatSecretary relays by);
-      chat     -- true for chat.message: answered in the chat room, or passed (agent.pass)."""
+      chat     -- true for chat.message: answered in the chat room, or passed (agent.pass);
+      description, fields -- what the task is and its payload fields, declared to the Registry by the roles that take it
+                  (accepted_messages), so a caller knows whom to send it and how to fill it."""
     path = Path(os.environ.get("AKINAKES_REPLY_SPECS") or Path(__file__).with_name("akinakes_reply_specs.json"))
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -232,6 +241,16 @@ def load_reply_specs() -> dict[str, dict[str, Any]]:
 
 def reply_spec(message_type: str) -> dict[str, Any]:
     return load_reply_specs().get(message_type) or {}
+
+
+def accepted_messages(config: ChannelConfig) -> list[dict[str, Any]]:
+    """What this role declares to the Registry (agent_registry AcceptedMessage): its AGENT_ACCEPTS types with the
+    task's own description and fields from the reply specs."""
+    out = []
+    for task_type in config.accepts:
+        spec = reply_spec(task_type)
+        out.append({"type": task_type, "description": spec.get("description"), "fields": spec.get("fields") or {}})
+    return out
 
 
 def expected_reply_text(task_type: str) -> str:
@@ -467,26 +486,51 @@ def _orchestrator_message(chain_id: str) -> dict[str, Any]:
     return _chat_message(chain_id)
 
 
-async def room_agents(chain_id: str) -> list[dict[str, Any]]:
-    """The agents in the room of this message (Chat Service members) with what the Registry says they do."""
+async def _registry_agents() -> dict[str, dict[str, Any]]:
+    assert _config is not None and _http is not None
+    if not _config.registry_url:
+        return {}
+    try:
+        reg = await _http.get(f"{_config.registry_url}/agents", timeout=10)
+        reg.raise_for_status()
+        return {a.get("uid"): a for a in reg.json()}
+    except Exception as exc:  # noqa: BLE001 -- the caller still has what it read elsewhere
+        log_event("plugin:akinakes-channel", "registry_unreadable", error=str(exc))
+        return {}
+
+
+def _describe_agent(uid: str, a: dict[str, Any]) -> dict[str, Any]:
+    return {"uid": uid, "role": a.get("role"), "specialization": a.get("specialization"), "description": a.get("description"),
+            "accepts": a.get("accepts") or []}
+
+
+async def room_agents(chain_id: str) -> dict[str, Any]:
+    """The room of this message (its name, type -- workspace, project, team, bureau -- and parent; a project's id is its
+    room's id) and the agents in it (Chat Service members) with what the Registry says they do and the bus tasks they take."""
     assert _config is not None and _http is not None
     room_id = (_orchestrator_message(chain_id).get("payload") or {}).get("room_id") or ""
-    resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/members", headers={"X-User-Email": _config.agent_uid}, timeout=10)
+    headers = {"X-User-Email": _config.agent_uid}
+    resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/members", headers=headers, timeout=10)
     resp.raise_for_status()
     uids = [m["uid"] for m in resp.json() if m.get("ptype") == "agent" and m.get("uid") != _config.agent_uid]
-    known: dict[str, dict[str, Any]] = {}
-    if _config.registry_url:
-        try:
-            reg = await _http.get(f"{_config.registry_url}/agents", timeout=10)
-            reg.raise_for_status()
-            known = {a.get("uid"): a for a in reg.json()}
-        except Exception as exc:  # noqa: BLE001 -- the member list alone is still useful
-            log_event("plugin:akinakes-channel", "registry_unreadable", error=str(exc))
-    out = []
-    for uid in uids:
-        a = known.get(uid) or {}
-        out.append({"uid": uid, "role": a.get("role"), "specialization": a.get("specialization"), "description": a.get("description")})
-    return out
+    room: dict[str, Any] = {"id": room_id}
+    try:
+        r = await _http.get(f"{_config.chat_url}/rooms/{room_id}", headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        room.update({"name": data.get("name"), "type": data.get("room_type"), "parent_id": data.get("parent_id")})
+    except Exception as exc:  # noqa: BLE001 -- the member list alone is still useful
+        log_event("plugin:akinakes-channel", "room_unreadable", room_id=room_id, error=str(exc))
+    known = await _registry_agents()
+    return {"room": room, "agents": [_describe_agent(uid, known.get(uid) or {}) for uid in uids]}
+
+
+async def bus_agents(chain_id: str) -> list[dict[str, Any]]:
+    """Every agent on the bus that declares tasks it takes (Registry `accepts`), in the room or not."""
+    assert _config is not None
+    _orchestrator_message(chain_id)
+    known = await _registry_agents()
+    return [_describe_agent(uid, a) for uid, a in known.items() if uid != _config.agent_uid and a.get("accepts")]
 
 
 async def hand_to_agents(chain_id: str, agent_uids: list[str], text: str | None) -> list[str]:
@@ -514,18 +558,31 @@ async def hand_to_agents(chain_id: str, agent_uids: list[str], text: str | None)
     return sent
 
 
-async def publish_bus_task(chain_id: str, task_type: str, fields: dict[str, Any]) -> dict[str, Any]:
-    """A task for the bus (scope routing picks the agent), as chatSecretary published a classified request."""
+async def publish_bus_task(chain_id: str, agent_uid: str, task_type: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """A task for the agent the model chose (bus_agents / room_agents show who takes what). Sent with route=[agent] and
+    returnTo=this agent: without a route the bus lets any poller claim it, this coordinator included (it does not skip
+    the sender), and the result must come back here to be told in the room."""
     assert _config is not None
     original = _orchestrator_message(chain_id)
     if not task_type.startswith(("task.", "query.")):
         raise ValueError('task_type must start with "task." or "query.".')
+    if not agent_uid or agent_uid == _config.agent_uid:
+        raise ValueError("agent_uid must be the agent that takes this task (from bus_agents or room_agents).")
+    known = await _registry_agents()
+    if known:
+        accepted = {a.get("type") for a in (known.get(agent_uid) or {}).get("accepts") or []}
+        if agent_uid not in known:
+            raise ValueError(f'No agent "{agent_uid}" is registered. bus_agents lists the agents and their tasks.')
+        if task_type not in accepted:
+            raise ValueError(f'{agent_uid} does not take {task_type}; it takes: {", ".join(sorted(accepted)) or "nothing declared"}.')
     payload = original.get("payload") or {}
-    msg = make_message(_config.agent_uid, task_type, chain_id=chain_id, room_id=payload.get("room_id"),
-                       user_uid=payload.get("sender_uid"), original_text=payload.get("text", ""), **fields)
+    room_id = payload.get("room_id") or ""
+    msg = make_message(_config.agent_uid, task_type, chain_id=chain_id, route=[agent_uid], return_to=_config.agent_uid,
+                       room_id=room_id, user_uid=payload.get("sender_uid"), original_text=payload.get("text", ""), **fields)
     ack = await _publish(msg)
     _answered.add(chain_id)
-    log_event("plugin:akinakes-channel", "bus_task_published", chain_id=chain_id, task_type=task_type)
+    _bus_tasks[chain_id] = room_id
+    log_event("plugin:akinakes-channel", "bus_task_published", chain_id=chain_id, task_type=task_type, agent=agent_uid)
     return ack
 
 
@@ -587,7 +644,20 @@ async def on_turn_end(chain_id: str) -> None:
 
 # --- inbound ---------------------------------------------------------------------------------------------------------
 
-def render_task_text(msg: dict[str, Any]) -> str:
+def render_bus_catalog(agents: list[dict[str, Any]]) -> str:
+    """The bus tasks as the coordinator's task text lists them: agent, then each task it takes with its fields. In the
+    text itself, not only behind bus_agents: on the live run (2026-11-01) the small model never called bus_agents and
+    told the room an objective was set when nothing had set it."""
+    lines = []
+    for a in agents:
+        for t in a.get("accepts") or []:
+            fields = ", ".join(f"{k} ({v})" for k, v in (t.get("fields") or {}).items())
+            lines.append(f'- {a["uid"]}: {t.get("type")} -- {t.get("description") or ""}'
+                         + (f" Fields: {fields}." if fields else ""))
+    return "\n".join(lines)
+
+
+def render_task_text(msg: dict[str, Any], bus_catalog: str = "") -> str:
     env = msg["envelope"]
     payload = msg.get("payload") or {}
     task_type = payload.get("type", "")
@@ -603,12 +673,19 @@ def render_task_text(msg: dict[str, Any]) -> str:
             "- If the person wants work that the agents of the room do, pass the message on with hand_to_agents. "
             "room_agents shows who is in the room and what each does; chat_history shows the conversation so far (a "
             "short message may go on with an earlier one, and then it goes to the agent that conversation is with). "
-            "Hand it to several agents when more than one could answer. They answer in the room themselves. For work "
-            "that a specialist outside the room takes from the bus, use publish_bus_task. Afterwards you may "
-            "wait_for_agent_replies; if nobody answered, say so in the room.\n"
+            "Hand it to several agents when more than one could answer. They answer in the room themselves. Other "
+            "work is done by agents that take tasks from the bus (listed below; room_agents also tells you the room's "
+            "type and id, and a project's id is its room's id). If one of those tasks is what the person wants, "
+            "publish it with publish_bus_task to that agent, fields in your own words; its result comes back to you "
+            "later to tell the room. Afterwards you may wait_for_agent_replies for agents you handed the message to; "
+            "if nobody answered, say so in the room.\n"
+            "You change nothing yourself: never tell the room that something is done, set or saved unless an agent did "
+            "it. When you hand a request on or publish a task, say that it is in progress.\n"
             "Post at most one message of your own for this request, and do not repeat what an agent posted. Never show "
             "ids or internal names; call the agents by their names. Nobody reads this conversation, only what you post "
             "in the room."
+            + (f"\n\nTasks the agents on the bus take (agent uid: task type -- what it does. Fields):\n{bus_catalog}"
+               if bus_catalog else "")
         )
     if reply_spec(task_type).get("chat"):
         return (
@@ -638,14 +715,18 @@ async def _register(client: httpx.AsyncClient, config: ChannelConfig) -> None:
     if not config.registry_url:
         return
     try:
+        accepts = accepted_messages(config)
         r = await client.post(f"{config.registry_url}/agents", json={
             "uid": config.agent_uid, "role": config.role, "specialization": config.specialization,
             "scope": "workspace", "deployment_mode": "unmanaged", "description": config.description,
-            "personal_office_member": False,
+            "personal_office_member": False, "accepts": accepts,
         }, timeout=5)
         if r.status_code == 201:
             _agent_token = r.json().get("token", "") or ""
             log_event("plugin:akinakes-channel", "registered", uid=config.agent_uid)
+        elif r.status_code == 409:
+            # Registered before (the old agent of this uid, or an earlier start): keep the declared tasks current.
+            await client.patch(f"{config.registry_url}/agents/{config.agent_uid}", json={"accepts": accepts}, timeout=5)
     except Exception as exc:  # noqa: BLE001 -- non-fatal, same as AgentLoop._auto_register
         log_event("plugin:akinakes-channel", "register_failed", error=str(exc))
 
@@ -684,7 +765,12 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 if config.orchestrator and msg_type == "agent.pass":
                     _passes.setdefault(chain_id, set()).add((msg.get("payload") or {}).get("agent_uid") or "")
                     continue
-                if config.orchestrator and msg_type.startswith("result.") and (msg.get("payload") or {}).get("room_id"):
+                relay = config.orchestrator and msg_type.startswith("result.") and bool((msg.get("payload") or {}).get("room_id"))
+                if config.orchestrator and chain_id in _bus_tasks and (msg_type.startswith("result.") or msg_type == "system.skill_blocked"):
+                    # The answer to a task this coordinator published; the room comes from the task.
+                    msg = {**msg, "payload": {**(msg.get("payload") or {}), "room_id": _bus_tasks.pop(chain_id)}}
+                    relay = True
+                if relay:
                     key = f'{chain_id}-relay-{(msg.get("envelope") or {}).get("messageId", "")[:8]}'
                     _pending[key] = msg
                     _relay_keys.add(key)
@@ -700,7 +786,11 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                     except Exception as exc:  # noqa: BLE001 -- stale settings must not drop the task
                         log_event("plugin:akinakes-channel", "before_task_failed", error=str(exc))
                 log_event("plugin:akinakes-channel", "task_received", chain_id=chain_id, task_type=pending_task_type(chain_id))
-                inject(chain_id, render_task_text(msg))
+                catalog = ""
+                if config.orchestrator and reply_spec(msg_type).get("chat"):
+                    catalog = render_bus_catalog([a for uid, a in (await _registry_agents()).items()
+                                                  if uid != config.agent_uid and a.get("accepts")])
+                inject(chain_id, render_task_text(msg, catalog))
         except Exception as exc:  # noqa: BLE001 -- a bus outage is waited out, not a crash loop
             status.last_error = str(exc)
             log_event("plugin:akinakes-channel", "poll_failed", error=str(exc))
