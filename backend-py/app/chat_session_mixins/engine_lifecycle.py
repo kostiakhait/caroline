@@ -967,6 +967,12 @@ class EngineLifecycleMixin:
                                 "not_logged_in",
                                 "You don't have an active Claude Code login or a SquirrelWisdom account "
                                 "signed in -- please sign in to one of them to continue.",
+                                # Bug fix (2026-11-02), confirmed live: without this the failed
+                                # turn's own trailing ResultMessage reset the state to "connected"
+                                # 12 ms later, so the status bar showed the error for an instant
+                                # and went back to "ready" -- the tab looked deaf. The next turn's
+                                # init/result clears it the usual way.
+                                arm_ignore_next_result=True,
                             )
                             continue
 
