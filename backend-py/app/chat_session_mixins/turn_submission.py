@@ -4,7 +4,8 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 
 class TurnSubmissionMixin:
-    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False) -> None:
+    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False,
+               request_text: str | None = None) -> None:
         # Per standing instruction ("ВЕЗДЕ логируем и ВСЁ"): this is the
         # single choke point EVERY turn goes through -- real user messages,
         # every proactive/internal nudge (inject_proactive already logs
@@ -46,7 +47,7 @@ class TurnSubmissionMixin:
             text = self._with_interim_notes(text)
             self.pending_interim_notes = []
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
-            self._route_sw_turn(text, attachments, is_real_user, is_voice, suppress_narration)
+            self._route_sw_turn(text, attachments, is_real_user, is_voice, suppress_narration, request_text)
             return
         # Bug fix (2026-09-18), per explicit instruction after a real
         # incident: never push straight into the live client while a
@@ -436,7 +437,8 @@ class TurnSubmissionMixin:
         if len(held) > 1:
             log_event("engine", "user_messages_merged", tab_id=self.tab_id, count=len(held), text_len=len(text))
         self.submit(text, attachments, True, is_voice)
-    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False) -> None:
+    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False,
+                       request_text: str | None = None) -> None:
         """Every turn in "sw" mode goes here, never to the Claude SDK (2026-10-03):
         while a small-model turn runs, new input is live context for it -- UNLESS it's a
         real user message arriving during a PROACTIVE turn, which queues as its own fresh
@@ -451,8 +453,9 @@ class TurnSubmissionMixin:
             log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
             self.small_model_pending_comments.append(text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}")
             return
-        self._start_small_model_turn(text, attachments, is_real_user, is_voice, suppress_narration)
-    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = True) -> bool:
+        self._start_small_model_turn(text, attachments, is_real_user, is_voice, suppress_narration, request_text)
+    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = True,
+                         request_text: str | None = None) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
         showing is now decided ENTIRELY by the model's own reply content
@@ -505,5 +508,8 @@ class TurnSubmissionMixin:
         # Internal turns follow the same chat-mode gate as real ones (2026-10-03):
         # in "sw" mode they run through the small-model cascade; everything else
         # (other modes, attachments, pending_text replays) keeps the SDK path.
-        self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration)
+        # request_text: the requester's own words when `text` wraps them in instructions (an akinakes turn); the
+        # formalizer and the checks read it, the model gets `text` (small_model_engine.run_small_model_turn).
+        self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration,
+                    request_text=request_text)
         return True

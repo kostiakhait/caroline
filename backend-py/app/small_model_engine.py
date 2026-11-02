@@ -3338,6 +3338,7 @@ async def run_small_model_turn(
     history_summary: str | None = None,
     recorder: Any = None,
     formalize_request: bool = True,
+    request_text: str | None = None,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -3393,7 +3394,12 @@ async def run_small_model_turn(
     # test box, 2026-10-22, and the turn ended asking the user to confirm a send.
     from app.sw_request_spec import formalize
 
-    request_spec_task = asyncio.ensure_future(formalize(user_text, recent_dialogue_lines, tab_id)) if formalize_request else None
+    # What the requester asked, in their own words: what the formalizer, the advice and every check read. The same as
+    # user_text, except where a caller wraps the request in instructions of its own (2026-11-02, akinakes: the
+    # channel's task template was formalized and checked as if the person had asked for it -- "hand the task to the
+    # room agents" came from our instructions, and every hand-off counted as asked). The model still gets user_text.
+    request = request_text or user_text
+    request_spec_task = asyncio.ensure_future(formalize(request, recent_dialogue_lines, tab_id)) if formalize_request else None
 
     # Explicit adapter -- never rely on camerlengo_ai.AI()'s own default
     # (Config.OPENROUTER_KEY, server-only) from this process. Which adapter, and
@@ -3411,7 +3417,7 @@ async def run_small_model_turn(
     # conversation so far and the user's reaction -- run alongside the rest of the setup, a real user's request only.
     rung_ladder = rung_advice.sw_ladder([cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS])
     rung_advice_task = asyncio.ensure_future(rung_advice.advise(
-        "sw", rung_ladder, user_text, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
+        "sw", rung_ladder, request, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
     )) if formalize_request else None
 
     registry = build_tool_registry()
@@ -3424,7 +3430,7 @@ async def run_small_model_turn(
         _engine_instructions(language),
         _ACT_DO_NOT_ASK_INSTRUCTION,
         _shared_policy_text(workspace_dir, tab_id),
-    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else [])
+    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in request else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else [])
       + ([history_summary] if history_summary else []))
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     if history_messages is not None:
@@ -3445,7 +3451,8 @@ async def run_small_model_turn(
         messages.append({"role": "user", "content": (
             f"{sent_line}\n[The task, formalized from the user's request -- this is the work to do. Every value "
             f"in it (names, amounts, dates, wording) is the user's own and is used exactly as given:]\n{request_spec}\n\n"
-            f"[The user's own words, for clarification:]\n{user_text}"
+            + (f"[The user's own words, for clarification:]\n{user_text}" if request == user_text else
+               f"[The task as it reached you, with its instructions, for clarification:]\n{user_text}")
         )})
     else:
         messages.append({"role": "user", "content": f"{sent_line}\n{user_text}"})
@@ -3453,7 +3460,7 @@ async def run_small_model_turn(
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
     # A real user's task -- what the changing-action check compares calls against.
-    tracker.task_text = (request_spec or user_text) if formalize_request else ""
+    tracker.task_text = (request_spec or request) if formalize_request else ""
     current_model = {"name": cfg.AI_MODEL_SMALL}
 
     async def run_stage(stage_index: int) -> str:
@@ -3565,7 +3572,7 @@ async def run_small_model_turn(
     ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
-        evidence = await _result_evidence(request_spec or user_text, list(tier_history) + list(trace), evidence_memo, tab_id)
+        evidence = await _result_evidence(request_spec or request, list(tier_history) + list(trace), evidence_memo, tab_id)
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate, can_retry, evidence)})
         if not_a_form is not None:
             verification_messages.append({"role": "assistant", "content": not_a_form})
@@ -3667,7 +3674,7 @@ async def run_small_model_turn(
     # no lower than tier 1 for an apparent fan-out task) and the verifier's own
     # unconditional red flag (_build_verification_prompt). See _looks_multi_
     # target's own comment for the real incident this closes off.
-    tracker.looks_multi_target = _looks_multi_target(user_text)
+    tracker.looks_multi_target = _looks_multi_target(request)
 
     # A real fact from the first second (2026-10-10): picking the starting tier is itself
     # a model call (~10s live), and until a tier starts the narrator had nothing to
@@ -3677,7 +3684,7 @@ async def run_small_model_turn(
         start_index = start_tier  # already decided by the fast lane's decline
         log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
     else:
-        start_index = await _start_tier_index(ai, cfg, user_text)
+        start_index = await _start_tier_index(ai, cfg, request)
         if tracker.looks_multi_target:
             # "check every mailbox" is a fan-out task, not necessarily a
             # COMPLEX dependent chain in _COMPLEXITY_PROMPT's own sense -- see
@@ -3690,7 +3697,7 @@ async def run_small_model_turn(
     # these tags -- see app/sw_tier_stats.py. Real user requests only.
     task_tags: list[str] = []
     if formalize_request:
-        task_tags = await _task_tags(request_spec or user_text, tab_id)
+        task_tags = await _task_tags(request_spec or request, tab_id)
         advised = await _tier_advice(task_tags, tiers, workspace_dir, tab_id)
         if advised is not None and advised > start_index:
             log_event("engine", "small_model_start_tier_raised", tab_id=tab_id, from_tier=start_index, to_tier=advised)
@@ -3791,7 +3798,7 @@ async def run_small_model_turn(
                 if tier_attempts == 0:
                     stay, why = True, "first attempt on this tier"
                 else:
-                    stay, why = await _attempt_progressed(request_spec or user_text, tier_history, attempt_lines, tab_id)
+                    stay, why = await _attempt_progressed(request_spec or request, tier_history, attempt_lines, tab_id)
                 log_event("engine", "small_model_retry_decision", tab_id=tab_id, tier=index, model=model,
                           attempt=tier_attempts + 1, stay=stay, why=why, verifier_said=action)
                 if stay and action == "up":
@@ -3833,7 +3840,7 @@ async def run_small_model_turn(
                 else:
                     emit(f"The check found this tier's work incomplete; retrying tier {index + 1} with what's missing.")
                     advice = await _tool_advice(
-                        request_spec or user_text, missing, tier_history, registry, tried_groups, tab_id,
+                        request_spec or request, missing, tier_history, registry, tried_groups, tab_id,
                     )
                     nudge = (
                         f"[Verifier checked the previous attempt and found it incomplete: {missing} Do the missing part "
@@ -3866,7 +3873,7 @@ async def run_small_model_turn(
         except Exception as exc:  # noqa: BLE001 -- statistics never cost the answer
             log_event("engine", "sw_tier_stats_record_failed", tab_id=tab_id, error=str(exc)[:200])
     if formalize_request and tiers_ran:
-        rung_advice.record(workspace_dir, tab_id, "sw", user_text, rung_ladder, start_index,
+        rung_advice.record(workspace_dir, tab_id, "sw", request, rung_ladder, start_index,
                            closed_on if closed_on is not None else tiers_ran[-1], escalation_notes)
     if not final_text:
         # No tier ever produced a usable candidate (all stalled/errored/escalated

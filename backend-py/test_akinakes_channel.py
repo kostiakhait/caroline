@@ -350,7 +350,7 @@ def test_the_result_of_a_published_task_is_told_in_its_room_even_without_room_id
     result = ch.make_message("projectSecretary", "result.secretary_ok", chain_id="m1", project_id="ws-default/r1", objective="Ship it")
     injected = []
     with pytest.raises(asyncio.CancelledError):
-        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text: injected.append((key, text)), None))
+        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text, request: injected.append((key, text)), None))
     (key, text), = injected
     assert key.startswith("m1-relay-") and key in ch._relay_keys
     assert ch._pending[key]["payload"]["room_id"] == "ws-default/r1" and "result.secretary_ok" in text
@@ -443,3 +443,20 @@ def test_a_task_is_answered_once(channel):
     with pytest.raises(ValueError, match="already answered"):
         run(ch.publish_result("c1", "result.section_draft", {"doc_id": "d1", "section_name": "Intro", "content": "Again"}))
     assert len(channel.posted) == 1
+
+
+def test_the_requester_words_are_the_message_or_the_task_without_our_instructions():
+    words = ch.requester_words(chat())
+    assert words == "alice wrote in the chat room:\nShorten the intro"
+    words = ch.requester_words(task("c1", "task.write_section"))
+    assert words.startswith("coordinator sent the task task.write_section over the Agent Bus, with:")
+    assert '"section_name": "Intro"' in words and "akinakes_publish_result" not in words
+
+
+def test_the_channel_injects_a_task_with_its_requester_words(monkeypatch, channel):
+    injected = []
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([task("c7", "task.write_section")]), ch._config,
+                             lambda key, text, request: injected.append((key, text, request)), None))
+    key, text, request = injected[0]
+    assert key == "c7" and "akinakes_publish_result" in text and request == ch.requester_words(task("c7", "task.write_section"))

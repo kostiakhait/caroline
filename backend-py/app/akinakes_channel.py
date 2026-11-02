@@ -43,7 +43,7 @@ DEFAULT_TTL_S = 600
 # Tab ids of the chains' sessions (main.akinakes_tab_id); settings_mirror leaves these tabs out.
 TAB_PREFIX = "akinakes-"
 
-InjectFn = Callable[[str, str], None]  # (chain_id, text)
+InjectFn = Callable[[str, str, "str | None"], None]  # (chain_id, text, the requester's own words or None)
 BeforeTaskFn = Callable[[], Awaitable[None]]
 
 
@@ -661,6 +661,20 @@ async def on_turn_end(chain_id: str) -> None:
 
 # --- inbound ---------------------------------------------------------------------------------------------------------
 
+def requester_words(msg: dict[str, Any]) -> str:
+    """What the sender of this message asked, without our instructions around it: the formalizer and every check of the
+    turn read this, the model gets render_task_text (2026-11-02: the whole template was formalized, and "hand the task
+    to the room agents" from our own instructions counted as the person's request). A chat message is the person's
+    text; a bus task is its type and fields."""
+    env = msg.get("envelope") or {}
+    payload = msg.get("payload") or {}
+    if reply_spec(payload.get("type") or "").get("chat"):
+        return f'{payload.get("sender_uid") or "someone"} wrote in the chat room:\n{payload.get("text") or ""}'
+    fields = {k: v for k, v in payload.items() if k != "type"}
+    return (f'{env.get("senderUid") or "an agent"} sent the task {payload.get("type", "")} over the Agent Bus, with:\n'
+            f"{json.dumps(fields, ensure_ascii=False, indent=2)}")
+
+
 def render_bus_catalog(agents: list[dict[str, Any]]) -> str:
     """The bus tasks as the coordinator's task text lists them: agent, then each task it takes with its fields. In the
     text itself, not only behind bus_agents: on the live run (2026-11-01) the small model never called bus_agents and
@@ -791,7 +805,7 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                     key = f'{chain_id}-relay-{(msg.get("envelope") or {}).get("messageId", "")[:8]}'
                     _pending[key] = msg
                     _relay_keys.add(key)
-                    inject(key, render_relay_text(msg, key))
+                    inject(key, render_relay_text(msg, key), None)
                     continue
                 if reply_spec(((msg.get("payload") or {}).get("type")) or "").get("chat") and not await admits_chat_message(msg, config, client):
                     continue
@@ -807,7 +821,7 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 if config.orchestrator and reply_spec(msg_type).get("chat"):
                     catalog = render_bus_catalog([a for uid, a in (await _registry_agents()).items()
                                                   if uid != config.agent_uid and a.get("accepts")])
-                inject(chain_id, render_task_text(msg, catalog))
+                inject(chain_id, render_task_text(msg, catalog), requester_words(msg))
         except Exception as exc:  # noqa: BLE001 -- a bus outage is waited out, not a crash loop
             status.last_error = str(exc)
             log_event("plugin:akinakes-channel", "poll_failed", error=str(exc))
