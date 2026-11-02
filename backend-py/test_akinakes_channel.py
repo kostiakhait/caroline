@@ -306,7 +306,7 @@ def test_a_bus_task_goes_to_the_chosen_agent_and_comes_back_here(monkeypatch):
     routing = http.posted[0][1]["envelope"]["routing"]
     assert routing["route"] == ["projectSecretary"] and routing["returnTo"] == "chatSecretary"
     assert http.posted[0][1]["envelope"]["chainId"] == "m1"
-    assert ch._bus_tasks == {"m1": "ws-default/r1"}
+    assert ch._bus_tasks == {"m1": {"room_id": "ws-default/r1", "asked_by": "alice", "asked": "Shorten the intro"}}
 
 
 def test_a_bus_task_may_name_its_own_room_among_its_fields(monkeypatch):
@@ -317,7 +317,7 @@ def test_a_bus_task_may_name_its_own_room_among_its_fields(monkeypatch):
     payload = http.posted[0][1]["payload"]
     assert payload["room_id"] == "other-room" and payload["objective"] == "Ship it"
     assert payload["user_uid"] == "alice" and payload["original_text"] == "Shorten the intro"  # always from the message
-    assert ch._bus_tasks == {"m1": "ws-default/r1"}  # the result is still told in the message's room
+    assert ch._bus_tasks["m1"]["room_id"] == "ws-default/r1"  # the result is still told in the message's room
 
 
 def test_a_bus_task_is_checked_against_what_the_agent_declares(monkeypatch):
@@ -357,12 +357,17 @@ class PollOnce(FakeHttp):
 def test_the_result_of_a_published_task_is_told_in_its_room_even_without_room_id(monkeypatch):
     """The secretaries' result.secretary_ok carries no room_id; the room comes from the published task."""
     orchestrator(monkeypatch)
-    ch._bus_tasks["m1"] = "ws-default/r1"
+    ch._bus_tasks["m1"] = {"room_id": "ws-default/r1", "asked_by": "alice", "asked": "Set the objective to: ship it"}
     result = ch.make_message("projectSecretary", "result.secretary_ok", chain_id="m1", project_id="ws-default/r1", objective="Ship it")
     injected = []
     with pytest.raises(asyncio.CancelledError):
-        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text, request: injected.append((key, text)), None))
-    (key, text), = injected
+        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text, request: injected.append((key, text, request)), None))
+    (key, text, request), = injected
+    assert request is None  # relay_words is not wired into the turn yet (open decision, see the akinakes plan)
+    # What relay_words gives: what the person asked and what the agent answered, not our template.
+    words = ch.relay_words(ch._pending[key], {"asked_by": "alice", "asked": "Set the objective to: ship it"})
+    assert words.startswith("alice asked in the chat room:\nSet the objective to: ship it\n\nprojectSecretary answered result.secretary_ok")
+    assert '"objective": "Ship it"' in words and "Agent Bus result" not in words
     assert key.startswith("m1-relay-") and key in ch._relay_keys
     assert ch._pending[key]["payload"]["room_id"] == "ws-default/r1" and "result.secretary_ok" in text
     assert ch._bus_tasks == {}

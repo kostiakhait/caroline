@@ -90,9 +90,10 @@ _asked: dict[str, set[str]] = {}
 _passes: dict[str, set[str]] = {}
 _relay_keys: set[str] = set()
 _posted: set[str] = set()  # chains the coordinator already answered in the room
-# chains the coordinator published a bus task for -> the room to tell. Kept past the turn: the result comes later, and
-# not every agent echoes room_id in its result (the secretaries' result.secretary_ok does not).
-_bus_tasks: dict[str, str] = {}
+# chains the coordinator published a bus task for -> the room to tell, who asked there and what. Kept past the turn:
+# the result comes later, and not every agent echoes room_id in its result (the secretaries' result.secretary_ok
+# does not). The request goes into the relay turn's requester words (relay_words).
+_bus_tasks: dict[str, dict[str, str]] = {}
 
 
 def load_config() -> ChannelConfig | None:
@@ -612,7 +613,7 @@ async def publish_bus_task(chain_id: str, agent_uid: str, task_type: str, fields
                        **task_fields)
     ack = await _publish(msg)
     _answered.add(chain_id)
-    _bus_tasks[chain_id] = room_id
+    _bus_tasks[chain_id] = {"room_id": room_id, "asked_by": payload.get("sender_uid") or "", "asked": payload.get("text") or ""}
     log_event("plugin:akinakes-channel", "bus_task_published", chain_id=chain_id, task_type=task_type, agent=agent_uid)
     return ack
 
@@ -639,6 +640,21 @@ async def wait_for_agent_replies(chain_id: str, seconds: float) -> dict[str, Any
         if (asked and not silent) or (not asked and replies) or time.monotonic() >= deadline:
             return {"replies": replies, "passed": sorted(passed), "silent": sorted(silent)}
         await asyncio.sleep(WAIT_POLL_S)
+
+
+def relay_words(msg: dict[str, Any], asked: dict[str, str]) -> str:
+    """A relay turn's requester words: what the person asked (when this coordinator published the task) and what the
+    agent answered, without our instructions around them. The formalizer and the checks read these (2026-11-02, live:
+    with none, the relay template itself was formalized -- "Content: [Agent Bus result. chainId=...]" -- and the
+    room was told "An agent finished the work for project_id ...")."""
+    env = msg.get("envelope") or {}
+    payload = msg.get("payload") or {}
+    fields = {k: v for k, v in payload.items() if k not in ("type", "room_id")}
+    answer = (f'{env.get("senderUid") or "an agent"} answered {payload.get("type", "")} over the Agent Bus, with:\n'
+              f"{json.dumps(fields, ensure_ascii=False, indent=2)}")
+    if not asked.get("asked"):
+        return answer
+    return f'{asked.get("asked_by") or "someone"} asked in the chat room:\n{asked["asked"]}\n\n{answer}'
 
 
 def render_relay_text(msg: dict[str, Any], key: str) -> str:
@@ -811,12 +827,18 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 relay = config.orchestrator and msg_type.startswith("result.") and bool((msg.get("payload") or {}).get("room_id"))
                 if config.orchestrator and chain_id in _bus_tasks and (msg_type.startswith("result.") or msg_type == "system.skill_blocked"):
                     # The answer to a task this coordinator published; the room comes from the task.
-                    msg = {**msg, "payload": {**(msg.get("payload") or {}), "room_id": _bus_tasks.pop(chain_id)}}
+                    asked = _bus_tasks.pop(chain_id)
+                    msg = {**msg, "payload": {**(msg.get("payload") or {}), "room_id": asked["room_id"]}}
                     relay = True
+                else:
+                    asked = {}
                 if relay:
                     key = f'{chain_id}-relay-{(msg.get("envelope") or {}).get("messageId", "")[:8]}'
                     _pending[key] = msg
                     _relay_keys.add(key)
+                    # relay_words(msg, asked) is built but not passed yet (2026-11-02): fed to the formalizer it reads
+                    # the person's request as work still to do (3/3, "set the objective" again). How a relay turn gets
+                    # its task and its yardstick is an open decision, see the akinakes plan.
                     inject(key, render_relay_text(msg, key), None)
                     continue
                 if reply_spec(((msg.get("payload") or {}).get("type")) or "").get("chat") and not await admits_chat_message(msg, config, client):
