@@ -20,7 +20,7 @@ def _failure(exc: Exception) -> dict[str, Any]:
 
 async def chat_post_message(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        await akinakes_channel.post_chat(str(args.get("chain_id") or ""), str(args.get("text") or ""))
+        await akinakes_channel.post_chat(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")), str(args.get("text") or ""))
     except Exception as exc:  # noqa: BLE001 -- the model gets the reason and decides
         return _failure(exc)
     return {"text": "Posted in the room."}
@@ -28,7 +28,7 @@ async def chat_post_message(args: dict[str, Any], _report_progress: Any) -> dict
 
 async def chat_history(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        messages = await akinakes_channel.chat_history(str(args.get("chain_id") or ""))
+        messages = await akinakes_channel.chat_history(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")))
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
     lines = [f"[{m.get('created_at', '')}] {m.get('sender_uid', '?')}: {_text(m)}" for m in messages]
@@ -50,20 +50,20 @@ def _text(message: dict[str, Any]) -> str:
 
 async def akinakes_pass(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        await akinakes_channel.publish_pass(str(args.get("chain_id") or ""))
+        await akinakes_channel.publish_pass(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")))
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
     return {"text": "Passed."}
 
 
-_CHAIN = {"chain_id": {"type": "string", "description": "The chainId from the chat message, exactly."}}
+_CHAIN = {"chain_id": {"type": "string", "description": "Optional: the chat message's chainId (taken from the conversation when left out)."}}
 
 # Only in an akinakes agent that has Chat Service (BUS_URL, AGENT_UID and CHAT_SERVICE_URL set).
 _config = akinakes_channel.load_config()
 # chatSecretary is the one the others pass to, so it has no pass of its own.
 _PASS_TOOLS = [] if _config is not None and _config.orchestrator else [
     PluginTool(name="akinakes_pass", description="The chat message with this chainId is not for you: pass it, and do nothing else.",
-               input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=akinakes_pass),
+               input_schema={"type": "object", "properties": _CHAIN, "required": []}, handler=akinakes_pass),
 ]
 PLUGIN = None if _config is None or not _config.chat_url else Plugin(
     name="akinakes_chat",
@@ -71,10 +71,10 @@ PLUGIN = None if _config is None or not _config.chat_url else Plugin(
     always_loaded=True,
     tools=[
         PluginTool(name="chat_post_message", description="Posts your answer to the chat message with this chainId in its room.",
-                   input_schema={"type": "object", "properties": {**_CHAIN, "text": {"type": "string"}}, "required": ["chain_id", "text"]},
+                   input_schema={"type": "object", "properties": {**_CHAIN, "text": {"type": "string"}}, "required": ["text"]},
                    handler=chat_post_message),
         PluginTool(name="chat_history", description="The conversation so far in the room of the chat message with this chainId.",
-                   input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=chat_history),
+                   input_schema={"type": "object", "properties": _CHAIN, "required": []}, handler=chat_history),
         *_PASS_TOOLS,
     ],
 )

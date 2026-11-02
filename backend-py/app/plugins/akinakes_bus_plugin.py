@@ -12,7 +12,7 @@ from app.plugins.loader import Plugin, PluginTool
 
 async def akinakes_publish_result(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        ack = await akinakes_channel.publish_result(str(args.get("chain_id") or ""), str(args.get("payload_type") or ""), dict(args.get("fields") or {}))
+        ack = await akinakes_channel.publish_result(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")), str(args.get("payload_type") or ""), dict(args.get("fields") or {}))
     except ValueError as exc:
         return {"is_error": True, "content": [{"type": "text", "text": str(exc)}]}
     return {"text": f"Published (messageId={ack.get('messageId')})."}
@@ -20,7 +20,7 @@ async def akinakes_publish_result(args: dict[str, Any], _report_progress: Any) -
 
 async def akinakes_report_blocked(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        ack = await akinakes_channel.publish_blocked(str(args.get("chain_id") or ""), str(args.get("reason") or "unspecified"))
+        ack = await akinakes_channel.publish_blocked(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")), str(args.get("reason") or "unspecified"))
     except ValueError as exc:
         return {"is_error": True, "content": [{"type": "text", "text": str(exc)}]}
     return {"text": f"Reported as blocked (messageId={ack.get('messageId')})."}
@@ -38,11 +38,11 @@ PLUGIN = None if akinakes_channel.load_config() is None else Plugin(
             input_schema={
                 "type": "object",
                 "properties": {
-                    "chain_id": {"type": "string", "description": "The chainId from the task message, exactly."},
+                    "chain_id": {"type": "string", "description": "Optional: the task's chainId (taken from the conversation when left out)."},
                     "payload_type": {"type": "string", "description": "The reply type named in the task message."},
                     "fields": {"type": "object", "description": "The result fields named in the task message."},
                 },
-                "required": ["chain_id", "payload_type", "fields"],
+                "required": ["payload_type", "fields"],
             },
             handler=akinakes_publish_result,
         ),
@@ -52,7 +52,7 @@ PLUGIN = None if akinakes_channel.load_config() is None else Plugin(
             input_schema={
                 "type": "object",
                 "properties": {"chain_id": {"type": "string"}, "reason": {"type": "string"}},
-                "required": ["chain_id", "reason"],
+                "required": ["reason"],
             },
             handler=akinakes_report_blocked,
         ),

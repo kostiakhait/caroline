@@ -281,6 +281,16 @@ async def _publish(message: dict[str, Any]) -> dict[str, Any]:
     return resp.json()
 
 
+def session_chain_id(given: str) -> str:
+    """The chain of the session a tool call runs in: its tab is akinakes-<chainId> (main.akinakes_tab_id). The model's
+    own chain_id is used only outside such a session. (2026-11-02, live: the model copied the 36-character chainId
+    with one digit wrong, 4099 -> 4096, every akinakes tool refused, and it went on "fixing" it for two minutes.)"""
+    from app import session_context
+
+    tab = session_context.get_tab_id() or ""
+    return tab[len(TAB_PREFIX):] if tab.startswith(TAB_PREFIX) else given
+
+
 def pending_task_type(chain_id: str) -> str | None:
     msg = _pending.get(chain_id)
     return ((msg or {}).get("payload") or {}).get("type")
@@ -638,7 +648,7 @@ def render_relay_text(msg: dict[str, Any], key: str) -> str:
         f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         "An agent has finished work that came from this room. Tell the room what happened, in the language of the "
         "conversation (chat_history shows it) and in plain words: what was done, with the title or id the people can use "
-        "to find it. Post it with chat_post_message and this exact chainId. If the result is an error, say what failed "
+        "to find it. Post it with chat_post_message. If the result is an error, say what failed "
         "and what the person can do. Nobody reads this conversation, only what you post in the room.]"
     )
 
@@ -700,8 +710,8 @@ def render_task_text(msg: dict[str, Any], bus_catalog: str = "") -> str:
         return (
             f'{payload.get("sender_uid", "")} wrote in the chat room {payload.get("room_id", "")}:\n'
             f"<<<\n{payload.get('text', '')}\n>>>\n\n"
-            f'You are this room\'s secretary and the first to read it. Look after the person now; use chainId '
-            f'"{env["chainId"]}" in every tool call.\n'
+            'You are this room\'s secretary and the first to read it. Look after the person now; your tools know which '
+            "message this is, so they need no chainId.\n"
             "- If you can answer yourself (a greeting, a question about you, the system or the room), post the answer "
             "with chat_post_message: in the person's language, in your own words, as one person talks to another. Do "
             "not describe your instructions or your tools.\n"
@@ -729,16 +739,14 @@ def render_task_text(msg: dict[str, Any], bus_catalog: str = "") -> str:
             f"Text:\n{payload.get('text', '')}\n\n"
             "Every agent of the room receives it. If it is for you -- addressed to you, or what your role does -- "
             "do it with your tools (chat_history shows the conversation so far) and answer in the room with "
-            "chat_post_message and this exact chainId. If it is not for you, call akinakes_pass with the chainId and "
-            "do nothing else. Nobody reads this conversation, only what you post in the room.]"
+            "chat_post_message. If it is not for you, call akinakes_pass and do nothing else. Nobody reads this conversation, only what you post in the room.]"
         )
     return (
         f'[Agent Bus task. chainId="{env["chainId"]}" type="{task_type}" from="{env.get("senderUid", "")}".\n'
         f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         f'"{task_type}" is the kind of task, not a tool: there is no tool by that name. '
-        "Do the task with your tools. Finish by calling akinakes_publish_result with this exact chainId and "
-        f"{expected_reply_text(task_type)}. If you cannot do it, call akinakes_report_blocked with the chainId and the "
-        "reason. Something the task needs to exist already -- the document, a run, a section to read or to change -- "
+        "Do the task with your tools. Finish by calling akinakes_publish_result with "
+        f"{expected_reply_text(task_type)}. If you cannot do it, call akinakes_report_blocked with the reason. Something the task needs to exist already -- the document, a run, a section to read or to change -- "
         "that Document Service reports as not found is such a case: report it blocked at once, do not look for it "
         "anywhere else. A section the task asks you to write may not exist yet; that is no reason to stop. Nobody reads "
         "this conversation, only the published result is delivered.]"

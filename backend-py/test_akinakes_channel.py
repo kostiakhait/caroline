@@ -218,7 +218,7 @@ def test_the_coordinator_says_one_thing_per_request(monkeypatch):
     run(ch.on_turn_end("m1"))
     assert "m1" not in ch._posted
     text = ch.render_task_text(chat())
-    assert "wrote in the chat room" in text and "Shorten the intro" in text and 'chainId "m1"' in text
+    assert "wrote in the chat room" in text and "Shorten the intro" in text and "need no chainId" in text
 
 
 def test_orchestrator_tools_refuse_a_role_that_is_not_the_coordinator(channel):
@@ -471,3 +471,16 @@ def test_the_channel_injects_a_task_with_its_requester_words(monkeypatch, channe
                              lambda key, text, request: injected.append((key, text, request)), None))
     key, text, request = injected[0]
     assert key == "c7" and "akinakes_publish_result" in text and request == ch.requester_words(task("c7", "task.write_section"))
+
+
+
+def test_a_tool_takes_the_chain_of_its_session_not_the_model_s_copy(monkeypatch):
+    """Live 2026-11-02: the model copied the chainId with one digit wrong, and every tool refused."""
+    from app import session_context
+    token = session_context.set_tab_id("akinakes-3c2474d8-fefb-4099-a70c-8dd45369de1f")
+    try:
+        assert ch.session_chain_id("3c2474d8-fefb-4096-a70c-8dd45369de1f") == "3c2474d8-fefb-4099-a70c-8dd45369de1f"
+        assert ch.session_chain_id("") == "3c2474d8-fefb-4099-a70c-8dd45369de1f"
+    finally:
+        session_context._current_tab_id.reset(token)
+    assert ch.session_chain_id("c1") == "c1"  # outside an akinakes session, as given

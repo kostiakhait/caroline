@@ -21,7 +21,7 @@ def _json(data: Any) -> dict[str, Any]:
 
 async def room_agents(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        return _json(await akinakes_channel.room_agents(str(args.get("chain_id") or "")))
+        return _json(await akinakes_channel.room_agents(akinakes_channel.session_chain_id(str(args.get("chain_id") or ""))))
     except Exception as exc:  # noqa: BLE001 -- the model gets the reason and decides
         return _failure(exc)
 
@@ -29,7 +29,7 @@ async def room_agents(args: dict[str, Any], _report_progress: Any) -> dict[str, 
 async def hand_to_agents(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
         uids = [str(u) for u in args.get("agent_uids") or []]
-        sent = await akinakes_channel.hand_to_agents(str(args.get("chain_id") or ""), uids, args.get("text") or None)
+        sent = await akinakes_channel.hand_to_agents(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")), uids, args.get("text") or None)
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
     return {"text": f"Handed to: {', '.join(sent)}. They answer in the room themselves, or pass."}
@@ -37,7 +37,7 @@ async def hand_to_agents(args: dict[str, Any], _report_progress: Any) -> dict[st
 
 async def bus_agents(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        return _json(await akinakes_channel.bus_agents(str(args.get("chain_id") or "")))
+        return _json(await akinakes_channel.bus_agents(akinakes_channel.session_chain_id(str(args.get("chain_id") or ""))))
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
 
@@ -47,7 +47,7 @@ async def publish_bus_task(args: dict[str, Any], _report_progress: Any) -> dict[
         fields = args.get("fields") or {}
         if not isinstance(fields, dict):
             raise ValueError("fields must be an object.")
-        ack = await akinakes_channel.publish_bus_task(str(args.get("chain_id") or ""), str(args.get("agent_uid") or ""),
+        ack = await akinakes_channel.publish_bus_task(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")), str(args.get("agent_uid") or ""),
                                                       str(args.get("task_type") or ""), fields)
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
@@ -56,13 +56,13 @@ async def publish_bus_task(args: dict[str, Any], _report_progress: Any) -> dict[
 
 async def wait_for_agent_replies(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
-        result = await akinakes_channel.wait_for_agent_replies(str(args.get("chain_id") or ""), float(args.get("seconds") or 30))
+        result = await akinakes_channel.wait_for_agent_replies(akinakes_channel.session_chain_id(str(args.get("chain_id") or "")), float(args.get("seconds") or 30))
     except Exception as exc:  # noqa: BLE001
         return _failure(exc)
     return _json(result)
 
 
-_CHAIN = {"chain_id": {"type": "string", "description": "The chainId from the chat message, exactly."}}
+_CHAIN = {"chain_id": {"type": "string", "description": "Optional: the chat message's chainId (taken from the conversation when left out)."}}
 
 _config = akinakes_channel.load_config()
 PLUGIN = None if _config is None or not _config.orchestrator or not _config.chat_url else Plugin(
@@ -72,29 +72,29 @@ PLUGIN = None if _config is None or not _config.orchestrator or not _config.chat
     tools=[
         PluginTool(name="room_agents", description="The room of the chat message with this chainId (name, type, id, parent) and the agents "
                                                    "in it, with their role, what they do and the bus tasks they take.",
-                   input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=room_agents),
+                   input_schema={"type": "object", "properties": _CHAIN, "required": []}, handler=room_agents),
         PluginTool(name="hand_to_agents",
                    description="Forward the chat message to the named agents (their uids from room_agents). Each answers in the room itself or passes. "
                                "Optional text replaces the message text for them (for example when you have made the request clearer).",
                    input_schema={"type": "object", "properties": {**_CHAIN, "agent_uids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                                                                  "text": {"type": "string"}}, "required": ["chain_id", "agent_uids"]},
+                                                                  "text": {"type": "string"}}, "required": ["agent_uids"]},
                    handler=hand_to_agents),
         PluginTool(name="bus_agents",
                    description="Every agent that takes tasks from the Agent Bus, in this room or not: what it does and each task it takes, "
                                "with the task's description and payload fields.",
-                   input_schema={"type": "object", "properties": _CHAIN, "required": ["chain_id"]}, handler=bus_agents),
+                   input_schema={"type": "object", "properties": _CHAIN, "required": []}, handler=bus_agents),
         PluginTool(name="publish_bus_task",
                    description="Publish one of the tasks bus_agents lists to the agent that takes it; its result returns to you later. "
                                "fields are that task's payload fields, in your own words where a field is free text.",
                    input_schema={"type": "object", "properties": {**_CHAIN, "agent_uid": {"type": "string", "description": "The agent's uid, from bus_agents."},
                                                                   "task_type": {"type": "string", "description": "One of the task types that agent takes."},
                                                                   "fields": {"type": "object"}},
-                                  "required": ["chain_id", "agent_uid", "task_type"]},
+                                  "required": ["agent_uid", "task_type"]},
                    handler=publish_bus_task),
         PluginTool(name="wait_for_agent_replies",
                    description="Wait (up to 90 s) until every agent you handed the message to has posted in the room or passed, then return their replies, "
                                "who passed and who stayed silent. Use it when you need to know whether anyone answered.",
-                   input_schema={"type": "object", "properties": {**_CHAIN, "seconds": {"type": "number"}}, "required": ["chain_id"]},
+                   input_schema={"type": "object", "properties": {**_CHAIN, "seconds": {"type": "number"}}, "required": []},
                    handler=wait_for_agent_replies),
     ],
 )
