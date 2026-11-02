@@ -235,8 +235,14 @@ def test_room_agents_lists_agent_members_except_itself(monkeypatch):
     assert result["room"] == {"id": "ws-default/r1", "name": "Thermal Research", "type": "project", "parent_id": "ws-default"}
 
 
+ROOM_MEMBERS = {"http://chat/rooms/ws-default/r1/members": [
+    {"uid": "alice", "ptype": "human"}, {"uid": "editorAgent", "ptype": "agent"}, {"uid": "researchAgent", "ptype": "agent"},
+    {"uid": "chatSecretary", "ptype": "agent"},
+]}
+
+
 def test_hand_to_agents_publishes_the_message_addressed_to_each(monkeypatch):
-    http = orchestrator(monkeypatch)
+    http = orchestrator(monkeypatch, ROOM_MEMBERS)
     sent = run(ch.hand_to_agents("m1", ["editorAgent", "researchAgent"], None))
     assert sent == ["editorAgent", "researchAgent"]
     first, second = (body for _url, body in http.posted)
@@ -250,6 +256,24 @@ def test_hand_to_agents_publishes_the_message_addressed_to_each(monkeypatch):
     with pytest.raises(ValueError, match="already handed"):
         run(ch.hand_to_agents("m1", ["editorAgent"], None))
     assert len(http.posted) == 2
+
+
+def test_hand_to_agents_refuses_uids_that_are_not_agents_of_the_room(monkeypatch):
+    # Live 2026-11-01: invented uids agent-01..03, published to nobody.
+    http = orchestrator(monkeypatch, ROOM_MEMBERS)
+    with pytest.raises(ValueError, match="Not agents of this room, nothing was sent: agent-01, alice") as refused:
+        run(ch.hand_to_agents("m1", ["editorAgent", "agent-01", "alice"], None))
+    assert "The room's agents are: editorAgent, researchAgent" in str(refused.value)
+    assert http.posted == [] and "m1" not in ch._asked and "m1" not in ch._answered
+    with pytest.raises(ValueError, match="Not agents of this room"):
+        run(ch.hand_to_agents("m1", ["chatSecretary"], None))  # not to itself either
+
+
+def test_hand_to_agents_sends_nothing_when_the_room_cannot_be_read(monkeypatch):
+    http = orchestrator(monkeypatch)  # no member list: Chat Service's answer is unusable
+    with pytest.raises(ValueError, match="Could not read the room's members, nothing was sent"):
+        run(ch.hand_to_agents("m1", ["editorAgent"], None))
+    assert http.posted == []
 
 
 REGISTRY = [

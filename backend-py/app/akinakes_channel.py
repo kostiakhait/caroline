@@ -504,15 +504,21 @@ def _describe_agent(uid: str, a: dict[str, Any]) -> dict[str, Any]:
             "accepts": a.get("accepts") or []}
 
 
+async def _room_agent_uids(room_id: str) -> list[str]:
+    """The agent members of the room (Chat Service), this coordinator left out."""
+    assert _config is not None and _http is not None
+    resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/members", headers={"X-User-Email": _config.agent_uid}, timeout=10)
+    resp.raise_for_status()
+    return [m["uid"] for m in resp.json() if m.get("ptype") == "agent" and m.get("uid") != _config.agent_uid]
+
+
 async def room_agents(chain_id: str) -> dict[str, Any]:
     """The room of this message (its name, type -- workspace, project, team, bureau -- and parent; a project's id is its
     room's id) and the agents in it (Chat Service members) with what the Registry says they do and the bus tasks they take."""
     assert _config is not None and _http is not None
     room_id = (_orchestrator_message(chain_id).get("payload") or {}).get("room_id") or ""
     headers = {"X-User-Email": _config.agent_uid}
-    resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/members", headers=headers, timeout=10)
-    resp.raise_for_status()
-    uids = [m["uid"] for m in resp.json() if m.get("ptype") == "agent" and m.get("uid") != _config.agent_uid]
+    uids = await _room_agent_uids(room_id)
     room: dict[str, Any] = {"id": room_id}
     try:
         r = await _http.get(f"{_config.chat_url}/rooms/{room_id}", headers=headers, timeout=10)
@@ -545,6 +551,17 @@ async def hand_to_agents(chain_id: str, agent_uids: list[str], text: str | None)
     agent_uids = [u for u in dict.fromkeys(agent_uids) if u not in _asked.get(chain_id, set())]
     if not agent_uids:
         raise ValueError("The message is already handed to these agents; they answer in the room themselves.")
+    # Only agents of this room (2026-11-01, live server: the model called it with invented uids agent-01..03 before
+    # ever reading the room, the channel published to them, and nobody got the request). The whole call is refused,
+    # nothing is sent, and the reply names the real agents, so the next call can be right.
+    try:
+        members = await _room_agent_uids(payload.get("room_id") or "")
+    except Exception as exc:  # noqa: BLE001 -- without the member list nothing can be checked, so nothing is sent
+        raise ValueError(f"Could not read the room's members, nothing was sent: {exc}") from None
+    strangers = [u for u in agent_uids if u not in members]
+    if strangers:
+        raise ValueError(f"Not agents of this room, nothing was sent: {', '.join(strangers)}. The room's agents are: "
+                         f"{', '.join(members) or 'none'} (room_agents tells what each does).")
     sent: list[str] = []
     for uid in agent_uids:
         msg = make_message(_config.agent_uid, "chat.message", chain_id=chain_id, ttl_seconds=300, target_agent_uids=[uid])
