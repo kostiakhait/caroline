@@ -261,7 +261,8 @@ class TurnSubmissionMixin:
         # disk -- that record may be the user's only copy of unfinished work, and a
         # crash would then resume the nudge instead of it.
         if is_real_user or peek_pending_turn(self.workspace_dir, self.tab_id) is None:
-            save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments)
+            save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments,
+                              is_real_user=is_real_user)
         else:
             log_event("engine", "pending_turn_kept_for_real_user_work", tab_id=self.tab_id, is_real_user=is_real_user)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/

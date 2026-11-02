@@ -83,15 +83,20 @@ class PendingTurn:
     text: str
     attachments: list
     submitted_at_iso: str
+    # The user's own request, not a nudge (2026-11-01, per explicit instruction: a resumed real request has its narrator --
+    # confirmed live, it was resumed as a proactive turn and ran 8 minutes in silence). A file from before this field: True,
+    # since a nudge never overwrites the user's pending turn (turn_submission.py, issue #3).
+    is_real_user: bool = True
 
 
 def _pending_turn_path(workspace_dir: str, tab_id: str) -> Path:
     return Path(workspace_dir) / f"pending-turn-{_sanitize_tab_id(tab_id)}.json"
 
 
-def save_pending_turn(workspace_dir: str, tab_id: str, text: str, attachments: list) -> None:
+def save_pending_turn(workspace_dir: str, tab_id: str, text: str, attachments: list, is_real_user: bool = True) -> None:
     from datetime import datetime, timezone
-    turn = {"text": text, "attachments": attachments, "submittedAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    turn = {"text": text, "attachments": attachments, "submittedAtIso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "isRealUser": is_real_user}
     try:
         path = _pending_turn_path(workspace_dir, tab_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +153,8 @@ def peek_pending_turn(workspace_dir: str, tab_id: str) -> PendingTurn | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return PendingTurn(text=data["text"], attachments=data.get("attachments") or [], submitted_at_iso=data.get("submittedAtIso", ""))
+        return PendingTurn(text=data["text"], attachments=data.get("attachments") or [], submitted_at_iso=data.get("submittedAtIso", ""),
+                           is_real_user=bool(data.get("isRealUser", True)))
     except Exception as exc:
         log_event("engine", "peek_pending_turn_failed", tab_id=tab_id, error=str(exc))
         return None

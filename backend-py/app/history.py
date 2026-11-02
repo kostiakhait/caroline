@@ -187,6 +187,17 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
             # not another wording pattern to keep chasing.
             if obj.get("isMeta"):
                 continue
+            # Bug fix (2026-11-01), confirmed live: a background Monitor/task
+            # finishing makes the CLI inject a "<task-notification>" as a
+            # "user"-role entry WITHOUT isMeta -- the only tells are
+            # origin.kind / promptSource="system" / turnOrigin. It was
+            # replayed into the chat as a bubble in the user's own voice.
+            # Same reasoning as isMeta: the CLI itself says "not the human".
+            if obj.get("type") == "user":
+                _origin = obj.get("origin")
+                _kind = _origin.get("kind") if isinstance(_origin, dict) else None
+                if (_kind and _kind != "human") or obj.get("promptSource") == "system" or obj.get("turnOrigin") == "task_notification":
+                    continue
             content = (obj.get("message") or {}).get("content")
             # Bug fix (2026-09-10): for "user" entries only, undo a possible
             # multi-submit() merge before doing anything else -- see

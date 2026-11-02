@@ -2373,6 +2373,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "it never happened, and if it still needs doing, start it again from scratch (checking first, "
                 f"per above, whether it actually needs redoing). Reply in {resume_lang}, if you reply at all.]",
                 pending_text=original_text,
+                # The user's own request keeps its narrator (2026-11-01, confirmed live: inject_proactive's default
+                # suppressed it, and a resumed real task ran 8 minutes in silence); a resumed nudge stays without one.
+                suppress_narration=not unfinished_turn.is_real_user,
             )
             # Bug fix (2026-09-15), root-caused live: inject_proactive()
             # (called just above) always passes is_real_user=False to
