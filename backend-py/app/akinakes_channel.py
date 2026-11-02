@@ -594,8 +594,12 @@ async def publish_bus_task(chain_id: str, agent_uid: str, task_type: str, fields
             raise ValueError(f'{agent_uid} does not take {task_type}; it takes: {", ".join(sorted(accepted)) or "nothing declared"}.')
     payload = original.get("payload") or {}
     room_id = payload.get("room_id") or ""
+    # The message's room is the default; a task whose own fields name a room (docCreator's room_id: the room to
+    # announce in) keeps the model's choice. Who asked and their words always come from the message. (2026-11-02,
+    # live: a task with room_id among its fields crashed with "multiple values for keyword argument 'room_id'".)
+    task_fields = {"room_id": room_id, **fields, "user_uid": payload.get("sender_uid"), "original_text": payload.get("text", "")}
     msg = make_message(_config.agent_uid, task_type, chain_id=chain_id, route=[agent_uid], return_to=_config.agent_uid,
-                       room_id=room_id, user_uid=payload.get("sender_uid"), original_text=payload.get("text", ""), **fields)
+                       **task_fields)
     ack = await _publish(msg)
     _answered.add(chain_id)
     _bus_tasks[chain_id] = room_id

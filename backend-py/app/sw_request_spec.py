@@ -8,27 +8,34 @@ to answer a sender "that the invoice is received and will be paid by Friday",
 the strongest tier drafted "we plan to pay on [date]" -- "I don't have a date"
 -- and the verifier approved it.
 
-On nano (explicit choice). Any failure leaves the turn as it was before: the
-request goes to the models in the user's own words only.
-
 The "report" field describes what to report, never the report itself (2026-11-01,
 live akinakes chat secretary): asked to set a project's objective, nano wrote
 "What to tell the user: Confirmed: Set the objective ..." before anything was
 done. The model posted "Objective confirmed" without setting it, and
 sw.content.grounding and the verifier, which check against this text as the
 task, took the false claim for wording the user asked for.
+
+Split into three microagents (2026-11-02, explicit instruction: "раздели
+формализатор на 2-3 и каждому поставь более четкое задание, ответы
+объединяй"), see app/microagents/sw_request_spec_parts.py. One nano call with
+ten fields filled them in: "set the objective" became "identify the fields,
+select sensors, create a formal document", plus an outgoing "your objective has
+been captured verbatim". Now each part has a narrow task, every action,
+condition and outgoing message must quote the request's words that ask for it
+(checked by code), and the parts run in parallel on the microagent ladder. The
+answers are merged into the same task text as before.
+
+Any failure leaves the turn as it was before: a part that fails adds nothing,
+and with no part at all the request goes to the models in the user's own words.
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
 import time
 from typing import Any
 
 from app.logging_setup import log_event
-
-REQUEST_SPEC_MODEL = "openai/gpt-5-nano"
-REQUEST_SPEC_REASONING = {"effort": "low"}
 
 # The fields, in the order they are shown to the models. The labels are what
 # the models and the verifier read.
@@ -45,35 +52,6 @@ FIELDS = (
     ("constraints", "Conditions and limits"),
 )
 
-_PROMPT = (
-    "CRITICAL: a program parses your reply. Reply with one JSON object and nothing else.\n\n"
-    "Below is a request a user gave their AI assistant, with the conversation before it. Turn the request "
-    "into a precise task for the assistant. Fields (leave out a field the request says nothing about):\n"
-    '- "requester": who asks (the user, or someone the user speaks for)\n'
-    '- "goal": what the request is for, in one sentence\n'
-    '- "actions": the concrete things to do, in order (list of short strings)\n'
-    '- "targets": people, mailboxes, files, chats, items it concerns (list)\n'
-    '- "content": what has to be written or produced -- the substance, with every value the user gave\n'
-    '- "outgoing": each message to be sent to someone other than the user, as "<recipient>: <what that '
-    'message says>" (list) -- only what is meant for that recipient\n'
-    '- "report": what the user should learn at the end -- name the information the answer must give them, never '
-    "write the answer itself; this goes to the user, never into a message to someone else\n"
-    '- "dates": dates, deadlines, times the user named, exactly as named ("до пятницы", "15:00")\n'
-    '- "deliverable": what the user should have when it is done\n'
-    '- "constraints": conditions the user set (list)\n'
-    "Rules: the assistant has done nothing yet -- every field describes work still to do, so never write that the "
-    "assistant has done, set, confirmed, sent or saved anything. This is about the assistant's own work only: a "
-    "message to send still says what the user wants it to say. Take everything from the request and the "
-    "conversation, invent nothing. "
-    "Copy names, numbers, "
-    "dates, quoted wording and any value the user gave EXACTLY, in their original language. Resolve "
-    "\"him\"/\"that mailbox\"/\"the same\" from the conversation when it says who or what is meant. Write the "
-    "rest in the request's language.\n\n"
-    "CONVERSATION BEFORE THE REQUEST:\n---\n{dialogue}\n---\n\n"
-    "REQUEST:\n---\n{request}\n---\n\n"
-    "Reply now."
-)
-
 
 def _render(spec: dict[str, Any]) -> str:
     lines = []
@@ -87,20 +65,54 @@ def _render(spec: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def merge(work: dict[str, Any] | None, outgoing: dict[str, Any] | None, outcome: dict[str, Any] | None) -> dict[str, Any]:
+    """The three parts' answers as the one spec the fields above describe. A part that failed (None) adds nothing."""
+    spec: dict[str, Any] = {}
+    if work:
+        spec.update({k: work.get(k) for k in ("requester", "goal", "targets", "dates")})
+        spec["actions"] = [a.get("do") for a in work.get("actions") or []]
+        spec["constraints"] = [c.get("condition") for c in work.get("constraints") or []]
+    if outgoing:
+        spec["outgoing"] = [f'{m.get("to")}: {m.get("says")}' for m in outgoing.get("messages") or []]
+    if outcome:
+        spec.update({k: outcome.get(k) for k in ("content", "report", "deliverable")})
+    return spec
+
+
+def _run_part(name: str, given: dict[str, Any], tab_id: str | None) -> dict[str, Any] | None:
+    """One part on the local microagent ladder (blocking; run in a thread). None when it could not be done."""
+    from app.microagent_client import build_local_runtime, new_budget
+    from app.microagents import sw_request_spec_parts
+
+    runtime = build_local_runtime()
+    if runtime is None:
+        return None
+    for agent in sw_request_spec_parts.llm_agents():
+        try:
+            runtime.register(agent)
+        except ValueError:
+            pass
+    result = runtime.run(name, given, runtime.new_context(budget=new_budget()))
+    if (result or {}).get("status") != "ok":
+        log_event("engine", "sw_request_spec_part_failed", tab_id=tab_id, part=name, error=(result or {}).get("error"))
+        return None
+    return (result or {}).get("output") or {}
+
+
 async def formalize(request: str, recent_dialogue_lines: list[str], tab_id: str | None = None) -> str | None:
     """The formalized task as text for the models, or None (nothing to add, or a failure)."""
-    from app.small_model_engine import resolve_narration_prompt
+    from app.microagents import sw_request_spec_parts as parts
 
     started = time.monotonic()
-    prompt = _PROMPT.format(dialogue="\n".join(recent_dialogue_lines[-8:]) or "(nothing yet)", request=request)
+    given = {"request": request, "dialogue": "\n".join(recent_dialogue_lines[-8:])}
+    names = (parts.REQUEST_WORK, parts.REQUEST_OUTGOING, parts.REQUEST_OUTCOME)
     try:
-        raw = (await resolve_narration_prompt(prompt, model=REQUEST_SPEC_MODEL, reasoning=REQUEST_SPEC_REASONING) or "").strip()
-        start, end = raw.find("{"), raw.rfind("}")
-        spec = json.loads(raw[start:end + 1]) if start >= 0 and end > start else None
+        answers = await asyncio.gather(*(asyncio.to_thread(_run_part, name, given, tab_id) for name in names))
     except Exception as exc:  # noqa: BLE001 -- the turn goes on with the user's words alone
         log_event("engine", "sw_request_spec_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__,
                   ms=int((time.monotonic() - started) * 1000))
         return None
-    text = _render(spec) if isinstance(spec, dict) else ""
-    log_event("engine", "sw_request_spec", tab_id=tab_id, ok=bool(text), ms=int((time.monotonic() - started) * 1000), spec=text[:1500])
+    text = _render(merge(*answers))
+    log_event("engine", "sw_request_spec", tab_id=tab_id, ok=bool(text), ms=int((time.monotonic() - started) * 1000),
+              parts_failed=[n for n, a in zip(names, answers) if a is None], spec=text[:1500])
     return text or None

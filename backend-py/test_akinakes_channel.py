@@ -309,6 +309,17 @@ def test_a_bus_task_goes_to_the_chosen_agent_and_comes_back_here(monkeypatch):
     assert ch._bus_tasks == {"m1": "ws-default/r1"}
 
 
+def test_a_bus_task_may_name_its_own_room_among_its_fields(monkeypatch):
+    # Live 2026-11-02: docCreator's task has a room_id field, and the call crashed with "multiple values for room_id".
+    http = with_registry(monkeypatch)
+    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_set_objective",
+                            {"project_id": "p1", "objective": "Ship it", "room_id": "other-room", "user_uid": "mallory"}))
+    payload = http.posted[0][1]["payload"]
+    assert payload["room_id"] == "other-room" and payload["objective"] == "Ship it"
+    assert payload["user_uid"] == "alice" and payload["original_text"] == "Shorten the intro"  # always from the message
+    assert ch._bus_tasks == {"m1": "ws-default/r1"}  # the result is still told in the message's room
+
+
 def test_a_bus_task_is_checked_against_what_the_agent_declares(monkeypatch):
     http = with_registry(monkeypatch)
     with pytest.raises(ValueError, match="does not take task.write_section; it takes: task.project_set_objective"):
