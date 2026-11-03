@@ -90,6 +90,8 @@ _asked: dict[str, set[str]] = {}
 _passes: dict[str, set[str]] = {}
 _relay_keys: set[str] = set()
 _posted: set[str] = set()  # chains the coordinator already answered in the room
+_nudged: set[str] = set()  # chains whose turn ended with nothing for the room and got one more turn
+_inject: "InjectFn | None" = None
 # chains the coordinator published a bus task for -> the room to tell, who asked there and what. Kept past the turn:
 # the result comes later, and not every agent echoes room_id in its result (the secretaries' result.secretary_ok
 # does not). The request goes into the relay turn's requester words (relay_words).
@@ -669,11 +671,26 @@ def render_relay_text(msg: dict[str, Any], key: str) -> str:
     )
 
 
+NUDGE_TEXT = (
+    "Nothing you wrote reached the room: only chat_post_message, hand_to_agents and publish_bus_task do anything, and "
+    "plain text at the end of a turn is thrown away. You do not do the person's work yourself. Act now: answer in the "
+    "room if you can answer yourself, or pass the request on to the agent that does that work (hand_to_agents or "
+    "publish_bus_task), using what room_agents and the task list show."
+)
+
+
 async def on_turn_end(chain_id: str) -> None:
     """Call when a session's turn ended. Nothing published for the chain -> the task's blocked reply (agent.pass for a
     chat message)."""
     if chain_id in _pending and chain_id not in _answered and chain_id not in _relay_keys:
         try:
+            if _config is not None and _config.orchestrator and _inject is not None and chain_id not in _nudged:
+                # The small model sometimes does the requested work itself and ends the turn in plain text, which nobody
+                # reads (a plan written in the log, nothing in the room). One more turn says so; the chain stays open.
+                _nudged.add(chain_id)
+                log_event("plugin:akinakes-channel", "coordinator_nudged", chain_id=chain_id)
+                _inject(chain_id, NUDGE_TEXT, requester_words(_pending[chain_id]))
+                return
             if _config is not None and _config.orchestrator:
                 await post_chat(chain_id, "I could not handle that request. Could you say it another way?")
             else:
@@ -685,6 +702,7 @@ async def on_turn_end(chain_id: str) -> None:
     _answered.discard(chain_id)
     _relay_keys.discard(chain_id)
     _posted.discard(chain_id)
+    _nudged.discard(chain_id)
     _asked.pop(chain_id, None)
     _passes.pop(chain_id, None)
 
@@ -874,6 +892,8 @@ def start_akinakes_channel(inject: InjectFn, before_task: BeforeTaskFn | None = 
     _config = config
     _http = httpx.AsyncClient(timeout=30)
     status.configured = True
+    global _inject
+    _inject = inject
     log_event("plugin:akinakes-channel", "starting", uid=config.agent_uid, role=config.role, bus=config.bus_url)
     client = _http
 

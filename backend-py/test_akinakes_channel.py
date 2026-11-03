@@ -432,6 +432,19 @@ def test_a_coordinator_turn_without_an_answer_tells_the_room_and_a_relay_turn_do
     assert len(http.posted) == 1
 
 
+def test_a_coordinator_turn_with_nothing_for_the_room_gets_one_more_turn_then_the_fallback(monkeypatch):
+    http = orchestrator(monkeypatch)
+    injected = []
+    monkeypatch.setattr(ch, "_inject", lambda key, text, words: injected.append((key, text, words)))
+    monkeypatch.setattr(ch, "_nudged", set())
+    run(ch.on_turn_end("m1"))
+    assert http.posted == [] and "m1" in ch._pending and injected[0][0] == "m1" and "hand_to_agents" in injected[0][1]
+    assert "Shorten the intro" in injected[0][2]
+    run(ch.on_turn_end("m1"))
+    assert len(injected) == 1 and http.posted[0][0] == "http://chat/internal/rooms/ws-default/r1/agent_message"
+    assert "m1" not in ch._pending and "m1" not in ch._nudged
+
+
 def test_scope_from_env(monkeypatch):
     monkeypatch.setenv("AGENT_SCOPE", '[{"room_id": "ws-default", "recursive": true}]')
     assert ch._scope_from_env() == [{"room_id": "ws-default", "recursive": True}]
