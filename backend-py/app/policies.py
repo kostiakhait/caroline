@@ -459,6 +459,34 @@ def reuse_window_for_same_document_or_site_instruction() -> str:
     )
 
 
+def reuse_known_methods_instruction() -> str:
+    """Real incident (2026-11-02): the user said "if you can't find them
+    yourself, send ChatGPT after them"; Caroline had worked with ChatGPT in
+    the embedded browser all session, yet answered that she had "no channel
+    to ChatGPT" after a search of her TOOL NAMES for "ChatGPT" found
+    nothing. The facts memory (save_info/request_info) holds what is known
+    about people and things, but nothing held HOW she solved a kind of task,
+    and nothing made her look before declaring something impossible. Kept
+    general on purpose: a method, not a site-specific rule; the ChatGPT case
+    is only the example. A website is never a tool name -- it is reached
+    through the embedded browser, often already open and signed in."""
+    return (
+        "REMEMBER HOW YOU SOLVED THINGS. Whenever a task is done by a method that was not obvious -- which "
+        "tool, window, site, script or sequence of steps actually worked, a workaround for something that "
+        "failed first -- save it with save_info right then, phrased as a method for that KIND of task: \"To "
+        "<do this kind of thing>: <what worked>, <what does not work>\", in terms of the goal, not of this one "
+        "occasion.\n"
+        "RECALL BEFORE GIVING UP OR STARTING: before you tell the user you cannot do something, have no access "
+        "to something, or have to ask them how, and before you begin any task of a kind you may have done "
+        "before, call request_info for how you did that kind of task earlier, then look at this conversation's "
+        "own earlier turns and list_my_windows. A site or service the user names (ChatGPT, a webmail, a portal) "
+        "is not a tool, so never conclude it is unreachable because no tool carries its name: it is reached "
+        "through the embedded browser (open_app_browser / app_browser_*), often already open and signed in as "
+        "the user -- reuse that window. Saying you cannot do what you did earlier in the same session is a "
+        "serious error."
+    )
+
+
 def no_internal_mechanics_to_user_instruction() -> str:
     """Per explicit instruction (2026-09-10): confirmed live -- Caroline
     kept narrating her own plumbing to the user ("let me look at what
@@ -1129,6 +1157,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     compact_continuation_is_genuine_instruction,
     document_opening_preference_instruction,
     reuse_window_for_same_document_or_site_instruction,
+    reuse_known_methods_instruction,
     usage_cap_self_awareness_instruction,
     proactive_context_recovery_instruction,
     no_internal_mechanics_to_user_instruction,

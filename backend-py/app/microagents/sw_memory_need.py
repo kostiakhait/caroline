@@ -34,7 +34,11 @@ _PROMPT = (
     "When in doubt, say it is needed: a needless look-up costs little, a missed one makes the assistant "
     "answer as if it did not know the user.\n"
     f"If needed, give 1 to {MAX_QUERIES} short search queries (in the language of the message, each about "
-    "one subject, naming the thing to find, not the whole message).\n\n"
+    "one subject, naming the thing to find, not the whole message).\n"
+    "Also: when the message asks the assistant to DO something (an action, a task, a piece of work) rather than "
+    "just talk, it is needed, and one of the queries must ask how the assistant did that kind of task before "
+    "-- phrased as \"how I did <the kind of task>\" and naming the sites, services or tools the message "
+    "mentions (for example a web service the user names) -- so that a method found earlier comes back.\n\n"
     "CONVERSATION (latest last):\n{dialogue}\n\n"
     "NEW MESSAGE:\n{message}\n\n"
     'Reply with a JSON object: {{"needs_memory": true|false, "why": "<one short sentence>", "queries": ["...", ...]}}'

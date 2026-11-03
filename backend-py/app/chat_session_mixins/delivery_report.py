@@ -91,11 +91,20 @@ class DeliveryReportMixin:
     def _dr_finish(self, message: Any) -> None:
         """A real turn has ended and its answer stands. Starts the check in the background."""
         record, self._dr = self._dr, None
-        if record is None or os.environ.get("CAROLINE_NO_DELIVERY_CHECK") == "1":
+        if record is None:
             return
         if getattr(message, "is_error", False) or not record.has_work:
             return  # an error is handled by the retry machinery; with no work done there is nothing to report on
+        asyncio.create_task(self._dr_remember_method(record))
+        if os.environ.get("CAROLINE_NO_DELIVERY_CHECK") == "1":
+            return
         asyncio.create_task(self._dr_check(record))
+
+    async def _dr_remember_method(self, record: delivery_report.TurnRecord) -> None:
+        """Method memory (app/method_memory.py): a finished turn's way of doing its task, saved by the code."""
+        from app.method_memory import remember_method
+
+        await remember_method(record.user_text, list(record.work.trace), record.delivered_transcript(), self.tab_id)
 
     REPEAT_WINDOW_S = 180
 
