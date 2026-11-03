@@ -821,6 +821,10 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 status.tasks_received += 1
                 status.last_task_at_iso = datetime.now(timezone.utc).isoformat()
                 msg_type = (msg.get("payload") or {}).get("type") or ""
+                # A role takes tasks, queries and chat messages. Results and events broadcast on the bus are not work for it
+                # (without this, a writer answered another agent's result.section_draft with a second one).
+                if not config.orchestrator and not msg_type.startswith(("task.", "query.", "chat.")):
+                    continue
                 if config.orchestrator and msg_type == "agent.pass":
                     _passes.setdefault(chain_id, set()).add((msg.get("payload") or {}).get("agent_uid") or "")
                     continue
