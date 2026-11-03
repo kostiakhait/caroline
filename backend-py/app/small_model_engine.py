@@ -70,6 +70,7 @@ backend startup over a missing/broken dependency, per this module's own
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -527,6 +528,15 @@ async def _hedged_verifier_call(make_call: Callable[[], Awaitable[str]], tab_id:
 
 
 
+def _takes_usage_extra(ai: Any) -> bool:
+    """Whether Camerlengo's resolve_agentic() takes usage_extra (2026-11-03): an older
+    AI.py does not, and the call then goes without it."""
+    try:
+        return "usage_extra" in inspect.signature(ai.resolve_agentic).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 async def _resolve_agentic_with_watchdog(
     ai: Any, tracker: _TurnTracker, *, parent_cancels: tuple[threading.Event, ...] = (), **resolve_kwargs: Any,
 ) -> str:
@@ -547,6 +557,8 @@ async def _resolve_agentic_with_watchdog(
     parent_cancels: the flags of whatever started this attempt (a parallel-stage
     branch's turn and tier attempt) -- once one of them is set, this attempt is
     given up too, so an abandoned branch stops waiting and stops acting."""
+    if "usage_extra" in resolve_kwargs and not _takes_usage_extra(ai):
+        resolve_kwargs.pop("usage_extra")
     tracker.touch_progress()
     started = time.monotonic()
     attempt_cancel = threading.Event()
@@ -1101,6 +1113,7 @@ class _SquirrelWisdomStepAdapter:
         self, model: str, messages: list[dict[str, Any]], max_tokens: int | None = None, temperature: float = 0.2,
         transforms: list[str] | None = None, stop: Any = None, tools: list[dict[str, Any]] | None = None,
         reasoning: dict[str, Any] | None = None, timeout: float | None = None, plugins: list[dict[str, Any]] | None = None,
+        usage_extra: dict[str, Any] | None = None,  # the proxy's usage-log tag; the server logs this path itself
     ) -> Any:
         body: dict[str, Any] = {
             "command": "ai:resolveAgenticStep", "key": CAROLINE_SW_KEY, "messages": messages, "model": model,
@@ -1353,7 +1366,7 @@ def _run_plan_tool(name: str, args: dict[str, Any], tracker: _TurnTracker) -> st
 async def _run_parallel_stage(
     stage_index: int, *, tracker: _TurnTracker, tab_id: str | None, send: session_context.SendFn | None,
     main_loop: asyncio.AbstractEventLoop, registry: "ToolRegistry", ai: Any, cfg: Any,
-    system_text: str, user_text: str, model: str, recorder: Any = None,
+    system_text: str, user_text: str, model: str, reasoning: dict[str, Any] | None, recorder: Any = None,
 ) -> str:
     if tracker.plan_stages is None or not (0 <= stage_index < len(tracker.plan_stages)):
         return f"ERROR: the declared plan has no stage {stage_index}."
@@ -1409,8 +1422,10 @@ async def _run_parallel_stage(
                             ai, branch_tracker, parent_cancels=parent_cancels,
                             messages=branch_messages, tool_defs=branch_tools, executor_fn=traced_executor,
                             model=model, max_iterations=MAX_ITERATIONS,
-                            transforms=DISABLE_MIDDLE_OUT, reasoning=REASONING_EFFORT,
-                            app="caroline",
+                            # The tier's own effort (2026-11-03): branches ran at "high" on every tier,
+                            # nano and codex-mini included, while the tier itself runs at "low".
+                            transforms=DISABLE_MIDDLE_OUT, reasoning=reasoning,
+                            app="caroline", usage_extra={"purpose": "branch", "stage": stage_index, "step": step_index},
                         ),
                         tab_id, lambda _line: None,
                     )
@@ -2279,6 +2294,7 @@ async def verify_claude_attempt(
                 ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
                 max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
                 transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+                usage_extra={"purpose": "claude_ladder_verifier"},
             ), tab_id),
             tab_id, lambda _line: None,
         ), timeout=CLAUDE_ATTEMPT_VERDICT_TIMEOUT_S)
@@ -2362,6 +2378,7 @@ async def verify_delivery(user_text: str, trace: list[str], delivered: str, tab_
                 ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
                 max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
                 transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+                usage_extra={"purpose": "delivery_report_verifier"},
             ), tab_id),
             tab_id, lambda _line: None,
         ), timeout=DELIVERY_VERDICT_TIMEOUT_S)
@@ -2426,6 +2443,7 @@ async def summarize_conversation(digest: str, tab_id: str) -> str | None:
                 ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
                 max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
                 transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+                usage_extra={"purpose": "compaction_recovery_summary"},
             ), tab_id),
             tab_id, lambda _line: None,
         ), timeout=RECOVERY_SUMMARY_TIMEOUT_S)
@@ -3461,13 +3479,13 @@ async def run_small_model_turn(
     tracker = _TurnTracker()
     # A real user's task -- what the changing-action check compares calls against.
     tracker.task_text = (request_spec or request) if formalize_request else ""
-    current_model = {"name": cfg.AI_MODEL_SMALL}
+    current_model = {"name": cfg.AI_MODEL_SMALL, "reasoning": TIER_REASONING_EFFORT[0]}
 
     async def run_stage(stage_index: int) -> str:
         return await _run_parallel_stage(
             stage_index, tracker=tracker, tab_id=tab_id, send=send, main_loop=main_loop,
             registry=registry, ai=ai, cfg=cfg, system_text=messages[0]["content"],
-            user_text=user_text, model=current_model["name"], recorder=recorder,
+            user_text=user_text, model=current_model["name"], reasoning=current_model["reasoning"], recorder=recorder,
         )
 
     live_dialogue = [f"User: {user_text}"]
@@ -3584,7 +3602,7 @@ async def run_small_model_turn(
                 model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                 reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
-                app="caroline",
+                app="caroline", usage_extra={"purpose": "verifier"},
             ), tab_id),
             tab_id, emit,
         )
@@ -3731,6 +3749,7 @@ async def run_small_model_turn(
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
         emit(f"Tier {index + 1} ({model}) is working.")
         current_model["name"] = model
+        current_model["reasoning"] = TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)]
         candidate = ""
         try:
             candidate = await _call_with_funds_wait(
@@ -3739,8 +3758,8 @@ async def run_small_model_turn(
                     messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
                     model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                     get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                    reasoning=TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)], on_usage=on_usage,
-                    app="caroline",
+                    reasoning=current_model["reasoning"], on_usage=on_usage,
+                    app="caroline", usage_extra={"purpose": "tier", "tier": index},
                 ),
                 tab_id, emit,
             )
