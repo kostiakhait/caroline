@@ -361,11 +361,13 @@ def test_the_result_of_a_published_task_is_told_in_its_room_even_without_room_id
     result = ch.make_message("projectSecretary", "result.secretary_ok", chain_id="m1", project_id="ws-default/r1", objective="Ship it")
     injected = []
     with pytest.raises(asyncio.CancelledError):
-        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text, request: injected.append((key, text, request)), None))
-    (key, text, request), = injected
-    assert request is None  # relay_words is not wired into the turn yet (open decision, see the akinakes plan)
-    # What relay_words gives: what the person asked and what the agent answered, not our template.
+        run(ch._poll_forever(PollOnce([result]), ch._config, lambda key, text, request, relay=False: injected.append((key, text, request, relay)), None))
+    (key, text, request, relay), = injected
+    # A relay turn is not a request: the turn gets what the person asked and what the agent answered, not our template,
+    # and the relay flag (no formalizer, no start-rung advice).
+    assert relay is True
     words = ch.relay_words(ch._pending[key], {"asked_by": "alice", "asked": "Set the objective to: ship it"})
+    assert request == words
     assert words.startswith("alice asked in the chat room:\nSet the objective to: ship it\n\nprojectSecretary answered result.secretary_ok")
     assert '"objective": "Ship it"' in words and "Agent Bus result" not in words
     assert key.startswith("m1-relay-") and key in ch._relay_keys

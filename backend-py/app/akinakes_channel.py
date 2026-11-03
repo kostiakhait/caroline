@@ -43,7 +43,7 @@ DEFAULT_TTL_S = 600
 # Tab ids of the chains' sessions (main.akinakes_tab_id); settings_mirror leaves these tabs out.
 TAB_PREFIX = "akinakes-"
 
-InjectFn = Callable[[str, str, "str | None"], None]  # (chain_id, text, the requester's own words or None)
+InjectFn = Callable[..., None]  # (chain_id, text, the requester's own words or None, relay=False)
 BeforeTaskFn = Callable[[], Awaitable[None]]
 
 
@@ -861,7 +861,7 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                     # relay_words(msg, asked) is built but not passed yet (2026-11-02): fed to the formalizer it reads
                     # the person's request as work still to do (3/3, "set the objective" again). How a relay turn gets
                     # its task and its yardstick is an open decision, see the akinakes plan.
-                    inject(key, render_relay_text(msg, key), None)
+                    inject(key, render_relay_text(msg, key), relay_words(msg, asked), True)
                     continue
                 if reply_spec(((msg.get("payload") or {}).get("type")) or "").get("chat") and not await admits_chat_message(msg, config, client):
                     continue

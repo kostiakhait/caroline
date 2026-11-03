@@ -3357,6 +3357,7 @@ async def run_small_model_turn(
     recorder: Any = None,
     formalize_request: bool = True,
     request_text: str | None = None,
+    relay: bool = False,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -3417,7 +3418,10 @@ async def run_small_model_turn(
     # channel's task template was formalized and checked as if the person had asked for it -- "hand the task to the
     # room agents" came from our instructions, and every hand-off counted as asked). The model still gets user_text.
     request = request_text or user_text
-    request_spec_task = asyncio.ensure_future(formalize(request, recent_dialogue_lines, tab_id)) if formalize_request else None
+    # A relay turn (akinakes: an agent's finished work reported to the room) is not a request: nothing to formalize and
+    # no start-rung advice (the advisor read a plan in the report as a document to interpret and started on the top
+    # rung, 2026-11-03). The checks still run, with `request` as their yardstick.
+    request_spec_task = asyncio.ensure_future(formalize(request, recent_dialogue_lines, tab_id)) if formalize_request and not relay else None
 
     # Explicit adapter -- never rely on camerlengo_ai.AI()'s own default
     # (Config.OPENROUTER_KEY, server-only) from this process. Which adapter, and
@@ -3436,7 +3440,7 @@ async def run_small_model_turn(
     rung_ladder = rung_advice.sw_ladder([cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS])
     rung_advice_task = asyncio.ensure_future(rung_advice.advise(
         "sw", rung_ladder, request, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
-    )) if formalize_request else None
+    )) if formalize_request and not relay else None
 
     registry = build_tool_registry()
     system = "\n\n".join([
@@ -3714,7 +3718,7 @@ async def run_small_model_turn(
     # higher of the choice above and the tier that does not fail too often on tasks with
     # these tags -- see app/sw_tier_stats.py. Real user requests only.
     task_tags: list[str] = []
-    if formalize_request:
+    if formalize_request and not relay:
         task_tags = await _task_tags(request_spec or request, tab_id)
         advised = await _tier_advice(task_tags, tiers, workspace_dir, tab_id)
         if advised is not None and advised > start_index:
@@ -3891,7 +3895,7 @@ async def run_small_model_turn(
             sw_tier_stats.record(workspace_dir, task_tags, tiers_ran, closed_on)
         except Exception as exc:  # noqa: BLE001 -- statistics never cost the answer
             log_event("engine", "sw_tier_stats_record_failed", tab_id=tab_id, error=str(exc)[:200])
-    if formalize_request and tiers_ran:
+    if formalize_request and not relay and tiers_ran:
         rung_advice.record(workspace_dir, tab_id, "sw", request, rung_ladder, start_index,
                            closed_on if closed_on is not None else tiers_ran[-1], escalation_notes)
     if not final_text:

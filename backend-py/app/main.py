@@ -1229,10 +1229,10 @@ async def get_or_create_akinakes_session(chain_id: str) -> ChatSession:
     return session
 
 
-def _inject_from_akinakes(chain_id: str, text: str, request_text: str | None = None) -> None:
+def _inject_from_akinakes(chain_id: str, text: str, request_text: str | None = None, relay: bool = False) -> None:
     async def _do() -> None:
         session = await get_or_create_akinakes_session(chain_id)
-        session.inject_proactive(text, request_text=request_text)
+        session.inject_proactive(text, request_text=request_text, relay=relay)
 
     asyncio.create_task(_do())
 
