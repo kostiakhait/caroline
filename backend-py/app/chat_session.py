@@ -396,17 +396,14 @@ class ChatSession(
         # Why the watchdog last interrupted, in words the model is told -- see
         # _hang_interrupt_note.
         self.hang_interrupt_reason: str | None = None
-        # Which CLI turn a ResultMessage belongs to (2026-10-30, confirmed live, tab 1
-        # 23:19:18 and 23:20:54): the CLI announces each turn it starts with an init
-        # message. _cli_turn_running: between that init and the turn's result.
-        # _input_preparing: an input taken off the queue but not yet handed to the
-        # CLI (the memory advisor can hold it ~25s). _input_awaiting_init: handed to
-        # an idle CLI, whose turn has not announced itself yet. While either holds,
-        # or the queue still has input, a result is the end of an EARLIER turn and
-        # must not close the pending one -- see result_is_stale in _run_loop.
-        self._cli_turn_running = False
+        # Whether a ResultMessage can belong to the pending turn (2026-10-30, confirmed
+        # live, tab 1 23:19:18): _input_preparing is an input taken off the queue but
+        # not yet handed to the CLI (the memory advisor can hold it ~25s). While it
+        # holds, or the queue still has input, a result is the end of an EARLIER turn
+        # and must not close the pending one -- see result_is_stale in _run_loop.
+        # (An "init not yet seen" signal was tried too and removed, 2026-11-03: the CLI
+        # does not announce every turn with init, so turns never closed.)
         self._input_preparing = False
-        self._input_awaiting_init = False
 
         # Bug fix (2026-09-15, "Стоп должен срабатывать ВСЕГДА"): the real
         # OS pid of the currently-live CLI subprocess, captured directly at

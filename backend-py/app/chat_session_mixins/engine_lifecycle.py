@@ -479,22 +479,15 @@ class EngineLifecycleMixin:
             await self._ladder_before_yield(item)
             self._inflight_begin()
             self._input_preparing = False
-            # Handed to a CLI that is mid-turn, the input is merged into that turn
-            # or queued behind it -- undecidable here, so only the idle case waits for init.
-            self._input_awaiting_init = not self._cli_turn_running
             yield item["message"]
     def _result_precedes_pending_input(self) -> bool:
         """True: the ResultMessage just received ends an EARLIER CLI turn, while input of the pending turn is still
-        queued, being prepared, or handed to the CLI without its turn having started (no init yet). See
-        _cli_turn_running's own __init__ comment."""
+        queued or being prepared. See _input_preparing's own __init__ comment."""
         if getattr(self, "engine_kind", "") != "claude":
             return False
-        stale = bool(self.queue) or self._input_preparing or self._input_awaiting_init
+        stale = bool(self.queue) or self._input_preparing
         if stale:
-            log_event(
-                "engine", "result_precedes_pending_input", tab_id=self.tab_id, queued=len(self.queue),
-                preparing=self._input_preparing, awaiting_init=self._input_awaiting_init,
-            )
+            log_event("engine", "result_precedes_pending_input", tab_id=self.tab_id, queued=len(self.queue), preparing=self._input_preparing)
         return stale
     async def _glue_memory_advice(self, item: dict[str, Any]) -> None:
         """The memory advisor (app/memory_advisor.py) for a real user message of the Claude/Codex engines: the
@@ -850,7 +843,7 @@ class EngineLifecycleMixin:
                 query_started_at = time.monotonic()
                 log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=self.current_chat_source, engine=self.engine_kind)
                 self._open_tool_calls = {}  # a new stream: no call of the old one can still answer
-                self._cli_turn_running = self._input_preparing = self._input_awaiting_init = False
+                self._input_preparing = False
                 if self.engine_kind == "openai":
                     self.client = CodexEngine(build_codex_options(self.workspace_dir, system_prompt_append, mcp_servers, resume_session_id))
                 else:
@@ -1206,7 +1199,6 @@ class EngineLifecycleMixin:
                         # pending_attachments for something ELSE that got
                         # queued in the meantime.
                         self._inflight_end()
-                        self._cli_turn_running = False
                         if await self._ladder_on_result(message):
                             continue  # the attempt was rejected: the next model has the turn, nothing of this one is shown
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending or self.clear_tab_result_pending
@@ -1214,11 +1206,15 @@ class EngineLifecycleMixin:
                         # earlier CLI turn's result closed the pending turn of a message the CLI had
                         # not started yet -- at 23:19:18 the message was still with the memory
                         # advisor (and the refusal guard then re-ran it through SW: two engines
-                        # answering one message); at 23:20:54 it had just been handed over, its init
-                        # not in yet. The tab then looked idle while the CLI worked on it, and the
-                        # user's next message became an "empty turn" the watchdog interrupted. See
-                        # _cli_turn_running's own __init__ comment. Codex announces itself only
-                        # once per connection, so this holds for the Claude engine only.
+                        # answering one message). See _input_preparing's own __init__ comment.
+                        # Claude engine only (see _result_precedes_pending_input).
+                        #
+                        # Bug fix (2026-11-03), confirmed live (tab 1, 22 crashes since 2026-10-31):
+                        # the two flags below are read further down for EVERY result (the result
+                        # envelope's wasInternalCheckReply), so a stale result, which skips the
+                        # block that sets them, raised UnboundLocalError and restarted the session.
+                        was_real_user_turn = False
+                        was_awaiting_post_turn_check_reply = False
                         result_is_stale = not result_is_fake and self._result_precedes_pending_input()
                         if not result_is_fake and not result_is_stale:
                             was_real_user_turn = self.pending_is_real_user
@@ -1592,8 +1588,6 @@ class EngineLifecycleMixin:
                             self._dr_finish(message)
 
                     if isinstance(message, SystemMessage) and message.subtype == "init":
-                        self._cli_turn_running = True
-                        self._input_awaiting_init = False
                         self.has_seen_init = True
                         self.connecting_since = None
                         log_event("engine", "init_received", tab_id=self.tab_id, elapsed_ms=round((time.monotonic() - query_started_at) * 1000), resume=resume_session_id)
