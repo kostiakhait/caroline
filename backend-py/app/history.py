@@ -116,6 +116,10 @@ def _extract_text_and_attachments(content: Any) -> tuple[str, list[dict[str, str
     return "\n\n".join(text_parts), attachments
 
 
+def _is_internal_block(b: Any) -> bool:
+    return isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str) and SYNTHETIC_TURN_MARKER.strip("⁣") in b["text"]
+
+
 def _split_user_submessages(content: Any) -> list[Any]:
     """Bug fix (2026-09-10): confirmed live -- when multiple submit() calls
     (chat_session.py) queue up faster than the CLI drains the queue (always
@@ -224,6 +228,15 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
                     isinstance(b, dict) and b.get("type") == "tool_use" for b in group
                 ):
                     continue
+                if obj.get("type") == "user" and isinstance(group, list):
+                    # Internal blocks (SYNTHETIC_TURN_MARKER) inside a group are cut out on their own: the user's
+                    # words riding in the same message (a recovery replay) must survive them.
+                    internal = [b for b in group if _is_internal_block(b)]
+                    if internal:
+                        rest = [b for b in group if not _is_internal_block(b)]
+                        if not any(isinstance(b, dict) and b.get("type") == "text" and not _HISTORY_STAMP_PATTERN.match(b.get("text") or "") for b in rest):
+                            continue
+                        group = rest
                 text, attachments = _extract_text_and_attachments(group)
                 if not text.strip() and not attachments:
                     continue

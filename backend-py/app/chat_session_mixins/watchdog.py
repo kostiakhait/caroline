@@ -719,7 +719,8 @@ class WatchdogMixin:
             self.hang_interrupted_tool_elapsed_s = None
             if self.hang_interrupt_reason:
                 # The watchdog itself ended this stream: say so, and why (2026-10-30).
-                tool_note = " " + self._hang_interrupt_note()
+                # Already injected once at the soft interrupt (inject_proactive); only the reason rides here.
+                tool_note = f" The hang watchdog ended the stream: {self.hang_interrupt_reason}."
                 self.hang_interrupt_reason = None
             watchdog_note = (
                 f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}):"
@@ -729,7 +730,7 @@ class WatchdogMixin:
             )
         if self.pending_user_text is not None:
             log_event("engine", "handle_failure_replay_pending", tab_id=self.tab_id, text_len=len(self.pending_user_text))
-            self._push_message(f"{watchdog_note}\n\n{self.pending_user_text}", self.pending_attachments, False)
+            self._push_message(self.pending_user_text, self.pending_attachments, False, internal_note=watchdog_note)
         else:
             # current_language_name() is synchronous/instant (2026-09-09
             # redesign) -- this pending_user_text re-check is kept regardless

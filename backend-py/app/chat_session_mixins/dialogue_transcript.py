@@ -580,7 +580,7 @@ class DialogueTranscriptMixin:
             if isinstance(blocks, list) and blocks and isinstance(blocks[-1], dict) and blocks[-1].get("text") == text:
                 return True
         return False
-    def _push_message(self, text: str, attachments: list[Any], is_voice: bool, memory_advice_for: str | None = None) -> None:
+    def _push_message(self, text: str, attachments: list[Any], is_voice: bool, memory_advice_for: str | None = None, internal_note: str | None = None) -> None:
         """memory_advice_for: the user's own words, for a REAL user message -- _input_stream then glues the memory
         advisor's block to the message (app/memory_advisor.py)."""
         sent_line = f"[Sent: {_format_timestamp_for_model(datetime.now(timezone.utc).astimezone())}"
@@ -591,6 +591,9 @@ class DialogueTranscriptMixin:
         if self._stop_note_in_next_push:
             self._stop_note_in_next_push = False
             content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + STOP_NOTE_TEXT})
+        if internal_note:
+            # Caroline's own service text, never the user's words: marked as its own block so the transcript drops it.
+            content.append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + internal_note})
         for attachment in attachments:
             content.extend(_attachment_to_blocks(attachment))
         if text:
