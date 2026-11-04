@@ -4,9 +4,10 @@ any group is looked at."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from app import skills
+from app import skill_import, skills
 from app.plugins.loader import Plugin, PluginTool
 from app.workspace_dir import WORKSPACE_DIR
 
@@ -39,6 +40,21 @@ async def read_skill_file(args: dict[str, Any], _report_progress: Any) -> dict[s
         return {"text": str(exc), "is_error": True}
 
 
+async def import_skill(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(
+            skill_import.import_skills,
+            WORKSPACE_DIR,
+            str(args.get("source") or ""),
+            (args.get("name") or None),
+            (args.get("description") or None),
+            bool(args.get("overwrite")),
+        )
+    except skill_import.ImportProblem as exc:
+        return {"text": str(exc), "is_error": True}
+    return {"text": skill_import.report_text(result), "is_error": not result["imported"]}
+
+
 PLUGIN = Plugin(
     name="skills",
     description="Your skills: written instructions for particular kinds of work",
@@ -62,6 +78,15 @@ PLUGIN = Plugin(
             description="Reads one file of a skill (a path from the file list use_skill gave, relative to the skill's folder).",
             input_schema={"name": str, "path": str},
             handler=read_skill_file,
+        ),
+        PluginTool(
+            name="import_skill",
+            description="Makes a real skill of what the owner pointed at: a folder, a .zip/.skill package (may hold "
+                        "several skills), or a .md/.txt/.docx file. Only when the owner asks in chat. Fills in a missing "
+                        "name/description, refuses a name already taken, never runs scripts. overwrite=true replaces an "
+                        "earlier import (the old one is kept). Afterwards check the description it reports.",
+            input_schema={"source": str, "name": str | None, "description": str | None, "overwrite": bool | None},
+            handler=import_skill,
         ),
     ],
 )

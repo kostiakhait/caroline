@@ -9,6 +9,8 @@ changed:
 
 - the scheduled reminders                      -> note "vault:backup"                  (folder Caroline:Vault)
 - Skills/lessons-learned/<topic>/SKILL.md      -> note "vault:skill:<topic>"
+- Skills/<name>/ made by skill_import.py (whole folders) -> attachments "skill__<name>.zip" of note
+  "vault:imported-skills", replaced when the folder's content changed
 - workspace/dehydrated/ and workspace/uploads/ -> attachments of note "vault:dehydrated-files",
   attached as "<dir>__<file name>"; a file larger than a note attachment may be is skipped.
 The persona and the other settings are carried by settings_mirror.py.
@@ -24,10 +26,14 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
+import tempfile
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app import skill_import
 from app.logging_setup import log_event
 
 VAULT_FOLDER = os.environ.get("CAROLINE_SETTINGS_VAULT_FOLDER", "Caroline:Vault")
@@ -35,6 +41,9 @@ STATE_FILE = "vault-backup-state.json"            # digest of what each note was
 BACKUP_NOTE = "vault:backup"
 SKILL_PREFIX = "vault:skill:"
 FILES_NOTE = "vault:dehydrated-files"
+IMPORTED_NOTE = "vault:imported-skills"           # skills made by skill_import: one zip attachment each
+IMPORTED_PREFIX = "skill__"
+IMPORTED_STATE = "skillzip:"                      # state key prefix: digest of the folder last attached
 LESSONS_DIR = ("Skills", "lessons-learned")
 FILE_DIRS = ("dehydrated", "uploads")
 BACKUP_KIND = "vault-backup-hourly"               # the old model-driven reminder, removed from the schedule
@@ -98,6 +107,36 @@ def _lesson_skills(workspace_dir: str) -> dict[str, str]:
             except OSError:
                 continue
     return skills
+
+
+def _imported_skills(workspace_dir: str) -> dict[str, Path]:
+    """Skills/<name>/ folders made by skill_import (they carry its marker): a whole folder, not one SKILL.md."""
+    root = Path(workspace_dir, "Skills")
+    found: dict[str, Path] = {}
+    if root.is_dir():
+        for folder in sorted(root.iterdir()):
+            if folder.is_dir() and not folder.name.startswith(".") and (folder / skill_import.MARKER).is_file() \
+                    and (folder / "SKILL.md").is_file():
+                found[folder.name] = folder
+    return found
+
+
+def _skill_files(folder: Path) -> list[Path]:
+    return sorted(p for p in folder.rglob("*") if p.is_file() and p.name != skill_import.MARKER)
+
+
+def _folder_digest(folder: Path) -> str:
+    h = hashlib.sha256()
+    for path in _skill_files(folder):
+        h.update(path.relative_to(folder).as_posix().encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def _zip_skill(folder: Path, name: str, dest: Path) -> int:
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in _skill_files(folder):
+            zf.write(path, f"{name}/{path.relative_to(folder).as_posix()}")
+    return dest.stat().st_size
 
 
 def _local_files(workspace_dir: str) -> dict[str, Path]:
@@ -204,6 +243,35 @@ async def backup_now(workspace_dir: str) -> dict[str, Any]:
                     except Exception as exc:  # noqa: BLE001 -- one bad file must not stop the rest
                         log_event("engine", "vault_backup_attach_failed", file=name, error=str(exc)[:200])
             _save_state(workspace_dir, account, state)
+        # Imported skills (skill_import.py): each one as a zip attached to its own note; replaced when its content changed.
+        digests = {n: _folder_digest(f) for n, f in _imported_skills(workspace_dir).items()}
+        changed = [n for n, d in digests.items() if state.get(IMPORTED_STATE + n) != d]
+        if changed:
+            index = await _index()
+            if IMPORTED_NOTE not in index:
+                await _write_note(index, IMPORTED_NOTE, IMPORTED_NOTE)
+            note_id = index[IMPORTED_NOTE]["id"]
+            have = {a.get("originalName"): a for a in await _with_session(lambda s: notes_plugin.list_attachments(s, note_id))}
+            for name in changed:
+                folder = Path(workspace_dir, "Skills", name)
+                if sum(p.stat().st_size for p in _skill_files(folder)) > MAX_ATTACHMENT_BYTES:
+                    log_event("engine", "vault_backup_skill_too_big", skill=name)
+                    continue
+                attachment = IMPORTED_PREFIX + name + ".zip"
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        archive = Path(tmp) / attachment
+                        if _zip_skill(folder, name, archive) > MAX_ATTACHMENT_BYTES:
+                            log_event("engine", "vault_backup_skill_too_big", skill=name)
+                            continue
+                        if attachment in have:
+                            await _with_session(lambda s, f=have[attachment]["filename"]: notes_plugin.remove_attachment(s, note_id, f))
+                        await _with_session(lambda s, p=str(archive), n=attachment: notes_plugin.attach_file(s, note_id, p, n))
+                    state[IMPORTED_STATE + name] = digests[name]
+                    written.append(attachment)
+                except Exception as exc:  # noqa: BLE001 -- one bad skill must not stop the rest
+                    log_event("engine", "vault_backup_attach_failed", file=attachment, error=str(exc)[:200])
+            _save_state(workspace_dir, account, state)
     if written or attached:
         log_event("engine", "vault_backup_done", notes=written, attached=attached)
     return {"ok": True, "written": written, "attached": attached}
@@ -268,6 +336,29 @@ async def restore_missing(workspace_dir: str) -> dict[str, Any]:
                     restored.append(f"{sub}__{name}")
                 except Exception as exc:  # noqa: BLE001
                     log_event("engine", "vault_backup_download_failed", file=f"{sub}__{name}", error=str(exc)[:200])
+        packages = index.get(IMPORTED_NOTE)
+        if packages:
+            for att in await _with_session(lambda s: notes_plugin.list_attachments(s, packages["id"])):
+                original = str(att.get("originalName") or "")
+                name = original[len(IMPORTED_PREFIX):-len(".zip")] if original.startswith(IMPORTED_PREFIX) and original.endswith(".zip") else ""
+                target = Path(workspace_dir, "Skills", name)
+                if not name or name != skill_import.slugify(name) or target.exists():
+                    continue
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        archive = Path(tmp) / original
+                        await _with_session(lambda s, f=att["filename"], t=str(archive): notes_plugin.download_attachment(s, f, t))
+                        skill_import.extract_zip_safely(archive, Path(tmp) / "x")
+                        unpacked = Path(tmp) / "x" / name
+                        if not (unpacked / "SKILL.md").is_file():
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(unpacked), str(target))
+                    (target / skill_import.MARKER).write_text(json.dumps({"source": "restored from Notes"}), encoding="utf-8")
+                    state[IMPORTED_STATE + name] = _folder_digest(target)
+                    restored.append(original)
+                except Exception as exc:  # noqa: BLE001
+                    log_event("engine", "vault_backup_download_failed", file=original, error=str(exc)[:200])
         _save_state(workspace_dir, account, state)
     if restored:
         log_event("engine", "vault_backup_restored", count=len(restored))
