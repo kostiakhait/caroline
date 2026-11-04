@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
-from app import skills
+from app import action_ledger, skills
 
 
 class EngineLifecycleMixin:
@@ -732,6 +732,7 @@ class EngineLifecycleMixin:
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
                     instruction_memory_system_prompt_clause(self.workspace_dir),
                     working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
+                    action_ledger.system_prompt_clause(self.workspace_dir),
                     memory_topics_system_prompt_clause(self.workspace_dir, self.tab_id),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),

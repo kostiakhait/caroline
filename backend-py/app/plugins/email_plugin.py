@@ -47,6 +47,7 @@ import json
 import re
 from typing import Any
 
+from app import action_ledger
 from app.plugins import email_credentials
 from app.plugins.contacts_plugin import upsert_contacts_from_emails
 from app.plugins.loader import Plugin, PluginTool
@@ -73,6 +74,7 @@ _sessions = SessionManager()
 # previously scoped only to email:create) rather than mint a whole new
 # credential for the same feature area.
 from app.sw_service_keys_local import EMAIL_SERVICE_KEY  # noqa: E402
+from app.workspace_dir import WORKSPACE_DIR  # noqa: E402
 
 _ACCOUNT_PARAM_NOTE = (
     " A mailbox that has worked before needs only its `address`: the saved password and servers are "
@@ -139,6 +141,10 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return result.get("messages") or []
 
     messages = await _sessions.with_session(do)
+    for message in messages if isinstance(messages, list) else []:
+        # What Caroline herself wrote to this sender / in this thread, from the action log (2026-11-04).
+        if isinstance(message, dict) and (mark := action_ledger.short_mark_for_mail(WORKSPACE_DIR, message.get("from"), message.get("subject"))):
+            message["action_log"] = mark
     return {"text": json.dumps(messages, indent=2, ensure_ascii=False)}
 
 
@@ -218,7 +224,11 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     pairs = getaddresses([data.get("from") or "", data.get("to") or ""])
     asyncio.ensure_future(upsert_contacts_from_emails(pairs, exclude={args.get("address") or ""}))
     _truncate_body(data, int(args.get("bodyOffset") or 0))
-    return {"text": json.dumps(data, indent=2, ensure_ascii=False)}
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    # What Caroline herself wrote to this sender / in this thread, from the action log (2026-11-04): by code, at the moment of reading.
+    if note := action_ledger.note_for_mail(WORKSPACE_DIR, data.get("from"), data.get("subject")):
+        text += "\n\n" + note
+    return {"text": text}
 
 
 @_with_saved_credentials

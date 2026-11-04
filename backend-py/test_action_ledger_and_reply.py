@@ -153,3 +153,38 @@ def test_checker_note_marks_sent_actions_for_the_delivery_check(tmp_path):
     al.append(ws, "1", "email_send", {"to": ["oksana@x.org"], "subject": "Re: Misha"})
     note = al.checker_note(ws)
     assert "ALREADY SENT" in note and "oksana@x.org" in note and "never lacks a 'draft to send'" in note
+
+
+def test_system_prompt_clause_carries_what_went_out_for_days(tmp_path):
+    ws = str(tmp_path)
+    assert al.system_prompt_clause(ws) == ""
+    al.append(ws, "1", "email_send_reply", {"address": "me@x.org", "to": "anita@x.org", "subject": "Re: Next steps",
+                                           "text": "Tuesdays at 10 am work best for me."})
+    clause = al.system_prompt_clause(ws)
+    assert "anita@x.org" in clause and "Tuesdays at 10 am" in clause and "never ask the owner whether" in clause
+    assert al.system_prompt_clause(ws, days=0.0000001) == ""
+    al.append(ws, "1", "email_send", {"to": "b@x.org", "text": "x" * 500})
+    assert "..." in al.system_prompt_clause(ws, text_chars=50)
+
+
+def test_a_mail_from_someone_she_wrote_to_carries_what_she_sent(tmp_path):
+    ws = str(tmp_path)
+    al.append(ws, "1", "email_send_reply", {"to": "AFrohlich@lucydanielscenter.org", "subject": "Re: Next steps",
+                                           "text": "Tuesdays at 10 am work best for me."})
+    al.append(ws, "1", "email_send", {"to": "other@x.org", "subject": "Unrelated", "text": "nope"})
+    by_sender = al.note_for_mail(ws, "Anita Frohlich <afrohlich@lucydanielscenter.org>", "Thank you")
+    assert "Tuesdays at 10 am" in by_sender and "do not ask the owner whether he wrote it" in by_sender and "Unrelated" not in by_sender
+    by_thread = al.note_for_mail(ws, "someone.else@y.org", "RE: Re: Next steps")
+    assert "Tuesdays at 10 am" in by_thread
+    assert al.note_for_mail(ws, "stranger@z.org", "Hello") == ""
+    assert al.short_mark_for_mail(ws, "AFrohlich@lucydanielscenter.org", "x").startswith("you wrote to this sender/thread")
+    assert al.short_mark_for_mail(ws, "stranger@z.org", "Hello") == ""
+    assert al.note_for_mail(ws, None, None) == ""
+
+
+def test_the_prompt_block_stays_short_and_points_to_the_rest(tmp_path):
+    ws = str(tmp_path)
+    for i in range(9):
+        al.append(ws, "1", "email_send" if i % 2 else "telegram_send_message", {"to": f"p{i}@x.org", "subject": f"S{i}", "text": "t" * 400})
+    clause = al.system_prompt_clause(ws)
+    assert clause.count("\n- ") == 5 and "Sent folder" in clause and len(clause) < 2500
