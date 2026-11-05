@@ -96,6 +96,23 @@ async def project_add_objective(args: dict[str, Any], _report_progress: Any) -> 
         return _failure(exc)
 
 
+async def project_set_objective(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
+    """The objective, replacing the earlier ones (the old secretary only appended: a project set twice held both)."""
+    try:
+        project_id = str(args.get("project_id") or "")
+        if not project_id:
+            raise RuntimeError("project_id required")
+        doc = await _project_doc(project_id)
+        if not doc.get("id"):
+            raise RuntimeError("Could not create/find project document")
+        state = _state(doc)
+        state["objectives"] = [{"text": args.get("objective") or "", "set_by": args.get("set_by") or "user"}]
+        await _save_state(doc, state)
+        return _reply({"project_id": project_id, "doc_id": doc["id"], "objectives": state["objectives"]})
+    except Exception as exc:  # noqa: BLE001
+        return _failure(exc)
+
+
 async def project_add_decision(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     try:
         return _reply(await _append(str(args.get("project_id") or ""), "decisions", {
@@ -127,9 +144,11 @@ async def _decisions_doc(bureau_id: str) -> dict[str, Any]:
 
 async def bureau_capture_decision(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
     bureau_id, decision, context = str(args.get("bureau_id") or ""), str(args.get("decision") or ""), str(args.get("context") or "")
+    # The section title is the model's short name for the decision (the old agent cut the decision at 80 characters).
+    title = str(args.get("title") or "").strip()
     try:
-        if not bureau_id or not decision:
-            raise RuntimeError("bureau_id and decision required")
+        if not bureau_id or not decision or not title:
+            raise RuntimeError("bureau_id, decision and title required")
         doc = await _decisions_doc(bureau_id)
         if not doc.get("id"):
             raise RuntimeError("Could not create decisions document")
@@ -137,7 +156,7 @@ async def bureau_capture_decision(args: dict[str, Any], _report_progress: Any) -
         if context:
             content += f"\n\n*Context:* {context}"
         await _call("POST", f"/documents/{doc['id']}/sections", body={
-            "title": decision[:80], "content": content, "content_type": "text", "section_type": "параграф",
+            "title": title, "content": content, "content_type": "text", "section_type": "параграф",
             "order": len(doc.get("sections") or []) + 1,
         })
         return _reply({"bureau_id": bureau_id, "doc_id": doc["id"]})
@@ -186,15 +205,19 @@ PLUGIN = None if not _base() else Plugin(
     tools=[
         _tool("project_state_get", "The project's state: objectives, decisions, tasks, status, and its document id.",
               _PROJECT, ["project_id"], project_state_get),
-        _tool("project_add_objective", "Adds an objective to the project's state.",
+        _tool("project_set_objective", "Sets the project's objective, replacing the objectives recorded before.",
+              {**_PROJECT, "objective": _STR, "set_by": _STR}, ["project_id", "objective"], project_set_objective),
+        _tool("project_add_objective", "Adds one more objective to the project's state, keeping the earlier ones.",
               {**_PROJECT, "objective": _STR, "set_by": _STR}, ["project_id", "objective"], project_add_objective),
         _tool("project_add_decision", "Records a decision in the project's state.",
               {**_PROJECT, "decision": _STR, "decided_by": _STR, "chain_id": _STR}, ["project_id", "decision"], project_add_decision),
         _tool("project_assign_task", "Adds a task with its assignee to the project's state (status assigned).",
               {**_PROJECT, "task_title": _STR, "assignee": _STR, "chain_id": _STR}, ["project_id", "task_title", "assignee"],
               project_assign_task),
-        _tool("bureau_capture_decision", "Records a bureau's decision, with its context, in the bureau's decisions document.",
-              {"bureau_id": _STR, "decision": _STR, "context": _STR}, ["bureau_id", "decision"], bureau_capture_decision),
+        _tool("bureau_capture_decision", "Records a bureau's decision, with its context, in the bureau's decisions document. "
+              "title is a short name for the decision, in your own words.",
+              {"bureau_id": _STR, "decision": _STR, "title": _STR, "context": _STR}, ["bureau_id", "decision", "title"],
+              bureau_capture_decision),
         _tool("bureau_add_summary", "Stores a summary of a bureau's discussion as a document of its own.",
               {"bureau_id": _STR, "summary": _STR, "title": _STR}, ["bureau_id", "summary"], bureau_add_summary),
         _tool("bureau_list_decisions", "The bureau's recorded decisions and its decisions document id.",

@@ -326,7 +326,7 @@ def test_a_bus_task_is_checked_against_what_the_agent_declares(monkeypatch):
         run(ch.publish_bus_task("m1", "projectSecretary", "task.write_section", {}))
     with pytest.raises(ValueError, match='No agent "ghostAgent"'):
         run(ch.publish_bus_task("m1", "ghostAgent", "task.project_set_objective", {}))
-    with pytest.raises(ValueError, match="agent_uid must be"):
+    with pytest.raises(ValueError, match="to_agent is the agent that takes this task, not you"):
         run(ch.publish_bus_task("m1", "chatSecretary", "task.x", {}))
     assert http.posted == []
 
@@ -504,3 +504,241 @@ def test_a_tool_takes_the_chain_of_its_session_not_the_model_s_copy(monkeypatch)
     finally:
         session_context._current_tab_id.reset(token)
     assert ch.session_chain_id("c1") == "c1"  # outside an akinakes session, as given
+
+
+# --- broadcast requests and the level secretaries (akinakes plan, group 3, 2026-11-05) --------------------------------
+
+LEVEL_REGISTRY = [
+    {"uid": "projectSecretary", "role": "secretary", "accepts": [{"type": "task.level_request", "fields": {}}]},
+    {"uid": "writerAgent", "role": "writer", "accepts": [{"type": "task.write_section", "fields": {}}]},
+    {"uid": "chatSecretary", "role": "chat_secretary", "accepts": []},
+]
+
+
+def test_level_secretary_switch_from_env(monkeypatch):
+    monkeypatch.setenv("BUS_URL", "http://bus")
+    monkeypatch.setenv("AGENT_UID", "projectSecretary")
+    monkeypatch.delenv("AKINAKES_LEVEL_SECRETARY", raising=False)
+    assert ch.load_config().level == ""
+    monkeypatch.setenv("AKINAKES_LEVEL_SECRETARY", "Project")
+    assert ch.load_config().level == "project"
+    monkeypatch.setenv("AKINAKES_LEVEL_SECRETARY", "team")
+    assert ch.load_config().level == ""
+
+
+def test_a_task_without_an_addressee_is_broadcast(monkeypatch):
+    http = orchestrator(monkeypatch, {"http://registry/agents": LEVEL_REGISTRY})
+    ch._config.registry_url = "http://registry"
+    monkeypatch.setattr(ch, "_claimed", set())
+    run(ch.publish_bus_task("m1", "", "task.level_request", {}))
+    body = http.posted[0][1]
+    routing = body["envelope"]["routing"]
+    # no route and no returnTo: the bus gives it to every poller (with returnTo it would give it only to that agent)
+    assert routing["route"] == [] and routing["returnTo"] is None and routing["targetAgentUids"] == []
+    assert body["payload"]["text"] == "Shorten the intro" and body["payload"]["room_id"] == "ws-default/r1"
+    assert body["payload"]["asked_by"] == "alice"
+    assert ch._bus_tasks["m1"]["room_id"] == "ws-default/r1" and "m1" in ch._answered
+    with pytest.raises(ValueError, match="already on the bus"):
+        run(ch.publish_bus_task("m1", "", "task.level_request", {}))
+
+
+def test_a_broadcast_needs_some_agent_that_takes_its_type(monkeypatch):
+    http = orchestrator(monkeypatch, {"http://registry/agents": LEVEL_REGISTRY})
+    ch._config.registry_url = "http://registry"
+    with pytest.raises(ValueError, match="No agent on the bus takes task.nothing"):
+        run(ch.publish_bus_task("m1", "", "task.nothing", {}))
+    assert http.posted == []
+
+
+def test_nobody_claims_a_broadcast_and_the_room_is_told(monkeypatch):
+    orchestrator(monkeypatch)
+    injected = []
+    monkeypatch.setattr(ch, "_inject", lambda key, text, request, relay=False: injected.append((key, text, request, relay)))
+    monkeypatch.setattr(ch, "_claimed", set())
+    monkeypatch.setattr(ch, "CLAIM_WAIT_S", 0)
+    ch._bus_tasks["m1"] = {"room_id": "ws-default/r1", "asked_by": "alice", "asked": "Set the objective"}
+    run(ch._claim_deadline("m1"))
+    (key, text, request, relay), = injected
+    assert relay is True and ch._pending[key]["payload"]["type"] == ch.NOT_TAKEN
+    assert ch._pending[key]["payload"]["room_id"] == "ws-default/r1" and "No agent on the bus took" in text
+    assert "alice asked in the chat room:\nSet the objective" in request and ch._bus_tasks == {}
+
+
+def test_a_claimed_broadcast_is_not_reported_as_not_taken(monkeypatch):
+    orchestrator(monkeypatch)
+    injected = []
+    monkeypatch.setattr(ch, "_inject", lambda *a, **k: injected.append(a))
+    monkeypatch.setattr(ch, "_claimed", set())
+    monkeypatch.setattr(ch, "CLAIM_WAIT_S", 0)
+    ch._bus_tasks["m1"] = {"room_id": "ws-default/r1", "asked_by": "alice", "asked": "x"}
+    claim = ch.make_message("projectSecretary", ch.LEVEL_CLAIMED, chain_id="m1", target_agent_uids=["chatSecretary"])
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([claim]), ch._config, lambda *a, **k: injected.append(a), None))
+    assert "m1" in ch._claimed and injected == []  # the claim is not a task for the coordinator
+    run(ch._claim_deadline("m1"))
+    assert injected == [] and "m1" in ch._bus_tasks  # the answer is still awaited
+
+
+def level_request(chain_id: str = "L1", text: str = "Set the objective of this project to shipping v2") -> dict:
+    return ch.make_message("chatSecretary", "task.level_request", chain_id=chain_id, text=text, room_id="p1", asked_by="alice")
+
+
+def test_a_worker_takes_only_broadcasts_of_the_types_it_declares_and_never_its_own(monkeypatch, channel):
+    monkeypatch.setattr(ch, "_config", ch.ChannelConfig("http://bus", "writerAgent", "writer", [], "", "", accepts=["task.write_section"]))
+    own = ch.make_message("writerAgent", "task.write_section", chain_id="own", doc_id="d1")
+    broadcast_write = ch.make_message("chatSecretary", "task.write_section", chain_id="w1", doc_id="d1", section_name="Intro")
+    addressed_other = ch.make_message("chatSecretary", "task.edit_section", chain_id="a1", route=["writerAgent"])
+    injected = []
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([level_request(), own, broadcast_write, addressed_other]), ch._config,
+                             lambda key, text, request, relay=False: injected.append(key), None))
+    assert injected == ["w1", "a1"]
+
+
+def test_a_role_that_declares_nothing_still_takes_every_task(monkeypatch, channel):
+    """Unchanged default: the type check applies only to a role that declares its types."""
+    injected = []
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([level_request()]), ch._config, lambda key, *a, **k: injected.append(key), None))
+    assert injected == ["L1"]
+
+
+def test_a_reply_to_a_routed_task_is_unchanged_by_the_sender_option():
+    routed = task()
+    assert ch.make_reply(routed, "w", "result.x", to_sender_if_unrouted=True)["envelope"]["routing"]["targetAgentUids"] == []
+    unrouted = level_request()
+    assert ch.make_reply(unrouted, "w", "result.x")["envelope"]["routing"]["targetAgentUids"] == []  # default: as before
+    assert ch.make_reply(unrouted, "w", "result.x", to_sender_if_unrouted=True)["envelope"]["routing"]["targetAgentUids"] == ["chatSecretary"]
+
+
+ROOMS = [
+    {"id": "ws1", "name": "Research Lab", "room_type": "workspace", "parent_id": None},
+    {"id": "p1", "name": "Thermal Research", "room_type": "project", "parent_id": "ws1"},
+    {"id": "p2", "name": "Report Writing", "room_type": "project", "parent_id": "ws1"},
+    {"id": "b1", "name": "Accounting", "room_type": "bureau", "parent_id": "ws1"},
+]
+LEVEL_ANSWERS = {
+    "http://chat/rooms": ROOMS,
+    "http://chat/rooms/p1/members": [{"uid": "alice", "ptype": "user", "display_name": "Alice"}, {"uid": "writerAgent", "ptype": "agent"},
+                                     {"uid": "projectSecretary", "ptype": "agent"}],
+    "http://chat/rooms/p2/members": [{"uid": "bob", "ptype": "user"}],
+    "http://registry/agents": LEVEL_REGISTRY,
+}
+
+
+def level_secretary(monkeypatch, answers: dict | None = None) -> FakeHttp:
+    http = FakeHttp({**LEVEL_ANSWERS, **(answers or {})})
+    config = ch.ChannelConfig("http://bus", "projectSecretary", "secretary", [], "", "http://registry", chat_url="http://chat",
+                              chat_key="k", accepts=["task.level_request", "task.project_set_objective"], level="project")
+    monkeypatch.setattr(ch, "_config", config)
+    monkeypatch.setattr(ch, "_http", http)
+    monkeypatch.setattr(ch, "_pending", {})
+    monkeypatch.setattr(ch, "_answered", set())
+    monkeypatch.setattr(ch, "_level", {})
+    monkeypatch.setattr(ch, "_subtasks", {})
+    monkeypatch.setattr(ch, "_subtask_results", {})
+    monkeypatch.setattr(ch, "status", ch.ChannelStatus())
+    return http
+
+
+def test_the_level_secretary_claims_a_request_its_microagent_finds_its_own(monkeypatch):
+    http = level_secretary(monkeypatch)
+    seen = {}
+
+    async def decide(level, text, origin, rooms):
+        seen.update(level=level, text=text, origin=origin, rooms=rooms)
+        return {"mine": True, "room_id": "p1", "why": "asked in the project's own room about this project"}
+
+    monkeypatch.setattr(ch, "_decide_ownership", decide)
+    injected = []
+    run(ch._consider_level_request(level_request(), ch._config, lambda key, text, request, relay=False: injected.append((key, text, request)),
+                                   None, False))
+    # the microagent saw the request, where it was asked and the project rooms only, with their members
+    assert seen["level"] == "project" and seen["text"].startswith("Set the objective")
+    assert seen["origin"]["name"] == "Thermal Research" and seen["origin"]["parent_name"] == "Research Lab"
+    assert [r["id"] for r in seen["rooms"]] == ["p1", "p2"]
+    assert [m["uid"] for m in seen["rooms"][0]["members"]] == ["alice", "writerAgent"]  # itself left out
+    assert seen["rooms"][0]["members"][1]["accepts"] == ["task.write_section"]
+    claim = http.posted[0][1]
+    assert claim["payload"]["type"] == ch.LEVEL_CLAIMED and claim["envelope"]["routing"]["targetAgentUids"] == ["chatSecretary"]
+    (key, text, request), = injected
+    assert key == "L1" and ch._level["L1"]["room"]["id"] == "p1"
+    assert 'the project "Thermal Research"' in text and "Set the objective of this project to shipping v2" in text
+    assert "project_set_objective" in text and "result.level_done" in text
+    assert request == "alice asked in a chat room:\nSet the objective of this project to shipping v2"
+
+
+def test_the_level_secretary_stays_silent_on_a_request_that_is_not_its_own(monkeypatch):
+    http = level_secretary(monkeypatch)
+
+    async def decide(*_a):
+        return {"mine": False, "room_id": "", "why": "about the accounting bureau"}
+
+    monkeypatch.setattr(ch, "_decide_ownership", decide)
+    injected = []
+    run(ch._consider_level_request(level_request(), ch._config, lambda *a, **k: injected.append(a), None, False))
+    assert http.posted == [] and injected == [] and ch._pending == {}
+
+
+def test_an_undecided_microagent_claims_nothing(monkeypatch):
+    http = level_secretary(monkeypatch)
+
+    async def decide(*_a):
+        return None
+
+    monkeypatch.setattr(ch, "_decide_ownership", decide)
+    injected = []
+    run(ch._consider_level_request(level_request(), ch._config, lambda *a, **k: injected.append(a), None, False))
+    assert http.posted == [] and injected == []
+
+
+def test_the_level_secretary_answers_the_sender_by_name(monkeypatch):
+    http = level_secretary(monkeypatch)
+    ch._pending["L1"] = level_request()
+    run(ch.publish_result("L1", "result.level_done", {"summary": "The objective is now: shipping v2."}))
+    body = http.posted[0][1]
+    assert body["envelope"]["routing"]["targetAgentUids"] == ["chatSecretary"] and body["envelope"]["routing"]["route"] == []
+    assert body["payload"] == {"type": "result.level_done", "room_id": "p1", "summary": "The objective is now: shipping v2."}
+    ch._pending["L2"] = level_request("L2")
+    run(ch.publish_blocked("L2", "Document Service is down"))
+    blocked = http.posted[1][1]
+    assert blocked["payload"] == {"type": "result.level_blocked", "room_id": "p1", "reason": "Document Service is down"}
+    assert blocked["envelope"]["routing"]["targetAgentUids"] == ["chatSecretary"]
+
+
+def test_subtasks_go_to_members_and_their_results_are_collected(monkeypatch):
+    http = level_secretary(monkeypatch)
+    ch._pending["L1"] = level_request()
+    ch._level["L1"] = {"room": {"id": "p1", "name": "Thermal Research"}, "origin": {"id": "p1"}, "why": ""}
+    with pytest.raises(ValueError, match='"alice" is not an agent of this room'):
+        run(ch.level_publish_subtask("L1", "alice", "task.write_section", {}))
+    with pytest.raises(ValueError, match="does not take task.edit_section"):
+        run(ch.level_publish_subtask("L1", "writerAgent", "task.edit_section", {}))
+    run(ch.level_publish_subtask("L1", "writerAgent", "task.write_section", {"doc_id": "d1", "section_name": "Plan"}))
+    body = http.posted[0][1]
+    assert body["envelope"]["routing"]["route"] == ["writerAgent"] and body["envelope"]["routing"]["returnTo"] == "projectSecretary"
+    assert body["payload"]["room_id"] == "p1" and body["payload"]["user_uid"] == "alice"
+    result = ch.make_message("writerAgent", "result.section_draft", chain_id="L1", doc_id="d1", content="...")
+    assert ch._level_intake(result, "result.section_draft", "L1", ch._config, lambda *a: None, None)
+    got = run(ch.wait_for_level_results("L1", 1))
+    assert got["still_working"] == [] and got["results"][0]["from"] == "writerAgent"
+    run(ch.on_turn_end("L1"))
+    assert "L1" not in ch._level and "L1" not in ch._subtasks
+
+
+def test_level_tools_refuse_a_role_that_is_not_a_level_secretary(channel):
+    with pytest.raises(ValueError, match="project or bureau secretary only"):
+        run(ch.level_room("L1"))
+
+
+def test_the_ownership_microagent_checks_its_answer_not_its_decision():
+    from app.microagents import akinakes_level_ownership as own
+    rooms = [{"id": "p1", "name": "Thermal Research", "members": [{"uid": "writerAgent", "kind": "agent", "role": "writer"}]}]
+    agent_input = {"level": "project", "request": "Set the objective", "origin": {"id": "p1", "name": "Thermal Research", "type": "project"},
+                   "rooms": rooms}
+    assert own.verify_level_ownership(agent_input, {"mine": False, "room_id": "", "why": "not a project matter"}) is None
+    assert own.verify_level_ownership(agent_input, {"mine": True, "room_id": "p1", "why": "its room"}) is None
+    assert "room_id" in own.verify_level_ownership(agent_input, {"mine": True, "room_id": "p9", "why": "x"})
+    assert "mine" in own.verify_level_ownership(agent_input, {"mine": "yes", "room_id": "p1", "why": "x"})
+    prompt = own.prompt_level_ownership(agent_input, None)
+    assert "Set the objective" in prompt and '"Thermal Research"' in prompt and "writerAgent (agent: writer)" in prompt

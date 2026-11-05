@@ -74,11 +74,24 @@ def test_project_state_is_kept_as_the_old_secretary_kept_it(ds):
     assert run(ps.project_add_objective({"objective": "x"}, None))["is_error"]
 
 
+def test_set_objective_replaces_the_earlier_ones(ds):
+    run(ps.project_add_objective({"project_id": "p1", "objective": "Ship v2"}, None))
+    run(ps.project_add_objective({"project_id": "p1", "objective": "Ship v2"}, None))
+    run(ps.project_add_decision({"project_id": "p1", "decision": "Use LoRa"}, None))
+    run(ps.project_set_objective({"project_id": "p1", "objective": "Ship v3", "set_by": "ann"}, None))
+    assert state(ds, "p1")["objectives"] == [{"text": "Ship v3", "set_by": "ann"}]
+    assert state(ds, "p1")["decisions"][0]["text"] == "Use LoRa"
+    assert run(ps.project_set_objective({"objective": "x"}, None))["is_error"]
+
+
 def test_bureau_decisions_and_summaries(ds):
-    run(ps.bureau_capture_decision({"bureau_id": "b1", "decision": "Publish in May", "context": "after review"}, None))
-    run(ps.bureau_capture_decision({"bureau_id": "b1", "decision": "Second author: Ann"}, None))
+    run(ps.bureau_capture_decision({"bureau_id": "b1", "decision": "We publish the paper in May, after the review",
+                                    "title": "Publish in May", "context": "after review"}, None))
+    run(ps.bureau_capture_decision({"bureau_id": "b1", "decision": "Ann is the second author", "title": "Second author: Ann"}, None))
     decisions = json.loads(run(ps.bureau_list_decisions({"bureau_id": "b1"}, None))["text"])["decisions"]
     assert [d["title"] for d in decisions] == ["Publish in May", "Second author: Ann"]
+    # no title: refused, nothing cut out of the decision text
+    assert run(ps.bureau_capture_decision({"bureau_id": "b1", "decision": "Untitled"}, None))["is_error"]
     assert "*Context:* after review" in decisions[0]["content"]
     summary = json.loads(run(ps.bureau_add_summary({"bureau_id": "b1", "summary": "We agreed."}, None))["text"])
     doc = ds.docs[summary["doc_id"]]

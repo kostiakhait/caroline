@@ -84,12 +84,14 @@ PLUGIN = None if _config is None or not _config.orchestrator or not _config.chat
                                "with the task's description and payload fields.",
                    input_schema={"type": "object", "properties": _CHAIN, "required": []}, handler=bus_agents),
         PluginTool(name="publish_bus_task",
-                   description="Publish one of the tasks bus_agents lists to the agent that takes it; its result returns to you later. "
-                               "fields are that task's payload fields, in your own words where a field is free text.",
-                   input_schema={"type": "object", "properties": {**_CHAIN, "to_agent": {"type": "string", "description": "The agent that takes the task: its uid from bus_agents. It is who receives the task, not an identity this call acts as."},
-                                                                  "task_type": {"type": "string", "description": "One of the task types that agent takes."},
+                   description="Publish one of the tasks bus_agents lists; its result returns to you later. With to_agent it goes to that "
+                               "agent; without it, to every agent on the bus, and the one whose work it is takes it (a request for a "
+                               "project or a bureau goes this way). fields are that task's payload fields, in your own words where a "
+                               "field is free text.",
+                   input_schema={"type": "object", "properties": {**_CHAIN, "to_agent": {"type": "string", "description": "Optional: the agent that takes the task, its uid from bus_agents. It is who receives the task, not an identity this call acts as. Leave it out to send the task to everyone."},
+                                                                  "task_type": {"type": "string", "description": "One of the task types bus_agents lists."},
                                                                   "fields": {"type": "object"}},
-                                  "required": ["to_agent", "task_type"]},
+                                  "required": ["task_type"]},
                    handler=publish_bus_task),
         PluginTool(name="wait_for_agent_replies",
                    description="Wait (up to 90 s) until every agent you handed the message to has posted in the room or passed, then return their replies, "

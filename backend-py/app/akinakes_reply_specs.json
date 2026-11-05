@@ -117,6 +117,15 @@
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },
+  "task.level_request": {
+    "description": "A request that may be the business of a project or a bureau: something to record for it (an objective, a decision, an assignment, a summary) or work for its members. Publish it with no to_agent: every project and bureau secretary sees it, the one whose project or bureau it is takes it, and its answer comes back to you.",
+    "fields": {"text": "the request, in the person's own words"},
+    "replies": [
+      {"payload_type": "result.level_done", "required": ["summary"], "schema": {"type": "object", "properties": {"summary": {"type": "string", "minLength": 1}}, "required": ["summary"]}}
+    ],
+    "blocked": {"payload_type": "result.level_blocked", "reason_field": "reason"},
+    "echo": ["room_id"]
+  },
   "chat.message": {
     "chat": true
   }

@@ -66,6 +66,9 @@ class ChannelConfig:
     # task./query. types this role takes, declared to the Registry with their description and fields from the reply
     # specs, so chatSecretary (and any other caller) can find the agent and fill the task. AGENT_ACCEPTS, comma separated.
     accepts: list[str] = field(default_factory=list)
+    # The secretary of a level, "project" or "bureau" (see the "level secretary" section below).
+    # AKINAKES_LEVEL_SECRETARY; empty for every other role.
+    level: str = ""
 
 
 @dataclass
@@ -96,6 +99,14 @@ _inject: "InjectFn | None" = None
 # the result comes later, and not every agent echoes room_id in its result (the secretaries' result.secretary_ok
 # does not). The request goes into the relay turn's requester words (relay_words).
 _bus_tasks: dict[str, dict[str, str]] = {}
+# chains the coordinator broadcast a task on (no addressee) that no agent has claimed yet
+_claimed: set[str] = set()
+# level secretary, by chain of a request it took: its level's room and where the request came from; the agents it gave
+# subtasks to and their results as they arrive
+_level: dict[str, dict[str, Any]] = {}
+_subtasks: dict[str, set[str]] = {}
+_subtask_results: dict[str, list[dict[str, Any]]] = {}
+_background: set["asyncio.Task[None]"] = set()
 
 
 def load_config() -> ChannelConfig | None:
@@ -116,7 +127,19 @@ def load_config() -> ChannelConfig | None:
         chat_key=(os.environ.get("CHAT_INTERNAL_KEY") or "").strip(),
         orchestrator=(os.environ.get("AKINAKES_CHAT_ORCHESTRATOR") or "").strip().lower() in ("1", "true", "yes"),
         accepts=[t.strip() for t in (os.environ.get("AGENT_ACCEPTS") or "").split(",") if t.strip()],
+        level=_level_from_env(),
     )
+
+
+LEVEL_KINDS = ("project", "bureau")
+
+
+def _level_from_env() -> str:
+    level = (os.environ.get("AKINAKES_LEVEL_SECRETARY") or "").strip().lower()
+    if level and level not in LEVEL_KINDS:
+        log_event("plugin:akinakes-channel", "level_secretary_unknown", value=level)
+        return ""
+    return level
 
 
 def _scope_from_env() -> list[dict[str, Any]]:
@@ -186,10 +209,14 @@ def make_message(
     }
 
 
-def make_reply(original: dict[str, Any], sender_uid: str, payload_type: str, **payload_extra: Any) -> dict[str, Any]:
+def make_reply(original: dict[str, Any], sender_uid: str, payload_type: str, to_sender_if_unrouted: bool = False,
+               **payload_extra: Any) -> dict[str, Any]:
+    """to_sender_if_unrouted: a reply to a broadcast (no route, no returnTo) goes to its sender by name; without it the
+    reply would itself be a broadcast. Used by the level secretaries, whose requests come broadcast."""
     env = original["envelope"]
     routing = env.get("routing") or {}
     route = list(routing.get("route") or [])
+    unrouted = not route and not routing.get("returnTo")
     return make_message(
         sender_uid=sender_uid,
         payload_type=payload_type,
@@ -198,8 +225,16 @@ def make_reply(original: dict[str, Any], sender_uid: str, payload_type: str, **p
         ttl_seconds=(env.get("lifecycle") or {}).get("ttlSeconds", DEFAULT_TTL_S),
         route=route[1:] if route else [],
         return_to=routing.get("returnTo"),
+        target_agent_uids=[env["senderUid"]] if to_sender_if_unrouted and unrouted and env.get("senderUid") else None,
         **payload_extra,
     )
+
+
+def addressed_to(msg: dict[str, Any], uid: str) -> bool:
+    """The message names this agent: first of its route, or among its target agents."""
+    routing = (msg.get("envelope") or {}).get("routing") or {}
+    route = routing.get("route") or []
+    return (bool(route) and route[0] == uid) or uid in (routing.get("targetAgentUids") or [])
 
 
 def make_agent(config: ChannelConfig) -> dict[str, Any]:
@@ -320,7 +355,8 @@ async def publish_result(chain_id: str, payload_type: str, fields: dict[str, Any
         _check_schema(payload_type, replies[payload_type].get("schema"), fields)
     elif not payload_type.startswith("result."):
         raise ValueError('payload_type must start with "result.".')
-    ack = await _publish(make_reply(original, _config.agent_uid, payload_type, **{**_echoed(original, spec), **fields}))
+    ack = await _publish(make_reply(original, _config.agent_uid, payload_type, to_sender_if_unrouted=bool(_config.level),
+                                    **{**_echoed(original, spec), **fields}))
     _answered.add(chain_id)
     status.results_published += 1
     log_event("plugin:akinakes-channel", "result_published", chain_id=chain_id, payload_type=payload_type)
@@ -362,7 +398,7 @@ async def publish_blocked(chain_id: str, reason: str) -> dict[str, Any]:
         return await publish_pass(chain_id)
     blocked = spec.get("blocked") or {}
     if blocked.get("payload_type"):
-        reply = make_reply(original, _config.agent_uid, blocked["payload_type"],
+        reply = make_reply(original, _config.agent_uid, blocked["payload_type"], to_sender_if_unrouted=bool(_config.level),
                            **{**_echoed(original, spec), blocked.get("reason_field") or "reason": reason})
     else:
         routing = (original["envelope"].get("routing") or {})
@@ -588,16 +624,28 @@ async def hand_to_agents(chain_id: str, agent_uids: list[str], text: str | None)
     return sent
 
 
+LEVEL_REQUEST = "task.level_request"
+# How long the coordinator waits for some agent to claim a task it broadcast before it tells the room nobody took it.
+CLAIM_WAIT_S = 120.0
+NOT_TAKEN = "system.not_taken"
+
+
 async def publish_bus_task(chain_id: str, agent_uid: str, task_type: str, fields: dict[str, Any]) -> dict[str, Any]:
-    """A task for the agent the model chose (bus_agents / room_agents show who takes what). Sent with route=[agent] and
-    returnTo=this agent: without a route the bus lets any poller claim it, this coordinator included (it does not skip
-    the sender), and the result must come back here to be told in the room."""
+    """A task for the agent the model chose (bus_agents / room_agents show who takes what), sent with route=[agent] and
+    returnTo=this agent, so the result comes back here to be told in the room.
+
+    With no agent_uid the task is broadcast (owner, 2026-11-05: "it is a bus, it was designed for broadcast; addressed
+    sending is a special case"): no route and no returnTo, every agent sees it and the one whose work it is claims it
+    (the level secretaries: event.level_claimed) and answers to this coordinator by name. Nobody claims it within
+    CLAIM_WAIT_S: the room is told."""
     assert _config is not None
     original = _orchestrator_message(chain_id)
     if not task_type.startswith(("task.", "query.")):
         raise ValueError('task_type must start with "task." or "query.".')
-    if not agent_uid or agent_uid == _config.agent_uid:
-        raise ValueError("agent_uid must be the agent that takes this task (from bus_agents or room_agents).")
+    if agent_uid == _config.agent_uid:
+        raise ValueError("to_agent is the agent that takes this task, not you; leave it out to send the task to everyone.")
+    if not agent_uid:
+        return await _broadcast_bus_task(chain_id, original, task_type, fields)
     known = await _registry_agents()
     if known:
         accepted = {a.get("type") for a in (known.get(agent_uid) or {}).get("accepts") or []}
@@ -618,6 +666,43 @@ async def publish_bus_task(chain_id: str, agent_uid: str, task_type: str, fields
     _bus_tasks[chain_id] = {"room_id": room_id, "asked_by": payload.get("sender_uid") or "", "asked": payload.get("text") or ""}
     log_event("plugin:akinakes-channel", "bus_task_published", chain_id=chain_id, task_type=task_type, agent=agent_uid)
     return ack
+
+
+async def _broadcast_bus_task(chain_id: str, original: dict[str, Any], task_type: str, fields: dict[str, Any]) -> dict[str, Any]:
+    assert _config is not None
+    if chain_id in _bus_tasks:
+        raise ValueError("A task for this request is already on the bus; its answer comes back to you.")
+    known = await _registry_agents()
+    if known and not any(task_type in {t.get("type") for t in a.get("accepts") or []}
+                         for uid, a in known.items() if uid != _config.agent_uid):
+        raise ValueError(f"No agent on the bus takes {task_type}. bus_agents lists the tasks agents take.")
+    payload = original.get("payload") or {}
+    room_id = payload.get("room_id") or ""
+    # The room is where the person asked: the agent that claims the request finds its own place for it.
+    task_fields = {**fields, "room_id": room_id, "asked_by": payload.get("sender_uid"),
+                   "user_uid": payload.get("sender_uid"), "original_text": payload.get("text", "")}
+    task_fields.setdefault("text", payload.get("text", ""))
+    ack = await _publish(make_message(_config.agent_uid, task_type, chain_id=chain_id, **task_fields))
+    _answered.add(chain_id)
+    _bus_tasks[chain_id] = {"room_id": room_id, "asked_by": payload.get("sender_uid") or "", "asked": payload.get("text") or ""}
+    _claimed.discard(chain_id)
+    log_event("plugin:akinakes-channel", "bus_task_broadcast", chain_id=chain_id, task_type=task_type)
+    task = asyncio.get_running_loop().create_task(_claim_deadline(chain_id))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return ack
+
+
+async def _claim_deadline(chain_id: str) -> None:
+    """Nobody claimed a broadcast task: the room hears it through a relay turn, like any answer."""
+    await asyncio.sleep(CLAIM_WAIT_S)
+    if chain_id in _claimed or chain_id not in _bus_tasks or _inject is None:
+        return
+    asked = _bus_tasks.pop(chain_id)
+    log_event("plugin:akinakes-channel", "bus_task_not_taken", chain_id=chain_id)
+    msg = make_message("agentBus", NOT_TAKEN, chain_id=chain_id, room_id=asked["room_id"],
+                       reason="No agent on the bus took this request within two minutes: none of them found it to be its work.")
+    _start_relay(msg, asked, _inject)
 
 
 async def wait_for_agent_replies(chain_id: str, seconds: float) -> dict[str, Any]:
@@ -705,6 +790,276 @@ async def on_turn_end(chain_id: str) -> None:
     _nudged.discard(chain_id)
     _asked.pop(chain_id, None)
     _passes.pop(chain_id, None)
+    _level.pop(chain_id, None)
+    _subtasks.pop(chain_id, None)
+    _subtask_results.pop(chain_id, None)
+
+
+# --- level secretary (project, bureau) --------------------------------------------------------------------------------
+# akinakes plan, group 3, design F with the owner's decisions of 2026-11-05: one secretary per kind of level, for all its
+# rooms; requests reach it broadcast; the akinakes.level.ownership microagent decides whether a request is its own and
+# of which project or bureau; the turn then records it and/or distributes it among the level's members, and answers the
+# sender once. Nothing here reads the request's text: the microagent and the turn's model decide.
+
+LEVEL_CLAIMED = "event.level_claimed"
+WAIT_LEVEL_MAX_S = 600
+
+
+def _level_intake(msg: dict[str, Any], msg_type: str, chain_id: str, config: ChannelConfig, inject: InjectFn,
+                  before_task: BeforeTaskFn | None) -> bool:
+    """True when the message is dealt with here; False sends it down the ordinary role path (an addressed
+    task.project_* / task.bureau_* is answered there, with its reply spec)."""
+    if msg_type.startswith("result.") or msg_type == "system.skill_blocked":
+        if chain_id in _subtasks:
+            payload = msg.get("payload") or {}
+            _subtask_results.setdefault(chain_id, []).append({
+                "from": (msg.get("envelope") or {}).get("senderUid"), "type": msg_type,
+                "fields": {k: v for k, v in payload.items() if k != "type"}})
+            log_event("plugin:akinakes-channel", "level_subtask_result", chain_id=chain_id, payload_type=msg_type)
+        return True
+    if msg_type != LEVEL_REQUEST:
+        return False
+    if chain_id in _pending:
+        return True
+    task = asyncio.get_running_loop().create_task(
+        _consider_level_request(msg, config, inject, before_task, addressed_to(msg, config.agent_uid)))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return True
+
+
+def _describe_member(member: dict[str, Any], known: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if member.get("ptype") == "agent":
+        a = known.get(member.get("uid") or "") or {}
+        return {"uid": member.get("uid"), "kind": "agent", "name": member.get("display_name"), "role": a.get("role"),
+                "description": a.get("description"), "accepts": [t.get("type") for t in a.get("accepts") or []]}
+    return {"uid": member.get("uid"), "kind": "person", "name": member.get("display_name")}
+
+
+async def _room_members(room_id: str) -> list[dict[str, Any]]:
+    assert _config is not None and _http is not None
+    resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/members", headers={"X-User-Email": _config.agent_uid}, timeout=10)
+    resp.raise_for_status()
+    return [m for m in resp.json() if m.get("uid") != _config.agent_uid]
+
+
+async def _rooms_view(level: str, origin_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The rooms of this level with their members (Chat Service), and the room the request came from."""
+    assert _config is not None and _http is not None
+    resp = await _http.get(f"{_config.chat_url}/rooms", headers={"X-User-Email": _config.agent_uid},
+                           params={"all": "1"}, timeout=15)
+    resp.raise_for_status()
+    every = {r.get("id"): r for r in resp.json()}
+
+    def brief(r: dict[str, Any]) -> dict[str, Any]:
+        parent = every.get(r.get("parent_id")) or {}
+        return {"id": r.get("id"), "name": r.get("name"), "type": r.get("room_type"), "parent_id": r.get("parent_id"),
+                "parent_name": parent.get("name")}
+
+    mine = [brief(r) for r in every.values() if r.get("room_type") == level]
+    known = await _registry_agents()
+
+    async def members(room_id: str) -> list[dict[str, Any]]:
+        try:
+            return [_describe_member(m, known) for m in await _room_members(room_id)]
+        except Exception as exc:  # noqa: BLE001 -- a room without its member list is still a room
+            log_event("plugin:akinakes-channel", "level_members_unreadable", room_id=room_id, error=str(exc))
+            return []
+
+    for room, mems in zip(mine, await asyncio.gather(*(members(r["id"]) for r in mine))):
+        room["members"] = mems
+    origin = brief(every[origin_id]) if origin_id in every else {"id": origin_id}
+    return mine, origin
+
+
+async def _decide_ownership(level: str, text: str, origin: dict[str, Any], rooms: list[dict[str, Any]]) -> dict[str, Any] | None:
+    from app.microagents.akinakes_level_ownership import LEVEL_OWNERSHIP
+    from app.plugins.voice_api import _run_local_microagent
+
+    try:
+        result = await _run_local_microagent(LEVEL_OWNERSHIP, "app.microagents.akinakes_level_ownership",
+                                             {"level": level, "request": text, "origin": origin, "rooms": rooms})
+    except Exception as exc:  # noqa: BLE001 -- undecided: not claimed, the coordinator's deadline tells the room
+        log_event("plugin:akinakes-channel", "level_ownership_failed", error=str(exc)[:200])
+        return None
+    output = (result or {}).get("output") if (result or {}).get("status") == "ok" else None
+    if not isinstance(output, dict) or not isinstance(output.get("mine"), bool):
+        log_event("plugin:akinakes-channel", "level_ownership_undecided", error=(result or {}).get("error"))
+        return None
+    return output
+
+
+async def _consider_level_request(msg: dict[str, Any], config: ChannelConfig, inject: InjectFn,
+                                  before_task: BeforeTaskFn | None, addressed: bool) -> None:
+    env = msg.get("envelope") or {}
+    chain_id = env.get("chainId") or ""
+    payload = msg.get("payload") or {}
+    text = str(payload.get("text") or payload.get("original_text") or "")
+    try:
+        rooms, origin = await _rooms_view(config.level, str(payload.get("room_id") or ""))
+    except Exception as exc:  # noqa: BLE001
+        status.last_error = str(exc)
+        log_event("plugin:akinakes-channel", "level_rooms_unreadable", chain_id=chain_id, error=str(exc))
+        return
+    decision = await _decide_ownership(config.level, text, origin, rooms) or {}
+    why = str(decision.get("why") or "")
+    room = next((r for r in rooms if r["id"] == decision.get("room_id")), None) if decision.get("mine") else None
+    log_event("plugin:akinakes-channel", "level_ownership", chain_id=chain_id, mine=room is not None,
+              room_id=(room or {}).get("id"), why=why[:200], addressed=addressed)
+    if room is None:
+        if not addressed:
+            return
+        room = next((r for r in rooms if r["id"] == origin.get("id")), {})
+    if chain_id in _pending:
+        return
+    try:
+        await _publish(make_message(config.agent_uid, LEVEL_CLAIMED, chain_id=chain_id, ttl_seconds=300,
+                                    target_agent_uids=[env.get("senderUid") or CHAT_SECRETARY_UID],
+                                    room_id=payload.get("room_id"), level=config.level, level_room_id=room.get("id")))
+    except Exception as exc:  # noqa: BLE001 -- the work goes on; the coordinator may tell the room nobody took it
+        log_event("plugin:akinakes-channel", "level_claim_failed", chain_id=chain_id, error=str(exc))
+    _pending[chain_id] = msg
+    _answered.discard(chain_id)
+    _level[chain_id] = {"room": room, "origin": origin, "why": why}
+    if before_task is not None:
+        try:
+            await before_task()
+        except Exception as exc:  # noqa: BLE001
+            log_event("plugin:akinakes-channel", "before_task_failed", error=str(exc))
+    log_event("plugin:akinakes-channel", "task_received", chain_id=chain_id, task_type=LEVEL_REQUEST)
+    inject(chain_id, render_level_text(msg, config.level, room, origin, why), requester_words(msg))
+
+
+def _level_state(chain_id: str) -> dict[str, Any]:
+    if _config is None or not _config.level:
+        raise ValueError("This tool is for a project or bureau secretary only.")
+    state = _level.get(chain_id)
+    if state is None:
+        raise ValueError(f'No request of your {_config.level} is in progress for chainId "{chain_id}".')
+    return state
+
+
+async def level_room(chain_id: str) -> dict[str, Any]:
+    """The level's room this request belongs to, its members now (people; agents with role, what they do and the bus
+    tasks they take) and where the request was asked."""
+    state = _level_state(chain_id)
+    room = state["room"]
+    if not room.get("id"):
+        return {"room": None, "asked_in": state["origin"], "note": f"No {_config.level if _config else 'level'} is known for this request."}
+    known = await _registry_agents()
+    members = [_describe_member(m, known) for m in await _room_members(room["id"])]
+    return {"room": {k: room.get(k) for k in ("id", "name", "type", "parent_id", "parent_name")}, "members": members,
+            "asked_in": state["origin"]}
+
+
+async def level_post(chain_id: str, text: str) -> int:
+    """Posts in the level's room, as this secretary. Returns the message's seq."""
+    assert _config is not None and _http is not None
+    room_id = (_level_state(chain_id)["room"] or {}).get("id")
+    if not room_id:
+        raise ValueError("This request has no room of your level to post in.")
+    if not text.strip():
+        raise ValueError("The message text is empty.")
+    resp = await _http.post(
+        f"{_config.chat_url}/internal/rooms/{room_id}/agent_message",
+        json={"sender_uid": _config.agent_uid, "sender_type": "agent", "msg_type": "agent_message", "payload": {"text": text}},
+        headers={"x-internal-key": _config.chat_key}, timeout=15)
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    seq = int((data or {}).get("seq") or 0) if isinstance(data, dict) else 0
+    _level[chain_id]["posted_seq"] = seq
+    log_event("plugin:akinakes-channel", "level_posted", chain_id=chain_id, room_id=room_id, text_len=len(text))
+    return seq
+
+
+async def level_publish_subtask(chain_id: str, agent_uid: str, task_type: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """A part of the work for an agent member of the level's room, addressed to it; its result comes back here."""
+    assert _config is not None
+    state = _level_state(chain_id)
+    room_id = (state["room"] or {}).get("id")
+    if not room_id:
+        raise ValueError("This request has no room of your level, so it has no members to give work to.")
+    if not task_type.startswith(("task.", "query.")):
+        raise ValueError('task_type must start with "task." or "query.".')
+    members = [m.get("uid") for m in await _room_members(room_id) if m.get("ptype") == "agent"]
+    if agent_uid not in members:
+        raise ValueError(f'"{agent_uid}" is not an agent of this room, nothing was sent. Its agents are: {", ".join(members) or "none"}.')
+    known = await _registry_agents()
+    accepted = {t.get("type") for t in (known.get(agent_uid) or {}).get("accepts") or []}
+    if known and task_type not in accepted:
+        raise ValueError(f'{agent_uid} does not take {task_type}; it takes: {", ".join(sorted(accepted)) or "nothing declared"}.')
+    payload = (_pending.get(chain_id) or {}).get("payload") or {}
+    task_fields = {"room_id": room_id, **fields, "user_uid": payload.get("asked_by") or payload.get("user_uid"),
+                   "original_text": payload.get("text") or payload.get("original_text") or ""}
+    ack = await _publish(make_message(_config.agent_uid, task_type, chain_id=chain_id, route=[agent_uid],
+                                      return_to=_config.agent_uid, **task_fields))
+    _subtasks.setdefault(chain_id, set()).add(agent_uid)
+    log_event("plugin:akinakes-channel", "level_subtask_published", chain_id=chain_id, task_type=task_type, agent=agent_uid)
+    return ack
+
+
+async def wait_for_level_results(chain_id: str, seconds: float) -> dict[str, Any]:
+    """Waits (up to WAIT_LEVEL_MAX_S) until every agent given a subtask has returned its result, then returns the
+    results, who is still working, and what was said in the level's room since this secretary posted there."""
+    assert _config is not None and _http is not None
+    state = _level_state(chain_id)
+    deadline = time.monotonic() + max(1.0, min(float(seconds), WAIT_LEVEL_MAX_S))
+    while True:
+        results = list(_subtask_results.get(chain_id) or [])
+        waiting = sorted((_subtasks.get(chain_id) or set()) - {r.get("from") for r in results})
+        if not waiting or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(WAIT_POLL_S)
+    replies: list[dict[str, Any]] = []
+    room_id = (state["room"] or {}).get("id")
+    if room_id and "posted_seq" in state:
+        try:
+            resp = await _http.get(f"{_config.chat_url}/rooms/{room_id}/messages", headers={"X-User-Email": _config.agent_uid},
+                                   params={"after_seq": state["posted_seq"], "limit": CHAT_HISTORY_LIMIT}, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            page = data if isinstance(data, list) else data.get("messages") or []
+            replies = [{"from": m.get("sender_uid"), "text": (m.get("payload") or {}).get("text") or m.get("text")}
+                       for m in page if m.get("sender_uid") != _config.agent_uid]
+        except Exception as exc:  # noqa: BLE001 -- the bus results are still returned
+            log_event("plugin:akinakes-channel", "level_room_unreadable", room_id=room_id, error=str(exc))
+    return {"results": results, "still_working": waiting, "room_replies": replies}
+
+
+def render_level_text(msg: dict[str, Any], level: str, room: dict[str, Any], origin: dict[str, Any], why: str) -> str:
+    env = msg.get("envelope") or {}
+    payload = msg.get("payload") or {}
+    text = payload.get("text") or payload.get("original_text") or ""
+    asked_by = payload.get("asked_by") or payload.get("user_uid") or env.get("senderUid") or "someone"
+    where = f'"{origin.get("name") or origin.get("id") or "unknown"}" (a {origin.get("type") or "room"})'
+    if room.get("id"):
+        whose = (f'You found that it belongs to the {level} "{room.get("name")}" (its id, also its room\'s id: {room["id"]})'
+                 + (f": {why}" if why else ".") + "\n")
+    else:
+        whose = f"It was sent to you by name, but no {level} of yours is known for it.\n"
+    if level == "project":
+        records = ("project_state_get reads the project's state; project_set_objective sets the objective (replacing "
+                   "the earlier one), project_add_objective adds one more; project_add_decision records a decision; "
+                   "project_assign_task records who does which task")
+    else:
+        records = ("bureau_capture_decision records a decision of the bureau; bureau_add_summary stores a summary of its "
+                   "discussion; bureau_list_decisions reads the decisions recorded")
+    return (
+        f'[Agent Bus request for the {level} secretary. chainId="{env.get("chainId", "")}".\n'
+        f"{asked_by} asked in the room {where}:\n<<<\n{text}\n>>>\n\n"
+        f"{whose}\n"
+        f"You are the secretary of this {level}. Do what the request needs; your tools know which request this is.\n"
+        f"- Something to record for the {level}: {records}. A {level}'s id is its room's id.\n"
+        f"- Work for the {level}'s members: level_room shows the members (people, and agents with the bus tasks they "
+        f"take); level_post puts the request, or the part for the people, in the {level}'s room; "
+        "level_publish_subtask gives an agent member its part as one of the tasks it takes, in your own words; "
+        "wait_for_level_results collects what they return and what was said in the room.\n"
+        'Finish with akinakes_publish_result, payload_type "result.level_done", fields {"summary": what was done, in '
+        "plain words and in the language of the request, with the titles people can use to find what was made}. If "
+        "it cannot be done, call akinakes_report_blocked with the reason. Never say something was recorded, posted or "
+        "done unless one of your tools did it. Nobody reads this conversation; the published result goes back to the "
+        "room where the request was asked.]"
+    )
 
 
 # --- inbound ---------------------------------------------------------------------------------------------------------
@@ -718,6 +1073,10 @@ def requester_words(msg: dict[str, Any]) -> str:
     payload = msg.get("payload") or {}
     if reply_spec(payload.get("type") or "").get("chat"):
         return f'{payload.get("sender_uid") or "someone"} wrote in the chat room:\n{payload.get("text") or ""}'
+    if payload.get("type") == LEVEL_REQUEST:
+        # The person's own words, as for a chat message: the checks must not take the bus fields for the request.
+        return (f'{payload.get("asked_by") or payload.get("user_uid") or "someone"} asked in a chat room:\n'
+                f'{payload.get("text") or payload.get("original_text") or ""}')
     fields = {k: v for k, v in payload.items() if k != "type"}
     return (f'{env.get("senderUid") or "an agent"} sent the task {payload.get("type", "")} over the Agent Bus, with:\n'
             f"{json.dumps(fields, ensure_ascii=False, indent=2)}")
@@ -820,6 +1179,14 @@ async def _heartbeat_forever(client: httpx.AsyncClient, config: ChannelConfig) -
             log_event("plugin:akinakes-channel", "heartbeat_failed", error=str(exc))
 
 
+def _start_relay(msg: dict[str, Any], asked: dict[str, str], inject: InjectFn) -> None:
+    """A relay turn: the coordinator tells the room what an agent answered (or that nobody took the request)."""
+    key = f'{(msg.get("envelope") or {}).get("chainId", "")}-relay-{(msg.get("envelope") or {}).get("messageId", "")[:8]}'
+    _pending[key] = msg
+    _relay_keys.add(key)
+    inject(key, render_relay_text(msg, key), relay_words(msg, asked), True)
+
+
 async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject: InjectFn, before_task: BeforeTaskFn | None) -> None:
     agent = make_agent(config)
     while True:
@@ -839,12 +1206,27 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 status.tasks_received += 1
                 status.last_task_at_iso = datetime.now(timezone.utc).isoformat()
                 msg_type = (msg.get("payload") or {}).get("type") or ""
+                # The bus delivers a broadcast to its sender too: what this agent published is not work for it.
+                if (msg.get("envelope") or {}).get("senderUid") == config.agent_uid:
+                    continue
+                if config.level and _level_intake(msg, msg_type, chain_id, config, inject, before_task):
+                    continue
                 # A role takes tasks, queries and chat messages. Results and events broadcast on the bus are not work for it
                 # (without this, a writer answered another agent's result.section_draft with a second one).
                 if not config.orchestrator and not msg_type.startswith(("task.", "query.", "chat.")):
                     continue
+                # A task sent to everyone is taken only by a role that declares its type (a check of the type, not a
+                # reading of the text); one addressed to this role is always its own.
+                if (not config.orchestrator and config.accepts and msg_type.startswith(("task.", "query."))
+                        and msg_type not in config.accepts and not addressed_to(msg, config.agent_uid)):
+                    continue
                 if config.orchestrator and msg_type == "agent.pass":
                     _passes.setdefault(chain_id, set()).add((msg.get("payload") or {}).get("agent_uid") or "")
+                    continue
+                if config.orchestrator and msg_type == LEVEL_CLAIMED:
+                    _claimed.add(chain_id)
+                    log_event("plugin:akinakes-channel", "bus_task_claimed", chain_id=chain_id,
+                              by=(msg.get("envelope") or {}).get("senderUid"))
                     continue
                 relay = config.orchestrator and msg_type.startswith("result.") and bool((msg.get("payload") or {}).get("room_id"))
                 if config.orchestrator and chain_id in _bus_tasks and (msg_type.startswith("result.") or msg_type == "system.skill_blocked"):
@@ -855,13 +1237,7 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 else:
                     asked = {}
                 if relay:
-                    key = f'{chain_id}-relay-{(msg.get("envelope") or {}).get("messageId", "")[:8]}'
-                    _pending[key] = msg
-                    _relay_keys.add(key)
-                    # relay_words(msg, asked) is built but not passed yet (2026-11-02): fed to the formalizer it reads
-                    # the person's request as work still to do (3/3, "set the objective" again). How a relay turn gets
-                    # its task and its yardstick is an open decision, see the akinakes plan.
-                    inject(key, render_relay_text(msg, key), relay_words(msg, asked), True)
+                    _start_relay(msg, asked, inject)
                     continue
                 if reply_spec(((msg.get("payload") or {}).get("type")) or "").get("chat") and not await admits_chat_message(msg, config, client):
                     continue
