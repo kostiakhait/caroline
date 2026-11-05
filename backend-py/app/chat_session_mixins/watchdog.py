@@ -195,6 +195,8 @@ class WatchdogMixin:
                         name=tool_name, is_error=bool(block.is_error), result_preview=preview,
                         arguments_preview=args_preview,
                     )
+                    self.turn_action_log.append((tool_name, args_preview, bool(block.is_error), preview[:160]))
+                    del self.turn_action_log[:-12]
     # edition:end
     # edition:cut claude-session code no longer reached
     def _turn_outcomes_summary(self) -> str:

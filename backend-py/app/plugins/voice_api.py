@@ -1492,6 +1492,24 @@ _FINISH_CLAIM = re.compile(
 )
 
 
+# 2026-11-05: the narrator is a one-way aside -- nobody can answer it, and the real work goes on by itself. A remark that
+# asks the user for something, gives them a task or puts a question to them ("please log in", "введите код", "вам нужно
+# подтвердить") is invented: Caroline is doing the job herself. Such a remark is dropped (treated as "nothing to say").
+_ASKS_USER = re.compile(
+    r"\?|¿|"
+    r"\b(?:please|let me know|tell me|could you|would you|can you|you (?:need|should|must|have to|can|may|will need)|"
+    r"your (?:turn|choice|input|help)|"
+    r"пожалуйста|будь\s+ласка|прошу|скажите|скажи|сообщите|подскажите|ответьте|дайте\s+знать|"
+    r"(?:вам|тебе|вы|ты)\s+(?:нужно|надо|необходимо|следует|стоит|можете|можешь)|"
+    r"(?:вам|тобі|ти|ви)\s+(?:потрібно|треба|можете|можеш))(?!\w)|"
+    r"(?:^|[.!;:—-]\s*)(?:(?:now|then|next|теперь|потом|затем|тепер)\s+)?(?:введите|введи|войдите|зайдите|откройте|нажмите|подтвердите|выберите|укажите|уточните|"
+    r"пришлите|отправьте|проверьте|подождите|дождитесь|"
+    r"введіть|відкрийте|натисніть|підтвердіть|оберіть|"
+    r"enter|click|tap|open|log\s*in|sign\s*in|confirm|choose|select|pick|provide|send|check|wait|approve|type)(?!\w)",
+    re.IGNORECASE,
+)
+
+
 def _is_echo_of_prompt_example(text: str) -> bool:
     return any(
         _normalized_overlap(text, example)
@@ -1697,6 +1715,15 @@ def _progress_comment_prompt(
         "machinery -- describe the progress of the task itself, in the terms the user used.\n"
         "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
         "guess the user's intent or mood; never promise or plan next steps.\n"
+        "STATUS lists the actions of the task in the order they happened; its LAST lines are what is happening "
+        "now. Say concretely what the last one or two actions are (what is being opened, filled, searched, "
+        "written), never a vague \"still working\". A line saying what you already told the user is only there "
+        "so you do not repeat or contradict it.\n"
+        "You are doing the work yourself and nobody can answer you: NEVER ask the user a question, never ask or "
+        "tell them to do, check, choose, enter, confirm or wait for anything, never say what they \"need to\" "
+        "do -- even if STATUS or a result mentions a login, a code, a confirmation or a question. Report only "
+        "what YOU are doing or have found.\n"
+        "Never mention timed-out checks, waiting for a status, or saving notes.\n"
         "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
         "progress -- describe it that way.\n"
         "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
@@ -1917,6 +1944,11 @@ async def generate_progress_comment(
         # tense as if it were still in progress. Per explicit instruction:
         # match tense/mood to what STATUS actually shows instead of forcing
         # one tense for everything.
+        "STATUS lists the actions of the task in the order they happened; its LAST lines are what is happening "
+        "now. Say concretely what the last one or two actions are (what is being opened, filled, searched, "
+        "written), never a vague \"still working\". Do not repeat or contradict what you already told the "
+        "user (the last STATUS line says what that was). Never mention timed-out checks, waiting for a "
+        "status, or saving notes. "
         "Match your tense/mood to what STATUS actually shows: a step STATUS marks done is described as done "
         "(past tense is fine -- \"I sent it\", \"I found it\"); a step STATUS shows is still running is "
         "described as ongoing (\"I'm still working on X\"); a step that hasn't started yet but STATUS shows is "
@@ -2049,6 +2081,9 @@ async def generate_progress_comment(
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300])
         return None
+    if _ASKS_USER.search(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_asks_user", text=text[:300])
+        return None
     if already_said and any(_is_repeat(text, prev) for prev in already_said):
         log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300])
         return None
@@ -2144,6 +2179,9 @@ async def generate_progress_comment_direct(
         return ""
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300], direct=True)
+        return ""
+    if _ASKS_USER.search(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_asks_user", text=text[:300], direct=True)
         return ""
     if _states_figure_as_settled(text, activity, task):
         log_event("plugin:voice", "generate_progress_comment_rejected_settled_figure", text=text[:300], direct=True)

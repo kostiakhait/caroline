@@ -183,6 +183,7 @@ class TurnSubmissionMixin:
             # too rather than left to dangle in _pending_tool_calls forever.
             self._pending_tool_calls = {}
             self.turn_tool_outcomes = {}
+            self.turn_action_log = []
             self.turn_narration_remarks = []
             self.last_visible_output_at = time.monotonic()
             # Bug fix (2026-09-14): a genuine new real message is the one

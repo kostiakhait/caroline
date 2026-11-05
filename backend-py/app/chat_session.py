@@ -455,6 +455,10 @@ class ChatSession(
         # actually doing (see _narration_action_facts), not just its name.
         self._pending_tool_calls: dict[str, tuple[str, str]] = {}
         self.turn_tool_outcomes: dict[str, ToolOutcome] = {}
+        # Every tool call of this episode in the order it finished (name, arguments, is_error, result): turn_tool_outcomes is
+        # keyed by name and keeps only the LAST call of each tool, so a sixty-step browser task showed the narrator ten
+        # unordered lines. Capped at the last 12; reset wherever turn_tool_outcomes is.
+        self.turn_action_log: list[tuple[str, str, bool, str]] = []
         # Every narration remark actually SENT this real-user episode (2026-10-11,
         # ported from a teammate's branch) -- lets the drafting prompt see its own
         # earlier remarks so it doesn't restate the same status, and lets the very

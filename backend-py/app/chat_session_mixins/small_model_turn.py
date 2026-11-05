@@ -47,6 +47,7 @@ class SmallModelTurnMixin:
         self.consecutive_narration_count = 0
         self._pending_tool_calls = {}
         self.turn_tool_outcomes = {}
+        self.turn_action_log = []
         if is_real_user:
             self._dr_begin_sw(text)
         else:

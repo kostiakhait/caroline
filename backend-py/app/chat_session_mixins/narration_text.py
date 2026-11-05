@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+import re
+
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
+from app.plugins.voice_api import _ASKS_USER
+
+# Calls that say nothing about the task itself: waiting on an operation, looking up the tool catalogue. A remark built from
+# them reads as "a check timed out" or "I am reading the tool list".
+_BOOKKEEPING_CALLS = frozenset({"check_operation_status", "stop_operation", "describe_tool", "list_tools", "list_groups", "get_tool_instructions"})
+
+
+def _is_bookkeeping_call(name: str) -> bool:
+    return name.rsplit("__", 1)[-1] in _BOOKKEEPING_CALLS
 
 
 class TextNarrationMixin:
@@ -32,19 +43,33 @@ class TextNarrationMixin:
         # running" to the narrator for its entire actual duration. REGISTRY
         # is the same per-tab ground truth ChatSession.stop()'s own
         # cancel_for_tab already relies on for "what's really running".
-        running_calls = list(self._pending_tool_calls.values())
-        running_agents = REGISTRY.running_for_tab(self.tab_id)
-        finished = list(self.turn_tool_outcomes.values())
+        #
+        # Remarks must match what is actually being done. This used to list
+        # turn_tool_outcomes (the LAST call of each tool name, in the order the names first appeared, running calls first):
+        # a sixty-step browser task reached the narrator as ten unordered lines and it filled the gaps with "still filling
+        # the form". Now: the last 12 calls in the order they finished, then what is running, the bookkeeping calls left
+        # out (status polls, tool catalogue lookups), and what she has just told the user herself.
+        running_calls = [(n, a) for n, a in self._pending_tool_calls.values() if not _is_bookkeeping_call(n)]
+        running_agents = [op for op in REGISTRY.running_for_tab(self.tab_id) if not _is_bookkeeping_call(op.tool_name)]
+        finished = [entry for entry in self.turn_action_log if not _is_bookkeeping_call(entry[0])]
         if not running_calls and not running_agents and not finished:
             return None
-        lines: list[str] = []
+        lines: list[str] = ["The actions of this task, in the order they happened (the LAST lines are what is happening now):"]
+        for name, args_preview, is_error, result_preview in finished:
+            result = "ERROR: " + result_preview if is_error else result_preview
+            lines.append(f"Tool call {name} (arguments: {args_preview}); result: {result}")
         for name, args_preview in running_calls:
             lines.append(f"Tool call {name} started (arguments: {args_preview}).")
         for op in running_agents:
             lines.append(f"Tool call {op.tool_name} is still running in the background.")
-        for outcome in finished:
-            result = "ERROR: " + outcome.result_preview if outcome.is_error else outcome.result_preview
-            lines.append(f"Tool call {outcome.name} (arguments: {outcome.arguments_preview}); result: {result}")
+        # Her last reply may end in a question or a request to the user; handed over as it is, the narrator copies that
+        # shape and starts giving the user tasks. Only the sentences that state something are passed on.
+        said = " ".join(
+            sentence for sentence in re.split(r"(?<=[.!?])\s+", (getattr(self, "_turn_last_visible_text", None) or "").strip())
+            if sentence and "?" not in sentence and not _ASKS_USER.search(sentence)
+        ).strip()
+        if said:
+            lines.append(f"What she has already told the user in this task (do not repeat or contradict): {said[:300]}")
         return "\n".join(lines)
     def _narration_task(self) -> str:
         """The user's request for the current task -- the one thing the narrator
