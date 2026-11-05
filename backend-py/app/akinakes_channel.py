@@ -758,7 +758,7 @@ def render_relay_text(msg: dict[str, Any], key: str) -> str:
         # post ("Update from the Agent Bus ... Reference task id ... Room: ..."). The tools know this turn without them.
         f"[An agent has finished work that came from this room. What it answered:\n"
         f"{json.dumps({k: v for k, v in payload.items() if k not in ('type', 'room_id')}, ensure_ascii=False, indent=2)}\n\n"
-        "Look at chat_history first: if you already told the room this (an earlier message of yours says the same), "
+        "Look at chat_history first: if the room already has this (an earlier message of yours or of another agent says the same), "
         "post nothing; if you said it was in progress or was not yet known, post what is new. Otherwise tell the room "
         "what happened, in the language of the conversation and in plain words, as one person tells another: what was "
         "done, with the title the people can use to find it. Say only what the answer above says. Never show ids, "
