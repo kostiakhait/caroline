@@ -40,6 +40,7 @@ class Tab(WatchdogMixin):
         self.has_seen_init = True
         self.turn_saw_any_visible_text = False
         self.turn_tool_outcomes = {}
+        self.turn_action_log = []
         self._pending_tool_calls = {}
         self._open_tool_calls = {}
         self.turn_joined_running = False

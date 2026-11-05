@@ -106,9 +106,10 @@ def test_advise_returns_the_step_and_passes_history_and_reaction(monkeypatch, is
         reaction.set_result(-0.8)
         return await ra.advise("claude", ra.CLAUDE_LADDER, "you got it wrong", "User: ...", ws, "t", reaction)
 
-    assert run(go()) == (2, "legal matter, previous answer was corrected")
+    # Opus is never a start step: asked for anyway, the turn starts on Sonnet; Opus only by escalation.
+    assert run(go()) == (1, "legal matter, previous answer was corrected")
     assert seen[0]["reaction"] == -0.8 and seen[0]["history"][0]["ended"] == "sonnet"
-    assert [s["model"] for s in seen[0]["ladder"]] == ["haiku", "sonnet", "opus"]
+    assert [s["model"] for s in seen[0]["ladder"]] == ["haiku", "sonnet"]
 
 
 def test_advise_failure_out_of_range_and_timeout_mean_no_advice(monkeypatch, isolated):

@@ -216,6 +216,42 @@ async def _address_book(command: str, doing: str, **params: Any) -> dict[str, An
     return reply
 
 
+# Addresses the email autosave below already wrote, with the name it wrote them with (2026-11-05, token spend): each
+# contact:put costs ~20 model calls on the server (the address book is searched by meaning), and the same senders came
+# back with every mail read -- 98 puts in one hour of a mail sweep. An address already written under the same name is
+# not written again; a new name for it still goes to the server, which merges it by meaning.
+_AUTOSAVED_FILE = "contacts-autosaved.json"
+_autosaved: dict[str, str] | None = None
+
+
+def _autosaved_path() -> Path:
+    from app.workspace_dir import WORKSPACE_DIR
+    return Path(WORKSPACE_DIR) / _AUTOSAVED_FILE
+
+
+def _load_autosaved() -> dict[str, str]:
+    global _autosaved
+    if _autosaved is None:
+        try:
+            loaded = json.loads(_autosaved_path().read_text(encoding="utf-8"))
+            _autosaved = {str(k): str(v) for k, v in loaded.items()} if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            _autosaved = {}
+    return _autosaved
+
+
+def _remember_autosaved(address: str, name: str) -> None:
+    known = _load_autosaved()
+    known[address] = name
+    try:
+        path = _autosaved_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(known, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        log_event("plugin", "contacts_autosaved_write_failed", error=str(exc)[:200])
+
+
 async def upsert_contacts_from_emails(pairs: list[tuple[str | None, str]], exclude: set[str] | None = None) -> None:
     """Per explicit instruction (2026-10-13): "Кэролайн должна сохранять в адресной книге
     емейлы всех адресатов и отправителей писем, которые отсылает или читает" -- a
@@ -247,10 +283,15 @@ async def upsert_contacts_from_emails(pairs: list[tuple[str | None, str]], exclu
             continue
         seen.add(key)
         contact = {"name": (name or "").strip() or addr, "emails": [{"value": addr}]}
+        known = _load_autosaved().get(key)
+        if known is not None and (known == contact["name"] or contact["name"].lower() == key):
+            continue
         try:
             reply = await _address_book("contact:put", "Saving a contact seen in email", contact=contact)
             if reply.get("is_error"):
                 log_event("plugin", "contacts_email_autosave_failed", address=key, error=reply.get("text"))
+            else:
+                _remember_autosaved(key, contact["name"])
         except Exception as exc:  # noqa: BLE001 -- side-channel bookkeeping, must never raise into the caller
             log_event("plugin", "contacts_email_autosave_failed", address=key, error=str(exc))
 

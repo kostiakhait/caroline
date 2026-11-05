@@ -105,10 +105,20 @@ class WatchdogMixin:
                 agent_registry.register(self.workspace_dir, self.tab_id, message.task_id, message.description, message.task_type, message.tool_use_id)
             elif isinstance(message, TaskNotificationMessage):
                 running = agent_registry.running(self.workspace_dir, self.tab_id)
-                description = (running.get(message.task_id) or {}).get("description")  # read BEFORE finish() pops it
+                entry = running.get(message.task_id) or {}  # read BEFORE finish() pops it
+                description = entry.get("description")
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status)
                 summary = (message.summary or "").strip()
-                if summary:
+                if summary and entry.get("task_type") == "local_bash" and self.turn_pending:
+                    # 2026-11-05, per explicit instruction (token spend): a background shell command finishing while the
+                    # session that started it is still in its turn reaches that turn by itself -- the CLI queues the
+                    # <task-notification> into it (seen in the transcripts: "Файлы готовы..." right after it). A fresh
+                    # pseudo-session for it re-read the ~45k base and redid or re-checked the same work: 373 of 377
+                    # background tasks in Nov 2-5 were shell commands, about half answered [[NO_UPDATE]]. Real sub-agents,
+                    # and a command finishing after its session went idle, still get their own thread below.
+                    log_event("engine", "background_report_left_to_live_turn", tab_id=self.tab_id, task_id=message.task_id,
+                              status=message.status)
+                elif summary:
                     real_tab_id = pseudo_tab.real_tab_id_from_pseudo(self.tab_id) if pseudo_tab.is_pseudo_tab_id(self.tab_id) else self.tab_id
                     notification_text = (
                         f"[Your sub-agent (agentId {message.task_id}"
