@@ -371,7 +371,7 @@ def test_the_result_of_a_published_task_is_told_in_its_room_even_without_room_id
     assert words.startswith("alice asked in the chat room:\nSet the objective to: ship it\n\nprojectSecretary answered result.secretary_ok")
     assert '"objective": "Ship it"' in words and "Agent Bus result" not in words
     assert key.startswith("m1-relay-") and key in ch._relay_keys
-    assert ch._pending[key]["payload"]["room_id"] == "ws-default/r1" and "result.secretary_ok" in text
+    assert ch._pending[key]["payload"]["room_id"] == "ws-default/r1" and "result.secretary_ok" not in text and "Ship it" in text
     assert ch._bus_tasks == {}
 
 
@@ -766,3 +766,12 @@ def test_the_ownership_microagent_checks_its_answer_not_its_decision():
     assert "mine" in own.verify_level_ownership(agent_input, {"mine": "yes", "room_id": "p1", "why": "x"})
     prompt = own.prompt_level_ownership(agent_input, None)
     assert "Set the objective" in prompt and '"Thermal Research"' in prompt and "writerAgent (agent: writer)" in prompt
+
+
+def test_relay_text_shows_no_internal_ids_and_does_not_repeat_the_room():
+    msg = {"envelope": {"senderUid": "projectSecretary"},
+           "payload": {"type": "result.level_done", "room_id": "ROOM-1", "summary": "Objective set."}}
+    text = ch.render_relay_text(msg, "CHAIN-9-relay-ab")
+    assert "CHAIN-9" not in text and "ROOM-1" not in text and "result.level_done" not in text
+    assert "Objective set." in text
+    assert "chat_history first" in text and "post nothing" in text

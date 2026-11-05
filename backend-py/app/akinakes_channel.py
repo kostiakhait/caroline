@@ -754,12 +754,17 @@ def relay_words(msg: dict[str, Any], asked: dict[str, str]) -> str:
 def render_relay_text(msg: dict[str, Any], key: str) -> str:
     payload = msg.get("payload") or {}
     return (
-        f'[Agent Bus result. chainId="{key}" type="{payload.get("type", "")}" room="{payload.get("room_id", "")}".\n'
-        f"Payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        "An agent has finished work that came from this room. Tell the room what happened, in the language of the "
-        "conversation (chat_history shows it) and in plain words: what was done, with the title or id the people can use "
-        "to find it. Post it with chat_post_message. If the result is an error, say what failed "
-        "and what the person can do. Nobody reads this conversation, only what you post in the room.]"
+        # No chainId, type or room id in the header (2026-11-05, live runs 4 and 6): the model copied them into the room
+        # post ("Update from the Agent Bus ... Reference task id ... Room: ..."). The tools know this turn without them.
+        f"[An agent has finished work that came from this room. What it answered:\n"
+        f"{json.dumps({k: v for k, v in payload.items() if k not in ('type', 'room_id')}, ensure_ascii=False, indent=2)}\n\n"
+        "Look at chat_history first: if you already told the room this (an earlier message of yours says the same), "
+        "post nothing; if you said it was in progress or was not yet known, post what is new. Otherwise tell the room "
+        "what happened, in the language of the conversation and in plain words, as one person tells another: what was "
+        "done, with the title the people can use to find it. Say only what the answer above says. Never show ids, "
+        "chain or task names, \"Agent Bus\" or other internal words. Post one message with chat_post_message. If the "
+        "result is an error, say what failed and what the person can do. Nobody reads this conversation, only what "
+        "you post in the room.]"
     )
 
 
@@ -1127,7 +1132,8 @@ def render_task_text(msg: dict[str, Any], bus_catalog: str = "") -> str:
             "later to tell the room. Afterwards you may wait_for_agent_replies for agents you handed the message to; "
             "if nobody answered, say so in the room.\n"
             "You change nothing yourself: never tell the room that something is done, set or saved unless an agent did "
-            "it. When you hand a request on or publish a task, say that it is in progress.\n"
+            "it. When you hand a request on or publish a task, say only that you passed it on and will tell the room when "
+            "it is done: never that it has been done, set, updated or recorded, because that is not known yet.\n"
             "Post at most one message of your own for this request, and do not repeat what an agent posted. Never show "
             "ids or internal names; call the agents by their names. Nobody reads this conversation, only what you post "
             "in the room."
