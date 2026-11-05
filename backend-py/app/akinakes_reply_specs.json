@@ -61,51 +61,11 @@
     ],
     "blocked": {"payload_type": "result.analysis_error", "reason_field": "reason"}
   },
-  "task.project_set_objective": {
-    "description": "Set or update a project's objective in its project-state record.",
-    "fields": {"project_id": "the project (its room id)", "objective": "the objective, in plain words", "set_by": "who set it"},
-    "replies": [
-      {"payload_type": "result.secretary_ok", "required": ["project_id", "objective"]}
-    ],
-    "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
-  },
-  "task.project_add_decision": {
-    "description": "Record a decision in a project's decision log.",
-    "fields": {"project_id": "the project (its room id)", "decision": "the decision, in plain words", "decided_by": "who decided"},
-    "replies": [
-      {"payload_type": "result.secretary_ok", "required": ["project_id", "decision"]}
-    ],
-    "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
-  },
-  "task.project_assign": {
-    "description": "Record that a task in a project is assigned to a participant.",
-    "fields": {"project_id": "the project (its room id)", "task_title": "the task", "assignee": "who it is assigned to"},
-    "replies": [
-      {"payload_type": "result.secretary_ok", "required": ["project_id", "task_title", "assignee"]}
-    ],
-    "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
-  },
   "query.project_state": {
     "description": "Return a project's state: objectives, decisions, assignments.",
     "fields": {"project_id": "the project (its room id)"},
     "replies": [
       {"payload_type": "result.secretary_ok", "required": ["project_id", "doc_id", "state"]}
-    ],
-    "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
-  },
-  "task.bureau_capture_decision": {
-    "description": "Save a decision from a bureau's discussion into the bureau's documents.",
-    "fields": {"bureau_id": "the bureau (its room id)", "decision": "the decision, in plain words", "context": "what led to it"},
-    "replies": [
-      {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}
-    ],
-    "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
-  },
-  "task.bureau_summarize": {
-    "description": "Save a summary of a bureau's discussion as a document.",
-    "fields": {"bureau_id": "the bureau (its room id)", "summary": "the summary text", "title": "document title"},
-    "replies": [
-      {"payload_type": "result.secretary_ok", "required": ["bureau_id", "doc_id"]}
     ],
     "blocked": {"payload_type": "result.secretary_error", "reason_field": "reason"}
   },

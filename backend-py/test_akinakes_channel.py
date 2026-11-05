@@ -277,8 +277,8 @@ def test_hand_to_agents_sends_nothing_when_the_room_cannot_be_read(monkeypatch):
 
 
 REGISTRY = [
-    {"uid": "projectSecretary", "role": "secretary", "accepts": [{"type": "task.project_set_objective", "description": "Set a project's objective.",
-                                                                  "fields": {"project_id": "the project (its room id)", "objective": "the objective"}}]},
+    {"uid": "projectSecretary", "role": "secretary", "accepts": [{"type": "task.project_record_note", "description": "Record a note for a project.",
+                                                                  "fields": {"project_id": "the project (its room id)", "note": "the note"}}]},
     {"uid": "editorAgent", "role": "editor", "accepts": []},
     {"uid": "chatSecretary", "role": "chat_secretary", "accepts": [{"type": "task.x", "fields": {}}]},
 ]
@@ -294,15 +294,15 @@ def test_a_bus_task_must_be_a_task_or_query(monkeypatch):
     http = orchestrator(monkeypatch)
     with pytest.raises(ValueError, match="task_type must start"):
         run(ch.publish_bus_task("m1", "projectSecretary", "result.x", {}))
-    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_set_objective", {"project_id": "p1", "objective": "Ship it"}))
+    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_record_note", {"project_id": "p1", "note": "Ship it"}))
     payload = http.posted[0][1]["payload"]
-    assert payload["type"] == "task.project_set_objective" and payload["objective"] == "Ship it" and payload["room_id"] == "ws-default/r1"
+    assert payload["type"] == "task.project_record_note" and payload["note"] == "Ship it" and payload["room_id"] == "ws-default/r1"
 
 
 def test_a_bus_task_goes_to_the_chosen_agent_and_comes_back_here(monkeypatch):
     """Without a route the bus lets any poller claim the task, the coordinator itself included."""
     http = with_registry(monkeypatch)
-    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_set_objective", {"project_id": "ws-default/r1", "objective": "Ship it"}))
+    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_record_note", {"project_id": "ws-default/r1", "note": "Ship it"}))
     routing = http.posted[0][1]["envelope"]["routing"]
     assert routing["route"] == ["projectSecretary"] and routing["returnTo"] == "chatSecretary"
     assert http.posted[0][1]["envelope"]["chainId"] == "m1"
@@ -312,20 +312,20 @@ def test_a_bus_task_goes_to_the_chosen_agent_and_comes_back_here(monkeypatch):
 def test_a_bus_task_may_name_its_own_room_among_its_fields(monkeypatch):
     # Live 2026-11-02: docCreator's task has a room_id field, and the call crashed with "multiple values for room_id".
     http = with_registry(monkeypatch)
-    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_set_objective",
-                            {"project_id": "p1", "objective": "Ship it", "room_id": "other-room", "user_uid": "mallory"}))
+    run(ch.publish_bus_task("m1", "projectSecretary", "task.project_record_note",
+                            {"project_id": "p1", "note": "Ship it", "room_id": "other-room", "user_uid": "mallory"}))
     payload = http.posted[0][1]["payload"]
-    assert payload["room_id"] == "other-room" and payload["objective"] == "Ship it"
+    assert payload["room_id"] == "other-room" and payload["note"] == "Ship it"
     assert payload["user_uid"] == "alice" and payload["original_text"] == "Shorten the intro"  # always from the message
     assert ch._bus_tasks["m1"]["room_id"] == "ws-default/r1"  # the result is still told in the message's room
 
 
 def test_a_bus_task_is_checked_against_what_the_agent_declares(monkeypatch):
     http = with_registry(monkeypatch)
-    with pytest.raises(ValueError, match="does not take task.write_section; it takes: task.project_set_objective"):
+    with pytest.raises(ValueError, match="does not take task.write_section; it takes: task.project_record_note"):
         run(ch.publish_bus_task("m1", "projectSecretary", "task.write_section", {}))
     with pytest.raises(ValueError, match='No agent "ghostAgent"'):
-        run(ch.publish_bus_task("m1", "ghostAgent", "task.project_set_objective", {}))
+        run(ch.publish_bus_task("m1", "ghostAgent", "task.project_record_note", {}))
     with pytest.raises(ValueError, match="to_agent is the agent that takes this task, not you"):
         run(ch.publish_bus_task("m1", "chatSecretary", "task.x", {}))
     assert http.posted == []
@@ -377,10 +377,10 @@ def test_the_result_of_a_published_task_is_told_in_its_room_even_without_room_id
 
 def test_a_role_declares_its_tasks_from_the_reply_specs(monkeypatch):
     config = ch.ChannelConfig("http://bus", "projectSecretary", "secretary", [], "", "http://registry",
-                              accepts=["task.project_set_objective", "query.project_state"])
+                              accepts=["task.level_request", "query.project_state"])
     declared = ch.accepted_messages(config)
-    assert [a["type"] for a in declared] == ["task.project_set_objective", "query.project_state"]
-    assert declared[0]["description"] and "project_id" in declared[0]["fields"]
+    assert [a["type"] for a in declared] == ["task.level_request", "query.project_state"]
+    assert declared[0]["description"] and "text" in declared[0]["fields"] and "project_id" in declared[1]["fields"]
 
     class Registry(FakeHttp):
         def __init__(self, code: int) -> None:
@@ -437,10 +437,11 @@ def test_a_coordinator_turn_without_an_answer_tells_the_room_and_a_relay_turn_do
 def test_a_coordinator_turn_with_nothing_for_the_room_gets_one_more_turn_then_the_fallback(monkeypatch):
     http = orchestrator(monkeypatch)
     injected = []
-    monkeypatch.setattr(ch, "_inject", lambda key, text, words: injected.append((key, text, words)))
+    monkeypatch.setattr(ch, "_inject", lambda key, text, words, relay=False: injected.append((key, text, words, relay)))
     monkeypatch.setattr(ch, "_nudged", set())
     run(ch.on_turn_end("m1"))
     assert http.posted == [] and "m1" in ch._pending and injected[0][0] == "m1" and "hand_to_agents" in injected[0][1]
+    assert injected[0][3] is True  # the coordinator's nudge is not formalized either
     assert "Shorten the intro" in injected[0][2]
     run(ch.on_turn_end("m1"))
     assert len(injected) == 1 and http.posted[0][0] == "http://chat/internal/rooms/ws-default/r1/agent_message"
@@ -478,7 +479,7 @@ def test_a_task_is_answered_once(channel):
 
 def test_the_requester_words_are_the_message_or_the_task_without_our_instructions():
     words = ch.requester_words(chat())
-    assert words == "alice wrote in the chat room:\nShorten the intro"
+    assert words == "Shorten the intro"
     words = ch.requester_words(task("c1", "task.write_section"))
     assert words.startswith("coordinator sent the task task.write_section over the Agent Bus, with:")
     assert '"section_name": "Intro"' in words and "akinakes_publish_result" not in words
@@ -491,6 +492,29 @@ def test_the_channel_injects_a_task_with_its_requester_words(monkeypatch, channe
                              lambda key, text, request: injected.append((key, text, request)), None))
     key, text, request = injected[0]
     assert key == "c7" and "akinakes_publish_result" in text and request == ch.requester_words(task("c7", "task.write_section"))
+
+
+def test_the_coordinator_ignores_events_on_the_bus(monkeypatch):
+    orchestrator(monkeypatch)
+    monkeypatch.setattr(ch, "_registry_agents", lambda: asyncio.sleep(0, {}))
+    injected = []
+    event = ch.make_message("documentService", "event.section_written", chain_id="e1", doc_id="d1")
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([event]), ch._config,
+                             lambda key, text, request, relay=False: injected.append(key), None))
+    assert injected == [] and "e1" not in ch._pending
+
+
+def test_only_the_coordinator_s_chat_turns_skip_the_formalizer(monkeypatch):
+    """The coordinator routes, it does not do the work: its chat turns are relay turns (live 2026-11-05: the formalizer
+    asked for the person's own words to be posted back). Every other role's turn is injected as before."""
+    orchestrator(monkeypatch)
+    monkeypatch.setattr(ch, "_registry_agents", lambda: asyncio.sleep(0, {}))
+    injected = []
+    with pytest.raises(asyncio.CancelledError):
+        run(ch._poll_forever(PollOnce([chat("m9")]), ch._config,
+                             lambda key, text, request, relay=False: injected.append((key, request, relay)), None))
+    assert injected and injected[0][2] is True and injected[0][1] == "Shorten the intro" + chr(10) * 2 + ch.ROOM_SECRETARY_TASK
 
 
 
@@ -629,7 +653,7 @@ LEVEL_ANSWERS = {
 def level_secretary(monkeypatch, answers: dict | None = None) -> FakeHttp:
     http = FakeHttp({**LEVEL_ANSWERS, **(answers or {})})
     config = ch.ChannelConfig("http://bus", "projectSecretary", "secretary", [], "", "http://registry", chat_url="http://chat",
-                              chat_key="k", accepts=["task.level_request", "task.project_set_objective"], level="project")
+                              chat_key="k", accepts=["task.level_request", "task.project_record_note"], level="project")
     monkeypatch.setattr(ch, "_config", config)
     monkeypatch.setattr(ch, "_http", http)
     monkeypatch.setattr(ch, "_pending", {})
@@ -665,7 +689,7 @@ def test_the_level_secretary_claims_a_request_its_microagent_finds_its_own(monke
     assert key == "L1" and ch._level["L1"]["room"]["id"] == "p1"
     assert 'the project "Thermal Research"' in text and "Set the objective of this project to shipping v2" in text
     assert "project_set_objective" in text and "result.level_done" in text
-    assert request == "alice asked in a chat room:\nSet the objective of this project to shipping v2"
+    assert request == "Set the objective of this project to shipping v2"
 
 
 def test_the_level_secretary_stays_silent_on_a_request_that_is_not_its_own(monkeypatch):

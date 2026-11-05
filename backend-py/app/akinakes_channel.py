@@ -729,6 +729,13 @@ async def wait_for_agent_replies(chain_id: str, seconds: float) -> dict[str, Any
         await asyncio.sleep(WAIT_POLL_S)
 
 
+# The coordinator's job, in the words its checks read (2026-11-05). Its chat and relay turns run without the formalizer
+# (which took the person's request for work to do and had the person's own words posted back), so sw.action.scope had
+# only "set the objective of this project" and refused every chat_post_message as not part of the task.
+ROOM_SECRETARY_TASK = ("Your task as the room's secretary: answer the person in the room, or pass the request on to the "
+                       "agents that do the work and tell the room what they answered.")
+
+
 def relay_words(msg: dict[str, Any], asked: dict[str, str]) -> str:
     """A relay turn's requester words: what the person asked (when this coordinator published the task) and what the
     agent answered, without our instructions around them. The formalizer and the checks read these (2026-11-02, live:
@@ -740,8 +747,8 @@ def relay_words(msg: dict[str, Any], asked: dict[str, str]) -> str:
     answer = (f'{env.get("senderUid") or "an agent"} answered {payload.get("type", "")} over the Agent Bus, with:\n'
               f"{json.dumps(fields, ensure_ascii=False, indent=2)}")
     if not asked.get("asked"):
-        return answer
-    return f'{asked.get("asked_by") or "someone"} asked in the chat room:\n{asked["asked"]}\n\n{answer}'
+        return f"{answer}\n\n{ROOM_SECRETARY_TASK}"
+    return f'{asked.get("asked_by") or "someone"} asked in the chat room:\n{asked["asked"]}\n\n{answer}\n\n{ROOM_SECRETARY_TASK}'
 
 
 def render_relay_text(msg: dict[str, Any], key: str) -> str:
@@ -774,7 +781,7 @@ async def on_turn_end(chain_id: str) -> None:
                 # reads (a plan written in the log, nothing in the room). One more turn says so; the chain stays open.
                 _nudged.add(chain_id)
                 log_event("plugin:akinakes-channel", "coordinator_nudged", chain_id=chain_id)
-                _inject(chain_id, NUDGE_TEXT, requester_words(_pending[chain_id]))
+                _inject(chain_id, NUDGE_TEXT, requester_words(_pending[chain_id]), True)
                 return
             if _config is not None and _config.orchestrator:
                 await post_chat(chain_id, "I could not handle that request. Could you say it another way?")
@@ -1072,11 +1079,13 @@ def requester_words(msg: dict[str, Any]) -> str:
     env = msg.get("envelope") or {}
     payload = msg.get("payload") or {}
     if reply_spec(payload.get("type") or "").get("chat"):
-        return f'{payload.get("sender_uid") or "someone"} wrote in the chat room:\n{payload.get("text") or ""}'
+        # The person's words alone: with "X wrote in the chat room:" in front, the formalizer took the whole line for
+        # the content to post and the coordinator posted it back to the room (live run 1, 2026-11-05).
+        text = str(payload.get("text") or "")
+        return f"{text}\n\n{ROOM_SECRETARY_TASK}" if _config is not None and _config.orchestrator else text
     if payload.get("type") == LEVEL_REQUEST:
         # The person's own words, as for a chat message: the checks must not take the bus fields for the request.
-        return (f'{payload.get("asked_by") or payload.get("user_uid") or "someone"} asked in a chat room:\n'
-                f'{payload.get("text") or payload.get("original_text") or ""}')
+        return str(payload.get("text") or payload.get("original_text") or "")
     fields = {k: v for k, v in payload.items() if k != "type"}
     return (f'{env.get("senderUid") or "an agent"} sent the task {payload.get("type", "")} over the Agent Bus, with:\n'
             f"{json.dumps(fields, ensure_ascii=False, indent=2)}")
@@ -1228,6 +1237,10 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                     log_event("plugin:akinakes-channel", "bus_task_claimed", chain_id=chain_id,
                               by=(msg.get("envelope") or {}).get("senderUid"))
                     continue
+                # The other events on the bus (Document Service announces every section written) are not requests either:
+                # the coordinator took one for a task and tried to answer it (live 2026-11-05, once the events arrived).
+                if msg_type.startswith("event."):
+                    continue
                 relay = config.orchestrator and msg_type.startswith("result.") and bool((msg.get("payload") or {}).get("room_id"))
                 if config.orchestrator and chain_id in _bus_tasks and (msg_type.startswith("result.") or msg_type == "system.skill_blocked"):
                     # The answer to a task this coordinator published; the room comes from the task.
@@ -1253,7 +1266,14 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                 if config.orchestrator and reply_spec(msg_type).get("chat"):
                     catalog = render_bus_catalog([a for uid, a in (await _registry_agents()).items()
                                                   if uid != config.agent_uid and a.get("accepts")])
-                inject(chain_id, render_task_text(msg, catalog), requester_words(msg))
+                # The coordinator routes: it passes the work on and never does it. The formalizer reads a request as work
+                # for the reader to do and told the first live run to post the person's own words back (2026-11-05),
+                # so its chat turns run as relay turns: no formalizer, no start-rung advice; the checks read the words.
+                turn = (chain_id, render_task_text(msg, catalog), requester_words(msg))
+                if config.orchestrator and reply_spec(msg_type).get("chat"):
+                    inject(*turn, True)
+                else:
+                    inject(*turn)
         except Exception as exc:  # noqa: BLE001 -- a bus outage is waited out, not a crash loop
             status.last_error = str(exc)
             log_event("plugin:akinakes-channel", "poll_failed", error=str(exc))
