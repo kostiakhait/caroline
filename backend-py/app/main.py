@@ -1531,6 +1531,12 @@ async def _handle_control_request_inner(
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
         log_event("engine", "tts_done", request_id=request_id, audio_bytes=len(audio_b64))
         return {"type": "control_response", "op": op, "ok": True, "stdout": audio_b64, "requestId": request_id}
+    if op == "ferret_tool_result":
+        # The Ferret browser editor's page answering a tool call of plugins/ferret_editor_plugin.py. Only a backend started with
+        # CAROLINE_FERRET_EDITOR=1 ever sends the call, so on every other deployment nothing waits and nothing sends this.
+        from app.plugins import ferret_editor_plugin
+        taken = bool(request_id) and ferret_editor_plugin.resolve(request_id, bool(parsed.get("ok")), parsed.get("result"), parsed.get("error"))
+        return {"type": "control_response", "op": op, "ok": taken, "stderr": None if taken else "no ferret tool call is waiting for this answer", "requestId": request_id}
     if op == "editor_result":
         outcome, path = parsed.get("outcome"), parsed.get("path")
         if not request_id or not outcome or not path:

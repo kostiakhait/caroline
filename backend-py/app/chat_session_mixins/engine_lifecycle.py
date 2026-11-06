@@ -784,7 +784,9 @@ class EngineLifecycleMixin:
                     # and agents reached for them (an external email MCP) instead of Caroline's own tools. A
                     # structural fix with no names or lists in it; applies to subagents too. Verified with a real
                     # probe that the Claude login is unaffected.
-                    "extra_args": {"strict-mcp-config": None},
+                    # CAROLINE_NO_NATIVE_TOOLS=1 (a hosted deployment with a fixed tool set, the Ferret editor): the Claude CLI's own
+                    # tools (shell, files, web) are switched off, so only Caroline's own MCP tools exist. Unset: nothing changes.
+                    "extra_args": {"strict-mcp-config": None, **({"tools": ""} if os.environ.get("CAROLINE_NO_NATIVE_TOOLS") == "1" else {})},
                     # Caroline's own definition of the default agent -- carries her rules, which a subagent does
                     # NOT inherit from --append-system-prompt. See agent_definitions.py.
                     "agents": caroline_agents(),
