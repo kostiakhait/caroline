@@ -1548,7 +1548,9 @@ def build_tool_registry() -> ToolRegistry:
     ever learn the real result, so it had to guess or just claim success.
     Confirmed live as the actual cause of a placeholder note being left
     behind while the model told the user it was "preparing" the real one."""
-    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_STAGE_TOOL_DEFS) + list(_WEB_SEARCH_TOOL_DEFS)
+    # Opt-in (the Ferret editor host sets CAROLINE_NO_NATIVE_TOOLS=1; nothing sets it elsewhere): no web search of its own -- only the tools the loaded plugins hand it.
+    _web_search_defs = [] if os.environ.get("CAROLINE_NO_NATIVE_TOOLS") == "1" else list(_WEB_SEARCH_TOOL_DEFS)
+    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_STAGE_TOOL_DEFS) + _web_search_defs
     lookup: dict[str, tuple[str, PluginTool]] = {}
     tool_instructions: dict[str, str] = {}
     own_plugins: list[dict[str, Any]] = []
