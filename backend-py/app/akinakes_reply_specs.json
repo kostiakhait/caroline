@@ -86,6 +86,15 @@
     "blocked": {"payload_type": "result.level_blocked", "reason_field": "reason"},
     "echo": ["room_id"]
   },
+  "task.create_document": {
+    "description": "Create a new document (docx, xlsx, pdf, markdown, html, json or text) with the given sections.",
+    "fields": {"title": "document title", "format": "docx, xlsx, pdf, md, html, json or txt", "sections": "list of section names", "project_id": "the project (its room id), if any", "room_id": "the room to announce it in"},
+    "replies": [
+      {"payload_type": "result.document_created", "required": ["doc_id", "title"], "when": "the document exists in Document Service (type document, with the sections asked for; for docx, xlsx and pdf its file is rendered and stored too)", "schema": {"type": "object", "properties": {"doc_id": {"type": "string", "minLength": 1}, "title": {"type": "string", "minLength": 1}}, "required": ["doc_id", "title"]}}
+    ],
+    "blocked": {"payload_type": "result.document_error", "reason_field": "reason"},
+    "echo": ["room_id"]
+  },
   "chat.message": {
     "chat": true
   }

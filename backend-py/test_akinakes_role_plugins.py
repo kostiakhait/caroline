@@ -109,3 +109,34 @@ def test_a_service_plugin_is_not_loaded_without_its_service(monkeypatch, module,
     assert importlib.reload(importlib.import_module(module)).PLUGIN is None
     monkeypatch.setenv(env, "http://svc")
     assert importlib.reload(importlib.import_module(module)).PLUGIN is not None
+
+
+def test_file_plugin_only_for_the_document_creator(monkeypatch):
+    from app.plugins import akinakes_file_plugin as fp
+    monkeypatch.setenv("DOCUMENT_SERVICE_URL", "http://svc")
+    monkeypatch.delenv("AGENT_ROLE", raising=False)
+    assert importlib.reload(fp).PLUGIN is None
+    monkeypatch.setenv("AGENT_ROLE", "writer")
+    assert importlib.reload(fp).PLUGIN is None
+    monkeypatch.setenv("AGENT_ROLE", "doc_creator")
+    assert [t.name for t in importlib.reload(fp).PLUGIN.tools] == ["document_render_file"]
+    monkeypatch.delenv("DOCUMENT_SERVICE_URL")
+    assert importlib.reload(fp).PLUGIN is None
+
+
+def test_render_file_exports_then_stores(monkeypatch):
+    import httpx
+    from app.plugins import akinakes_file_plugin as fp
+    monkeypatch.setenv("DOCUMENT_SERVICE_URL", "http://svc")
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        return httpx.Response(200, content=b"PK-file") if request.method == "GET" else httpx.Response(200, json={})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(fp.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    got = json.loads(run(fp.document_render_file({"doc_id": "d1", "format": "docx"}, None))["text"])
+    assert got == {"doc_id": "d1", "format": "docx", "bytes": 7}
+    assert seen == [("GET", "/documents/d1/export", {"format": "docx"}), ("POST", "/documents/d1/file", {})]
+    assert run(fp.document_render_file({"doc_id": "d1", "format": "md"}, None))["is_error"]
