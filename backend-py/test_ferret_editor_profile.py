@@ -85,3 +85,18 @@ def test_codex_native_tools_are_off_only_when_the_host_asks(monkeypatch):
     assert "features.shell_tool=false" in off and "features.browser_use=false" in off
     # they are not a sign-in: has_chatgpt_or_device_login looks at _config_overrides() only
     assert openai_mode._config_overrides() == []
+
+
+def test_product_role_only_when_the_host_gives_it(monkeypatch, tmp_path):
+    from app import product_role, small_model_engine
+    from app.persona import get_persona
+    monkeypatch.delenv("CAROLINE_PRODUCT_ROLE_FILE", raising=False)
+    assert product_role.role_clause() is None
+    p = get_persona(str(tmp_path))
+    assert "personal assistant" in small_model_engine._persona_system_message(p)
+    role = tmp_path / "role.md"
+    role.write_text("You are a game designer and game programmer.", encoding="utf-8")
+    monkeypatch.setenv("CAROLINE_PRODUCT_ROLE_FILE", str(role))
+    assert "game designer" in product_role.role_clause() and "not an assistant" in product_role.role_clause()
+    sw = small_model_engine._persona_system_message(p)
+    assert "game designer" in sw and "personal assistant" not in sw

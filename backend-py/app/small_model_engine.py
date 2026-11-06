@@ -82,7 +82,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import model_billing, rung_advice, session_context, skills, sw_tier_stats, tool_groups
+from app import model_billing, product_role, rung_advice, session_context, skills, sw_tier_stats, tool_groups
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
@@ -645,6 +645,9 @@ def _persona_system_message(persona: Persona) -> str:
     else:
         agreement = "Use grammatical forms matching your stated gender when replying in a language that grammatically marks gender."
     bio_line = persona.biography or persona.bio
+    role = product_role.role_text()  # opt-in (app/product_role.py): a host of one product gives her role there instead of "personal assistant"
+    if role:
+        return f"You are {persona.name}, {persona.age}, {persona.gender}.\n{agreement}\n{role}"
     return (
         f"You are {persona.name}, {persona.age}, {persona.gender}. {persona.bio}\n"
         f"{bio_line}\n"

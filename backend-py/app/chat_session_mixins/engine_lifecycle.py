@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
-from app import action_ledger, skills
+from app import action_ledger, product_role, skills
 
 
 class EngineLifecycleMixin:
@@ -729,6 +729,7 @@ class EngineLifecycleMixin:
                 self._system_prompt_language = current_language_name(self.tab_id)
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
+                    product_role.role_clause(),  # opt-in: CAROLINE_PRODUCT_ROLE_FILE, set only by a host of one product (app/product_role.py)
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
                     instruction_memory_system_prompt_clause(self.workspace_dir),
                     working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
