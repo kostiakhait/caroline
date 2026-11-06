@@ -1076,6 +1076,16 @@ def render_level_text(msg: dict[str, Any], level: str, room: dict[str, Any], ori
 
 # --- inbound ---------------------------------------------------------------------------------------------------------
 
+def _expected_text(task_type: str) -> str:
+    """What the sender expects to be true when the task is done, from the task's own catalog entry (its `when`): the
+    checks of the turn read it as part of the request (live, 2026-11-06: rendering the file of a docx was refused as
+    "not required", though the task is to create a docx)."""
+    spec = reply_spec(task_type)
+    parts = [spec.get("description") or ""] + [r["when"] for r in spec.get("replies") or [] if r.get("when")]
+    parts = [p.rstrip(". ") + "." for p in parts if p]
+    return ("What the task is, and what the sender expects when it is done: " + " ".join(parts) + "\n") if parts else ""
+
+
 def requester_words(msg: dict[str, Any]) -> str:
     """What the sender of this message asked, without our instructions around it: the formalizer and every check of the
     turn read this, the model gets render_task_text (2026-11-02: the whole template was formalized, and "hand the task
@@ -1092,8 +1102,14 @@ def requester_words(msg: dict[str, Any]) -> str:
         # The person's own words, as for a chat message: the checks must not take the bus fields for the request.
         return str(payload.get("text") or payload.get("original_text") or "")
     fields = {k: v for k, v in payload.items() if k != "type"}
+    # The sender waits for the answer on the bus: delivering it (or saying the task cannot be done) is part of what was
+    # asked, so the turn's scope check does not take the delivery for something nobody requested (live, 2026-11-06:
+    # a document creator did the work and was then refused the publish of its result, 4 of 5 tasks).
     return (f'{env.get("senderUid") or "an agent"} sent the task {payload.get("type", "")} over the Agent Bus, with:\n'
-            f"{json.dumps(fields, ensure_ascii=False, indent=2)}")
+            f"{json.dumps(fields, ensure_ascii=False, indent=2)}\n"
+            f"{_expected_text(payload.get('type') or '')}"
+            "The sender waits for the answer over the Agent Bus: delivering the result, or reporting that the task cannot "
+            "be done, is part of the task.")
 
 
 def render_bus_catalog(agents: list[dict[str, Any]]) -> str:

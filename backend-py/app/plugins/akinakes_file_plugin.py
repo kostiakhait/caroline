@@ -40,7 +40,8 @@ PLUGIN = None if not _base() or (os.environ.get("AGENT_ROLE") or "").strip() != 
     always_loaded=True,
     tools=[
         _tool("document_render_file", "Renders the document as a file of the format (docx, xlsx or pdf) and stores it as the "
-              "document's file. Call it after the document's sections are in place.",
+              "document's file. Only for docx, xlsx and pdf (a markdown, html, json or text document has no separate file). "
+              "Call it after the document's sections are in place.",
               {"doc_id": {"type": "string"}, "format": {"type": "string", "enum": list(FORMATS)}}, ["doc_id", "format"],
               document_render_file),
     ],

@@ -775,3 +775,11 @@ def test_relay_text_shows_no_internal_ids_and_does_not_repeat_the_room():
     assert "CHAIN-9" not in text and "ROOM-1" not in text and "result.level_done" not in text
     assert "Objective set." in text
     assert "chat_history first" in text and "post nothing" in text
+
+
+def test_the_requester_words_say_what_the_sender_expects(monkeypatch):
+    spec = {"task.make_thing": {"description": "Make a thing", "replies": [{"payload_type": "result.thing", "when": "the thing exists and has a file"}]}}
+    monkeypatch.setattr(ch, "load_reply_specs", lambda: spec)
+    words = ch.requester_words(task("c1", "task.make_thing"))
+    assert "Make a thing. the thing exists and has a file." in words and "waits for the answer" in words
+    assert "What the task is" not in ch.requester_words(task("c1", "task.unknown_thing"))
