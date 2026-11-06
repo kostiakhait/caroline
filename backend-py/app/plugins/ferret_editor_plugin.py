@@ -76,6 +76,23 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
      "them. -> state queued|starting|running|done|error|cancelled, seconds, usd (what it costs), outputs, log tail.",
      {"id": "string?", "out": "string?"}),
     ("gpu_cancel", "Cancel a GPU job. {id}", {"id": "string"}),
+    # Unreal Engine through the importer app on the person's own computer (PLAN-PLAYER 10.7.1)
+    ("ue_places", "The person's importer apps (the Ferret UE importer/exporter on their computers): bridge id, computer, online or not, "
+     "busy, the installed UE versions and the UE projects found there (path, engine version, maps). If none is online, tell the person to "
+     "install it from the editor's menu UE > Download the UE importer/exporter and sign in.", {}),
+    ("ue_import", "Import a map of a UE project on the person's computer as a new level of the open project (geometry with baked materials, "
+     "environment, collision, physics, landscape). {project: the .uproject path as ue_places gives it, map: '/Game/...', level?: the new "
+     "level's name (default the map's name), what?: parts besides geometry (environment, collision, physics, landscape; default all), "
+     "bridge?: when several apps are online}. Waits up to ~3 minutes; a longer job answers with its id for ue_status. The level's files "
+     "come into levels/<level>/.",
+     {"project": "string", "map": "string", "level": "string?", "what": "string[]?", "bridge": "string?"}),
+    ("ue_export", "Export a level of the open project into a UE project on the person's computer as a new map (models and textures "
+     "imported by Interchange, a PlayerStart per spawn). {level, project: the .uproject path as ue_places gives it, map?: "
+     "'/Game/...' (default /Game/Ferret/<level>/<level>), bridge?}. Waits up to ~3 minutes, then answers with the id for ue_status.",
+     {"level": "string", "project": "string", "map": "string?", "bridge": "string?"}),
+    ("ue_status", "UE jobs started from this editor: {id?} one job (a finished import brings its level into the project), or all. -> state "
+     "queued|running|done|error|cancelled, progress, result.", {"id": "string?"}),
+    ("ue_cancel", "Stop a UE job. {id}", {"id": "string"}),
 ]
 
 _waiting: dict[str, asyncio.Future] = {}
