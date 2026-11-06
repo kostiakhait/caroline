@@ -97,5 +97,16 @@
   },
   "chat.message": {
     "chat": true
+  },
+  "event.document_changed": {
+    "description": "The synopses of a changed document are out of date (the maintainer gives itself this task when the Document Service events about the document have settled).",
+    "replies": [
+      {
+        "payload_type": "event.doc_metadata_updated",
+        "required": ["doc_id"],
+        "when": "the synopses of the document's sections and of the document are up to date"
+      }
+    ],
+    "silent_blocked": true
   }
 }

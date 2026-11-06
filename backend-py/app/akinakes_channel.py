@@ -32,6 +32,7 @@ from uuid import uuid4
 
 import httpx
 
+from app import akinakes_maintainer
 from app.logging_setup import log_event
 from app.task_supervisor import supervise
 
@@ -69,6 +70,9 @@ class ChannelConfig:
     # The secretary of a level, "project" or "bureau" (see the "level secretary" section below).
     # AKINAKES_LEVEL_SECRETARY; empty for every other role.
     level: str = ""
+    # Event types this role takes as work (AGENT_SUBSCRIBES, comma separated). Every other role ignores events. Only the
+    # document maintainer uses it (akinakes_maintainer.py): the Document Service events become one turn per document.
+    subscribes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -128,6 +132,7 @@ def load_config() -> ChannelConfig | None:
         orchestrator=(os.environ.get("AKINAKES_CHAT_ORCHESTRATOR") or "").strip().lower() in ("1", "true", "yes"),
         accepts=[t.strip() for t in (os.environ.get("AGENT_ACCEPTS") or "").split(",") if t.strip()],
         level=_level_from_env(),
+        subscribes=[t.strip() for t in (os.environ.get("AGENT_SUBSCRIBES") or "").split(",") if t.strip()],
     )
 
 
@@ -396,6 +401,11 @@ async def publish_blocked(chain_id: str, reason: str) -> dict[str, Any]:
         return {"messageId": None}
     if spec.get("chat"):
         return await publish_pass(chain_id)
+    if spec.get("silent_blocked"):
+        # Work taken from an event: nobody asked, so nobody is told that it could not be done.
+        _answered.add(chain_id)
+        log_event("plugin:akinakes-channel", "blocked_not_published", chain_id=chain_id, reason=reason[:200])
+        return {"messageId": None}
     blocked = spec.get("blocked") or {}
     if blocked.get("payload_type"):
         reply = make_reply(original, _config.agent_uid, blocked["payload_type"], to_sender_if_unrouted=bool(_config.level),
@@ -795,6 +805,7 @@ async def on_turn_end(chain_id: str) -> None:
         except Exception as exc:  # noqa: BLE001
             status.last_error = str(exc)
             log_event("plugin:akinakes-channel", "blocked_publish_failed", chain_id=chain_id, error=str(exc))
+    akinakes_maintainer.turn_ended(chain_id)
     _pending.pop(chain_id, None)
     _answered.discard(chain_id)
     _relay_keys.discard(chain_id)
@@ -1076,6 +1087,38 @@ def render_level_text(msg: dict[str, Any], level: str, room: dict[str, Any], ori
 
 # --- inbound ---------------------------------------------------------------------------------------------------------
 
+# The task the document maintainer gives itself when Document Service events about a document have settled
+# (akinakes_maintainer.py); the reply spec of this type says what it answers.
+DOCUMENT_CHANGED = "event.document_changed"
+
+
+def render_maintenance_words(payload: dict[str, Any]) -> str:
+    return (f"The document {payload.get('doc_id', '')} was changed. Keep its synopses current: a short synopsis on every "
+            "section that has content, a roll-up of the children's synopses on every parent section, and one for the "
+            "whole document. Writing them with the maintainer tools is the task; publishing that the metadata is updated "
+            "is part of it.")
+
+
+def render_maintenance_text(chain_id: str, payload: dict[str, Any]) -> str:
+    doc_id = payload.get("doc_id", "")
+    return (
+        f'[Document maintenance. chainId="{chain_id}" document="{doc_id}".\n'
+        "The document was changed. Its synopses may be out of date. Do this with your tools:\n"
+        "1. maintainer_pending shows what is out of date: leaves_to_write (each with its content), parents_to_roll_up "
+        "(deepest first, each with its children's synopses) and whether the document's synopsis is needed.\n"
+        "2. For each leaf write a synopsis of 1-2 sentences in the language of its content, from that content only "
+        "(maintainer_set_section_synopsis). Then call maintainer_pending again: parents whose children are all done are listed.\n"
+        "3. For each parent write a 1-2 sentence summary of its children's synopses (maintainer_set_section_synopsis), "
+        "deepest first. Repeat steps 2-3 until no parent is listed.\n"
+        "4. When the document's synopsis is needed, write 2-3 sentences from the top-level synopses "
+        "(maintainer_set_document_synopsis).\n"
+        "A synopsis is the text only, no quotes or labels, and says only what the content says. When maintainer_pending "
+        "lists nothing, finish by calling akinakes_publish_result with payload_type=\"event.doc_metadata_updated\" and "
+        f"fields doc_id=\"{doc_id}\". If a section cannot be read or stored, report it with akinakes_report_blocked. "
+        "Nobody reads this conversation.]"
+    )
+
+
 def _expected_text(task_type: str) -> str:
     """What the sender expects to be true when the task is done, from the task's own catalog entry (its `when`): the
     checks of the turn read it as part of the request (live, 2026-11-06: rendering the file of a docx was refused as
@@ -1101,6 +1144,8 @@ def requester_words(msg: dict[str, Any]) -> str:
     if payload.get("type") == LEVEL_REQUEST:
         # The person's own words, as for a chat message: the checks must not take the bus fields for the request.
         return str(payload.get("text") or payload.get("original_text") or "")
+    if payload.get("type") == DOCUMENT_CHANGED:
+        return render_maintenance_words(payload)
     fields = {k: v for k, v in payload.items() if k != "type"}
     # The sender waits for the answer on the bus: delivering it (or saying the task cannot be done) is part of what was
     # asked, so the turn's scope check does not take the delivery for something nobody requested (live, 2026-11-06:
@@ -1129,6 +1174,8 @@ def render_task_text(msg: dict[str, Any], bus_catalog: str = "") -> str:
     env = msg["envelope"]
     payload = msg.get("payload") or {}
     task_type = payload.get("type", "")
+    if task_type == DOCUMENT_CHANGED:
+        return render_maintenance_text(env["chainId"], payload)
     if reply_spec(task_type).get("chat") and _config is not None and _config.orchestrator:
         return (
             f'{payload.get("sender_uid", "")} wrote in the chat room {payload.get("room_id", "")}:\n'
@@ -1242,6 +1289,11 @@ async def _poll_forever(client: httpx.AsyncClient, config: ChannelConfig, inject
                     continue
                 if config.level and _level_intake(msg, msg_type, chain_id, config, inject, before_task):
                     continue
+                if msg_type in config.subscribes:
+                    doc_id = akinakes_maintainer.event_doc_id(msg)
+                    if doc_id:
+                        akinakes_maintainer.note_event(doc_id)
+                    continue
                 # A role takes tasks, queries and chat messages. Results and events broadcast on the bus are not work for it
                 # (without this, a writer answered another agent's result.section_draft with a second one).
                 if not config.orchestrator and not msg_type.startswith(("task.", "query.", "chat.")):
@@ -1312,6 +1364,24 @@ def start_akinakes_channel(inject: InjectFn, before_task: BeforeTaskFn | None = 
     status.configured = True
     global _inject
     _inject = inject
+
+    async def _start_maintenance(doc_id: str) -> str | None:
+        msg = make_message(sender_uid="documentService", payload_type=DOCUMENT_CHANGED,
+                           chain_id=f"maintain-{doc_id}-{uuid4().hex[:8]}", doc_id=doc_id)
+        chain_id = msg["envelope"]["chainId"]
+        _pending[chain_id] = msg
+        _answered.discard(chain_id)
+        if before_task is not None:
+            try:
+                await before_task()
+            except Exception as exc:  # noqa: BLE001
+                log_event("plugin:akinakes-channel", "before_task_failed", error=str(exc))
+        log_event("plugin:akinakes-channel", "task_received", chain_id=chain_id, task_type=DOCUMENT_CHANGED)
+        inject(chain_id, render_task_text(msg), requester_words(msg))
+        return chain_id
+
+    if config.subscribes:
+        akinakes_maintainer.configure(_start_maintenance)
     log_event("plugin:akinakes-channel", "starting", uid=config.agent_uid, role=config.role, bus=config.bus_url)
     client = _http
 
