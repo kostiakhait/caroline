@@ -67,6 +67,18 @@ def _config_overrides() -> list[str]:
         return []
 
 
+# Opt-in (the Ferret editor host sets CAROLINE_NO_NATIVE_TOOLS=1; nothing sets it on any other platform): Codex runs with its built-in shell, browser and agent tools off,
+# so it has only the tools Caroline hands it (the plugins that are loaded). Kept apart from _config_overrides(): these must not count as a sign-in.
+_NATIVE_TOOL_OFF = [
+    "features.shell_tool=false", "features.unified_exec=false", "features.multi_agent=false", "features.apps=false", "features.image_generation=false",
+    "features.view_image=false", "features.computer_use=false", "features.browser_use=false", "features.in_app_browser=false", "web_search=\"disabled\"",
+]
+
+
+def _native_tool_overrides() -> list[str]:
+    return list(_NATIVE_TOOL_OFF) if os.environ.get("CAROLINE_NO_NATIVE_TOOLS") == "1" else []
+
+
 def has_chatgpt_or_device_login(workspace_dir: str) -> bool:
     """The shared ~/.codex already has credentials -- from `codex login` run
     directly, the ChatGPT desktop app, or a prior Caroline ChatGPT/device
@@ -153,7 +165,7 @@ def build_codex_options(
     home = codex_home_dir(workspace_dir)
     os.makedirs(home, exist_ok=True)
     extra_env: dict[str, str] = {}
-    config_overrides = _config_overrides()
+    config_overrides = [*_config_overrides(), *_native_tool_overrides()]
     if resolve_openai_source(workspace_dir) == "key":
         key = get_own_openai_api_key(workspace_dir)
         if key:

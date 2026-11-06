@@ -74,3 +74,14 @@ def test_an_error_from_the_page_is_an_error_result(monkeypatch):
             session_context._current_send.reset(token)
     out = asyncio.run(run())
     assert out["is_error"] and "outside the project" in out["text"]
+
+
+def test_codex_native_tools_are_off_only_when_the_host_asks(monkeypatch):
+    from app import openai_mode
+    monkeypatch.delenv("CAROLINE_NO_NATIVE_TOOLS", raising=False)
+    assert openai_mode._native_tool_overrides() == []
+    monkeypatch.setenv("CAROLINE_NO_NATIVE_TOOLS", "1")
+    off = openai_mode._native_tool_overrides()
+    assert "features.shell_tool=false" in off and "features.browser_use=false" in off
+    # they are not a sign-in: has_chatgpt_or_device_login looks at _config_overrides() only
+    assert openai_mode._config_overrides() == []
