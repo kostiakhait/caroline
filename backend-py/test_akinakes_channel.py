@@ -783,3 +783,14 @@ def test_the_requester_words_say_what_the_sender_expects(monkeypatch):
     words = ch.requester_words(task("c1", "task.make_thing"))
     assert "Make a thing. the thing exists and has a file." in words and "waits for the answer" in words
     assert "What the task is" not in ch.requester_words(task("c1", "task.unknown_thing"))
+
+
+def test_the_memory_queries_are_answered_with_the_old_agents_result_types():
+    recall = ch.reply_spec("query.memory_recall")
+    assert [r["payload_type"] for r in recall["replies"]] == ["result.memory_recall"]
+    assert recall["echo"] == ["request_uid", "scope_level"] and "query" in recall["fields"]
+    ch._check_schema("result.memory_recall", recall["replies"][0]["schema"], {"results": [], "sufficient": False})
+    with pytest.raises(ValueError):
+        ch._check_schema("result.memory_recall", recall["replies"][0]["schema"], {"results": ["bare text"], "sufficient": True})
+    remember = ch.reply_spec("query.memory_remember")
+    assert [r["payload_type"] for r in remember["replies"]] == ["result.memory_remember"] and remember["echo"] == ["request_uid"]

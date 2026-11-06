@@ -108,5 +108,55 @@
       }
     ],
     "silent_blocked": true
+  },
+  "query.memory_recall": {
+    "description": "Searches the organization's memory for what is known about the query and returns the findings.",
+    "fields": {
+      "query": "what to look for, in the sender's words",
+      "caller_email": "whose memory it is (the person or agent asking)",
+      "scope_level": "1 the agent's own, 2 its project, 3 or 4 the whole workspace (default 4)",
+      "top_k": "how many findings at most (default 5)",
+      "request_uid": "the sender's id of this request, echoed in the reply"
+    },
+    "replies": [
+      {
+        "payload_type": "result.memory_recall",
+        "required": ["results", "sufficient"],
+        "when": "the search is done, also when nothing was found (then results is an empty list and sufficient is false)",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "results": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}, "synopsis": {"type": "string"}},
+                "required": ["synopsis"]
+              }
+            },
+            "sufficient": {"type": "boolean"}
+          },
+          "required": ["results", "sufficient"]
+        }
+      }
+    ],
+    "echo": ["request_uid", "scope_level"]
+  },
+  "query.memory_remember": {
+    "description": "Keeps a piece of information in the organization's memory for the caller.",
+    "fields": {
+      "content": "what to remember, in full sentences",
+      "caller_email": "whose memory it is (the person or agent asking)",
+      "tags": "optional list of tags",
+      "request_uid": "the sender's id of this request, echoed in the reply"
+    },
+    "replies": [
+      {
+        "payload_type": "result.memory_remember",
+        "required": ["saved"],
+        "when": "the information is handed to the memory (saved is true)"
+      }
+    ],
+    "echo": ["request_uid"]
   }
 }
