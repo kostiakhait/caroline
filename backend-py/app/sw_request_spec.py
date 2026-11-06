@@ -53,6 +53,62 @@ FIELDS = (
 )
 
 
+# Seen live 2026-11-06 (Ferret editor, SW engine on its cheapest rung): asked "Замени шарик кубиком", the formalizer's
+# answer became a task that was its own instruction ("reply with one JSON object ... content, report, deliverable"), and
+# the turn answered with that JSON without touching the project. Two guards, both for every platform: the task is
+# thrown away when it is that, and a reply of that shape is never a finished answer.
+_PROMPT_MARKERS = (
+    "a program parses your reply",
+    "reply with one json object",
+    "below is a request a user gave their ai assistant",
+    "conversation before the request",
+    "reply with: {",
+)
+_SPEC_KEYS = ("requester", "goal", "actions", "targets", "content", "outgoing", "report", "dates", "deliverable", "constraints")
+
+
+def looks_like_formalizer_output(text: str) -> bool:
+    """True for the formalizer's own instruction or a JSON object of its fields (content/report/deliverable ...)."""
+    import json
+    import re
+
+    body = (text or "").strip()
+    if not body:
+        return False
+    low = body.lower()
+    if any(marker in low for marker in _PROMPT_MARKERS):
+        return True
+    fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", body, re.DOTALL)
+    candidate = fenced.group(1) if fenced else body
+    if candidate.startswith("{"):
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and len(data) >= 2 and set(data) <= set(_SPEC_KEYS):
+            return True
+        if data is None and sum(f'"{key}"' in candidate for key in _SPEC_KEYS) >= 3:
+            return True
+    return False
+
+
+def _stems(text: str) -> set[str]:
+    import re
+
+    return {w[:5] for w in re.findall(r"\w+", (text or "").lower()) if len(w) >= 4}
+
+
+def spec_problem(request: str, text: str) -> str | None:
+    """Why the formalized task cannot be used as the task, or None. A task that is the formalizer's own instruction,
+    asks for a JSON of its fields, or shares no word with the request has lost the person's request."""
+    if looks_like_formalizer_output(text) or any(m in text.lower() for m in _PROMPT_MARKERS) or "deliverable" in text.lower() and "json" in text.lower():
+        return "is the formalizer's own instruction or a JSON of its fields"
+    wanted = _stems(request)
+    if wanted and not (wanted & _stems(text)):
+        return "has lost the request's words"
+    return None
+
+
 def _render(spec: dict[str, Any]) -> str:
     lines = []
     for key, label in FIELDS:
@@ -113,6 +169,10 @@ async def formalize(request: str, recent_dialogue_lines: list[str], tab_id: str 
                   ms=int((time.monotonic() - started) * 1000))
         return None
     text = _render(merge(*answers))
+    problem = spec_problem(request, text) if text else None
+    if problem:
+        log_event("engine", "sw_request_spec_thrown_away", tab_id=tab_id, problem=problem, spec=text[:600])
+        return None
     log_event("engine", "sw_request_spec", tab_id=tab_id, ok=bool(text), ms=int((time.monotonic() - started) * 1000),
               parts_failed=[n for n, a in zip(names, answers) if a is None], spec=text[:1500])
     return text or None

@@ -2189,7 +2189,10 @@ def _strip_verdict_preface(verified: str, candidate: str) -> str:
 
 
 def _usable(text: str) -> bool:
-    return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
+    from app.sw_request_spec import looks_like_formalizer_output
+
+    return (bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
+            and not looks_like_formalizer_output(text))
 
 
 VERIFIER_OK = "OK"

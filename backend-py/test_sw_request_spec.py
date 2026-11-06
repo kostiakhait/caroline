@@ -66,6 +66,25 @@ def test_the_parts_merge_into_the_old_task_text():
     assert rs._render(rs.merge(None, None, None)) == ""
 
 
+def test_a_task_that_is_the_formalizers_own_instruction_is_thrown_away():
+    # Live 2026-11-06: "Замени шарик кубиком" came back as the formalizer's instruction and the turn answered with JSON.
+    junk = "- Goal: Reply with one JSON object and nothing else, with content, report, deliverable"
+    assert rs.spec_problem("Замени шарик кубиком", junk)
+    assert rs.spec_problem("Замени шарик кубиком", "- Goal: Photosynthesis in plants")  # lost the request
+    assert rs.spec_problem("Замени шарик кубиком", "- Goal: заменить шарик на кубик") is None
+
+
+def test_a_reply_of_the_formalizers_shape_is_not_a_finished_answer():
+    from app import small_model_engine as engine
+
+    assert rs.looks_like_formalizer_output('{"content": "cube", "report": "done", "deliverable": "a cube"}')
+    assert rs.looks_like_formalizer_output('```json\n{"content": "x", "report": "y", "deliverable": "z"}\n```')
+    assert not rs.looks_like_formalizer_output('{"name": "ball", "radius": 1}')
+    assert not rs.looks_like_formalizer_output("Готово: шарик заменён кубиком.")
+    assert not engine._usable('{"content": "cube", "report": "done", "deliverable": "a cube"}')
+    assert engine._usable("Готово: шарик заменён кубиком.")
+
+
 class FakeRuntime:
     def __init__(self, answers):
         self.answers = answers
