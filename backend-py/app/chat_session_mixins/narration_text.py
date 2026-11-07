@@ -259,8 +259,14 @@ class TextNarrationMixin:
         # recover from, not this cosmetic narrator's.
         activity = self._narration_action_facts()
         if activity is None:
-            log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
-            return
+            # Per explicit instruction (2026-11-07): "the narrator must ALWAYS give a remark at least once a minute; facts
+            # always exist -- the model is doing something, at the very least still the same as before, or 'working it
+            # out'". No tool call is not "no fact": the fact is that she is still on the request without a result yet.
+            # Stated plainly so the narrator neither invents progress nor goes quiet.
+            activity = "No tool has been called in this task yet; she is still working the request out (thinking it through, nothing found or done yet)."
+            if self.turn_narration_remarks:
+                activity += f" Your previous remark was: {self.turn_narration_remarks[-1][:200]} If nothing has changed since, say that she is still busy with the same thing."
+            log_event("engine", "progress_narration_no_tool_facts", tab_id=self.tab_id)
         # Ported from a teammate's branch (807b3ea): how long this request has
         # been running is a real fact too ("this one is taking a while"), but
         # kept OUT of `activity` itself (which staleness/other checks compare
