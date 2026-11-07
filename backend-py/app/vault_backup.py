@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from app import skill_import
+from app import reminder_tombstones, skill_import
 from app.logging_setup import log_event
 
 VAULT_FOLDER = os.environ.get("CAROLINE_SETTINGS_VAULT_FOLDER", "Caroline:Vault")
@@ -298,7 +298,8 @@ async def restore_missing(workspace_dir: str) -> dict[str, Any]:
             path = Path(workspace_dir) / "schedule.json"
             local = _read_json(path)
             local = local if isinstance(local, list) else []
-            known = {r.get("id") for r in local if isinstance(r, dict)}
+            # A cancelled reminder is absent locally too -- it must not come back from the cloud copy.
+            known = {r.get("id") for r in local if isinstance(r, dict)} | reminder_tombstones.cancelled_ids(workspace_dir)
             added = [r for r in remote if isinstance(r, dict) and r.get("id") and r["id"] not in known]
             if added:
                 _write_json_atomic(path, local + added)

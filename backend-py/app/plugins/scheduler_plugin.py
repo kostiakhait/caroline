@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from app.event_memory import forget_event_by_reminder_id, remember_event
 from app.logging_setup import log_event
+from app.reminder_tombstones import mark_cancelled
 from app.plugins.loader import Plugin, PluginTool
 from app.policies import follow_explicit_parameters_instruction
 from app.session_context import get_tab_id
@@ -322,6 +323,8 @@ async def list_reminders(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 async def cancel_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     before = _load_reminders()
     after = [r for r in before if r.get("id") != args["id"]]
+    # Recorded even when the id is not in the file: the cloud copy may still hold it (see reminder_tombstones.py).
+    mark_cancelled(WORKSPACE_DIR, args["id"])
     _save_reminders(after)
     removed = len(after) < len(before)
     if removed:

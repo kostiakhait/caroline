@@ -152,3 +152,18 @@ def test_hostile_names_in_notes_never_write_outside_the_workspace(tmp_path, note
     notes.blobs.update({"x": b"1", "y": b"2"})
     assert run(vb.restore_missing(str(ws)))["restored"] == []
     assert not (tmp_path / "evil").exists() and not list(tmp_path.rglob("x"))
+
+
+def test_a_cancelled_reminder_is_not_brought_back_by_restore(tmp_path, notes):
+    from app.reminder_tombstones import mark_cancelled
+
+    old = tmp_path / "old"
+    old.mkdir()
+    seed(old)
+    run(vb.backup_now(str(old)))  # the cloud copy still holds r1
+    here = tmp_path / "here"
+    here.mkdir()
+    (here / "schedule.json").write_text(json.dumps([{"id": "r9", "note": "kept"}]), encoding="utf-8")
+    mark_cancelled(str(here), "r1")  # what cancel_reminder does
+    run(vb.restore_missing(str(here)))
+    assert [r["id"] for r in json.loads((here / "schedule.json").read_text(encoding="utf-8"))] == ["r9"]
