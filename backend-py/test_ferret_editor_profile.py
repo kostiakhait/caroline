@@ -101,3 +101,55 @@ def test_product_role_only_when_the_host_gives_it(monkeypatch, tmp_path):
     assert "game designer" in product_role.role_clause() and "not an assistant" in product_role.role_clause()
     sw = small_model_engine._persona_system_message(p)
     assert "game designer" in sw and "personal assistant" not in sw
+
+
+def test_a_file_the_person_sent_reaches_the_page_as_bytes(monkeypatch, tmp_path):
+    """uploads_list names what the chat's paperclip saved; project_import_upload sends one to the page as base64 for project_write_binary."""
+    import base64
+    mod = _reload_plugin(monkeypatch, True)
+    from app import session_context, workspace_dir
+    monkeypatch.setattr(workspace_dir, "WORKSPACE_DIR", str(tmp_path))
+    up = tmp_path / "uploads"
+    up.mkdir()
+    blob = bytes(range(256)) * 4
+    stored = "0a1b2c3d-0000-4000-8000-000000000001-ship.glb"
+    (up / stored).write_bytes(blob)
+    (tmp_path / "secret.txt").write_text("not an upload")
+    sent = []
+
+    async def send(frame):
+        sent.append(frame)
+        mod.resolve(frame["id"], True, {"path": frame["args"]["path"], "bytes": len(base64.b64decode(frame["args"]["dataBase64"]))})
+
+    async def call(name, args):
+        token = session_context.set_send(send)
+        try:
+            return await next(t for t in mod.PLUGIN.tools if t.name == name).handler(args, None)
+        finally:
+            session_context._current_send.reset(token)
+    names = {t.name for t in mod.PLUGIN.tools}
+    assert {"uploads_list", "project_import_upload"} <= names
+
+    listed = asyncio.run(call("uploads_list", {}))
+    assert '"name": "ship.glb"' in listed["text"] and f'"bytes": {len(blob)}' in listed["text"]
+
+    for ref in ("ship.glb", stored, str(up / stored)):                        # by the person's name, the stored name, the path of the note
+        sent.clear()
+        out = asyncio.run(call("project_import_upload", {"upload": ref, "to": "assets/ship.glb"}))
+        assert not out.get("is_error"), out
+        assert sent[0]["name"] == "project_write_binary" and sent[0]["args"]["path"] == "assets/ship.glb"
+        assert base64.b64decode(sent[0]["args"]["dataBase64"]) == blob
+    sent.clear()
+    asyncio.run(call("project_import_upload", {"upload": "ship.glb", "to": "levels/a/"}))      # a folder: the file keeps its name
+    assert sent[0]["args"]["path"] == "levels/a/ship.glb"
+    sent.clear()
+    asyncio.run(call("project_import_upload", {"upload": "ship.glb"}))                        # no path: the project's root
+    assert sent[0]["args"]["path"] == "ship.glb"
+
+    # nothing outside uploads/ can be sent, and a missing file is an error that names what there is
+    sent.clear()
+    for bad in (str(tmp_path / "secret.txt"), "../secret.txt", "nothing.glb", ""):
+        out = asyncio.run(call("project_import_upload", {"upload": bad, "to": "x.bin"}))
+        assert out["is_error"], bad
+    assert not sent
+    assert "ship.glb" in asyncio.run(call("project_import_upload", {"upload": "nothing.glb"}))["text"]

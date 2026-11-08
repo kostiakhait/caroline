@@ -9,6 +9,10 @@ server, so a call crosses to the page: the handler sends the frame {"type": "fer
 WebSocket and waits; the page answers with the control op `ferret_tool_result` {requestId, ok, result | error}, which main.py hands
 to resolve() below. Nothing else of the page is reachable from here, and nothing outside the project is reachable from the page.
 
+Files the person sends from their own computer (the paperclip of her chat) are saved by the backend in its workspace, `uploads/`; two tools of her
+own (not relayed: the bytes are here) bring them into the project: uploads_list names them, project_import_upload sends one to the page, which writes it
+into the project as a file (project_write_binary on the page's side).
+
 The tool table is the one of the plan: project files (list, read, search, write, edit, delete, move), the Ferret API (docs, check,
 build), the viewer (restart, travel to a level, the engine's commands, its log, a picture) and the GPU jobs. Skills are not here:
 Caroline's own skills plugin gives them (use_skill, read_skill_file) from the release's folder (CAROLINE_SKILL_DIRS).
@@ -17,9 +21,12 @@ Caroline's own skills plugin gives them (use_skill, read_skill_file) from the re
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 from app.logging_setup import log_event
@@ -144,9 +151,82 @@ def _tool(name: str, description: str, fields: dict[str, str]) -> PluginTool:
     return PluginTool(name=name, description=description, input_schema=_schema(fields), handler=handler)
 
 
+# ---- the person's files: what the paperclip of the chat saved on this server -> the project ------------------------------------------------------
+MAX_IMPORT_BYTES = 25 * 1024 * 1024         # the chat takes files up to 20 MB
+_UPLOAD_PREFIX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-")
+
+
+def _uploads_dir() -> Path:
+    from app import workspace_dir          # read when called: the workspace is the backend's own (CAROLINE_WORKSPACE_DIR)
+    return Path(workspace_dir.WORKSPACE_DIR) / "uploads"
+
+
+def _uploaded() -> list[Path]:
+    """The saved files, the newest first."""
+    d = _uploads_dir()
+    files = [f for f in d.iterdir() if f.is_file()] if d.is_dir() else []
+    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def _find_upload(ref: str) -> Path:
+    """`ref`: the path the chat's note gave, the stored name, or the name the person's file had (the newest with that name)."""
+    root = _uploads_dir().resolve()
+    files = _uploaded()
+    if not ref or not ref.strip():
+        raise ValueError("name the file: its name as uploads_list gives it, or the path from the note of the attachment")
+    ref = ref.strip()
+    p = Path(ref)
+    if p.is_absolute():
+        r = p.resolve()
+        if r.parent == root and r.is_file():
+            return r
+        raise ValueError(f"\"{ref}\" is not one of the files the person sent (uploads_list names them)")
+    for f in files:
+        if f.name == ref:
+            return f
+    for f in files:
+        if _UPLOAD_PREFIX.sub("", f.name) == ref:
+            return f
+    raise ValueError(f"no file \"{ref}\" among the files the person sent: " + (", ".join(_UPLOAD_PREFIX.sub("", f.name) for f in files[:20]) or "none yet"))
+
+
+async def _uploads_list(_args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
+    rows = [{"name": _UPLOAD_PREFIX.sub("", f.name), "file": f.name, "bytes": f.stat().st_size,
+             "sent": __import__("datetime").datetime.fromtimestamp(f.stat().st_mtime).isoformat(timespec="seconds")} for f in _uploaded()[:100]]
+    return {"text": json.dumps({"files": rows}, ensure_ascii=False)}
+
+
+async def _project_import_upload(args: dict[str, Any], _report_progress: Any) -> dict[str, Any]:
+    to = args.get("to")
+    try:
+        src = _find_upload(str(args.get("upload") or ""))
+        size = src.stat().st_size
+        if size > MAX_IMPORT_BYTES:
+            raise ValueError(f"{_UPLOAD_PREFIX.sub('', src.name)} is {size} bytes: more than {MAX_IMPORT_BYTES} can be brought into the project")
+        if not to or str(to).endswith("/"):                                      # no path, or a folder: the file keeps the name the person's computer gave it
+            to = str(to or "") + _UPLOAD_PREFIX.sub("", src.name)
+        data = base64.b64encode(src.read_bytes()).decode("ascii")
+    except (ValueError, OSError) as exc:
+        return {"text": f"project_import_upload: {exc}", "is_error": True}
+    out = await _call_page("project_write_binary", {"path": to, "dataBase64": data})
+    if not out.get("is_error"):
+        out["text"] = out["text"][:2000]
+    return out
+
+
+_LOCAL = [
+    PluginTool(name="uploads_list", description="The files the person sent from their own computer with the paperclip of the chat (newest first): name, bytes, when. "
+               "Images and PDFs you were also shown in the chat; any other kind (a model, a texture, an archive) reaches the project only through project_import_upload.",
+               input_schema=_schema({}), handler=_uploads_list),
+    PluginTool(name="project_import_upload", description="Put a file the person sent (uploads_list) into the project as it is, bytes and all: {upload, to?}. "
+               "`upload` is its name as uploads_list gives it (or the path from the note of the attachment); `to` the project path (default: the file's own name in the "
+               "project's root; a path ending in / is a folder such as assets/ or levels/<name>/, the file keeps its name there). Replaces a file of that name. Up to 25 MB.",
+               input_schema=_schema({"upload": "string", "to": "string?"}), handler=_project_import_upload),
+]
+
 PLUGIN = Plugin(
     name="ferret-editor",
     description="The open Ferret project in the browser editor: its files, check and build, the viewer, GPU jobs",
     always_loaded=True,
-    tools=[_tool(*row) for row in _TABLE],
+    tools=[_tool(*row) for row in _TABLE] + _LOCAL,
 ) if ENABLED else None
