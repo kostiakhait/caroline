@@ -457,8 +457,8 @@ class PermissionGuardMixin:
 
     async def _check_file_transfer(self, tool_name: str, args: dict[str, Any]) -> str | None:
         """Registered with session_context's register_file_transfer_guard; awaited by
-        dispatch() before a tool call that sends a local file off the machine or writes
-        a received one. turn.file.transfer decides per file, from app/file_facts.py's
+        dispatch() before a tool call that sends a local file off the machine (saving a
+        received file is not checked, owner's rule 2026-11-10). turn.file.transfer decides per file, from app/file_facts.py's
         facts about the path, who started this turn and the conversation (2026-10-22,
         replacing a static deny/allow list). Fail-open like _check_action_before_send:
         an agent that could not run lets the call through, logged."""

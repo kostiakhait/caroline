@@ -299,7 +299,7 @@ async def dispatch(
         if send_blocked_reason:
             log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved_send", tool=tool_name, reason=send_blocked_reason)
             return {"operation_id": "", "status": "error", "error": f"Blocked: {send_blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}
-    # A local file leaving the machine, or a received one being written (2026-10-22):
+    # A local file leaving the machine (2026-10-22; saving received files is not checked, 2026-11-10):
     # the session's turn.file.transfer microagent decides, from what is known about
     # the path (app/file_facts.py) and the conversation.
     if file_transfers_in(tool_name, args):

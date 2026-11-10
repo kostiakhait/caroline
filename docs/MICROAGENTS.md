@@ -52,7 +52,7 @@ See `permission_guard.py` for a compact example (schema, prompt, verify, `llm_ag
 | `turn.permission.guard` | `permission_guard.py` | Whether the user's OK is on record for what is about to happen |
 | `action.sanction` | `action_sanction.py` | After each real user message: did it grant or revoke approval of an open action |
 | `turn.action.summary` | `action_summary.py` | One-sentence description of a send-type call |
-| `turn.file.transfer` | `file_transfer.py` | Whether a local file may leave the machine / a received file may be written somewhere |
+| `turn.file.transfer` | `file_transfer.py` | Whether a local file may leave the machine (only whether the owner wants it sent, never its contents; received files are not checked) |
 | `reply.review` + `reply.review.check` | `reply_review.py`, `reply_review_check.py` | Outbound text on-topic, free of internal plumbing, human-sounding; rewritten when not; the checker sanitizes the rewrite |
 | `reply.translate` | `reply_translate.py` | Translation to the conversation language, preserving deliberate quotes |
 | `turn.refusal.guard` | `refusal_guard.py` | Whether the assistant quietly declined a real task |
