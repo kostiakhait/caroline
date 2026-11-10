@@ -62,26 +62,30 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("viewer_log", "The log under the viewer: build and game errors and messages. {n?} the last n lines (default 60).", {"n": "number?"}),
     ("viewer_screenshot", "A picture of the running game: -> the image", {"width": "number?", "height": "number?"}),
     ("gpu_render_page", "Render a page of the project in a browser with a GPU (WebGL, WebGPU, video) and bring back pictures or a video. "
+     "WHERE IT RUNS (all three gpu_ tools): on the Ferret companion app on the person's own computer when it is online (free, their GPU); with no app the tool does NOT start "
+     "a machine: it answers state 'needs-companion' with a download link, and you offer the person the app (see the answer's `next`); only if they decline do you call again with where:'cloud' "
+     "(the paid GPU machine). Never start the cloud by yourself and never say why a job failed beyond what the answer's `error`/`log` say. "
      "{dir?, entry?, width?, height?, seconds?, fps?, format?, out?}: `dir` is the folder holding the page (default the whole project), "
      "`entry` its HTML file (default index.html); format 'png' (one picture after `seconds`, default) or 'mp4' (a recording of `seconds` "
-     "at `fps`); results go to `out` (default renders/). Waits up to ~3 minutes, then answers with the job id for gpu_status.",
+     "at `fps`); results go to `out` (default renders/); `where`: auto (default) | companion | cloud. Waits up to ~3 minutes, then answers with the job id for gpu_status.",
      {"dir": "string?", "entry": "string?", "width": "number?", "height": "number?", "seconds": "number?", "fps": "number?",
-      "format": "string?", "out": "string?"}),
+      "format": "string?", "out": "string?", "where": "string?"}),
     ("gpu_video", "Make or convert a video on the GPU (ffmpeg with the hardware encoder). {inputs?: [project paths], images?: "
      "'frames/f_%04d.png' (a numbered picture sequence from the project), output: 'name.mp4', fps?, video?: {codec: "
      "h264|h265|av1|vp9|gif|copy, quality?, scale?: 'WxH', start?, duration?}, audio?: {codec: aac|opus|mp3|copy|none, kbps?}, out?}. "
-     "The output goes to `out` (default renders/).",
-     {"inputs": "string[]?", "images": "string?", "output": "string", "fps": "number?", "video": "object?", "audio": "object?", "out": "string?"}),
+     "The output goes to `out` (default renders/); `where` as for gpu_render_page.",
+     {"inputs": "string[]?", "images": "string?", "output": "string", "fps": "number?", "video": "object?", "audio": "object?", "out": "string?", "where": "string?"}),
     ("gpu_blender", "Run Blender in the background on the GPU (Cycles/OptiX). {blend?: path of a .blend in the project, script?: path of "
      "a Python script in the project, include?: [extra project paths: textures, models], frame? or range?: [first, last] to render, "
      "engine?: CYCLES|BLENDER_EEVEE_NEXT|BLENDER_WORKBENCH, format?: PNG|JPEG|OPEN_EXR, device?: OPTIX|CUDA|CPU, out?}. A script writes "
      "its files into the folder `out/` (relative path) to get them back, e.g. a glTF export: "
-     "bpy.ops.export_scene.gltf(filepath='out/model.glb'). Results go to `out` (default renders/).",
+     "bpy.ops.export_scene.gltf(filepath='out/model.glb'). Results go to `out` (default renders/); `where` as for gpu_render_page.",
      {"blend": "string?", "script": "string?", "include": "string[]?", "frame": "number?", "range": "number[]?", "engine": "string?",
-      "format": "string?", "device": "string?", "out": "string?"}),
-    ("gpu_status", "GPU jobs of this person: {id?} one job (and, when it is done, its outputs are brought into the project), or all of "
-     "them. -> state queued|starting|running|done|error|cancelled, seconds, usd (what it costs), outputs, log tail.",
+      "format": "string?", "device": "string?", "out": "string?", "where": "string?"}),
+    ("gpu_status", "GPU jobs of this person (on the companion app or the cloud machine): {id?} one job (and, when it is done, its outputs are brought into the project), or all of "
+     "them. -> where, state queued|starting|running|done|error|cancelled, seconds, usd (the cloud's cost), outputs, error and log tail as the machine gave them.",
      {"id": "string?", "out": "string?"}),
+    ("gpu_install", "Install on the person's computer what the companion app lacks for GPU jobs: {tool: ffmpeg | blender}. ONLY after the person said yes to a question you asked when a gpu_ tool answered state 'needs-install' (it names the tool, its size and where it is downloaded from); never before, never on your own. Waits up to ~3 minutes, then answers with an id for gpu_status. After it, ask for the job again.", {"tool": "string"}),
     ("gpu_cancel", "Cancel a GPU job. {id}", {"id": "string"}),
     # Unreal Engine through the importer app on the person's own computer (PLAN-PLAYER 10.7.1)
     ("ue_places", "The person's importer apps (the Ferret UE importer/exporter on their computers): bridge id, computer, online or not, "

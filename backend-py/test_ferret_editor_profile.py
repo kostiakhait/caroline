@@ -35,6 +35,9 @@ def test_editor_profile_is_exactly_skills_and_ferret_tools(monkeypatch):
     assert {"use_skill", "read_skill_file"} <= tools and "import_skill" not in tools
     assert "project_write" in tools and "viewer_screenshot" in tools and "gpu_blender" in tools and "gpu_cancel" in tools
     assert {"ue_places", "ue_import", "ue_export", "ue_status", "ue_cancel"} <= tools  # PLAN-PLAYER 10.7.1
+    assert "gpu_install" in tools
+    for t in (t for p in plugins for t in p.tools if t.name in ("gpu_render_page", "gpu_video", "gpu_blender")):
+        assert "where" in t.input_schema                        # companion app first, the cloud machine only when asked (gpu-tools.js)
     assert not any(("mail" in t or "telegram" in t or "message" in t or "calendar" in t or "doc" in t.replace("api_docs", "")) for t in tools)
 
 
