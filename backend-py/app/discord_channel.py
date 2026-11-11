@@ -116,7 +116,8 @@ async def _run_client(workspace_dir: str, inject_proactive: Callable[[str], None
 def start_discord_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> asyncio.Task[None]:
     async def _loop() -> None:
         while True:
-            linked = has_discord_token(workspace_dir)
+            # DPAPI decrypt + mkdir + file reads: off the event loop thread (a slow disk froze the loop, 2026-11-10)
+            linked = await asyncio.to_thread(has_discord_token, workspace_dir)
             _status.linked = linked
             if not linked:
                 await asyncio.sleep(30)

@@ -308,6 +308,7 @@ public partial class App : System.Windows.Application
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
         {
             Logger.Log($"UNHANDLED (non-UI thread, terminating={args.IsTerminating}): {args.ExceptionObject}");
+            Logger.Flush(); // the crash line must be on disk before the process dies (Log only queues)
         };
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {

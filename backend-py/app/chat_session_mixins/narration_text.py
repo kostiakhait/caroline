@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
@@ -323,6 +324,11 @@ class TextNarrationMixin:
             if comment:
                 break
             log_event("engine", "progress_narration_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
+            # Confirmed live (2026-11-10): the four attempts used to fire within ~30 ms of each other, so a server
+            # answering 502/504 (SquirrelWisdom ai:resolve) burnt all of them at once and the remark was lost. A pause
+            # that grows with the attempt gives the server time to come back; the stale check then ends the wait early.
+            if attempt < NARRATION_GENERATION_RETRY_ATTEMPTS:
+                await asyncio.sleep(min(1.5 * attempt, 4.0))
         stale = _stale()
         if stale:
             log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, had_comment=bool(comment))

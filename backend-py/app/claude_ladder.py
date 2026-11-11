@@ -62,7 +62,7 @@ class LadderTurn:
 
     def observe(self, wire: dict[str, Any]) -> None:
         """Records the real tool calls and their results of this rung, for the verifier."""
-        content = (wire.get("message") or {}).get("content")
+        content = _wire_content(wire)
         if not isinstance(content, list) or wire.get("parent_tool_use_id"):
             return
         if wire.get("type") == "assistant":
@@ -107,8 +107,14 @@ def may_descend(cache_cold: bool, real_user: bool, raised_calls: int) -> bool:
     return cache_cold or (real_user and raised_calls >= DESCEND_MIN_CALLS)
 
 
+def _wire_content(wire: dict[str, Any]) -> Any:
+    """The content of a wire message; `message` may be a plain string (a user note), then there are no blocks."""
+    message = wire.get("message")
+    return message.get("content") if isinstance(message, dict) else None
+
+
 def visible_text(wire: dict[str, Any]) -> str:
-    content = (wire.get("message") or {}).get("content")
+    content = _wire_content(wire)
     if not isinstance(content, list):
         return ""
     return "\n".join(

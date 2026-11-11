@@ -16,6 +16,7 @@ ChatSession's own reset-unrecoverable-session path).
 from __future__ import annotations
 
 import json
+import time
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -537,7 +538,26 @@ def has_chat_mode(workspace_dir: str, tab_id: str) -> bool:
     return _chat_mode_path(workspace_dir, tab_id).exists()
 
 
+# Redesign (2026-11-10): the hang/compaction/narration checks of EVERY tab call this every few seconds from the
+# asyncio loop thread, and each call was an exists() + read_text() on the disk. The loop-stall sampler caught the loop
+# standing in exactly these calls. The mode only changes through save_chat_mode (same process), so the answer is
+# kept in memory; the short TTL only covers a file edited by hand.
+_CHAT_MODE_TTL_S = 20.0
+_chat_mode_cache: dict[tuple[str, str], tuple[float, str]] = {}
+
+
 def load_chat_mode(workspace_dir: str, tab_id: str) -> str:
+    key = (str(workspace_dir), tab_id)
+    hit = _chat_mode_cache.get(key)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _CHAT_MODE_TTL_S:
+        return hit[1]
+    mode = _read_chat_mode(workspace_dir, tab_id)
+    _chat_mode_cache[key] = (now, mode)
+    return mode
+
+
+def _read_chat_mode(workspace_dir: str, tab_id: str) -> str:
     path = _chat_mode_path(workspace_dir, tab_id)
     if not path.exists():
         return "claude"
@@ -555,6 +575,7 @@ def save_chat_mode(workspace_dir: str, tab_id: str, mode: str) -> None:
         path = _chat_mode_path(workspace_dir, tab_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"mode": mode}, indent=2) + "\n", encoding="utf-8")
+        _chat_mode_cache[(str(workspace_dir), tab_id)] = (time.monotonic(), mode)
     except Exception as exc:
         log_event("engine", "save_chat_mode_failed", tab_id=tab_id, error=str(exc))
 

@@ -1041,7 +1041,25 @@ def _last_language_path(tab_id: str) -> Path:
     return Path(WORKSPACE_DIR) / f"last-language-{_sanitize_tab_id(tab_id)}.json"
 
 
+# Redesign (2026-11-10): the narrator and other ticks ask for the tab's language every few seconds on the loop thread
+# (a file read, and without a persisted language a read of the dialogue as well). Kept in memory for a short while;
+# _save_persisted_language refreshes it.
+_LANGUAGE_TTL_S = 15.0
+_language_cache: dict[str, tuple[float, str | None]] = {}
+_language_guess_cache: dict[str, tuple[float, str]] = {}
+
+
 def _load_persisted_language(tab_id: str) -> str | None:
+    hit = _language_cache.get(tab_id)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S:
+        return hit[1]
+    lang = _read_persisted_language(tab_id)
+    _language_cache[tab_id] = (now, lang)
+    return lang
+
+
+def _read_persisted_language(tab_id: str) -> str | None:
     try:
         data = json.loads(_last_language_path(tab_id).read_text(encoding="utf-8"))
         lang = data.get("lang")
@@ -1053,6 +1071,7 @@ def _load_persisted_language(tab_id: str) -> str | None:
 def _save_persisted_language(tab_id: str, lang: str) -> None:
     try:
         _last_language_path(tab_id).write_text(json.dumps({"lang": lang}, indent=2) + "\n", encoding="utf-8")
+        _language_cache[tab_id] = (time.monotonic(), lang.strip() or None)
     except Exception as exc:
         log_event("engine", "save_persisted_language_failed", tab_id=tab_id, error=str(exc))
 
@@ -1516,7 +1535,16 @@ def current_language_name(tab_id: str) -> str:
     rather than porting that same bug first. Per-tab (2026-09-10 fix, see
     _last_language_path's own docstring) -- one tab's language never
     leaks into another's."""
-    return _load_persisted_language(tab_id) or _language_from_recent_user_messages(tab_id) or "English"
+    persisted = _load_persisted_language(tab_id)
+    if persisted:
+        return persisted
+    hit = _language_guess_cache.get(tab_id)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S:
+        return hit[1]
+    guess = _language_from_recent_user_messages(tab_id) or "English"
+    _language_guess_cache[tab_id] = (now, guess)
+    return guess
 
 
 def _language_from_recent_user_messages(tab_id: str) -> str | None:
