@@ -102,6 +102,17 @@ async def email_list_messages_batch(args: dict[str, Any], _rp: Any) -> dict[str,
     return {"text": f"{summary}\n{total_messages} message(s) total.\n\n" + json.dumps(report, indent=2, ensure_ascii=False)}
 
 
+def _parse_message_text(text: str) -> dict[str, Any]:
+    """email_get_message's text is the message JSON, optionally followed by a plain-text note (what Caroline
+    herself wrote to this sender, from the action log). json.loads on the whole string died with "Extra data"
+    on every message that had such a note, failing the whole range read (confirmed live, 2026-11-13)."""
+    message, end = json.JSONDecoder().raw_decode(text)
+    note = text[end:].strip()
+    if note and isinstance(message, dict):
+        message["action_log_note"] = note
+    return message
+
+
 def _message_label(item: dict[str, Any]) -> str:
     return f'{item.get("address", "?")} {item.get("folder", "?")}:{item.get("uid", "?")}'
 
@@ -168,14 +179,14 @@ async def email_read_range(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         outcomes.extend(chunk_outcomes)
         for outcome in chunk_outcomes:
             if outcome["ok"]:
-                body = json.loads(outcome["result"]["text"])
+                body = _parse_message_text(outcome["result"]["text"])
                 body_chars_so_far += len(body.get("text") or "") + len(body.get("html") or "")
 
     messages: list[dict[str, Any]] = []
     errors: list[str] = []
     for outcome in outcomes:
         if outcome["ok"]:
-            messages.append(json.loads(outcome["result"]["text"]))
+            messages.append(_parse_message_text(outcome["result"]["text"]))
         else:
             errors.append(f'{outcome["label"]}: {outcome["error"]}')
     messages.sort(key=lambda m: int(m["uid"]), reverse=True)
