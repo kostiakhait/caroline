@@ -392,6 +392,27 @@ async def translate_text(
     return translated
 
 
+# A remark opening with an answer ("Да, ...", "Yes, ...", "Подтверждаю") or an order in the "ты" form
+# ("отправляй", "send it") speaks FOR the user or TO someone -- never what Caroline reports about her own work.
+_USER_VOICE_OPENER = re.compile(
+    r"^\W*(?:да|нет|ага|угу|ок|окей|хорошо|согласн\w*|подтвержда\w*|конечно|yes|yeah|yep|no|nope|ok|okay|sure|agreed|confirmed?)\b"
+    r"|^\W*(?:отправляй|отправь|пиши|напиши|делай|сделай|шли|пошли|отвечай|ответь|давай|send|go ahead|do it|reply)\b",
+    re.IGNORECASE,
+)
+
+
+def _answers_for_the_user(original: str, revised: str) -> bool:
+    """True when `revised` is a reply of the user's (or an order) put in place of Caroline's own text:
+    it opens like an answer/command the original did not, or the original asked the user something
+    ('?' or an ask-the-user phrase) and the revision no longer asks anything."""
+    revised = revised.strip()
+    if revised == original.strip() or revised == "[[NO_UPDATE]]":
+        return False
+    if _USER_VOICE_OPENER.search(revised) and not _USER_VOICE_OPENER.search(original.strip()):
+        return True
+    return bool(_ASKS_USER.search(original)) and not _ASKS_USER.search(revised) and len(revised) < len(original) // 4
+
+
 async def review_reply(text: str, task: str, session: str | None = None, timeout: float = 15.0) -> str | None:
     """Per explicit instruction (2026-10-11): every piece of outbound text
     (a progress-narration remark or a real final reply) must be checked for
@@ -435,6 +456,13 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
         log_event("plugin:voice", "review_reply_failed", reason="empty")
         return None
     revised = output["text"]
+    # Deterministic backstop (2026-11-13), confirmed live: a 1653-char reply with a drafted email and the question
+    # "send it?" came back as "Да, отправляй ответ как написано." -- the user's answer, in the user's voice, shown as
+    # Caroline's own message. The prompt forbids it and the reviewer's own check passed it, so no model is trusted
+    # with this: a revision that answers or commands where the original asked is thrown away.
+    if _answers_for_the_user(text, revised):
+        log_event("plugin:voice", "review_reply_rejected_answers_for_user", original=text[:300], revised=revised[:300])
+        return text
     # The reviewer's own sanitizer (2026-10-24): a revision that says something the
     # original did not is thrown away -- the user sees Caroline's own text instead of
     # words the reviewer made up. Nothing to check when the text is unchanged or the
@@ -2081,7 +2109,7 @@ async def generate_progress_comment(
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300])
         return None
-    if _ASKS_USER.search(text):
+    if _ASKS_USER.search(text) or _USER_VOICE_OPENER.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_asks_user", text=text[:300])
         return None
     if already_said and any(_is_repeat(text, prev) for prev in already_said):
@@ -2180,7 +2208,7 @@ async def generate_progress_comment_direct(
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300], direct=True)
         return ""
-    if _ASKS_USER.search(text):
+    if _ASKS_USER.search(text) or _USER_VOICE_OPENER.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_asks_user", text=text[:300], direct=True)
         return ""
     if _states_figure_as_settled(text, activity, task):
