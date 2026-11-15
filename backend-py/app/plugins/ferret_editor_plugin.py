@@ -44,6 +44,8 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("project_list", "List the files of the open project with their sizes. {dir?} limits to a folder.", {"dir": "string?"}),
     ("project_read", "Read a text file of the project. {path, from?, to?} (1-based line numbers, inclusive). Binary files give only their size.",
      {"path": "string", "from": "number?", "to": "number?"}),
+    ("project_view_image", "LOOK at a picture file of the project (a render, a texture, a reference photo): -> the image itself. {path}. Large pictures are shrunk to fit. "
+     "Reading a picture as text shows nothing; this is the way to see it.", {"path": "string"}),
     ("project_search", "Search the text files of the project. {query, regex?, dir?} -> up to 100 matching lines with path and line number.",
      {"query": "string", "regex": "boolean?", "dir": "string?"}),
     ("project_write", "Create a file or replace it whole. {path, content}.", {"path": "string", "content": "string"}),
@@ -58,7 +60,9 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
      {"levels": "string[]"}),
     ("viewer_restart", "Rebuild the project and restart the game in the viewer; waits until it runs or fails. -> {ok, level, errors}", {}),
     ("viewer_level", "Travel the viewer to a level of the project. {level}", {"level": "string"}),
-    ("viewer_command", "Run one of the running game's engine commands. {name, args?}; 'commands.list' lists them all.",
+    ("viewer_command", "Run one of the running game's engine commands. {name, args?}; 'help' lists them all. To TEST the game, play it: input.actions (what is bound), "
+     "input.hold {actions:[{action, down?, x?, y?}], seconds} (press the game's own actions for some game seconds), scene.entities / scene.node (positions and rotations before and after), "
+     "camera.view {name: front|back|left|right|top|iso|fit} (look from other sides, then viewer_screenshot).",
      {"name": "string", "args": "object?"}),
     ("viewer_log", "The log under the viewer: build and game errors and messages. {n?} the last n lines (default 60).", {"n": "number?"}),
     ("viewer_screenshot", "A picture of the running game: -> the image", {"width": "number?", "height": "number?"}),
@@ -67,7 +71,7 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
      "a machine: it answers state 'needs-companion' with a download link, and you offer the person the app (see the answer's `next`); only if they decline do you call again with where:'cloud' "
      "(the paid GPU machine). Never start the cloud by yourself and never say why a job failed beyond what the answer's `error`/`log` say. "
      "{dir?, entry?, width?, height?, seconds?, fps?, format?, out?}: `dir` is the folder holding the page (default the whole project), "
-     "`entry` its HTML file (default index.html); format 'png' (one picture after `seconds`, default) or 'mp4' (a recording of `seconds` "
+     "`entry` its HTML file (default index.html); format 'png' (one picture after `seconds`, default; the answer then CONTAINS the picture and a `picture` verdict: EMPTY means the page drew nothing, see `pageProblems`) or 'mp4' (a recording of `seconds` "
      "at `fps`); results go to `out` (default renders/); `where`: auto (default) | companion | cloud. Waits up to ~3 minutes, then answers with the job id for gpu_status.",
      {"dir": "string?", "entry": "string?", "width": "number?", "height": "number?", "seconds": "number?", "fps": "number?",
       "format": "string?", "out": "string?", "where": "string?"}),
