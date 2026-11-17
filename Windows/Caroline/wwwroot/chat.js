@@ -494,9 +494,13 @@
     } catch (err) { console.error("[caroline] loadAttachmentBlob failed (ignored):", err); return null; }
   }
 
+  // Per explicit instruction (2026-11-17): a "[System note: ...]" is Caroline's own service text to the model (the watchdog's interrupt note, a
+  // recovery or engine-switch note) and must NEVER be shown as a bubble, live or replayed, whatever path brought it (the marker the server
+  // puts on such turns can be lost on the way). Structural: the text opens with it, after the optional "[Sent: ...]" stamp.
+  const SYSTEM_NOTE_RE = /^\s*(?:\[Sent:[^\]]*\]\s*)?\[System note:/i;
   function isLeakedInternalText(text) {
     return typeof text === "string" && (
-      text.includes("[[NO_UPDATE]]") || text.includes("PreCompact callback") || text.includes("[[caroline-internal-turn]]")
+      text.includes("[[NO_UPDATE]]") || text.includes("PreCompact callback") || text.includes("[[caroline-internal-turn]]") || SYSTEM_NOTE_RE.test(text)
     );
   }
 
@@ -1028,6 +1032,8 @@
   }
 
   function addBubble(role, text, attachments, opts) {
+    // service text is never a bubble, from whichever path it comes (see SYSTEM_NOTE_RE); a detached node keeps the callers working
+    if (role === "user" && isLeakedInternalText(text)) return document.createElement("div");
     const ts = (opts && opts.ts) || Date.now();
     if (!opts || opts.persist !== false) saveTranscriptEntry(role, text, attachments, ts);
     const dateLabel = dateSeparatorLabelIfNeeded(ts);

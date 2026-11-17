@@ -116,6 +116,9 @@ def _extract_text_and_attachments(content: Any) -> tuple[str, list[dict[str, str
     return "\n\n".join(text_parts), attachments
 
 
+_SYSTEM_NOTE_TEXT = re.compile(r"^\s*(?:\[Sent:[^\]]*\]\s*)?\[System note:", re.IGNORECASE)
+
+
 def _is_internal_block(b: Any) -> bool:
     return isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str) and SYNTHETIC_TURN_MARKER.strip("⁣") in b["text"]
 
@@ -244,6 +247,10 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
                 # dropped per sub-message, so a real message merged behind it still survives.
                 # Substring, since the "[Sent: ...]" stamp block comes before the marked text.
                 if obj.get("type") == "user" and SYNTHETIC_TURN_MARKER.strip("⁣") in text:
+                    continue
+                # Per explicit instruction (2026-11-17): a "[System note: ...]" is Caroline's service text, never the user's words, even when the
+                # marker above did not survive the way to the transcript (the stamp block comes first).
+                if obj.get("type") == "user" and _SYSTEM_NOTE_TEXT.match(text):
                     continue
                 # Bug fix (2026-09-09): this rebuild path is entirely
                 # separate from the live sdk_message stream's own
