@@ -188,3 +188,18 @@ def test_the_prompt_block_stays_short_and_points_to_the_rest(tmp_path):
         al.append(ws, "1", "email_send" if i % 2 else "telegram_send_message", {"to": f"p{i}@x.org", "subject": f"S{i}", "text": "t" * 400})
     clause = al.system_prompt_clause(ws)
     assert clause.count("\n- ") == 5 and "Sent folder" in clause and len(clause) < 2500
+
+
+def test_a_delivery_complaint_must_quote_the_message_itself():
+    message = "Ответ Peacock я не писала. Если нужен, покажу черновик от вашего имени."
+    bad = {"complete": False, "missing": "the draft text for Peacock", "pointer": "Вот черновик ответа"}
+    assert delivery_completeness.verify_completeness({"final_text": message}, bad) is not None
+    assert delivery_completeness.verify_completeness({"final_text": message}, {**bad, "pointer": ""}) is not None
+    good = {"complete": False, "missing": "no draft follows", "pointer": "покажу черновик"}
+    assert delivery_completeness.verify_completeness({"final_text": message}, good) is None
+    assert delivery_completeness.verify_completeness({"final_text": message}, {"complete": True, "missing": "", "pointer": ""}) is None
+
+
+def test_the_completeness_prompt_calls_an_offer_and_a_confirmation_no_failure():
+    prompt = delivery_completeness.prompt_completeness({"final_text": "x", "recent_dialogue": "y"}, None)
+    assert "OFFER" in prompt and "confirmed, approved or sent" in prompt and '"pointer"' in prompt

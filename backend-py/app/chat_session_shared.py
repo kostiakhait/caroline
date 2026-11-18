@@ -703,18 +703,30 @@ FALLBACK_COMPACTION_THRESHOLD_TOKENS = FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD
 # Own choice, not a specified value.
 AUTH_RETRY_ESCALATION_THRESHOLD = 3
 
+# Rewritten 2026-11-17 (explicit instruction): this note is a state check of ONE thing, the user's latest request to DO
+# something, never "go and finish whatever looks open". Only an active, unblocked request is continued -- to the very end;
+# a request waiting for the owner or blocked outside her reach, a question, a note to remember and a discussion are
+# not unfinished work. Before this, the note made her answer old reports with drafts nobody had asked for.
 CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
-    "Check whether you actually finished what you were doing -- having called a tool is not the same thing as "
-    "the work being done; a tool call only counts once you've checked its real result and confirmed it matches "
-    "what was actually asked for, not just that the call was made. In particular: if your last reply described "
-    "a plan (\"I'll do X, then Y\", \"let me go through them\", anything framed as about to happen) without you "
-    "actually carrying every step of it out to the end in that same reply, the task is NOT done and the work is "
-    "NOT finished, no matter how complete or confident that reply sounded -- continue it now, for real, using "
-    "your tools, rather than repeating or restating the plan. If anything else is unfinished, unverified, or "
-    "was left as a placeholder/stub rather than the real thing, continue that too. If everything genuinely is "
-    "finished and verified, do nothing and reply with exactly [[NO_UPDATE]], with no explanation. Reply in "
-    "{language}."
+    "State check. Look only at the user's latest request to DO something (an action or a piece of work) "
+    "that they have not withdrawn, replaced or already had done. Old reports, earlier open items, "
+    "reminders, and anything you noticed yourself are NOT that request. Which case is it?\n"
+    "1. The request is active and NOT blocked, but not finished: your last reply described a plan (\"I'll "
+    "do X, then Y\", \"let me go through them\") without carrying every step out, or a tool call was made "
+    "and its real result was never checked against what was asked, or something was left as a placeholder "
+    "or stub. Continue it now, for real, with your tools, to the very end in this reply; do not restate "
+    "the plan, and do not stop halfway. Do only what that request asked, nothing added.\n"
+    "2. The request is waiting for the owner: a draft or a question was shown and awaits their word, or a "
+    "fact, choice, approval or credential only they can give is missing. Or it is blocked outside your "
+    "reach: a usage cap, a tool or service that is down. That is NOT unfinished work. Do not continue it, "
+    "do not guess the missing piece, do not do what the answer would have authorized (nothing is sent, no "
+    "draft is made for someone who did not ask for one), and do not repeat the question or the report. "
+    "Reply with exactly [[NO_UPDATE]].\n"
+    "3. The request is finished and checked, or there is no such request (the last thing was only a "
+    "question, a note to remember, or a discussion): reply with exactly [[NO_UPDATE]].\n"
+    "In the [[NO_UPDATE]] cases give no explanation. Reply in {language}."
 )
+
 
 # Per explicit instruction (2026-09-22), after a real incident: on the OpenAI
 # engine specifically -- confirmed live, and specifically NOT observed on

@@ -1851,7 +1851,11 @@ _CLAUDE_ATTEMPT_QUESTION_RULE = (
     "files and tools could not (after they were tried); a choice that really depends on the user's preference; a "
     "permission only the user can give. Do not escalate such a reply -- a stronger model would only ask the same "
     "thing. Escalate a question only when the assistant could have found the answer or done the step itself with "
-    "its tools and did not try."
+    "its tools and did not try. Likewise a request that only asked a question, to remember something, or to talk "
+    "something over is finished once answered, saved or discussed in words: a reply that does no further work "
+    "is OK, and a reply that does MORE than was asked (sends or drafts a message nobody asked for, takes up other "
+    "tasks) is not. A task that is blocked outside the assistant's reach (a service down, a usage cap) and says so "
+    "plainly is OK as it stands too."
 )
 
 

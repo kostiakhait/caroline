@@ -27,8 +27,29 @@ MAX_BLOCK_CHARS = 6000
 BLOCK_HEADER = "[Memory look-up done for this message"
 
 
-async def _decide(message: str, dialogue: list[str], tab_id: str | None) -> tuple[bool, list[str], str]:
-    """(memory needed, queries, why). The advisor failing means: needed, the message itself as the query."""
+# What a message that is not an order to act on must NOT turn into (2026-11-17, explicit instruction: Caroline "works
+# badly when she is not asked to do anything right now -- only to answer or to remember": she wrote drafts to people,
+# started agents and took up old items). One block per message, glued by the code, so no engine has to remember it.
+KIND_BLOCKS = {
+    "answer": "the user asks only a question. Answer it in words.",
+    "remember": "the user tells you something to keep (a fact, a preference, a rule, a correction). Save it with save_info "
+                "and confirm in one short line.",
+    "discuss": "the user is thinking aloud or working something out with you. Talk it through; make no move yet.",
+}
+KIND_RULES = (" Do exactly that and nothing else: do not send or write to anyone, do not prepare or show a draft nobody asked "
+              "for, do not start agents or other work, and do not take up earlier open items, reports or reminders as if "
+              "they were this request. If you notice something else that may need doing, say so in one line and wait for "
+              "the user's word. If the user's next message is a command, then act.]")
+
+
+def kind_block(kind: str) -> str:
+    text = KIND_BLOCKS.get(kind)
+    return f"[Request kind: {text}{KIND_RULES}" if text else ""
+
+
+async def _decide(message: str, dialogue: list[str], tab_id: str | None) -> tuple[bool, list[str], str, str]:
+    """(memory needed, queries, why, request kind). The advisor failing means: needed, the message itself as the query,
+    kind "do" (no restriction is added when the kind is unknown)."""
     from app.microagents.sw_memory_need import MEMORY_NEED
     from app.plugins.voice_api import _run_local_microagent
 
@@ -40,11 +61,12 @@ async def _decide(message: str, dialogue: list[str], tab_id: str | None) -> tupl
     output = (result or {}).get("output") if (result or {}).get("status") == "ok" else None
     if not isinstance(output, dict) or not isinstance(output.get("needs_memory"), bool):
         log_event("engine", "memory_advisor_undecided", tab_id=tab_id, error=(result or {}).get("error"))
-        return True, [message[:200]], "the advisor could not decide"
+        return True, [message[:200]], "the advisor could not decide", "do"
     queries = [q.strip() for q in output.get("queries") or [] if isinstance(q, str) and q.strip()]
     if output["needs_memory"] and not queries:
         queries = [message[:200]]
-    return output["needs_memory"], queries, str(output.get("why") or "")
+    kind = output.get("request_kind")
+    return output["needs_memory"], queries, str(output.get("why") or ""), kind if isinstance(kind, str) else "do"
 
 
 async def _search(query: str) -> str | None:
@@ -83,12 +105,16 @@ async def memory_block(message: str, dialogue: list[str] | None = None, tab_id: 
 
 async def _block(message: str, dialogue: list[str], tab_id: str | None) -> str:
     started = time.monotonic()
-    needed, queries, why = await _decide(message, dialogue, tab_id)
+    decided = await _decide(message, dialogue, tab_id)
+    needed, queries, why = decided[:3]
+    kind_text = kind_block(decided[3] if len(decided) > 3 else "do")
+    if kind_text:
+        log_event("engine", "request_kind_restricted", tab_id=tab_id, kind=decided[3])
     log_event("engine", "memory_advisor_decide_timing", tab_id=tab_id, ms=round((time.monotonic() - started) * 1000), needed=needed,
               queries=len(queries), dialogue_lines=len(dialogue), message_chars=len(message))
     if not needed:
         log_event("engine", "memory_advisor_not_needed", tab_id=tab_id, why=why, ms=int((time.monotonic() - started) * 1000))
-        return ""
+        return kind_text
     search_started = time.monotonic()
     replies = await asyncio.gather(*(_search(q) for q in queries))
     found = [(q, r) for q, r in zip(queries, replies) if r]
@@ -96,7 +122,7 @@ async def _block(message: str, dialogue: list[str], tab_id: str | None) -> str:
               answered=len(found), ms=int((time.monotonic() - started) * 1000),
               search_ms=int((time.monotonic() - search_started) * 1000))
     if not found:
-        return ""
+        return kind_text
     parts = [f"{BLOCK_HEADER}: your memory was searched because {why or 'the message may rely on what you already know'}. "
              "This is a hint, not a restriction -- call request_info yourself for anything more.]"]
     budget = MAX_BLOCK_CHARS
@@ -106,4 +132,6 @@ async def _block(message: str, dialogue: list[str], tab_id: str | None) -> str:
         parts.append(f'[Memory, query "{query}": {text}]')
         if budget <= 0:
             break
+    if kind_text:
+        parts.append(kind_text)
     return "\n".join(parts)

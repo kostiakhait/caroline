@@ -53,13 +53,19 @@ _PROMPT = (
     "waiting for your yes\", \"tell me when to send it\") does not claim to show any content right now: it is "
     "complete, even when a draft is being discussed in the dialogue. Flag only a message that points at content "
     "it is presenting in itself (\"below\", \"here is\", \"the text:\" followed by nothing) and does not contain it.\n\n"
+    "NOT a failure, whatever the dialogue says: an OFFER or a condition (\"if you need it, I will show a "
+    "draft\", \"I can prepare it\", \"want me to write it?\"); a report that something was NOT done or NOT sent; "
+    "a correction or an apology; an answer that simply has no draft in it because none was asked for. Whether "
+    "the user has confirmed, approved or sent anything is never a missing piece of the message: the only thing "
+    "that can be missing is content the message itself says it is showing in itself, right now.\n\n"
     "Use RECENT DIALOGUE only for context (what was asked for, what the assistant said earlier it would "
     "show) -- judge completeness against the MESSAGE itself, not against the dialogue's own earlier promises "
     "in isolation.\n\n"
     "If everything the message claims to deliver is actually present, set complete=true and leave missing "
     "empty. If something claimed is genuinely missing, set complete=false and describe in one short, plain "
-    "sentence what is missing (e.g. \"the message says the draft is shown below but no draft text follows\") "
-    "-- this will be used to tell the assistant to actually include it.\n\n"
+    "sentence what is missing (e.g. \"the message says the draft is shown below but no draft text follows\"), "
+    "and in \"pointer\" copy, word for word, the phrase of the MESSAGE that says the content is shown in it. "
+    "Without such a phrase there is no failure: answer complete=true and leave missing and pointer empty.\n\n"
     "RECENT DIALOGUE (oldest first, last line is the newest):\n{recent_dialogue}\n\n"
     "MESSAGE ABOUT TO BE SENT:\n---\n{final_text}\n---\n\n"
     "Reply now."
@@ -75,6 +81,13 @@ def verify_completeness(input: Any, output: Any) -> Optional[str]:
         return '"complete" must be a boolean'
     if not output["complete"] and not (output.get("missing") or "").strip():
         return '"missing" must be a non-empty string when complete is false'
+    if not output["complete"]:
+        # The complaint must rest on the message's own words (2026-11-17: the checker once "found missing" a user's
+        # confirmation, and once took an offer for a promise). A pointer that is not in the message is not a complaint.
+        pointer = " ".join(str(output.get("pointer") or "").split())
+        text = " ".join(str(input.get("final_text") or "").split())
+        if len(pointer) < 4 or pointer.lower() not in text.lower():
+            return '"pointer" must be a phrase copied word for word from the message when complete is false'
     return None
 
 
@@ -87,7 +100,7 @@ def llm_agents() -> List["M.Agent"]:
             "a mere description is detailed enough.",
             input_schema=_object({"recent_dialogue": _STRING, "final_text": _STRING}, required=["final_text"]),
             output_schema=_object(
-                {"complete": {"type": "boolean"}, "missing": _STRING}, required=["complete", "missing"],
+                {"complete": {"type": "boolean"}, "missing": _STRING, "pointer": _STRING}, required=["complete", "missing", "pointer"],
             ),
             build_prompt=prompt_completeness, verify=verify_completeness,
         ),

@@ -424,9 +424,15 @@ class DialogueTranscriptMixin:
             return
         self._last_delivery_correction_at = now
         log_event("engine", "delivery_incomplete", tab_id=self.tab_id, missing=missing)
+        pointer = result.get("pointer") or ""
+        # Rewritten 2026-11-17 (explicit instruction): the note never orders new content. It only repairs a promise the
+        # message itself made, and only when the user asked for that content; it never asks for a new draft or task.
         self.inject_proactive(
-            f"[Internal: the last message you sent did not actually deliver everything it claimed to -- "
-            f"{missing} Please actually include it now.]"
+            f"[Internal: your last message says \"{pointer}\", but the content it points at is not in it -- {missing} "
+            f"If the user asked for that content, give exactly that content now, nothing else. If they did not ask "
+            f"for it, do not write it up: say in one line that you have not shown it, or answer [[NO_UPDATE]] if "
+            f"nothing needs saying. Do not start any other task, do not send anything and do not make a draft for "
+            f"anyone because of this note.]"
         )
     async def _patch_cli_transcript_text(self, replacements: list[tuple[str, str]]) -> None:
         """Rewrites the CLI engine's own just-written transcript entry so its

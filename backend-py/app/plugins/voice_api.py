@@ -1041,7 +1041,7 @@ async def check_delivery_completeness(final_text: str, recent_dialogue: str) -> 
     if not isinstance(output, dict) or not isinstance(output.get("complete"), bool):
         log_event("plugin:voice", "check_delivery_completeness_failed", reason="malformed")
         return None
-    return {"complete": output["complete"], "missing": str(output.get("missing") or "")}
+    return {"complete": output["complete"], "missing": str(output.get("missing") or ""), "pointer": str(output.get("pointer") or "")}
 
 
 async def check_question_already_answered(final_text: str, recent_dialogue: str) -> dict[str, Any] | None:

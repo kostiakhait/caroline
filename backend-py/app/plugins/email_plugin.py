@@ -499,7 +499,18 @@ def _check_sent_mail_too_instruction() -> str:
         "Sent that just hasn't been seen/marked from the other end yet. Don't flag or nudge about something as "
         "needing attention, or re-raise it as unresolved, without first checking whether it was already answered. "
         'This applies per-thread/subject, not as a blanket "read all of Sent every time" -- check Sent for the '
-        "specific thing you're about to flag before flagging it."
+        "specific thing you're about to flag before flagging it.\n"
+        "The Sent folder is not always called \"Sent\": on Gmail it is \"[Gmail]/Sent Mail\" (a search in \"Sent\" "
+        "there finds nothing and proves nothing). Call email_list_folders for the mailbox and use the folder it "
+        "shows as sent mail; if you could not open that folder, say you could not check, never say nothing was "
+        "sent. Search it by the thread's subject (without the Re:/RE: prefix) AND by the other party's address, "
+        "over the whole thread, not only the latest day. A reply the owner sent himself, from a phone or another "
+        "program, is in that folder and not in your own action log.\n"
+        "Before writing who asked or said what in a thread (\"X asked whether...\"), look at the From header "
+        "of the very message you attribute it to. A question the owner put in his own letter is the owner's, even "
+        "when the next message in the thread is from the person he asked. Quote what the other party actually "
+        "wrote; do not fill in what you assume she meant, and do not add emotion or tone (rudeness, urgency) "
+        "that the letter does not contain."
     )
 
 
