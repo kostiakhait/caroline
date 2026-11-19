@@ -335,6 +335,38 @@ _forced_startup_compaction_for_tab: set[str] = set()
 _language_refreshed_for_tab: set[str] = set()
 
 
+REMINDER_DIALOGUE_WINDOW_MINUTES = 24 * 60
+
+
+def _owner_dialogue_for_reminder(real_tab_id: str) -> str:
+    """The owner's dialogue in the tab that scheduled the reminder, last 24 hours, as the window showed it.
+
+    2026-11-19, live: a reminder fires into a FRESH pseudo-session (fresh=True below), whose own dialogue files are
+    empty, so the 18:00 mail report asked again about a court motion the owner had settled at 12:18 ("ничего не
+    делаем") and a LinkedIn contact he had dismissed at 14:04 ("неинтересно, проехали"). lastReport carries only
+    what Caroline said last time, never what the owner answered. Withheld text is left out: the owner never saw it."""
+    from app import dialogue_log
+
+    try:
+        entries = dialogue_log.read_entries(WORKSPACE_DIR, real_tab_id)
+        picked = dialogue_log.select(
+            entries, limit=dialogue_log.MAX_LIMIT, since_minutes=REMINDER_DIALOGUE_WINDOW_MINUTES, include_withheld=False,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the reminder still runs, as before, without it
+        log_event("engine", "reminder_owner_dialogue_failed", tab_id=real_tab_id, error=str(exc)[:200])
+        return ""
+    if not picked:
+        return ""
+    return (
+        "\n\nYour dialogue with the owner in their chat over the last 24 hours (both sides, as the window showed "
+        "it, oldest first). What the owner decided, answered, declined or closed there stands: never ask again "
+        "about a matter he already answered or dismissed, and never put it in the report as something waiting for "
+        "his decision. Mention such a matter only if something actually new about it arrived after his answer, and "
+        "then say what is new. Matters you already reported in this dialogue are not new either, unless they "
+        f"changed:\n---\n{dialogue_log.render(picked)}\n---"
+    )
+
+
 def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     """Ported from server.ts's startDueCheckLoop callback. Reminders are
     Caroline's own proactive behavior (memory backup, checking things), not
@@ -430,8 +462,9 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
         f"since then; check everything fresh, as of now:\n{last_report['text']}"
         if last_report.get("text") else ""
     )
+    owner_dialogue = _owner_dialogue_for_reminder(real_tab_id) if event_type == "user" else ""
     delivered = pseudo.inject_proactive(
-        f"⏰ Reminder due ({when}): {reminder.get('note')}{previous}\n\n{instruction}",
+        f"⏰ Reminder due ({when}): {reminder.get('note')}{previous}{owner_dialogue}\n\n{instruction}",
         suppress_narration=True,
     )
     if delivered:

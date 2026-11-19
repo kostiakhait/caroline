@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any, List, Optional
 
 from app.microagent_client import Microagent as M
+from app.microagents.format_echo import format_echo
 
 REVIEW = "reply.review"
 
@@ -35,6 +36,9 @@ _STRING = {"type": "string"}
 
 def _object(properties: dict, required: Optional[List[str]] = None) -> dict:
     return {"type": "object", "properties": properties, "required": list(properties) if required is None else required}
+
+
+_OUTPUT_SCHEMA = _object({"text": _STRING}, required=["text"])
 
 
 # Evolution-engine genome (2026-10-17): see PermissionGuard.py's own
@@ -126,7 +130,7 @@ def verify_review(input: Any, output: Any) -> Optional[str]:
     text = output.get("text")
     if not isinstance(text, str) or len(text.strip()) < 3:
         return '"text" must be a non-empty string'
-    return None
+    return format_echo(input["text"], text, _OUTPUT_SCHEMA)
 
 
 def llm_agents() -> List[M.Agent]:
@@ -138,7 +142,7 @@ def llm_agents() -> List[M.Agent]:
             "Checks one piece of outbound assistant text for task relevance, absence of internal "
             "implementation details, and human-sounding tone -- rewriting it only if it fails one of those.",
             input_schema=_object({"text": _STRING, "task": _STRING}, required=["text", "task"]),
-            output_schema=_object({"text": _STRING}, required=["text"]),
+            output_schema=_OUTPUT_SCHEMA,
             build_prompt=prompt_review, verify=verify_review,
         ),
     ]
