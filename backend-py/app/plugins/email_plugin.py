@@ -228,6 +228,12 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     # What Caroline herself wrote to this sender / in this thread, from the action log (2026-11-04): by code, at the moment of reading.
     if note := action_ledger.note_for_mail(WORKSPACE_DIR, data.get("from"), data.get("subject")):
         text += "\n\n" + note
+    # Owner's order (2026-11-20): a significant date in a letter becomes a reminder by itself (app/auto_reminders.py).
+    from app import auto_reminders
+    from app.session_context import get_tab_id
+    auto_reminders.consider_in_background(
+        f"Subject: {data.get('subject')}\nFrom: {data.get('from')}\n\n{data.get('body') or data.get('text') or ''}",
+        f"a letter in the mailbox {args.get('address') or ''}", get_tab_id())
     return {"text": text}
 
 

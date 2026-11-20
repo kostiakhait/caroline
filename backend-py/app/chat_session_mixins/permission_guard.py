@@ -439,7 +439,13 @@ class PermissionGuardMixin:
             log_event("engine", "send_policy_no_facts_allowed", tab_id=self.tab_id, tool=tool_name)
             return None
         action = self.action_registry.get(self._action_id_for_pending_send) if self._action_id_for_pending_send else None
-        reason = send_block_reason(facts, approved=bool(action and action.approved))
+        gate_reason, gate_checked = None, False
+        from app.permission_policy import is_own_identity_communication
+        if is_own_identity_communication(facts):
+            gate_reason, gate_checked = await self._final_text_gate(tool_name, args, action.summary if action else summary)
+        reason = send_block_reason(
+            facts, approved=bool(action and action.approved), final_text_reason=gate_reason, final_text_checked=gate_checked,
+        )
         log_event(
             "engine", "send_policy_decided", tab_id=self.tab_id, tool=tool_name,
             action_type=facts.get("action_type"), sender_identity=facts.get("sender_identity"),
@@ -454,6 +460,34 @@ class PermissionGuardMixin:
         if reason:
             self.pending_unapproved_action = reason
         return reason
+
+    async def _final_text_gate(self, tool_name: str, args: dict[str, Any], summary: str | None) -> tuple[str | None, bool]:
+        """The owner's rule (2026-11-20): a send under his own identity needs the FINAL text shown to him and his yes
+        after it (app/own_identity_gate.py). Returns (reason or None, checked). Reads what really reached the window
+        from the exact dialogue record; a yes before the text was shown never counts. Fail-closed: an error means
+        'not checked', which the policy treats as blocked."""
+        from app import dialogue_log, own_identity_gate as gate
+        from app.plugins.voice_api import check_action_sanction
+
+        try:
+            body = gate.body_of(args)
+            # A background session (a sub-agent, a reminder) sends on the strength of what was shown in the owner's tab.
+            entries = dialogue_log.read_entries(self.workspace_dir, self.approval_bridge_tab_id or self.tab_id)
+            shown = gate.shown_entry(entries, body)
+            answers = gate.messages_after(entries, int(shown.get("ms") or 0)) if shown else []
+            approved = False
+            if shown and answers:
+                decisions = await check_action_sanction(
+                    "\n".join(answers[-3:]), [{"id": "draft", "summary": f"Send exactly the text that was just shown: {summary or tool_name}"}],
+                )
+                approved = any(d.get("action_id") == "draft" and d.get("decision") == "approved" for d in (decisions or []))
+            reason = gate.missing_reason(body, shown, answers, approved)
+            log_event("engine", "final_text_gate", tab_id=self.tab_id, tool=tool_name, shown=bool(shown),
+                      answers_after=len(answers), approved=approved, allowed=reason is None)
+            return reason, True
+        except Exception as exc:  # noqa: BLE001 -- fail-closed: unchecked means blocked
+            log_event("engine", "final_text_gate_failed", tab_id=self.tab_id, tool=tool_name, error=str(exc)[:200])
+            return None, False
 
     async def _check_file_transfer(self, tool_name: str, args: dict[str, Any]) -> str | None:
         """Registered with session_context's register_file_transfer_guard; awaited by

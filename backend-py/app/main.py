@@ -449,6 +449,8 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # So check_background_relay_worth (deliver_relayed_reply) can judge the
     # eventual result against what was actually asked, not in isolation.
     pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, reminder.get("note"))
+    if event_type == "user":
+        pseudo_tab.set_pseudo_turn_always_relay(pseudo.tab_id)
     # A firing resumed after a restart (scheduler_plugin.set_reminder_awaiting_retry):
     # its dueAtIso has already moved on to the next time, so it is named by
     # when the usage cap interrupted it instead.
@@ -1341,10 +1343,46 @@ def _inject_from_signal(text: str) -> None:
     _inject_messenger_proactive(text)
 
 
+# A note about a message in Caroline's OWN account (not the owner's) says so in these words (the channels' own text).
+_OWN_ACCOUNT_MARKERS = ("Caroline's own separate", "separate Discord bot account, not the user's")
+OWN_CHAT_INSTRUCTION = (
+    "\n\nThis is Caroline's own chat: answer the correspondent yourself, right now, with the send tool of this account, "
+    "as Caroline. Do not wait for the owner and do not ask him unless the matter truly needs his decision. Then report "
+    "to the owner in ONE short line: who wrote, what about, and what you answered (or what you need from him)."
+)
+
+
+def is_own_account_note(text: str) -> bool:
+    return any(marker in text for marker in _OWN_ACCOUNT_MARKERS)
+
+
+async def _answer_own_chat_in_background(primary: "ChatSession", text: str) -> None:
+    """Owner's order (2026-11-20): a message in Caroline's OWN chats is answered at once, not queued behind whatever the
+    owner's conversation is doing. It runs in a background session of its own (app/pseudo_tab.py); only its one-line
+    report reaches the owner's window. Any failure falls back to the old path (the owner's session)."""
+    import hashlib
+
+    try:
+        pseudo = await pseudo_tab.get_or_create_pseudo_session(
+            primary.tab_id, "ownchat-" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:12], sessions.get)
+        pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, "Answer a message in your own chat, then report to the owner in one line")
+        pseudo_tab.set_pseudo_turn_always_relay(pseudo.tab_id)
+        if pseudo.inject_proactive(text + OWN_CHAT_INSTRUCTION, suppress_narration=True):
+            log_event("engine", "own_chat_background_answer", tab_id=primary.tab_id, pseudo_id=pseudo.tab_id)
+            return
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "own_chat_background_failed", tab_id=primary.tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+    primary.inject_proactive(text)
+
+
 def _inject_messenger_proactive(text: str) -> None:
     primary = primary_session()
-    if primary is not None:
-        primary.inject_proactive(text)
+    if primary is None:
+        return
+    if is_own_account_note(text):
+        asyncio.create_task(_answer_own_chat_in_background(primary, text))
+        return
+    primary.inject_proactive(text)
 
 
 def _ratatosk_stop_session() -> bool:

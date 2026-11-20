@@ -143,12 +143,22 @@ def candidate_text(turn: LadderTurn, result_text: str | None) -> str:
     return ""
 
 
+def awaits_user(candidate: str) -> bool:
+    """A reply that shows a draft (a quoted block) and ends with a question to the user is a finished turn: it waits
+    for the owner's word. Judging it as unfinished work threw such drafts away and handed the turn to a stronger model
+    that then acted on a yes the owner had given before the draft existed (2026-11-20)."""
+    text = (candidate or "").strip()
+    if not text or text[-1] not in "?？":
+        return False
+    return any(line.lstrip().startswith(">") for line in text.splitlines())
+
+
 def needs_verdict(turn: LadderTurn, candidate: str, is_error: bool) -> bool:
     """False for what has nothing to judge: the top rung (nobody is left to hand it to), an
-    error result, and a deliberately silent internal turn."""
+    error result, a deliberately silent internal turn, and a draft that waits for the user's yes."""
     if turn.is_top or is_error:
         return False
-    return NO_UPDATE_SENTINEL not in candidate
+    return NO_UPDATE_SENTINEL not in candidate and not awaits_user(candidate)
 
 
 def continuation_note(turn: LadderTurn, missing: str) -> str:

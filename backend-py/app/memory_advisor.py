@@ -103,7 +103,73 @@ async def memory_block(message: str, dialogue: list[str] | None = None, tab_id: 
         return ""
 
 
+DETAIL_TEXT = {
+    "full": "this matter is important to the owner: cover it fully, with the specifics he needs",
+    "normal": "cover this matter at the usual level of detail",
+    "brief": "this matter is of low importance to the owner: keep it short",
+}
+
+
+async def route_block(message: str, dialogue: list[str], tab_id: str | None) -> str:
+    """Track routing (2026-11-20): which matter the message belongs to; the matter's importance is raised by the
+    mention (strongly by an explicit instruction); the block tells the engine to answer about THIS matter only and to
+    give news on other matters as separate messages with a human lead-in. "" on any failure (fail-open)."""
+    from app import track_importance as ti
+    from app.memory_topics import get_current_topic, recent_topics, set_current_topic
+    from app.microagents.track_route import TRACK_ROUTE
+    from app.plugins.voice_api import _run_local_microagent
+    from app.workspace_dir import WORKSPACE_DIR
+
+    try:
+        today, week = recent_topics(WORKSPACE_DIR)
+        tracks = [{"id": t["id"], "description": (t.get("description") or "")[:160], "closed": t.get("status") == "closed",
+                   "importance": ti.get(WORKSPACE_DIR, t["id"])} for t in today + week if t.get("id")]
+        current = get_current_topic(WORKSPACE_DIR, tab_id)
+        result = await _run_local_microagent(TRACK_ROUTE, "app.microagents.track_route", {
+            "message": message, "dialogue": dialogue[-8:], "tracks": tracks, "current_id": current or ""})
+        output = (result or {}).get("output") if (result or {}).get("status") == "ok" else None
+        if not isinstance(output, dict) or not isinstance(output.get("matter"), str):
+            log_event("engine", "track_route_undecided", tab_id=tab_id, error=(result or {}).get("error"))
+            return ""
+        track_id, matter, explicit = output.get("track_id") or "", output["matter"].strip(), bool(output.get("explicit"))
+        if track_id:
+            importance = ti.bump(WORKSPACE_DIR, track_id, explicit)
+            if tab_id:
+                set_current_topic(WORKSPACE_DIR, tab_id, track_id)
+            description = next((t["description"] for t in tracks if t["id"] == track_id), matter)
+            what = f'an existing track ("{description}")'
+        else:
+            importance = ti.clamp(output.get("importance"))
+            if explicit:
+                importance = max(importance, ti.EXPLICIT_FLOOR)
+            if tab_id:
+                ti.pending_new[tab_id] = importance
+            what = "a NEW matter (no open track covers it; save_info will open one)"
+        level = ti.detail_level(importance)
+        log_event("engine", "track_routed", tab_id=tab_id, track_id=track_id or None, matter=matter, explicit=explicit,
+                  importance=round(importance, 2), detail=level)
+        return (
+            f'[Track routing: this message is about "{matter}" -- {what}, importance {importance:.2f}: {DETAIL_TEXT[level]}. '
+            "Answer ONLY about this matter. If you have news on other matters, never weave it into this reply: give each "
+            "as its own separate message that opens with a natural lead-in naming the matter, in the owner's language "
+            "(for example \"Относительно вакансии…\", \"По переписке с Линет Дикерсон…\"). A short message of the "
+            "owner (\"check that it went out\", \"yes\") refers to this matter, not to another one.]"
+        )
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        log_event("engine", "track_route_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+        return ""
+
+
 async def _block(message: str, dialogue: list[str], tab_id: str | None) -> str:
+    route_task = asyncio.ensure_future(route_block(message, dialogue, tab_id))
+    try:
+        text = await _block_memory(message, dialogue, tab_id)
+    finally:
+        route = await route_task
+    return "\n".join(part for part in (route, text) if part)
+
+
+async def _block_memory(message: str, dialogue: list[str], tab_id: str | None) -> str:
     started = time.monotonic()
     decided = await _decide(message, dialogue, tab_id)
     needed, queries, why = decided[:3]

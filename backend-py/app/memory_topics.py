@@ -137,8 +137,12 @@ def replace_topics(workspace_dir: str, tiers: dict[str, Any], now: float | None 
         for topic in entries or []:
             if isinstance(topic, dict) and topic.get("id"):
                 topics[topic["id"]] = _entry(topic)
-    details = _load(workspace_dir).get("details") or {}
-    _save(workspace_dir, {"fetched_at": now if now is not None else time.time(), "topics": topics, "details": details})
+    stored = _load(workspace_dir)
+    details = stored.get("details") or {}
+    # Bug fix (2026-11-20): "current_by_tab" used to be dropped here too, so every slim-list refresh (at least every
+    # STALE_AFTER_S) erased which track each tab was working on -- the next message then had no current track.
+    _save(workspace_dir, {"fetched_at": now if now is not None else time.time(), "topics": topics, "details": details,
+                          "current_by_tab": stored.get("current_by_tab") or {}})
 
 
 def set_current_topic(workspace_dir: str, tab_id: str, topic_id: str) -> None:
@@ -236,6 +240,10 @@ def memory_topics_system_prompt_clause(workspace_dir: str, tab_id: str | None = 
             text += "  [CURRENT TRACK of this tab]"
         if topic.get("status") == "closed":
             text += "  [closed]"
+        from app import track_importance
+        rated = track_importance.get(workspace_dir, topic.get("id"), now)
+        if rated is not None:
+            text += f"  [importance {rated:.2f}: {track_importance.detail_level(rated)} detail]"
         return text
     parts = [
         "Topics you and the user have been discussing lately, from your topic memory (short descriptions only -- "

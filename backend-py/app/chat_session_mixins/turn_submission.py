@@ -220,6 +220,10 @@ class TurnSubmissionMixin:
             # _check_action_sanction's own early return) whenever nothing is
             # open.
             asyncio.ensure_future(self._check_action_sanction(text))
+            # Owner's order (2026-11-20): significant dated things he says are set as reminders at once, with one
+            # line of notice (app/auto_reminders.py).
+            from app import auto_reminders
+            auto_reminders.consider_in_background(text, "a message from the owner to the secretary", self.tab_id)
             # Per explicit special order (2026-10-19; reworked 2026-10-24): every
             # real user message is also scored for an emotional reaction, and the
             # score goes to the evolution as the reaction to the previous turn --
@@ -496,6 +500,9 @@ class TurnSubmissionMixin:
         attachments = attachments or []
         log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
+        if text.startswith("[New "):   # an incoming messenger note: a date in it may deserve a reminder (2026-11-20)
+            from app import auto_reminders
+            auto_reminders.consider_in_background(text, "an incoming messenger note", self.tab_id)
         # Per explicit instruction (2026-10-11): a proactive note is often exactly
         # the thing that says whose account/identity a reply would go out under
         # (e.g. "your own Telegram account" vs "the owner's own correspondence,

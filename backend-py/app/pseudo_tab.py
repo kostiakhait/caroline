@@ -136,6 +136,16 @@ def pop_pseudo_turn_task(pseudo_id: str) -> str | None:
     return _pseudo_turn_task.pop(pseudo_id, None)
 
 
+# Pseudo turns whose result always reaches the owner (2026-11-20): a reminder he asked for (or Caroline set for him)
+# must never be dropped by the "routine, nothing new" relay filter -- that filter swallowed the 11:30 reminder about the
+# 12:00 session with Anita.
+_pseudo_turn_always_relay: set[str] = set()
+
+
+def set_pseudo_turn_always_relay(pseudo_id: str) -> None:
+    _pseudo_turn_always_relay.add(pseudo_id)
+
+
 _pseudo_sessions: "dict[str, ChatSession]" = {}
 _pseudo_sessions_starting: set[str] = set()
 # Per pseudo tab_id -- the in-progress pseudo-turn's own latest real visible
@@ -195,6 +205,8 @@ def _make_pseudo_session_send(real_tab_id: str, pseudo_id: str, get_target_sessi
             _mark_awaiting_retry(pseudo_id, False)
             text = _pseudo_turn_last_visible_text.pop(pseudo_id, None)
             task = pop_pseudo_turn_task(pseudo_id)
+            always_relay = pseudo_id in _pseudo_turn_always_relay
+            _pseudo_turn_always_relay.discard(pseudo_id)
             _dispose_pseudo_session(pseudo_id)
             if not text:
                 return
@@ -203,7 +215,8 @@ def _make_pseudo_session_send(real_tab_id: str, pseudo_id: str, get_target_sessi
             if target is None:
                 log_event("engine", "pseudo_reply_dropped_no_real_tab", real_tab_id=real_tab_id, pseudo_id=pseudo_id, text_len=len(text))
                 return
-            asyncio.create_task(target.deliver_relayed_reply(text, task=task, is_voice=bool(event.get("isVoice"))))
+            extra = {"always": True} if always_relay else {}
+            asyncio.create_task(target.deliver_relayed_reply(text, task=task, is_voice=bool(event.get("isVoice")), **extra))
 
     return _send
 

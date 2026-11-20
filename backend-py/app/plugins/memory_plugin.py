@@ -528,6 +528,10 @@ async def _drain_one(entry_id: str, inject: Any = None) -> None:
                     update_topic(WORKSPACE_DIR, saved_topic)
                     if tab_id and saved_topic.get("id"):
                         set_current_topic(WORKSPACE_DIR, tab_id, saved_topic["id"])
+                    if saved_topic.get("id"):
+                        # A new track gets the importance the router estimated for the owner's message (2026-11-20).
+                        from app import track_importance
+                        track_importance.set_initial(WORKSPACE_DIR, saved_topic["id"], track_importance.pending_new.pop(tab_id or "", track_importance.DEFAULT_INITIAL))
             await _refresh_topics_if_stale()
         except Exception as exc:  # noqa: BLE001
             reaction = None

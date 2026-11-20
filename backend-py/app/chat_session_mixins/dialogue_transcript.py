@@ -507,7 +507,7 @@ class DialogueTranscriptMixin:
             return
         log_event("engine", "transcript_patch_empty_file", tab_id=self.tab_id)
     # edition:end
-    async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False) -> None:
+    async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False, always: bool = False) -> None:
         """Per explicit instruction (2026-10-13), "Фоновые задачи... должны
         мержиться только на уровне вывода пользователю": delivers a reply that
         was generated and already reviewed inside a DIFFERENT (headless)
@@ -541,7 +541,8 @@ class DialogueTranscriptMixin:
         if self._recent_repeat_of(text):
             log_event("engine", "relayed_reply_suppressed_as_repeat", tab_id=self.tab_id, text=text[:300])
             return
-        verdict = await check_background_relay_worth(text, task=task)
+        # `always` (2026-11-20): a reminder for the owner is delivered whatever the filter would say.
+        verdict = None if always else await check_background_relay_worth(text, task=task)
         if verdict is not None and not verdict["worth_relaying"]:
             log_event(
                 "engine", "background_relay_suppressed_as_routine", tab_id=self.tab_id,
