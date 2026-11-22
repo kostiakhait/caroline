@@ -91,6 +91,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
+
 from app.login_api import get_v2_session, is_logged_in
 from app.logging_setup import log_event
 from app.plugins.companion_contacts_store import load_store as load_contacts_store
@@ -986,14 +988,22 @@ async def _sync_tab_list(workspace_dir: str) -> None:
 _injected_inbox_msg_ids: set[str] = set()
 
 
-async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None:
+async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> bool:
+    """False when the server could not be reached at all; the caller skips the rest of its tick."""
     # One read per tab's own inbox. Reading the whole `tabs` subtree in one
     # call stopped working once tabs/<id>/history_v2 and tabs/<id>/att/* got
     # big (Camerlengo answers "nothing" for it -- confirmed live: phone
     # messages sat unread in Camerlengo and never reached the desktop).
-    for tab_id in tab_ids:
+    for index, tab_id in enumerate(tab_ids):
         try:
             inbox = await get_all_mine(f"tabs/{tab_id}/inbox")
+        except httpx.TransportError as exc:
+            # No connection at all (2026-11-20..22 live, "getaddrinfo failed" while offline): every tab's
+            # read and then every sync of the tick failed the same way, each after its 3 attempts -- 252
+            # inbox_read_failed in two days, up to 21 a minute. An HTTP error (502/504) still goes per tab.
+            log_event("plugin:companion", "inbox_read_failed", tab_id=tab_id, error=str(exc) or type(exc).__name__,
+                      server_unreachable=True, skipped_tabs=len(tab_ids) - index - 1)
+            return False
         except Exception as exc:  # noqa: BLE001
             log_event("plugin:companion", "inbox_read_failed", tab_id=tab_id, error=str(exc))
             continue
@@ -1022,6 +1032,7 @@ async def _drain_inbox(inject_to_tab: InjectToTab, tab_ids: "list[str]") -> None
                 _injected_inbox_msg_ids.add(msg_id)
                 await _safe_delete(f"tabs/{tab_id}/inbox/{msg_id}")
                 log_event("plugin:companion", "inbox_message_injected", tab_id=tab_id, msg_id=msg_id)
+    return True
 
 
 async def _inbox_loop_tick(
@@ -1033,7 +1044,8 @@ async def _inbox_loop_tick(
     # Phone -> desktop first: a message the user just sent must not wait
     # behind the (slower) desktop -> phone syncs.
     tab_ids = list(dict.fromkeys(list(get_active_tab_ids()) + [t["id"] for t in (_desktop_settings_tab_list() or [])]))
-    await _drain_inbox(inject_to_tab, tab_ids)
+    if not await _drain_inbox(inject_to_tab, tab_ids):
+        return  # the server is unreachable: the syncs below would fail the same way; the next tick tries again
     await _sync_tab_list(workspace_dir)
     await _sync_history(workspace_dir, get_active_tab_ids, history_snapshot)
     await _sync_status(get_active_tab_ids, tab_status_snapshot)
