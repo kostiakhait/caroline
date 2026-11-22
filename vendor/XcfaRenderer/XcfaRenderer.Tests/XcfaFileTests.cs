@@ -34,9 +34,12 @@ public sealed class XcfaFileTests : IDisposable
     private static byte[] BuildSyntheticXcfa()
     {
         using var blobs = new MemoryStream();
+        // Blob offsets are absolute file offsets, like a real model's (CarolineA.xcfa: base at 16, right
+        // after the 16-byte header). Offsets into the blob area alone read the header back as the image.
+        const long HeaderSize = 16;
         long Append(byte[] data)
         {
-            var offset = blobs.Position;
+            var offset = HeaderSize + blobs.Position;
             blobs.Write(data);
             return offset;
         }
@@ -61,7 +64,7 @@ public sealed class XcfaFileTests : IDisposable
               "id": 0, "n": 2,
               "mf": "{{mfBase64}}",
               "af": "{{afBase64}}",
-              "blink": false, "h": 8, "w": 8, "sil": false, "sil_mul": 1.0,
+              "blink": false, "h": 8, "w": 8,
               "frames": [[{{frame0Off}}, {{Frame0Bytes.Length}}], [{{frame1Off}}, {{Frame1Bytes.Length}}]],
               "flows": [[{{flowOff}}, {{flowBytes.Length}}, {{F(FlowScale)}}]]
             }
@@ -117,8 +120,10 @@ public sealed class XcfaFileTests : IDisposable
         Assert.Equal(8, seg.Height);
         Assert.Equal(8, seg.Width);
         Assert.False(seg.Blink);
+        // A speaking segment carries neither "sil" nor "sil_mul" (in CarolineA.xcfa exactly the 685 silence
+        // segments of 4479 have "sil_mul"); its mere presence marks silence -- XcfaFile.cs, as XcfaLoader.py.
         Assert.False(seg.IsSilence);
-        Assert.Equal(1f, seg.SilenceMul);
+        Assert.Equal(0f, seg.SilenceMul);
         Assert.Equal(MeanFeatures, seg.MeanFeatures);
         Assert.Equal(2, seg.Frames.Length);
         Assert.Single(seg.Flows);

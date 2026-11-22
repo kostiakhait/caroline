@@ -33,7 +33,15 @@ public sealed class EndToEndRenderTests : IDisposable
 
     private readonly List<string> _tempFiles = new();
 
-    private static string? FindModel() => CandidateModels.FirstOrDefault(File.Exists);
+    // The installer's models for whoever runs the tests first: the paths above name one machine's
+    // user folder, so on every other machine this test skipped itself.
+    private static IEnumerable<string> InstalledModels()
+    {
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Caroline", "art", "models");
+        return new[] { "CarolineA", "CarolineB", "PeterA", "PeterB" }.Select(n => Path.Combine(dir, n + ".xcfa"));
+    }
+
+    private static string? FindModel() => InstalledModels().Concat(CandidateModels).FirstOrDefault(File.Exists);
 
     private string WriteSineWav(double freqHz, double seconds, int sampleRate = 16000)
     {
