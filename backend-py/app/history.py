@@ -116,6 +116,13 @@ def _extract_text_and_attachments(content: Any) -> tuple[str, list[dict[str, str
     return "\n\n".join(text_parts), attachments
 
 
+_SYSTEM_NOTE_TEXT = re.compile(r"^\s*(?:\[Sent:[^\]]*\]\s*)?\[System note:", re.IGNORECASE)
+
+
+def _is_internal_block(b: Any) -> bool:
+    return isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str) and SYNTHETIC_TURN_MARKER.strip("⁣") in b["text"]
+
+
 def _split_user_submessages(content: Any) -> list[Any]:
     """Bug fix (2026-09-10): confirmed live -- when multiple submit() calls
     (chat_session.py) queue up faster than the CLI drains the queue (always
@@ -187,6 +194,17 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
             # not another wording pattern to keep chasing.
             if obj.get("isMeta"):
                 continue
+            # Bug fix (2026-11-01), confirmed live: a background Monitor/task
+            # finishing makes the CLI inject a "<task-notification>" as a
+            # "user"-role entry WITHOUT isMeta -- the only tells are
+            # origin.kind / promptSource="system" / turnOrigin. It was
+            # replayed into the chat as a bubble in the user's own voice.
+            # Same reasoning as isMeta: the CLI itself says "not the human".
+            if obj.get("type") == "user":
+                _origin = obj.get("origin")
+                _kind = _origin.get("kind") if isinstance(_origin, dict) else None
+                if (_kind and _kind != "human") or obj.get("promptSource") == "system" or obj.get("turnOrigin") == "task_notification":
+                    continue
             content = (obj.get("message") or {}).get("content")
             # Bug fix (2026-09-10): for "user" entries only, undo a possible
             # multi-submit() merge before doing anything else -- see
@@ -213,6 +231,15 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
                     isinstance(b, dict) and b.get("type") == "tool_use" for b in group
                 ):
                     continue
+                if obj.get("type") == "user" and isinstance(group, list):
+                    # Internal blocks (SYNTHETIC_TURN_MARKER) inside a group are cut out on their own: the user's
+                    # words riding in the same message (a recovery replay) must survive them.
+                    internal = [b for b in group if _is_internal_block(b)]
+                    if internal:
+                        rest = [b for b in group if not _is_internal_block(b)]
+                        if not any(isinstance(b, dict) and b.get("type") == "text" and not _HISTORY_STAMP_PATTERN.match(b.get("text") or "") for b in rest):
+                            continue
+                        group = rest
                 text, attachments = _extract_text_and_attachments(group)
                 if not text.strip() and not attachments:
                     continue
@@ -220,6 +247,10 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
                 # dropped per sub-message, so a real message merged behind it still survives.
                 # Substring, since the "[Sent: ...]" stamp block comes before the marked text.
                 if obj.get("type") == "user" and SYNTHETIC_TURN_MARKER.strip("⁣") in text:
+                    continue
+                # Per explicit instruction (2026-11-17): a "[System note: ...]" is Caroline's service text, never the user's words, even when the
+                # marker above did not survive the way to the transcript (the stamp block comes first).
+                if obj.get("type") == "user" and _SYSTEM_NOTE_TEXT.match(text):
                     continue
                 # Bug fix (2026-09-09): this rebuild path is entirely
                 # separate from the live sdk_message stream's own

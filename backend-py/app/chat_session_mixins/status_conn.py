@@ -24,6 +24,7 @@ class StatusConnMixin:
         # turn actually started, independent of the activity signal -- is
         # what lets _check_hang enforce a hard ceiling on top of it.
         self.turn_pending_since = time.monotonic() if value else None
+        self.turn_joined_running = False
         # Every one of the ~9 places in this file that flips turn_pending
         # now republishes status automatically -- no call site has to
         # remember to do it itself (that "remember to do it everywhere"

@@ -16,17 +16,18 @@ namespace CarolineInstaller.Dependencies;
 /// </summary>
 internal static class WhatsappSidecarInstaller
 {
-    private static string SidecarDir => Path.Combine(AppPaths.AppDir, "whatsapp-sidecar");
-    private static string NodeModulesMarker => Path.Combine(SidecarDir, "node_modules", ".caroline-installed");
-
-    public static async Task InstallAsync(CancellationToken ct)
+    /// <param name="appDir">The app folder to set up; null: the active one. An update sets up the new folder before Caroline stops
+    /// (2026-10-31), while the running one is still in use.</param>
+    public static async Task InstallAsync(CancellationToken ct, string? appDir = null)
     {
-        if (!Directory.Exists(SidecarDir))
+        var sidecarDir = Path.Combine(appDir ?? AppPaths.AppDir, "whatsapp-sidecar");
+        var nodeModulesMarker = Path.Combine(sidecarDir, "node_modules", ".caroline-installed");
+        if (!Directory.Exists(sidecarDir))
         {
-            Logger.Log($"WhatsappSidecarInstaller: {SidecarDir} not found (older build without the sidecar?) -- skipping, WhatsApp just won't be available.");
+            Logger.Log($"WhatsappSidecarInstaller: {sidecarDir} not found (older build without the sidecar?) -- skipping, WhatsApp just won't be available.");
             return;
         }
-        if (File.Exists(NodeModulesMarker))
+        if (File.Exists(nodeModulesMarker))
         {
             Logger.Log("WhatsappSidecarInstaller: already installed, skipping");
             return;
@@ -44,7 +45,7 @@ internal static class WhatsappSidecarInstaller
         var psi = new ProcessStartInfo
         {
             FileName = AppPaths.NodeExe,
-            WorkingDirectory = SidecarDir,
+            WorkingDirectory = sidecarDir,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -56,7 +57,7 @@ internal static class WhatsappSidecarInstaller
         psi.ArgumentList.Add("--no-fund");
         psi.ArgumentList.Add("--omit=dev");
 
-        Logger.Log($"WhatsappSidecarInstaller: running npm install in {SidecarDir}");
+        Logger.Log($"WhatsappSidecarInstaller: running npm install in {sidecarDir}");
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("failed to start node.exe for npm install");
         var stdout = await proc.StandardOutput.ReadToEndAsync(ct);
         var stderr = await proc.StandardError.ReadToEndAsync(ct);
@@ -67,8 +68,8 @@ internal static class WhatsappSidecarInstaller
             throw new InvalidOperationException($"npm install failed (exit {proc.ExitCode}): {stderr}\n{stdout}");
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(NodeModulesMarker)!);
-        await File.WriteAllTextAsync(NodeModulesMarker, DateTime.UtcNow.ToString("O"), ct);
+        Directory.CreateDirectory(Path.GetDirectoryName(nodeModulesMarker)!);
+        await File.WriteAllTextAsync(nodeModulesMarker, DateTime.UtcNow.ToString("O"), ct);
         Logger.Log("WhatsappSidecarInstaller: npm install complete");
     }
 }

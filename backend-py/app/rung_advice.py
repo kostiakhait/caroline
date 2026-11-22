@@ -151,9 +151,13 @@ async def advise(engine: str, ladder: list[tuple[str, str]] | tuple, request: st
                  workspace_dir: str, tab_id: str, reaction: float | Awaitable[Any] | None = None) -> tuple[int | None, str]:
     """(start rung, why), or (None, "") with no advice. Every run is logged, the failures too."""
     started = time.monotonic()
+    # Per explicit instruction (2026-11-05): important topics start at most one step below the top (Sonnet on the Claude
+    # ladder, the "strong" tier on the SW one); the top step (Opus) is reached only by escalation, when the step below
+    # did not cope. The advice is not even shown the top step.
+    shown = ladder[:-1] if len(ladder) > 2 else ladder
     try:
         output = await asyncio.wait_for(
-            _advise(engine, ladder, request, dialogue, workspace_dir, tab_id, reaction), timeout=ADVICE_TIMEOUT_S,
+            _advise(engine, shown, request, dialogue, workspace_dir, tab_id, reaction), timeout=ADVICE_TIMEOUT_S,
         )
     except Exception as exc:  # noqa: BLE001 -- no advice: the engine starts where it always did
         log_event("engine", "turn_rung_advice", tab_id=tab_id, engine=engine, start_rung=None, failed=True,
@@ -161,7 +165,9 @@ async def advise(engine: str, ladder: list[tuple[str, str]] | tuple, request: st
         return None, ""
     rung = (output or {}).get("start_rung")
     why = str((output or {}).get("why") or "")
-    if not isinstance(rung, int) or isinstance(rung, bool) or not 0 <= rung < len(ladder):
+    if isinstance(rung, int) and not isinstance(rung, bool) and rung == len(shown) < len(ladder):
+        rung = len(shown) - 1  # asked for the top step anyway: start one below it
+    if not isinstance(rung, int) or isinstance(rung, bool) or not 0 <= rung < len(shown):
         rung = None
     log_event("engine", "turn_rung_advice", tab_id=tab_id, engine=engine, start_rung=rung,
               model=ladder[rung][0] if rung is not None else None, why=why[:300],

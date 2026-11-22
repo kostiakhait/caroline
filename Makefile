@@ -56,7 +56,7 @@ INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
 # once too many separate $(shell) subprocess spawns land in the same
 # Makefile parse pass. Four total here stays well clear of that.
 SKILLS_SRC := $(shell find "$(BACKEND_PY_DIR)/skills-src" -type f 2>/dev/null)
-BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(shell find "$(BACKEND_PY_DIR)/app/assets" -type f -name '*.html' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py
+BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(shell find "$(BACKEND_PY_DIR)/app/assets" -type f -name '*.html' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py $(BACKEND_PY_DIR)/VERSION
 CAROLINE_SRC := $(shell find "$(CAROLINE_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' -o -path '*/wwwroot/*' \) 2>/dev/null)
 NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' \) 2>/dev/null)
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
@@ -179,6 +179,7 @@ $(OUT)/.backend-py.stamp: $(BACKEND_PY_SRC) $(SKILLS_SRC)
 	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT)/backend-py/app"
 	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT)/backend-py/run_server.py"
 	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT)/backend-py/supervisor.py"
+	cp "$(BACKEND_PY_DIR)/VERSION" "$(OUT)/backend-py/VERSION"
 	find "$(OUT)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	rm -rf "$(OUT)/backend-py/skills-src"
 	cp -r "$(BACKEND_PY_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
@@ -246,6 +247,7 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT_LINUX)/backend-py/app"
 	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT_LINUX)/backend-py/run_server.py"
 	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT_LINUX)/backend-py/supervisor.py"
+	cp "$(BACKEND_PY_DIR)/VERSION" "$(OUT_LINUX)/backend-py/VERSION"
 	cp "$(BACKEND_PY_DIR)/requirements-linux.txt" "$(OUT_LINUX)/backend-py/requirements-linux.txt"
 	cp -r "$(BACKEND_PY_DIR)/skills-src" "$(OUT_LINUX)/backend-py/skills-src"
 	find "$(OUT_LINUX)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

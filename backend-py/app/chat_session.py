@@ -91,6 +91,12 @@ class ChatSession(
         # None for every ordinary user-facing tab (no bridging -- a real tab
         # already sees its own real dialogue directly).
         self.approval_bridge_tab_id = approval_bridge_tab_id
+        # A session whose proactive turns are tasks to do (2026-10-31): an akinakes chain, where a bus task arrives
+        # through inject_proactive(). Its turns are formalized like a real user's request, so the task text reaches
+        # the checks of changing calls (sw.action.scope, sw.content.grounding) and the tier advice. Without it the
+        # writer's sections went out with invented results unchecked (second real run). Off for every other session:
+        # a reminder or a messenger note is not the user's task.
+        self.proactive_turns_are_tasks = False
         # Per explicit instruction (2026-10-13): pure in-process, time-pruned
         # memory of this tab's own real user messages -- (epoch_ms, text)
         # pairs, appended once per genuinely-new real submit() (see that
@@ -376,6 +382,28 @@ class ChatSession(
         self.last_tool_use_started_at: float | None = None
         self.hang_interrupted_tool_name: str | None = None
         self.hang_interrupted_tool_elapsed_s: float | None = None
+        # Bug fix (2026-10-30), confirmed live (tab 1, 23:17 and 23:26): tool
+        # calls the CLI started and has not answered yet, id -> (name, started),
+        # for _check_hang only. _pending_tool_calls can't serve: a real user
+        # message clears it, and the process-activity mode never looked at any
+        # of it, so a 10-minute PowerShell call counted as "no tool running".
+        # Emptied only when a new stream starts (nothing can be open there).
+        self._open_tool_calls: dict[str, tuple[str, float]] = {}
+        # True once a message joins a turn that was already pending (the CLI
+        # queues it behind the running work): such a turn is not "empty" --
+        # see _check_hang's turn_is_empty. Cleared whenever turn_pending flips.
+        self.turn_joined_running = False
+        # Why the watchdog last interrupted, in words the model is told -- see
+        # _hang_interrupt_note.
+        self.hang_interrupt_reason: str | None = None
+        # Whether a ResultMessage can belong to the pending turn (2026-10-30, confirmed
+        # live, tab 1 23:19:18): _input_preparing is an input taken off the queue but
+        # not yet handed to the CLI (the memory advisor can hold it ~25s). While it
+        # holds, or the queue still has input, a result is the end of an EARLIER turn
+        # and must not close the pending one -- see result_is_stale in _run_loop.
+        # (An "init not yet seen" signal was tried too and removed, 2026-11-03: the CLI
+        # does not announce every turn with init, so turns never closed.)
+        self._input_preparing = False
 
         # Bug fix (2026-09-15, "Стоп должен срабатывать ВСЕГДА"): the real
         # OS pid of the currently-live CLI subprocess, captured directly at
@@ -427,6 +455,10 @@ class ChatSession(
         # actually doing (see _narration_action_facts), not just its name.
         self._pending_tool_calls: dict[str, tuple[str, str]] = {}
         self.turn_tool_outcomes: dict[str, ToolOutcome] = {}
+        # Every tool call of this episode in the order it finished (name, arguments, is_error, result): turn_tool_outcomes is
+        # keyed by name and keeps only the LAST call of each tool, so a sixty-step browser task showed the narrator ten
+        # unordered lines. Capped at the last 12; reset wherever turn_tool_outcomes is.
+        self.turn_action_log: list[tuple[str, str, bool, str]] = []
         # Every narration remark actually SENT this real-user episode (2026-10-11,
         # ported from a teammate's branch) -- lets the drafting prompt see its own
         # earlier remarks so it doesn't restate the same status, and lets the very

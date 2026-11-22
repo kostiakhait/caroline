@@ -167,7 +167,7 @@ _file_transfer_guard_by_tab: dict[str, SendActionGuardFn] = {}
 
 def register_file_transfer_guard(tab_id: str, fn: SendActionGuardFn) -> None:
     """Same shape as register_send_action_guard, for a tool call that sends a local
-    file off the machine or writes a received one (app/file_facts.py's
+    file off the machine (app/file_facts.py's
     file_transfers_in): dispatch() awaits it before the real handler runs, and the
     session's turn.file.transfer microagent decides (2026-10-22)."""
     _file_transfer_guard_by_tab[tab_id] = fn

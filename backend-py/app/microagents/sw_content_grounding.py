@@ -59,14 +59,22 @@ _ASKED_PROMPT = (
     "question, request, offer or promise. A task that only says to answer, reply or confirm does not ask the "
     "reply to ask anything new (where, who, when, which) or to promise anything (to send, to prepare, to "
     "call back). If the task has no such words, the quote is an empty string.\n\n"
+    # The request first and the TASK last, right before the answer (2026-11-01, measured on the live server, nano
+    # rung 1, 23 cases x 6 runs): real requests confirmed 43/54 instead of 28/54, invented ones wrongly confirmed
+    # 14/84 against 12/84. With the TASK first, nano mostly copied the request itself as its "quote".
+    "THE QUESTION, REQUEST, OFFER OR PROMISE IN THE TEXT:\n{request}\n\n{rejected}"
     "TASK:\n{task}\n\n"
-    "THE QUESTION, REQUEST, OFFER OR PROMISE IN THE TEXT:\n{request}\n\n"
     'Reply with a JSON object: {{"quote": "<exact words copied from the task, or empty>"}}'
 )
 
 
 def prompt_request_asked(input: Any, context: Any) -> str:
-    return _ASKED_PROMPT.format(task=input.get("task") or "(not given)", request=input.get("request") or "")
+    rejected = input.get("rejected") or ""
+    if rejected:
+        rejected = ("Your previous answer quoted the words below, and they are NOT in the TASK word for word -- copy "
+                    "the real wording of the TASK instead, or give an empty quote:\n- " + rejected + "\n\n")
+    return _ASKED_PROMPT.format(task=input.get("task") or "(not given)", request=input.get("request") or "",
+                                rejected=rejected)
 
 
 def verify_request_asked(input: Any, output: Any) -> Optional[str]:
@@ -84,6 +92,37 @@ def asked(task: str, output: dict[str, Any]) -> bool:
     task does not contain is not evidence (decided here, by code, not by the model)."""
     quote = _squash(output.get("quote") or "").strip(" .\"'«»")
     return bool(quote) and quote in _squash(task)
+
+
+REQUEST_MATCHES = "sw.request.matches"
+
+# Step 2 of a request's check (2026-11-01): sw.request.asked finds words in the task, asked() makes sure they are
+# there, and this agent decides whether those words ask for *this* request. Without it any sentence of the task
+# counted as evidence: with the retry of sw.request.asked, invented requests passed 25/84. Measured on the live
+# server (nano rung 1, 23 cases x 8 runs): with this step, real requests confirmed 59/72, invented ones 0/112. The
+# evidence first and the request last; "may ask for other things as well" took real ones from 55/72 to 59/72.
+_MATCHES_PROMPT = (
+    "An AI assistant wants to put a question, request, offer or promise into a text it is about to send. It says the "
+    "user's task asks for it, and gives the words of the task below as the evidence. Decide whether those words "
+    "really ask for precisely this: the same question, the same action or the same promise, about the same thing. "
+    "Words that ask for something else do not count, even when they are about the same topic: a different "
+    "question, another action, an extra detail, a promise nobody asked for. Words that only say to answer, reply "
+    "or confirm do not ask for anything new. The words may ask for other things as well; what matters is whether "
+    "this one is among them.\n\n"
+    "THE WORDS OF THE TASK GIVEN AS EVIDENCE:\n{quote}\n\n"
+    "THE QUESTION, REQUEST, OFFER OR PROMISE IN THE TEXT:\n{request}\n\n"
+    'Reply with a JSON object: {{"asks": true}} or {{"asks": false}}'
+)
+
+
+def prompt_request_matches(input: Any, context: Any) -> str:
+    return _MATCHES_PROMPT.format(quote=input.get("quote") or "", request=input.get("request") or "")
+
+
+def verify_request_matches(input: Any, output: Any) -> Optional[str]:
+    if not isinstance(output.get("asks"), bool):
+        return '"asks" must be true or false'
+    return None
 
 
 def prompt_content_grounding(input: Any, context: Any) -> str:
@@ -115,10 +154,17 @@ def llm_agents() -> List["M.Agent"]:
             build_prompt=prompt_content_grounding, verify=verify_content_grounding,
         ),
         M.Agent(
-            REQUEST_ASKED, "1",
+            REQUEST_ASKED, "3",
             "Quotes the words of the task that ask for one given question, request, offer or promise in an outgoing text.",
-            input_schema=_object({"task": _STRING, "request": _STRING}),
+            input_schema=_object({"task": _STRING, "request": _STRING, "rejected": _STRING}, ["task", "request"]),
             output_schema=_object({"quote": _STRING}),
             build_prompt=prompt_request_asked, verify=verify_request_asked,
+        ),
+        M.Agent(
+            REQUEST_MATCHES, "1",
+            "Decides whether given words of the task ask for one given question, request, offer or promise.",
+            input_schema=_object({"request": _STRING, "quote": _STRING}),
+            output_schema=_object({"asks": {"type": "boolean"}}),
+            build_prompt=prompt_request_matches, verify=verify_request_matches,
         ),
     ]

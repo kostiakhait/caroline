@@ -1,5 +1,5 @@
-"""What is known about a local path a tool call is about to send off the machine or
-write a received file to -- plain facts for the turn.file.transfer microagent
+"""What is known about a local path a tool call is about to send off the machine --
+plain facts for the turn.file.transfer microagent
 (app/microagents/file_transfer.py), which makes the decision. Nothing here allows
 or refuses anything.
 
@@ -79,15 +79,18 @@ def path_facts(path: str) -> list[str]:
     return facts
 
 
-# Argument names that carry a local path, by what happens to the file.
+# Argument names that carry a local path to be sent.
 _SEND_PATH_ARGS = ("path", "filePath", "file_path")
-_SAVE_PATH_ARGS = ("savePath", "save_path", "saveTo", "outputPath")
 
 
 def file_transfers_in(tool_name: str, args: dict[str, Any]) -> list[tuple[str, str]]:
-    """(direction, path) for every local file this tool call sends out ("send") or
-    writes a received file to ("save"). Sending is a tool whose name says it sends;
-    email attachments are listed under "attachments"."""
+    """("send", path) for every local file this tool call sends out. Sending is a tool
+    whose name says it sends; email attachments are listed under "attachments".
+
+    Per the owner's rule (2026-11-10): the guard blocks only sending. Saving a
+    received file (a downloaded attachment) is never checked -- the "save"
+    direction judged by a small model blocked every kind of attachment download
+    (an .ics, an NGO registration PDF "with personal data")."""
     name = tool_name.lower()
     out: list[tuple[str, str]] = []
     if "send" in name:
@@ -95,6 +98,4 @@ def file_transfers_in(tool_name: str, args: dict[str, Any]) -> list[tuple[str, s
         for attachment in args.get("attachments") or []:
             if isinstance(attachment, dict) and attachment.get("path"):
                 out.append(("send", str(attachment["path"])))
-    if "download" in name or "save" in name:
-        out += [("save", str(args[key])) for key in _SAVE_PATH_ARGS if args.get(key)]
     return out

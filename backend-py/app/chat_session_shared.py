@@ -677,6 +677,12 @@ FORCED_COMPACTION_LIMIT_PAUSE_MS = 30 * 60_000
 # that did real work started at 52K-99K. This sits clearly between the two.
 # Own choice of value, not a specified one.
 FORCED_COMPACTION_MIN_CONTEXT_TOKENS = 150_000   # raised from 20 000 (2026-10-26): compacting a small context saves nothing and loses state
+# Per explicit instruction (2026-10-30): the context is compacted once it is this large, at the first idle moment, and not
+# only on the hour or after 400k of growth. Every model call re-reads the whole context (a tab reached 270k within hours),
+# and an idle moment right after a turn is also when the cache is still warm and the compaction's own read is cheapest.
+# Needs SIZE_MIN_GROWTH_TOKENS of growth since the last compaction, so a summary that is itself large cannot loop.
+FORCED_COMPACTION_SIZE_TOKENS = 170_000
+FORCED_COMPACTION_SIZE_MIN_GROWTH_TOKENS = 40_000
 # Fallback-compaction threshold (2026-10-17): native/forced compaction (the
 # "/compact" sent above) is confirmed to sometimes achieve only a weak
 # reduction (observed live: ~14%, once even negative) on a badly bloated
@@ -697,18 +703,30 @@ FALLBACK_COMPACTION_THRESHOLD_TOKENS = FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD
 # Own choice, not a specified value.
 AUTH_RETRY_ESCALATION_THRESHOLD = 3
 
+# Rewritten 2026-11-17 (explicit instruction): this note is a state check of ONE thing, the user's latest request to DO
+# something, never "go and finish whatever looks open". Only an active, unblocked request is continued -- to the very end;
+# a request waiting for the owner or blocked outside her reach, a question, a note to remember and a discussion are
+# not unfinished work. Before this, the note made her answer old reports with drafts nobody had asked for.
 CONTINUE_OR_SILENT_NUDGE_TEMPLATE = (
-    "Check whether you actually finished what you were doing -- having called a tool is not the same thing as "
-    "the work being done; a tool call only counts once you've checked its real result and confirmed it matches "
-    "what was actually asked for, not just that the call was made. In particular: if your last reply described "
-    "a plan (\"I'll do X, then Y\", \"let me go through them\", anything framed as about to happen) without you "
-    "actually carrying every step of it out to the end in that same reply, the task is NOT done and the work is "
-    "NOT finished, no matter how complete or confident that reply sounded -- continue it now, for real, using "
-    "your tools, rather than repeating or restating the plan. If anything else is unfinished, unverified, or "
-    "was left as a placeholder/stub rather than the real thing, continue that too. If everything genuinely is "
-    "finished and verified, do nothing and reply with exactly [[NO_UPDATE]], with no explanation. Reply in "
-    "{language}."
+    "State check. Look only at the user's latest request to DO something (an action or a piece of work) "
+    "that they have not withdrawn, replaced or already had done. Old reports, earlier open items, "
+    "reminders, and anything you noticed yourself are NOT that request. Which case is it?\n"
+    "1. The request is active and NOT blocked, but not finished: your last reply described a plan (\"I'll "
+    "do X, then Y\", \"let me go through them\") without carrying every step out, or a tool call was made "
+    "and its real result was never checked against what was asked, or something was left as a placeholder "
+    "or stub. Continue it now, for real, with your tools, to the very end in this reply; do not restate "
+    "the plan, and do not stop halfway. Do only what that request asked, nothing added.\n"
+    "2. The request is waiting for the owner: a draft or a question was shown and awaits their word, or a "
+    "fact, choice, approval or credential only they can give is missing. Or it is blocked outside your "
+    "reach: a usage cap, a tool or service that is down. That is NOT unfinished work. Do not continue it, "
+    "do not guess the missing piece, do not do what the answer would have authorized (nothing is sent, no "
+    "draft is made for someone who did not ask for one), and do not repeat the question or the report. "
+    "Reply with exactly [[NO_UPDATE]].\n"
+    "3. The request is finished and checked, or there is no such request (the last thing was only a "
+    "question, a note to remember, or a discussion): reply with exactly [[NO_UPDATE]].\n"
+    "In the [[NO_UPDATE]] cases give no explanation. Reply in {language}."
 )
+
 
 # Per explicit instruction (2026-09-22), after a real incident: on the OpenAI
 # engine specifically -- confirmed live, and specifically NOT observed on
@@ -872,6 +890,14 @@ _ATTACHMENT_NOTE_PREFIX_TUPLE = tuple(_ATTACHMENT_NOTE_PREFIXES) + (
 # somewhere unfiltered.
 _SYNTHETIC_TURN_MARKER = SYNTHETIC_TURN_MARKER  # defined in history.py, whose parser drops marked turns
 
+# Heads the task an sw turn hands to the new engine when the tab is switched away from sw
+# mid-turn (engine_lifecycle.py's _hand_sw_turn_over).
+SW_HANDOVER_NOTE = (
+    "[Internal: the tab was switched to you while the previous engine was working on the request below; "
+    "it has been stopped. It may already have done some of the steps (opened pages, filled in forms, even "
+    "sent something) -- check the current state before repeating any action, then finish the request.]"
+)
+
 # Backward-compat only (2026-09-22): a same-day, since-reverted experiment
 # briefly had submit() prepend a "last hour of dialogue" block directly
 # into a real user message's own wire_text (per explicit instruction,
@@ -1027,7 +1053,25 @@ def _last_language_path(tab_id: str) -> Path:
     return Path(WORKSPACE_DIR) / f"last-language-{_sanitize_tab_id(tab_id)}.json"
 
 
+# Redesign (2026-11-10): the narrator and other ticks ask for the tab's language every few seconds on the loop thread
+# (a file read, and without a persisted language a read of the dialogue as well). Kept in memory for a short while;
+# _save_persisted_language refreshes it.
+_LANGUAGE_TTL_S = 15.0
+_language_cache: dict[str, tuple[float, str | None]] = {}
+_language_guess_cache: dict[str, tuple[float, str]] = {}
+
+
 def _load_persisted_language(tab_id: str) -> str | None:
+    hit = _language_cache.get(tab_id)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S:
+        return hit[1]
+    lang = _read_persisted_language(tab_id)
+    _language_cache[tab_id] = (now, lang)
+    return lang
+
+
+def _read_persisted_language(tab_id: str) -> str | None:
     try:
         data = json.loads(_last_language_path(tab_id).read_text(encoding="utf-8"))
         lang = data.get("lang")
@@ -1039,6 +1083,7 @@ def _load_persisted_language(tab_id: str) -> str | None:
 def _save_persisted_language(tab_id: str, lang: str) -> None:
     try:
         _last_language_path(tab_id).write_text(json.dumps({"lang": lang}, indent=2) + "\n", encoding="utf-8")
+        _language_cache[tab_id] = (time.monotonic(), lang.strip() or None)
     except Exception as exc:
         log_event("engine", "save_persisted_language_failed", tab_id=tab_id, error=str(exc))
 
@@ -1502,7 +1547,16 @@ def current_language_name(tab_id: str) -> str:
     rather than porting that same bug first. Per-tab (2026-09-10 fix, see
     _last_language_path's own docstring) -- one tab's language never
     leaks into another's."""
-    return _load_persisted_language(tab_id) or _language_from_recent_user_messages(tab_id) or "English"
+    persisted = _load_persisted_language(tab_id)
+    if persisted:
+        return persisted
+    hit = _language_guess_cache.get(tab_id)
+    now = time.monotonic()
+    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S:
+        return hit[1]
+    guess = _language_from_recent_user_messages(tab_id) or "English"
+    _language_guess_cache[tab_id] = (now, guess)
+    return guess
 
 
 def _language_from_recent_user_messages(tab_id: str) -> str | None:
@@ -1928,6 +1982,8 @@ __all__ = [
     'FORCED_COMPACTION_MIN_INTERVAL_MS',
     'FORCED_COMPACTION_LIMIT_PAUSE_MS',
     'FORCED_COMPACTION_MIN_CONTEXT_TOKENS',
+    'FORCED_COMPACTION_SIZE_TOKENS',
+    'FORCED_COMPACTION_SIZE_MIN_GROWTH_TOKENS',
     'FALLBACK_COMPACTION_THRESHOLD_TOKENS',
     'AUTH_RETRY_ESCALATION_THRESHOLD',
     'CONTINUE_OR_SILENT_NUDGE_TEMPLATE',
@@ -1939,6 +1995,7 @@ __all__ = [
     '_SYNTHETIC_HISTORY_TEXT_PATTERNS',
     '_ATTACHMENT_NOTE_PREFIX_TUPLE',
     '_SYNTHETIC_TURN_MARKER',
+    'SW_HANDOVER_NOTE',
     '_INLINE_HOUR_CONTEXT_BLOCK_PATTERN',
     '_is_synthetic_history_text',
     '_NO_UPDATE_SENTINEL',

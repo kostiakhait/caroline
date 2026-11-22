@@ -15,6 +15,9 @@ from app.microagent_client import Microagent as M
 MEMORY_NEED = "sw.memory.need"
 
 MAX_QUERIES = 3
+# What the message asks the assistant to do right now (2026-11-17, explicit instruction after Caroline turned
+# questions, "remember this" and discussions into sent drafts and new tasks): same call as the memory decision.
+REQUEST_KINDS = ("do", "answer", "remember", "discuss")
 
 _STRING = {"type": "string"}
 
@@ -34,10 +37,23 @@ _PROMPT = (
     "When in doubt, say it is needed: a needless look-up costs little, a missed one makes the assistant "
     "answer as if it did not know the user.\n"
     f"If needed, give 1 to {MAX_QUERIES} short search queries (in the language of the message, each about "
-    "one subject, naming the thing to find, not the whole message).\n\n"
+    "one subject, naming the thing to find, not the whole message).\n"
+    "Also: when the message asks the assistant to DO something (an action, a task, a piece of work) rather than "
+    "just talk, it is needed, and one of the queries must ask how the assistant did that kind of task before "
+    "-- phrased as \"how I did <the kind of task>\" and naming the sites, services or tools the message "
+    "mentions (for example a web service the user names) -- so that a method found earlier comes back.\n"
+    "Also give \"request_kind\": what the message asks the assistant to do RIGHT NOW. \"do\" = carry out an "
+    "action or a piece of work now (send, write and send, search and report, create, change, run, prepare "
+    "something the user asked for); an approval of a draft just shown (\"yes\", \"send it\") is \"do\". "
+    "\"answer\" = only a question or a request for information, to be answered in words. \"remember\" = the user "
+    "tells a fact, a preference, a rule or a correction, or asks to remember or note something, for later. "
+    "\"discuss\" = thinking aloud, complaining, commenting, or starting to work out something together "
+    "(\"we will write a reply, let us first discuss it\") with nothing to execute yet. Choose \"do\" only if the "
+    "message contains a clear command to act.\n\n"
     "CONVERSATION (latest last):\n{dialogue}\n\n"
     "NEW MESSAGE:\n{message}\n\n"
-    'Reply with a JSON object: {{"needs_memory": true|false, "why": "<one short sentence>", "queries": ["...", ...]}}'
+    'Reply with a JSON object: {{"needs_memory": true|false, "why": "<one short sentence>", "queries": ["...", ...], '
+    '"request_kind": "do"|"answer"|"remember"|"discuss"}}'
 )
 
 
@@ -57,6 +73,9 @@ def verify_memory_need(input: Any, output: Any) -> Optional[str]:
         return f'"queries" must be a list of at most {MAX_QUERIES} queries'
     if not all(isinstance(q, str) and q.strip() and len(q) <= 200 for q in queries):
         return "every query must be a short non-empty string"
+    kind = output.get("request_kind")
+    if kind is not None and kind not in REQUEST_KINDS:
+        return f'"request_kind" must be one of {", ".join(REQUEST_KINDS)}'
     if needs and not queries:
         return 'when memory is needed, "queries" must say what to look for'
     return None
@@ -69,7 +88,9 @@ def llm_agents() -> List["M.Agent"]:
             "Decides whether a user message needs the assistant's long-term memory, and what to search for.",
             input_schema=_object({"message": _STRING, "dialogue": {"type": "array", "items": _STRING}}),
             output_schema=_object({"needs_memory": {"type": "boolean"}, "why": _STRING,
-                                   "queries": {"type": "array", "items": _STRING}}),
+                                   "queries": {"type": "array", "items": _STRING},
+                                   "request_kind": {"type": "string", "enum": list(REQUEST_KINDS)}},
+                                  required=["needs_memory", "why", "queries"]),
             build_prompt=prompt_memory_need, verify=verify_memory_need,
         ),
     ]

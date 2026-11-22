@@ -117,6 +117,7 @@ public partial class MainWindow : Window
 
     public void ShowUpdateAvailable(string version) => _tray.ShowUpdateAvailable(version);
     public void HideUpdateAvailable() => _tray.HideUpdateAvailable();
+    public void ShowRestartedNotice(string text) => _tray.ShowBalloon(text);
 
     private bool _updatePopupShownThisDownload;
 

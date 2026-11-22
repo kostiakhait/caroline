@@ -4,7 +4,8 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 
 class TurnSubmissionMixin:
-    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False) -> None:
+    def submit(self, text: str, attachments: list[Any] | None = None, is_real_user: bool = True, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = False,
+               request_text: str | None = None, relay: bool = False) -> None:
         # Per standing instruction ("ВЕЗДЕ логируем и ВСЁ"): this is the
         # single choke point EVERY turn goes through -- real user messages,
         # every proactive/internal nudge (inject_proactive already logs
@@ -46,7 +47,7 @@ class TurnSubmissionMixin:
             text = self._with_interim_notes(text)
             self.pending_interim_notes = []
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
-            self._route_sw_turn(text, attachments, is_real_user, is_voice, suppress_narration)
+            self._route_sw_turn(text, attachments, is_real_user, is_voice, suppress_narration, request_text, relay)
             return
         # Bug fix (2026-09-18), per explicit instruction after a real
         # incident: never push straight into the live client while a
@@ -121,6 +122,7 @@ class TurnSubmissionMixin:
         if is_real_user or not self.turn_pending:
             self.pending_is_real_user = is_real_user
             self._turn_last_visible_text = None
+            self._turn_tool_call_count = 0
         # Same "only a genuinely new turn" guard as pending_is_real_user
         # just above -- see current_turn_suppress_narration's own __init__
         # comment for why this must never retroactively silence narration
@@ -151,7 +153,12 @@ class TurnSubmissionMixin:
         # _handle_failure's replay needs the real ones still there.
         if is_real_user or not self.turn_pending:
             self.pending_attachments = attachments
+        # Joins a turn still running (the CLI queues it behind that work): see
+        # turn_joined_running's own __init__ comment.
+        joins_running_turn = self.turn_pending
         self.turn_pending = True
+        if joins_running_turn:
+            self.turn_joined_running = True
         self.last_activity = time.monotonic()
         if is_real_user:
             self.last_user_activity = time.monotonic()
@@ -176,6 +183,7 @@ class TurnSubmissionMixin:
             # too rather than left to dangle in _pending_tool_calls forever.
             self._pending_tool_calls = {}
             self.turn_tool_outcomes = {}
+            self.turn_action_log = []
             self.turn_narration_remarks = []
             self.last_visible_output_at = time.monotonic()
             # Bug fix (2026-09-14): a genuine new real message is the one
@@ -212,6 +220,10 @@ class TurnSubmissionMixin:
             # _check_action_sanction's own early return) whenever nothing is
             # open.
             asyncio.ensure_future(self._check_action_sanction(text))
+            # Owner's order (2026-11-20): significant dated things he says are set as reminders at once, with one
+            # line of notice (app/auto_reminders.py).
+            from app import auto_reminders
+            auto_reminders.consider_in_background(text, "a message from the owner to the secretary", self.tab_id)
             # Per explicit special order (2026-10-19; reworked 2026-10-24): every
             # real user message is also scored for an emotional reaction, and the
             # score goes to the evolution as the reaction to the previous turn --
@@ -255,7 +267,8 @@ class TurnSubmissionMixin:
         # disk -- that record may be the user's only copy of unfinished work, and a
         # crash would then resume the nudge instead of it.
         if is_real_user or peek_pending_turn(self.workspace_dir, self.tab_id) is None:
-            save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments)
+            save_pending_turn(self.workspace_dir, self.tab_id, pending_text if pending_text is not None else text, attachments,
+                              is_real_user=is_real_user)
         else:
             log_event("engine", "pending_turn_kept_for_real_user_work", tab_id=self.tab_id, is_real_user=is_real_user)
         # Bug fix (2026-09-10): tag the WIRE copy (never pending_user_text/
@@ -429,7 +442,8 @@ class TurnSubmissionMixin:
         if len(held) > 1:
             log_event("engine", "user_messages_merged", tab_id=self.tab_id, count=len(held), text_len=len(text))
         self.submit(text, attachments, True, is_voice)
-    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False) -> None:
+    def _route_sw_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False,
+                       request_text: str | None = None, relay: bool = False) -> None:
         """Every turn in "sw" mode goes here, never to the Claude SDK (2026-10-03):
         while a small-model turn runs, new input is live context for it -- UNLESS it's a
         real user message arriving during a PROACTIVE turn, which queues as its own fresh
@@ -444,8 +458,9 @@ class TurnSubmissionMixin:
             log_event("engine", "small_model_live_comment_queued", tab_id=self.tab_id, text_len=len(text), is_real_user=is_real_user)
             self.small_model_pending_comments.append(text if is_real_user else f"{_SYNTHETIC_TURN_MARKER}{text}")
             return
-        self._start_small_model_turn(text, attachments, is_real_user, is_voice, suppress_narration)
-    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = True) -> bool:
+        self._start_small_model_turn(text, attachments, is_real_user, is_voice, suppress_narration, request_text, relay)
+    def inject_proactive(self, text: str, attachments: list[Any] | None = None, is_voice: bool = False, pending_text: str | None = None, suppress_narration: bool = True,
+                         request_text: str | None = None, relay: bool = False) -> bool:
         """Bug fix (2026-09-11), per explicit instruction: no more
         silent/silent_turn parameter -- whether a proactive reply is worth
         showing is now decided ENTIRELY by the model's own reply content
@@ -485,6 +500,9 @@ class TurnSubmissionMixin:
         attachments = attachments or []
         log_event("engine", "proactive_inject", tab_id=self.tab_id, text_len=len(text), attachment_count=len(attachments))
         asyncio.create_task(self.send({"type": "proactive_turn_queued"}))
+        if text.startswith("[New "):   # an incoming messenger note: a date in it may deserve a reminder (2026-11-20)
+            from app import auto_reminders
+            auto_reminders.consider_in_background(text, "an incoming messenger note", self.tab_id)
         # Per explicit instruction (2026-10-11): a proactive note is often exactly
         # the thing that says whose account/identity a reply would go out under
         # (e.g. "your own Telegram account" vs "the owner's own correspondence,
@@ -498,5 +516,9 @@ class TurnSubmissionMixin:
         # Internal turns follow the same chat-mode gate as real ones (2026-10-03):
         # in "sw" mode they run through the small-model cascade; everything else
         # (other modes, attachments, pending_text replays) keeps the SDK path.
-        self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration)
+        # request_text: the requester's own words when `text` wraps them in instructions (an akinakes turn); the
+        # formalizer and the checks read it, the model gets `text` (small_model_engine.run_small_model_turn).
+        # relay: the turn reports finished work and is not a request (akinakes): no formalizer, no start-rung advice.
+        self.submit(text, attachments, False, is_voice, pending_text=pending_text, suppress_narration=suppress_narration,
+                    request_text=request_text, relay=relay)
         return True

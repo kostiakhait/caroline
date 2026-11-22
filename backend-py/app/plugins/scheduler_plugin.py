@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from app.event_memory import forget_event_by_reminder_id, remember_event
 from app.logging_setup import log_event
+from app.reminder_tombstones import mark_cancelled
 from app.plugins.loader import Plugin, PluginTool
 from app.policies import follow_explicit_parameters_instruction
 from app.session_context import get_tab_id
@@ -183,6 +184,33 @@ def _migrate_legacy_recurrence(reminders: list[dict[str, Any]]) -> bool:
     return changed
 
 
+def _schedule_text(cron_text: str | None, due_iso: str | None) -> str:
+    return f"cron '{cron_text}'" if cron_text else f"once at {due_iso}"
+
+
+async def _advise(note: str, schedule: str, pending: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """reminder.advisor (app/microagents/reminder_advisor.py) on a new reminder against
+    the pending ones; None when there are none or on any failure -- then the reminder
+    is simply created, as before."""
+    if not pending:
+        return None
+    from app.plugins.voice_api import _run_local_microagent  # local: voice_api imports the plugin loader
+    from app.microagents.reminder_advisor import REMINDER_ADVISOR
+
+    existing = [{"id": r["id"], "note": r.get("note") or "", "schedule": _schedule_text(r.get("cron"), r.get("dueAtIso"))} for r in pending]
+    try:
+        result = await _run_local_microagent(REMINDER_ADVISOR, "app.microagents.reminder_advisor", {"new": {"note": note, "schedule": schedule}, "existing": existing})
+    except Exception as exc:  # noqa: BLE001 -- a failed check must not lose the user's reminder
+        log_event("engine", "reminder_advisor_failed", error=str(exc)[:200], error_type=type(exc).__name__)
+        return None
+    if not result or result.get("status") != "ok":
+        log_event("engine", "reminder_advisor_failed", error=(result or {}).get("error"))
+        return None
+    output = result.get("output") or {}
+    log_event("engine", "reminder_advisor_done", decision=output.get("decision"), id=output.get("id"), why=output.get("why"))
+    return output
+
+
 async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     reminders = _load_reminders()
     cron_text = args.get("cron")
@@ -208,6 +236,25 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     event_type = args.get("event_type") or "user"
     if event_type not in EVENT_TYPES:
         return {"text": f'Invalid event_type "{event_type}" -- must be one of {", ".join(EVENT_TYPES)}.', "is_error": True}
+    # Per explicit instruction (2026-10-29): an existing reminder on the same topic is
+    # refined, not duplicated. The advisor's merge is handed back to the model, which
+    # applies it with update_reminder (or corrects it); `separate` is for a reminder the
+    # user really wants next to a similar one.
+    if not args.get("separate"):
+        pending = [r for r in reminders if not r.get("fired") and r.get("kind") != BACKUP_KIND]
+        advice = await _advise(args["note"], _schedule_text(cron_text if cron else None, due_iso), pending)
+        if advice and advice.get("decision") == "update":
+            existing = next(r for r in pending if r["id"] == advice["id"])
+            suggested_cron = (advice.get("cron") or "").strip() or None
+            return {"text": (
+                f"Not scheduled: reminder {existing['id']} already covers this topic "
+                f"({_schedule_text(existing.get('cron'), existing.get('dueAtIso'))}): {existing.get('note')}\n\n"
+                f"Refine it instead -- call update_reminder with id {existing['id']}. Suggested merged reminder"
+                f"{f' (cron {suggested_cron!r})' if suggested_cron else ''}: {advice['note']}\n\n"
+                "Check the suggestion before you apply it: fix anything it dropped or invented, and anything that "
+                "contradicts the existing reminder's own rules (those win). Only if the user really wants a second, "
+                "separate reminder on this topic, call schedule_reminder again with separate=true."
+            )}
     reminder = {
         "id": uuid.uuid4().hex,
         "dueAtIso": due_iso,
@@ -231,6 +278,43 @@ async def schedule_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": f"Scheduled (id {reminder['id']}) for {due_iso} [{reminder['priority']}{rec_text}]: {args['note']}"}
 
 
+async def update_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """Refines a pending reminder in place: same id, same lastReport (2026-10-29)."""
+    reminders = _load_reminders()
+    reminder = next((r for r in reminders if r.get("id") == args["id"] and not r.get("fired")), None)
+    if reminder is None:
+        return {"text": f"No pending reminder with id {args['id']}.", "is_error": True}
+    try:
+        if args.get("cron"):
+            cron = _Cron(args["cron"])
+            reminder["cron"] = args["cron"]
+            reminder["dueAtIso"] = cron.next_after(datetime.now().astimezone()).isoformat()
+        if args.get("due_at_iso"):
+            due = datetime.fromisoformat(str(args["due_at_iso"]))
+            if due.tzinfo is None:
+                due = due.astimezone()
+            if not args.get("cron"):
+                reminder["cron"] = None
+            reminder["dueAtIso"] = due.isoformat()
+    except (ValueError, TypeError) as exc:
+        return {"text": f"Invalid schedule: {exc}", "is_error": True}
+    if args.get("event_type"):
+        if args["event_type"] not in EVENT_TYPES:
+            return {"text": f'Invalid event_type "{args["event_type"]}" -- must be one of {", ".join(EVENT_TYPES)}.', "is_error": True}
+        reminder["eventType"] = args["event_type"]
+    if args.get("priority"):
+        reminder["priority"] = args["priority"]
+    if args.get("note"):
+        reminder["note"] = args["note"]
+    reminder["updatedAtIso"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _save_reminders(reminders)
+    forget_event_by_reminder_id(WORKSPACE_DIR, reminder["id"])
+    remember_event(WORKSPACE_DIR, text=reminder["note"], due_at_iso=reminder["dueAtIso"], source="update_reminder", reminder_id=reminder["id"])
+    log_event("engine", "reminder_updated", reminder_id=reminder["id"], fields=sorted(k for k in ("note", "cron", "due_at_iso", "priority", "event_type") if args.get(k)))
+    rec_text = f", repeats on cron '{reminder['cron']}'" if reminder.get("cron") else ""
+    return {"text": f"Updated {reminder['id']}: next {reminder['dueAtIso']} [{reminder['priority']}{rec_text}]: {reminder['note']}"}
+
+
 async def list_reminders(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     pending = [r for r in _load_reminders() if not r.get("fired")]
     return {"text": json.dumps(pending, indent=2, ensure_ascii=False) if pending else "No pending reminders."}
@@ -239,6 +323,8 @@ async def list_reminders(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 async def cancel_reminder(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     before = _load_reminders()
     after = [r for r in before if r.get("id") != args["id"]]
+    # Recorded even when the id is not in the file: the cloud copy may still hold it (see reminder_tombstones.py).
+    mark_cancelled(WORKSPACE_DIR, args["id"])
     _save_reminders(after)
     removed = len(after) < len(before)
     if removed:
@@ -271,6 +357,23 @@ def set_reminder_awaiting_retry(reminder_id: str, waiting: bool) -> None:
             r.pop("awaitingRetry", None)
         _save_reminders(reminders)
         log_event("engine", "reminder_awaiting_retry_set", reminder_id=reminder_id, waiting=waiting)
+        return
+
+
+LAST_REPORT_MAX_CHARS = 2000
+
+
+def set_reminder_last_report(reminder_id: str, text: str) -> None:
+    """Keeps what a reminder's firing last reported to the user (2026-10-29): every
+    firing now starts a fresh session (main.py's _on_reminder_due), and this is all
+    of the earlier firings it is given -- enough to tell what is new since then. An
+    activity that is not a reminder has no record here and is left alone."""
+    reminders = _load_reminders()
+    for r in reminders:
+        if r.get("id") != reminder_id:
+            continue
+        r["lastReport"] = {"atIso": datetime.now().astimezone().isoformat(timespec="seconds"), "text": text[:LAST_REPORT_MAX_CHARS]}
+        _save_reminders(reminders)
         return
 
 
@@ -363,6 +466,10 @@ def _usage_instructions() -> str:
         "current turn; schedule_reminder is what exists for exactly that.\n"
         "cron has 6 fields, local time: second minute hour day-of-month month day-of-week (Sunday = 0). "
         "Examples: '0 0 9 * * *' every day at 09:00; '0 30 17 * * 6' every Saturday at 17:30; '0 0 */2 * * *' every 2 hours.",
+        "One reminder per topic. When the user adds to or changes something a reminder already does (another "
+        "mailbox for the same report, a new point to watch, a different time), refine that reminder with "
+        "update_reminder -- never add a second one next to it. schedule_reminder checks this itself: if an existing "
+        "reminder covers the topic it schedules nothing and hands you a suggested merge for update_reminder.",
         follow_explicit_parameters_instruction(),
     ))
 
@@ -383,11 +490,24 @@ PLUGIN = Plugin(
             "live progress chatter while it runs, but you still report the result when done. 'service' is for your "
             "own routine upkeep that doesn't concern the user at all (e.g. a memory/notes backup) -- also no "
             "progress chatter, AND stays completely silent afterward (reply [[NO_UPDATE]]) unless something is "
-            "actually broken.",
+            "actually broken. If a pending reminder already covers the same topic, nothing is scheduled: you get "
+            "its id and a suggested merge to apply with update_reminder. separate=true schedules it anyway -- only "
+            "when the user really wants a second reminder on that topic.",
             {
                 "due_at_iso": str | None, "note": str, "priority": str | None, "cron": str | None,
                 "recurring": str | None, "recurring_every_minutes": float | None, "event_type": str | None,
+                "separate": bool | None,
             }, schedule_reminder,
+        ),
+        PluginTool(
+            "update_reminder",
+            "Refine a pending reminder in place (see list_reminders for ids): a new note (give the WHOLE note, not "
+            "just the change), a new cron or due_at_iso, priority, event_type. Only the fields you pass change; the "
+            "reminder keeps its id and what it reported last time.",
+            {
+                "id": str, "note": str | None, "cron": str | None, "due_at_iso": str | None,
+                "priority": str | None, "event_type": str | None,
+            }, update_reminder,
         ),
         PluginTool(
             "list_reminders",

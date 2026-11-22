@@ -105,4 +105,4 @@ def test_plugin_is_discovered_and_always_loaded():
     from app.plugins.loader import discover_plugins
     plugin = next(p for p in discover_plugins() if p.name == "skills")
     assert plugin.always_loaded
-    assert {t.name for t in plugin.tools} == {"list_skills", "use_skill", "read_skill_file"}
+    assert {t.name for t in plugin.tools} == {"list_skills", "use_skill", "read_skill_file", "import_skill"}

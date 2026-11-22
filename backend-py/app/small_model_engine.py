@@ -70,6 +70,7 @@ backend startup over a missing/broken dependency, per this module's own
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -81,12 +82,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from app import rung_advice, session_context, skills, sw_tier_stats, tool_groups
+from app import model_billing, product_role, rung_advice, session_context, skills, sw_tier_stats, tool_groups
 from app.durability import load_tab_continuity_archive
 from app.logging_setup import log_event
 from app.model_key_provisioning import get_model_provider_key
 from app.operations import REGISTRY as OPERATIONS_REGISTRY
-from app.operations import _operation_to_dict, dispatch
+from app.operations import CHECK_OPERATION_WAIT_S, _operation_to_dict, dispatch, wait_for_operation
 from app.persona import Persona
 from app.owner_profile import get_owner_profile, owner_profile_system_prompt_clause
 from app.instruction_memory import instruction_memory_system_prompt_clause
@@ -347,7 +348,7 @@ async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], ta
             return result
         mark_funds_exhausted(reason)
         log_event("engine", "small_model_funds_exhausted", tab_id=tab_id, reason=reason, waited_s=round(waited_s))
-        emit(f"OpenRouter balance is insufficient ({reason}) -- waiting for a top-up.")
+        emit(f"The balance is insufficient ({reason}) -- waiting for a top-up.")
         if waited_s >= _FUNDS_EXHAUSTED_MAX_WAIT_S:
             raise _FundsExhaustedGivingUp(reason)
         await asyncio.sleep(_FUNDS_EXHAUSTED_RETRY_INTERVAL_S)
@@ -356,7 +357,7 @@ async def _call_with_funds_wait(call_fn: Callable[[], "asyncio.Future[str]"], ta
 
 def _funds_exhausted_final_answer(reason: str) -> str:
     return (
-        f"I can't answer right now -- the OpenRouter balance has run out ({reason}). "
+        f"I can't answer right now -- the balance has run out ({reason}). "
         "Once it is topped up, everything will work as before."
     )
 
@@ -527,6 +528,15 @@ async def _hedged_verifier_call(make_call: Callable[[], Awaitable[str]], tab_id:
 
 
 
+def _takes_usage_extra(ai: Any) -> bool:
+    """Whether Camerlengo's resolve_agentic() takes usage_extra (2026-11-03): an older
+    AI.py does not, and the call then goes without it."""
+    try:
+        return "usage_extra" in inspect.signature(ai.resolve_agentic).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 async def _resolve_agentic_with_watchdog(
     ai: Any, tracker: _TurnTracker, *, parent_cancels: tuple[threading.Event, ...] = (), **resolve_kwargs: Any,
 ) -> str:
@@ -547,6 +557,8 @@ async def _resolve_agentic_with_watchdog(
     parent_cancels: the flags of whatever started this attempt (a parallel-stage
     branch's turn and tier attempt) -- once one of them is set, this attempt is
     given up too, so an abandoned branch stops waiting and stops acting."""
+    if "usage_extra" in resolve_kwargs and not _takes_usage_extra(ai):
+        resolve_kwargs.pop("usage_extra")
     tracker.touch_progress()
     started = time.monotonic()
     attempt_cancel = threading.Event()
@@ -633,6 +645,9 @@ def _persona_system_message(persona: Persona) -> str:
     else:
         agreement = "Use grammatical forms matching your stated gender when replying in a language that grammatically marks gender."
     bio_line = persona.biography or persona.bio
+    role = product_role.role_text()  # opt-in (app/product_role.py): a host of one product gives her role there instead of "personal assistant"
+    if role:
+        return f"You are {persona.name}, {persona.age}, {persona.gender}.\n{agreement}\n{role}"
     return (
         f"You are {persona.name}, {persona.age}, {persona.gender}. {persona.bio}\n"
         f"{bio_line}\n"
@@ -778,7 +793,9 @@ _OPERATIONS_TOOL_DEFS: list[dict[str, Any]] = [
             "name": "check_operation_status",
             "description": (
                 "Checks the status of a previously started long-running tool operation (one whose start "
-                "returned status=\"running\" instead of \"done\"). Returns the current status "
+                "returned status=\"running\" instead of \"done\"). Waits for it to finish, up to "
+                f"{int(CHECK_OPERATION_WAIT_S)} seconds, so one call gets the final result as soon as there is "
+                "one -- no need to call it again right away. Returns the current status "
                 "(running/done/error/cancelled), any partial/intermediate data reported so far, and the final "
                 "result once done."
             ),
@@ -1099,6 +1116,7 @@ class _SquirrelWisdomStepAdapter:
         self, model: str, messages: list[dict[str, Any]], max_tokens: int | None = None, temperature: float = 0.2,
         transforms: list[str] | None = None, stop: Any = None, tools: list[dict[str, Any]] | None = None,
         reasoning: dict[str, Any] | None = None, timeout: float | None = None, plugins: list[dict[str, Any]] | None = None,
+        usage_extra: dict[str, Any] | None = None,  # the proxy's usage-log tag; the server logs this path itself
     ) -> Any:
         body: dict[str, Any] = {
             "command": "ai:resolveAgenticStep", "key": CAROLINE_SW_KEY, "messages": messages, "model": model,
@@ -1146,9 +1164,10 @@ async def _model_ai() -> Any | None:
     # base_url points this at Camerlengo's own /v1/chat/completions proxy
     # (not openrouter.ai directly) -- see model_key_provisioning.py's own
     # docstring: api_key here is the composite "<CAROLINE_SW_KEY>.<session>"
-    # token that proxy expects, not a real OpenRouter key.
-    return camerlengo_ai.AI(adapter=camerlengo_ai.OpenRouterAdapter(
-        api_key=api_key, base_url="https://www.squirrelwisdom.com/v1"))
+    # token that proxy expects, not a real OpenRouter key. The proxy charges no
+    # wallet, so every call is checked and charged here (app/model_billing.py).
+    return camerlengo_ai.AI(adapter=model_billing.ChargingAdapter(camerlengo_ai.OpenRouterAdapter(
+        api_key=api_key, base_url="https://www.squirrelwisdom.com/v1"), api_key))
 
 
 async def prewarm_model_access() -> None:
@@ -1176,6 +1195,9 @@ def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[s
         ).choices[0].message
         found = [a.get("url_citation") or {} for a in (via_server.annotations or []) if isinstance(a, dict) and a.get("type") == "url_citation"]
         return str(via_server.content or "").strip(), [s for s in found if s.get("url")]
+    charging = isinstance(ai.adapter, model_billing.ChargingAdapter)
+    if charging:
+        model_billing.ensure_funds(ai.adapter.session)
     response = ai.adapter.client.with_options(timeout=WEB_SEARCH_TIMEOUT_S, max_retries=0).chat.completions.create(
         model=cfg.AI_MODEL_SMALL,
         messages=[
@@ -1186,8 +1208,11 @@ def _web_search_once(question: str, ai: Any, cfg: Any) -> tuple[str, list[dict[s
         extra_body={
             "plugins": [{"id": "web", "engine": WEB_SEARCH_ENGINE, "max_results": WEB_SEARCH_MAX_RESULTS}],
             "reasoning": WEB_SEARCH_REASONING,
+            "usage": {"include": True},
         },
     )
+    if charging:
+        ai.adapter.charge(cfg.AI_MODEL_SMALL, response)
     message = response.model_dump()["choices"][0]["message"]
     sources = [a.get("url_citation") or {} for a in (message.get("annotations") or []) if a.get("type") == "url_citation"]
     return str(message.get("content") or "").strip(), [s for s in sources if s.get("url")]
@@ -1289,6 +1314,9 @@ class _TurnTracker:
     # user's words) and the latest calls of the turn, for the same check.
     task_text: str = ""
     recent_calls: list[str] = field(default_factory=list)
+    # Every call of the turn with its whole result, for sw.result.facts (2026-10-31): recent_calls cuts each
+    # result to 200 chars, and a document_get showed the id and title but not the text the facts came from.
+    call_results: list[tuple[str, str]] = field(default_factory=list)
 
     def touch_progress(self) -> None:
         self.last_progress_at = time.monotonic()
@@ -1341,7 +1369,7 @@ def _run_plan_tool(name: str, args: dict[str, Any], tracker: _TurnTracker) -> st
 async def _run_parallel_stage(
     stage_index: int, *, tracker: _TurnTracker, tab_id: str | None, send: session_context.SendFn | None,
     main_loop: asyncio.AbstractEventLoop, registry: "ToolRegistry", ai: Any, cfg: Any,
-    system_text: str, user_text: str, model: str, recorder: Any = None,
+    system_text: str, user_text: str, model: str, reasoning: dict[str, Any] | None, recorder: Any = None,
 ) -> str:
     if tracker.plan_stages is None or not (0 <= stage_index < len(tracker.plan_stages)):
         return f"ERROR: the declared plan has no stage {stage_index}."
@@ -1397,8 +1425,10 @@ async def _run_parallel_stage(
                             ai, branch_tracker, parent_cancels=parent_cancels,
                             messages=branch_messages, tool_defs=branch_tools, executor_fn=traced_executor,
                             model=model, max_iterations=MAX_ITERATIONS,
-                            transforms=DISABLE_MIDDLE_OUT, reasoning=REASONING_EFFORT,
-                            app="caroline",
+                            # The tier's own effort (2026-11-03): branches ran at "high" on every tier,
+                            # nano and codex-mini included, while the tier itself runs at "low".
+                            transforms=DISABLE_MIDDLE_OUT, reasoning=reasoning,
+                            app="caroline", usage_extra={"purpose": "branch", "stage": stage_index, "step": step_index},
                         ),
                         tab_id, lambda _line: None,
                     )
@@ -1521,7 +1551,9 @@ def build_tool_registry() -> ToolRegistry:
     ever learn the real result, so it had to guess or just claim success.
     Confirmed live as the actual cause of a placeholder note being left
     behind while the model told the user it was "preparing" the real one."""
-    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_STAGE_TOOL_DEFS) + list(_WEB_SEARCH_TOOL_DEFS)
+    # Opt-in (the Ferret editor host sets CAROLINE_NO_NATIVE_TOOLS=1; nothing sets it elsewhere): no web search of its own -- only the tools the loaded plugins hand it.
+    _web_search_defs = [] if os.environ.get("CAROLINE_NO_NATIVE_TOOLS") == "1" else list(_WEB_SEARCH_TOOL_DEFS)
+    tool_defs: list[dict[str, Any]] = list(_OPERATIONS_TOOL_DEFS) + list(_PLAN_TOOL_DEFS) + list(_STAGE_TOOL_DEFS) + _web_search_defs
     lookup: dict[str, tuple[str, PluginTool]] = {}
     tool_instructions: dict[str, str] = {}
     own_plugins: list[dict[str, Any]] = []
@@ -1559,6 +1591,7 @@ async def _run_operations_tool(name: str, args: dict[str, Any], registry: ToolRe
         op = OPERATIONS_REGISTRY.get(args["operation_id"])
         if op is None:
             return "Unknown or already-completed operation_id."
+        await wait_for_operation(op)
         body = _operation_to_dict(op)
         if op.status in ("done", "error", "cancelled"):
             op.collected = True  # no completion notice repeating it (operations._notify_unless_collected)
@@ -1713,7 +1746,7 @@ def _make_executor_fn(
                         f"Use the same one ({use_account}) -- an answer goes out from the identity that received the "
                         "message -- unless the task itself says to act as the other."
                     )
-            grounded, invented = _content_grounded(task_text, name, args, list(tracker.recent_calls), tab_id)
+            grounded, invented = _content_grounded(task_text, name, args, list(tracker.call_results), tab_id)
             if not grounded:
                 return (
                     f"NOT DONE: the content of this {name} call states things the task and your results do not "
@@ -1827,7 +1860,11 @@ _CLAUDE_ATTEMPT_QUESTION_RULE = (
     "files and tools could not (after they were tried); a choice that really depends on the user's preference; a "
     "permission only the user can give. Do not escalate such a reply -- a stronger model would only ask the same "
     "thing. Escalate a question only when the assistant could have found the answer or done the step itself with "
-    "its tools and did not try."
+    "its tools and did not try. Likewise a request that only asked a question, to remember something, or to talk "
+    "something over is finished once answered, saved or discussed in words: a reply that does no further work "
+    "is OK, and a reply that does MORE than was asked (sends or drafts a message nobody asked for, takes up other "
+    "tasks) is not. A task that is blocked outside the assistant's reach (a service down, a usage cap) and says so "
+    "plainly is OK as it stands too."
 )
 
 
@@ -1914,6 +1951,11 @@ def _build_verification_prompt(
             "knowledge or from the conversation itself needs no tool"
             + (", and neither does a reply that only reports on, summarizes or refers to work the person was already "
                "shown." if recent_dialogue else ".")
+            + " But a reply that states steps the assistant itself will do next (\"дальше\", \"потом я\", \"следующий "
+            "шаг\", \"next I will\", \"I will then\") -- even beside a report of finished work, and even when the "
+            "person's own request is met -- is NOT finished: those steps were not done in this attempt. Escalate it "
+            "and name the steps. Only a step that needs the user's approval or answer first (sending, paying, "
+            "deleting, publishing) may stay unsaid-done."
         )
     elif not tier_trace and not tracker.branch_trace:
     # edition:end
@@ -2160,7 +2202,10 @@ def _strip_verdict_preface(verified: str, candidate: str) -> str:
 
 
 def _usable(text: str) -> bool:
-    return bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
+    from app.sw_request_spec import looks_like_formalizer_output
+
+    return (bool(text.strip()) and ESCALATION_SENTINEL not in text and _is_silent_infra_failure(text) is None
+            and not looks_like_formalizer_output(text))
 
 
 VERIFIER_OK = "OK"
@@ -2270,6 +2315,7 @@ async def verify_claude_attempt(
                 ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
                 max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
                 transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+                usage_extra={"purpose": "claude_ladder_verifier"},
             ), tab_id),
             tab_id, lambda _line: None,
         ), timeout=CLAUDE_ATTEMPT_VERDICT_TIMEOUT_S)
@@ -2353,6 +2399,7 @@ async def verify_delivery(user_text: str, trace: list[str], delivered: str, tab_
                 ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
                 max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
                 transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+                usage_extra={"purpose": "delivery_report_verifier"},
             ), tab_id),
             tab_id, lambda _line: None,
         ), timeout=DELIVERY_VERDICT_TIMEOUT_S)
@@ -2417,6 +2464,7 @@ async def summarize_conversation(digest: str, tab_id: str) -> str | None:
                 ai, tracker, messages=messages, tool_defs=None, executor_fn=executor_fn, model=cfg.AI_MODEL_MINI,
                 max_iterations=MAX_ITERATIONS, on_progress=lambda _evt: None, get_new_messages=lambda: None,
                 transforms=DISABLE_MIDDLE_OUT, reasoning=VERIFIER_REASONING_EFFORT, on_usage=on_usage, app="caroline",
+                usage_extra={"purpose": "compaction_recovery_summary"},
             ), tab_id),
             tab_id, lambda _line: None,
         ), timeout=RECOVERY_SUMMARY_TIMEOUT_S)
@@ -2601,13 +2649,22 @@ def _account_consistent(task: str, tool_name: str, args: dict[str, Any], calls: 
     return consistent, use, why
 
 
-def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: list[str], tab_id: str | None) -> tuple[bool, str]:
+# How many microagent calls of one content-grounding check run at once (the parts of the call, the parts of the
+# turn's results).
+GROUNDING_WORKERS = 8
+
+
+def _content_grounded(task: str, tool_name: str, args: dict[str, Any], results: list[tuple[str, str]], tab_id: str | None) -> tuple[bool, str]:
     """The content-grounding check, run synchronously on the tool-call worker thread for the
     changing call just checked by sw.action.scope: sw.content.extract takes the statements
-    of fact out of what the call writes or sends, sw.content.grounding judges that list.
-    Fail-open (logged)."""
+    of fact out of what the call writes or sends, sw.result.facts quotes what the turn's
+    results say about them, sw.content.grounding judges the statements against the quotes.
+    Nothing is cut (2026-10-31): the call and every result are read whole, a long one in
+    parts, in parallel. Fail-open (logged)."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from app.microagent_client import build_local_runtime, new_budget
-    from app.microagents import sw_content_extract, sw_content_grounding
+    from app.microagents import sw_content_extract, sw_content_grounding, sw_result_facts
 
     shown = {k: v for k, v in (args or {}).items() if k not in ("password", "imapHost", "imapPort", "smtpHost", "smtpPort")}
     started = time.monotonic()
@@ -2628,30 +2685,90 @@ def _content_grounded(task: str, tool_name: str, args: dict[str, Any], calls: li
         return (result or {}).get("output") or {}
 
     try:
-        extracted = run(sw_content_extract, sw_content_extract.CONTENT_EXTRACT, {
-            "tool": tool_name, "args": json.dumps(shown, ensure_ascii=False, default=str)[:6000],
-        })
-        facts = [str(f) for f in (extracted or {}).get("facts") or []]
-        requests = [str(r) for r in (extracted or {}).get("requests") or []][:8]
+        call_parts = sw_result_facts.parts(json.dumps(shown, ensure_ascii=False, default=str))
+        with ThreadPoolExecutor(max_workers=GROUNDING_WORKERS) as pool:
+            extracted = list(pool.map(lambda part: run(sw_content_extract, sw_content_extract.CONTENT_EXTRACT, {
+                "tool": tool_name, "args": part,
+            }), call_parts))
+        facts = list(dict.fromkeys(str(f) for out in extracted for f in (out or {}).get("facts") or []))
+        requests = list(dict.fromkeys(str(r) for out in extracted for r in (out or {}).get("requests") or []))[:8]
         if not facts and not requests:
             log_event("engine", "sw_content_grounding", tab_id=tab_id, tool=tool_name, grounded=True, facts=0,
                       ms=int((time.monotonic() - started) * 1000))
             return True, ""
 
+        def quotes() -> list[str] | None:
+            """What the turn's results say about the facts, quoted word for word. A part that could not be read
+            gives nothing; None (the check fails open) only when no part could be read at all."""
+            inputs = [{"tool": label, "result": part, "statements": facts}
+                      for label, result in results for part in sw_result_facts.parts(result) if part.strip()]
+            def read(given: dict[str, Any]) -> tuple[list[str], list[str]] | None:
+                # A quote not in the part word for word gets one more try, named (2026-10-31, per explicit
+                # instruction); what still does not match is dropped, the matched quotes of both tries kept.
+                out = run(sw_result_facts, sw_result_facts.RESULT_FACTS, given)
+                if out is None:
+                    return None
+                kept, missed = sw_result_facts.kept_quotes(given, out)
+                if missed:
+                    again = run(sw_result_facts, sw_result_facts.RESULT_FACTS, {**given, "rejected": missed})
+                    if again is not None:
+                        more, missed = sw_result_facts.kept_quotes(given, again)
+                        kept += [q for q in more if q not in kept]
+                return kept, missed
+
+            with ThreadPoolExecutor(max_workers=GROUNDING_WORKERS) as pool:
+                found = list(pool.map(read, inputs))
+            failed = sum(out is None for out in found)
+            if inputs and failed == len(inputs):
+                return None
+            lines: list[str] = []
+            dropped: list[str] = []
+            for given, out in zip(inputs, found):
+                if out is None:
+                    continue
+                kept, missed = out
+                dropped += missed
+                lines += [f"- {given['tool']} says: {quote}" for quote in kept]
+            log_event("engine", "sw_result_facts", tab_id=tab_id, tool=tool_name, results=len(results), parts=len(inputs),
+                      failed=failed, quotes=len(lines), dropped=len(dropped))
+            if dropped:
+                log_event("engine", "sw_result_facts_dropped", tab_id=tab_id, tool=tool_name,
+                          quotes=[q[:300] for q in dropped[:10]])
+            return list(dict.fromkeys(lines))
+
         def judge_facts() -> list[str] | None:
             if not facts:
                 return []
-            judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": calls[-15:]})
+            quoted = quotes()
+            if quoted is None:
+                return None
+            judged = run(sw_content_grounding, sw_content_grounding.CONTENT_GROUNDING, {"task": task, "facts": facts, "calls": quoted})
             if judged is None or sw_content_grounding.verify_content_grounding({}, judged) is not None:
                 return None
             return [str(x) for x in judged["invented"]]
 
         def judge_request(request: str) -> str | None:
-            # A request is invented unless the agent quotes words that really are in the task.
-            quoted = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, {"task": task, "request": request})
+            # A request is invented unless the agent quotes words that really are in the task. A quote that is not
+            # in the task gets one more try, named, as sw.result.facts does (2026-11-01, akinakes chat secretary: on
+            # the same input nano quoted the outgoing text itself, or the task's words with a colon dropped, about
+            # half the time, and each miss refused the whole call).
+            given = {"task": task, "request": request}
+            quoted = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, given)
             if quoted is None or sw_content_grounding.verify_request_asked({}, quoted) is not None:
                 return None
-            return None if sw_content_grounding.asked(task, quoted) else f"the task does not ask for this: {request}"
+            if not sw_content_grounding.asked(task, quoted) and str(quoted.get("quote") or "").strip():
+                again = run(sw_content_grounding, sw_content_grounding.REQUEST_ASKED, {**given, "rejected": quoted["quote"]})
+                if again is not None and sw_content_grounding.verify_request_asked({}, again) is None:
+                    quoted = again
+            if not sw_content_grounding.asked(task, quoted):
+                return f"the task does not ask for this: {request}"
+            # The quote is in the task; do those words ask for *this* request? (2026-11-01: with the retry, nano
+            # quoted any sentence of the task -- "Do you need a lift?" for "promises to pick her up" -- and invented
+            # requests passed 25/84.)
+            judged = run(sw_content_grounding, sw_content_grounding.REQUEST_MATCHES, {"request": request, "quote": quoted["quote"]})
+            if judged is None or sw_content_grounding.verify_request_matches({}, judged) is not None:
+                return None
+            return None if judged["asks"] else f"the task does not ask for this: {request}"
 
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1 + len(requests)) as pool:
@@ -3267,6 +3384,8 @@ async def run_small_model_turn(
     history_summary: str | None = None,
     recorder: Any = None,
     formalize_request: bool = True,
+    request_text: str | None = None,
+    relay: bool = False,
 ) -> dict[str, Any]:
     """Answers `user_text` through the OpenRouter-only path -- never hands off
     to the Claude SDK (2026-10-03). Always returns {"status": "answered", "text"}.
@@ -3306,13 +3425,31 @@ async def run_small_model_turn(
     if camerlengo_ai is None:
         log_event("engine", "small_model_engine_unavailable", tab_id=tab_id)
         return _answer(_UNAVAILABLE_ANSWER)
+    # The wallet, read fresh: an empty one starts no turn at all (app/model_billing.py).
+    model_billing.mark_stale()
+    if not MODEL_CALLS_VIA_SQUIRRELWISDOM:
+        api_key = await get_model_provider_key()
+        if api_key:
+            try:
+                await asyncio.to_thread(model_billing.ensure_funds, model_billing.session_of(api_key))
+            except RuntimeError as exc:
+                log_event("engine", "small_model_turn_refused_no_funds", tab_id=tab_id)
+                return _answer(_funds_exhausted_final_answer(str(exc)))
     # The formalized task (app/sw_request_spec.py), drafted while the rest is set up --
     # for a real user's request only: an internal note (a permission-guard stop, a
     # finished background operation) was "formalized" into a task of its own on the
     # test box, 2026-10-22, and the turn ended asking the user to confirm a send.
     from app.sw_request_spec import formalize
 
-    request_spec_task = asyncio.ensure_future(formalize(user_text, recent_dialogue_lines, tab_id)) if formalize_request else None
+    # What the requester asked, in their own words: what the formalizer, the advice and every check read. The same as
+    # user_text, except where a caller wraps the request in instructions of its own (2026-11-02, akinakes: the
+    # channel's task template was formalized and checked as if the person had asked for it -- "hand the task to the
+    # room agents" came from our instructions, and every hand-off counted as asked). The model still gets user_text.
+    request = request_text or user_text
+    # A relay turn (akinakes: an agent's finished work reported to the room) is not a request: nothing to formalize and
+    # no start-rung advice (the advisor read a plan in the report as a document to interpret and started on the top
+    # rung, 2026-11-03). The checks still run, with `request` as their yardstick.
+    request_spec_task = asyncio.ensure_future(formalize(request, recent_dialogue_lines, tab_id)) if formalize_request and not relay else None
 
     # Explicit adapter -- never rely on camerlengo_ai.AI()'s own default
     # (Config.OPENROUTER_KEY, server-only) from this process. Which adapter, and
@@ -3330,15 +3467,15 @@ async def run_small_model_turn(
     # conversation so far and the user's reaction -- run alongside the rest of the setup, a real user's request only.
     rung_ladder = rung_advice.sw_ladder([cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS])
     rung_advice_task = asyncio.ensure_future(rung_advice.advise(
-        "sw", rung_ladder, user_text, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
-    )) if formalize_request else None
+        "sw", rung_ladder, request, "\n".join(recent_dialogue_lines[-8:]), workspace_dir, tab_id,
+    )) if formalize_request and not relay else None
     # The tier statistics' advice (tags, then sw.tier.advice), started here alongside the request
     # spec and the rung advice (2026-10-29): it used to wait for the spec, tagging the formalized
     # task, so spec, tags and advice ran one after another -- live, 7.6 + 4.6 + 6.0s before the
-    # first tier began. The tags now come from the user's own words.
+    # first tier began. The tags now come from the requester's own words.
     tier_advice_task = asyncio.ensure_future(_tags_and_tier_advice(
-        user_text, [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS], workspace_dir, tab_id,
-    )) if formalize_request else None
+        request, [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS], workspace_dir, tab_id,
+    )) if formalize_request and not relay else None
 
     registry = build_tool_registry()
     system = "\n\n".join([
@@ -3350,7 +3487,7 @@ async def run_small_model_turn(
         _engine_instructions(language),
         _ACT_DO_NOT_ASK_INSTRUCTION,
         _shared_policy_text(workspace_dir, tab_id),
-    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in user_text else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else [])
+    ] + ([_SEVERAL_REQUESTS_INSTRUCTION] if "\n\n" in request else []) + ([_VOICE_ANSWER_INSTRUCTION] if is_voice else [])
       + ([history_summary] if history_summary else []))
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     if history_messages is not None:
@@ -3371,7 +3508,8 @@ async def run_small_model_turn(
         messages.append({"role": "user", "content": (
             f"{sent_line}\n[The task, formalized from the user's request -- this is the work to do. Every value "
             f"in it (names, amounts, dates, wording) is the user's own and is used exactly as given:]\n{request_spec}\n\n"
-            f"[The user's own words, for clarification:]\n{user_text}"
+            + (f"[The user's own words, for clarification:]\n{user_text}" if request == user_text else
+               f"[The task as it reached you, with its instructions, for clarification:]\n{user_text}")
         )})
     else:
         messages.append({"role": "user", "content": f"{sent_line}\n{user_text}"})
@@ -3379,14 +3517,14 @@ async def run_small_model_turn(
     main_loop = asyncio.get_running_loop()
     tracker = _TurnTracker()
     # A real user's task -- what the changing-action check compares calls against.
-    tracker.task_text = (request_spec or user_text) if formalize_request else ""
-    current_model = {"name": cfg.AI_MODEL_SMALL}
+    tracker.task_text = (request_spec or request) if formalize_request else ""
+    current_model = {"name": cfg.AI_MODEL_SMALL, "reasoning": TIER_REASONING_EFFORT[0]}
 
     async def run_stage(stage_index: int) -> str:
         return await _run_parallel_stage(
             stage_index, tracker=tracker, tab_id=tab_id, send=send, main_loop=main_loop,
             registry=registry, ai=ai, cfg=cfg, system_text=messages[0]["content"],
-            user_text=user_text, model=current_model["name"], recorder=recorder,
+            user_text=user_text, model=current_model["name"], reasoning=current_model["reasoning"], recorder=recorder,
         )
 
     live_dialogue = [f"User: {user_text}"]
@@ -3443,6 +3581,9 @@ async def run_small_model_turn(
             tier_trace.append(_trace_line(evt.get("name"), args, evt.get("result", "")))
             tracker.recent_calls.append(_trace_line(evt.get("name"), args, str(evt.get("result", ""))[:200]))
             del tracker.recent_calls[:-20]
+            # Readable, not the raw JSON text: what sw.result.facts quotes from (see its own docstring).
+            from app.microagents.sw_result_facts import readable
+            tracker.call_results.append((f"{evt.get('name')}({args})", readable(evt.get("result", ""))))
         if evt.get("type") == "done" and on_live_dialogue_update:
             text = evt.get("text", "")
             if ESCALATION_SENTINEL not in text:
@@ -3488,7 +3629,7 @@ async def run_small_model_turn(
     ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
-        evidence = await _result_evidence(request_spec or user_text, list(tier_history) + list(trace), evidence_memo, tab_id)
+        evidence = await _result_evidence(request_spec or request, list(tier_history) + list(trace), evidence_memo, tab_id)
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate, can_retry, evidence)})
         if not_a_form is not None:
             verification_messages.append({"role": "assistant", "content": not_a_form})
@@ -3500,7 +3641,7 @@ async def run_small_model_turn(
                 model=first_model or cfg.AI_MODEL_MINI, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                 get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
                 reasoning=None if first_model else VERIFIER_REASONING_EFFORT, on_usage=on_usage,
-                app="caroline",
+                app="caroline", usage_extra={"purpose": "verifier"},
             ), tab_id),
             tab_id, emit,
         )
@@ -3590,7 +3731,7 @@ async def run_small_model_turn(
     # no lower than tier 1 for an apparent fan-out task) and the verifier's own
     # unconditional red flag (_build_verification_prompt). See _looks_multi_
     # target's own comment for the real incident this closes off.
-    tracker.looks_multi_target = _looks_multi_target(user_text)
+    tracker.looks_multi_target = _looks_multi_target(request)
 
     # A real fact from the first second (2026-10-10): picking the starting tier is itself
     # a model call (~10s live), and until a tier starts the narrator had nothing to
@@ -3600,7 +3741,7 @@ async def run_small_model_turn(
         start_index = start_tier  # already decided by the fast lane's decline
         log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
     else:
-        start_index = await _start_tier_index(ai, cfg, user_text)
+        start_index = await _start_tier_index(ai, cfg, request)
         if tracker.looks_multi_target:
             # "check every mailbox" is a fan-out task, not necessarily a
             # COMPLEX dependent chain in _COMPLEXITY_PROMPT's own sense -- see
@@ -3646,6 +3787,7 @@ async def run_small_model_turn(
         log_event("engine", "small_model_tier_started", tab_id=tab_id, tier=index, model=model)
         emit(f"Tier {index + 1} ({model}) is working.")
         current_model["name"] = model
+        current_model["reasoning"] = TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)]
         candidate = ""
         try:
             candidate = await _call_with_funds_wait(
@@ -3654,8 +3796,8 @@ async def run_small_model_turn(
                     messages=messages, tool_defs=registry.tool_defs, executor_fn=executor_fn,
                     model=model, max_iterations=MAX_ITERATIONS, on_progress=on_progress,
                     get_new_messages=get_new_messages, transforms=DISABLE_MIDDLE_OUT,
-                    reasoning=TIER_REASONING_EFFORT[min(index, len(TIER_REASONING_EFFORT) - 1)], on_usage=on_usage,
-                    app="caroline",
+                    reasoning=current_model["reasoning"], on_usage=on_usage,
+                    app="caroline", usage_extra={"purpose": "tier", "tier": index},
                 ),
                 tab_id, emit,
             )
@@ -3713,7 +3855,7 @@ async def run_small_model_turn(
                 if tier_attempts == 0:
                     stay, why = True, "first attempt on this tier"
                 else:
-                    stay, why = await _attempt_progressed(request_spec or user_text, tier_history, attempt_lines, tab_id)
+                    stay, why = await _attempt_progressed(request_spec or request, tier_history, attempt_lines, tab_id)
                 log_event("engine", "small_model_retry_decision", tab_id=tab_id, tier=index, model=model,
                           attempt=tier_attempts + 1, stay=stay, why=why, verifier_said=action)
                 if stay and action == "up":
@@ -3755,7 +3897,7 @@ async def run_small_model_turn(
                 else:
                     emit(f"The check found this tier's work incomplete; retrying tier {index + 1} with what's missing.")
                     advice = await _tool_advice(
-                        request_spec or user_text, missing, tier_history, registry, tried_groups, tab_id,
+                        request_spec or request, missing, tier_history, registry, tried_groups, tab_id,
                     )
                     nudge = (
                         f"[Verifier checked the previous attempt and found it incomplete: {missing} Do the missing part "
@@ -3787,8 +3929,8 @@ async def run_small_model_turn(
             sw_tier_stats.record(workspace_dir, task_tags, tiers_ran, closed_on)
         except Exception as exc:  # noqa: BLE001 -- statistics never cost the answer
             log_event("engine", "sw_tier_stats_record_failed", tab_id=tab_id, error=str(exc)[:200])
-    if formalize_request and tiers_ran:
-        rung_advice.record(workspace_dir, tab_id, "sw", user_text, rung_ladder, start_index,
+    if formalize_request and not relay and tiers_ran:
+        rung_advice.record(workspace_dir, tab_id, "sw", request, rung_ladder, start_index,
                            closed_on if closed_on is not None else tiers_ran[-1], escalation_notes)
     if not final_text:
         # No tier ever produced a usable candidate (all stalled/errored/escalated

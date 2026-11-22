@@ -27,11 +27,13 @@ def test_the_incident_of_2026_10_20_a_send_from_carolines_own_telegram_needs_not
 
 
 @pytest.mark.parametrize("identity", ["user_own", "n/a", None])
-def test_a_send_as_the_user_needs_an_order_or_an_approval(identity):
-    reason = send_block_reason(facts(identity=identity), approved=False)
-    assert reason and "user's own identity" in reason and "Send the file to Olga" in reason
-    assert send_block_reason(facts(identity=identity, ordered=True), approved=False) is None
-    assert send_block_reason(facts(identity=identity), approved=True) is None
+def test_a_send_as_the_user_is_decided_by_the_final_text_gate_alone(identity):
+    # an order or an approval is not enough (2026-11-20): only the gate's verdict counts
+    unchecked = send_block_reason(facts(identity=identity, ordered=True), approved=True)
+    assert unchecked and "final text could not be checked" in unchecked
+    blocked = send_block_reason(facts(identity=identity, ordered=True), approved=True, final_text_reason="not shown yet.", final_text_checked=True)
+    assert blocked and blocked.endswith("not shown yet.") and "Send the file to Olga" in blocked
+    assert send_block_reason(facts(identity=identity), approved=False, final_text_reason=None, final_text_checked=True) is None
 
 
 def test_money_needs_an_order_or_an_approval_whoever_pays():

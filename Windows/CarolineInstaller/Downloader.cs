@@ -164,6 +164,6 @@ internal sealed class Downloader
         return Convert.ToHexString(await sha256.ComputeHashAsync(stream, ct)).ToLowerInvariant();
     }
 
-    private static async Task<bool> HashMatchesAsync(string path, string expectedSha256Hex, CancellationToken ct) =>
+    internal static async Task<bool> HashMatchesAsync(string path, string expectedSha256Hex, CancellationToken ct) =>
         string.Equals(await HashAsync(path, ct), expectedSha256Hex, StringComparison.OrdinalIgnoreCase);
 }

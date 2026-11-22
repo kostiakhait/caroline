@@ -1,6 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import re
+
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
+from app.plugins.voice_api import _ASKS_USER
+
+# Calls that say nothing about the task itself: waiting on an operation, looking up the tool catalogue. A remark built from
+# them reads as "a check timed out" or "I am reading the tool list".
+_BOOKKEEPING_CALLS = frozenset({"check_operation_status", "stop_operation", "describe_tool", "list_tools", "list_groups", "get_tool_instructions"})
+
+
+def _is_bookkeeping_call(name: str) -> bool:
+    return name.rsplit("__", 1)[-1] in _BOOKKEEPING_CALLS
 
 
 class TextNarrationMixin:
@@ -32,19 +44,33 @@ class TextNarrationMixin:
         # running" to the narrator for its entire actual duration. REGISTRY
         # is the same per-tab ground truth ChatSession.stop()'s own
         # cancel_for_tab already relies on for "what's really running".
-        running_calls = list(self._pending_tool_calls.values())
-        running_agents = REGISTRY.running_for_tab(self.tab_id)
-        finished = list(self.turn_tool_outcomes.values())
+        #
+        # Remarks must match what is actually being done. This used to list
+        # turn_tool_outcomes (the LAST call of each tool name, in the order the names first appeared, running calls first):
+        # a sixty-step browser task reached the narrator as ten unordered lines and it filled the gaps with "still filling
+        # the form". Now: the last 12 calls in the order they finished, then what is running, the bookkeeping calls left
+        # out (status polls, tool catalogue lookups), and what she has just told the user herself.
+        running_calls = [(n, a) for n, a in self._pending_tool_calls.values() if not _is_bookkeeping_call(n)]
+        running_agents = [op for op in REGISTRY.running_for_tab(self.tab_id) if not _is_bookkeeping_call(op.tool_name)]
+        finished = [entry for entry in self.turn_action_log if not _is_bookkeeping_call(entry[0])]
         if not running_calls and not running_agents and not finished:
             return None
-        lines: list[str] = []
+        lines: list[str] = ["The actions of this task, in the order they happened (the LAST lines are what is happening now):"]
+        for name, args_preview, is_error, result_preview in finished:
+            result = "ERROR: " + result_preview if is_error else result_preview
+            lines.append(f"Tool call {name} (arguments: {args_preview}); result: {result}")
         for name, args_preview in running_calls:
             lines.append(f"Tool call {name} started (arguments: {args_preview}).")
         for op in running_agents:
             lines.append(f"Tool call {op.tool_name} is still running in the background.")
-        for outcome in finished:
-            result = "ERROR: " + outcome.result_preview if outcome.is_error else outcome.result_preview
-            lines.append(f"Tool call {outcome.name} (arguments: {outcome.arguments_preview}); result: {result}")
+        # Her last reply may end in a question or a request to the user; handed over as it is, the narrator copies that
+        # shape and starts giving the user tasks. Only the sentences that state something are passed on.
+        said = " ".join(
+            sentence for sentence in re.split(r"(?<=[.!?])\s+", (getattr(self, "_turn_last_visible_text", None) or "").strip())
+            if sentence and "?" not in sentence and not _ASKS_USER.search(sentence)
+        ).strip()
+        if said:
+            lines.append(f"What she has already told the user in this task (do not repeat or contradict): {said[:300]}")
         return "\n".join(lines)
     def _narration_task(self) -> str:
         """The user's request for the current task -- the one thing the narrator
@@ -234,8 +260,14 @@ class TextNarrationMixin:
         # recover from, not this cosmetic narrator's.
         activity = self._narration_action_facts()
         if activity is None:
-            log_event("engine", "progress_narration_skipped_no_facts", tab_id=self.tab_id)
-            return
+            # Per explicit instruction (2026-11-07): "the narrator must ALWAYS give a remark at least once a minute; facts
+            # always exist -- the model is doing something, at the very least still the same as before, or 'working it
+            # out'". No tool call is not "no fact": the fact is that she is still on the request without a result yet.
+            # Stated plainly so the narrator neither invents progress nor goes quiet.
+            activity = "No tool has been called in this task yet; she is still working the request out (thinking it through, nothing found or done yet)."
+            if self.turn_narration_remarks:
+                activity += f" Your previous remark was: {self.turn_narration_remarks[-1][:200]} If nothing has changed since, say that she is still busy with the same thing."
+            log_event("engine", "progress_narration_no_tool_facts", tab_id=self.tab_id)
         # Ported from a teammate's branch (807b3ea): how long this request has
         # been running is a real fact too ("this one is taking a while"), but
         # kept OUT of `activity` itself (which staleness/other checks compare
@@ -292,6 +324,11 @@ class TextNarrationMixin:
             if comment:
                 break
             log_event("engine", "progress_narration_retry", tab_id=self.tab_id, attempt=attempt, exhausted=attempt == NARRATION_GENERATION_RETRY_ATTEMPTS)
+            # Confirmed live (2026-11-10): the four attempts used to fire within ~30 ms of each other, so a server
+            # answering 502/504 (SquirrelWisdom ai:resolve) burnt all of them at once and the remark was lost. A pause
+            # that grows with the attempt gives the server time to come back; the stale check then ends the wait early.
+            if attempt < NARRATION_GENERATION_RETRY_ATTEMPTS:
+                await asyncio.sleep(min(1.5 * attempt, 4.0))
         stale = _stale()
         if stale:
             log_event("engine", "progress_narration_dropped_stale", tab_id=self.tab_id, reason=stale, had_comment=bool(comment))

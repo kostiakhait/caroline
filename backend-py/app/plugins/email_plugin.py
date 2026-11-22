@@ -47,6 +47,7 @@ import json
 import re
 from typing import Any
 
+from app import action_ledger
 from app.plugins import email_credentials
 from app.plugins.contacts_plugin import upsert_contacts_from_emails
 from app.plugins.loader import Plugin, PluginTool
@@ -73,6 +74,7 @@ _sessions = SessionManager()
 # previously scoped only to email:create) rather than mint a whole new
 # credential for the same feature area.
 from app.sw_service_keys_local import EMAIL_SERVICE_KEY  # noqa: E402
+from app.workspace_dir import WORKSPACE_DIR  # noqa: E402
 
 _ACCOUNT_PARAM_NOTE = (
     " A mailbox that has worked before needs only its `address`: the saved password and servers are "
@@ -139,6 +141,10 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         return result.get("messages") or []
 
     messages = await _sessions.with_session(do)
+    for message in messages if isinstance(messages, list) else []:
+        # What Caroline herself wrote to this sender / in this thread, from the action log (2026-11-04).
+        if isinstance(message, dict) and (mark := action_ledger.short_mark_for_mail(WORKSPACE_DIR, message.get("from"), message.get("subject"))):
+            message["action_log"] = mark
     return {"text": json.dumps(messages, indent=2, ensure_ascii=False)}
 
 
@@ -218,7 +224,17 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     pairs = getaddresses([data.get("from") or "", data.get("to") or ""])
     asyncio.ensure_future(upsert_contacts_from_emails(pairs, exclude={args.get("address") or ""}))
     _truncate_body(data, int(args.get("bodyOffset") or 0))
-    return {"text": json.dumps(data, indent=2, ensure_ascii=False)}
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    # What Caroline herself wrote to this sender / in this thread, from the action log (2026-11-04): by code, at the moment of reading.
+    if note := action_ledger.note_for_mail(WORKSPACE_DIR, data.get("from"), data.get("subject")):
+        text += "\n\n" + note
+    # Owner's order (2026-11-20): a significant date in a letter becomes a reminder by itself (app/auto_reminders.py).
+    from app import auto_reminders
+    from app.session_context import get_tab_id
+    auto_reminders.consider_in_background(
+        f"Subject: {data.get('subject')}\nFrom: {data.get('from')}\n\n{data.get('body') or data.get('text') or ''}",
+        f"a letter in the mailbox {args.get('address') or ''}", get_tab_id())
+    return {"text": text}
 
 
 @_with_saved_credentials
@@ -489,7 +505,18 @@ def _check_sent_mail_too_instruction() -> str:
         "Sent that just hasn't been seen/marked from the other end yet. Don't flag or nudge about something as "
         "needing attention, or re-raise it as unresolved, without first checking whether it was already answered. "
         'This applies per-thread/subject, not as a blanket "read all of Sent every time" -- check Sent for the '
-        "specific thing you're about to flag before flagging it."
+        "specific thing you're about to flag before flagging it.\n"
+        "The Sent folder is not always called \"Sent\": on Gmail it is \"[Gmail]/Sent Mail\" (a search in \"Sent\" "
+        "there finds nothing and proves nothing). Call email_list_folders for the mailbox and use the folder it "
+        "shows as sent mail; if you could not open that folder, say you could not check, never say nothing was "
+        "sent. Search it by the thread's subject (without the Re:/RE: prefix) AND by the other party's address, "
+        "over the whole thread, not only the latest day. A reply the owner sent himself, from a phone or another "
+        "program, is in that folder and not in your own action log.\n"
+        "Before writing who asked or said what in a thread (\"X asked whether...\"), look at the From header "
+        "of the very message you attribute it to. A question the owner put in his own letter is the owner's, even "
+        "when the next message in the thread is from the person he asked. Quote what the other party actually "
+        "wrote; do not fill in what you assume she meant, and do not add emotion or tone (rudeness, urgency) "
+        "that the letter does not contain."
     )
 
 

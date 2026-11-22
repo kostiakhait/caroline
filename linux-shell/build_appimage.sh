@@ -55,6 +55,8 @@ mkdir -p "$APPDIR"
 # needs no AppImage-specific changes to work inside the AppDir.
 cp -r "$INSTALL_ROOT/." "$APPDIR/"
 find "$APPDIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+# the downloaded appimagetool (HERE/.cache) is a build tool, not part of the app: it is 14 MB, and a second build in the same tree would ship it
+rm -rf "$APPDIR/linux-shell/.cache"
 
 cp "$HERE/AppRun" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
@@ -78,6 +80,8 @@ if [ ! -x "$APPIMAGETOOL" ]; then
     chmod +x "$APPIMAGETOOL"
 fi
 
+# npm leaves some files 0744 (owner-only execute); the AppImage is run by other users, and appimagetool refuses such an AppDir
+chmod -R a+rX "$APPDIR"
 echo "--- running appimagetool ---"
 mkdir -p "$OUTPUT_DIR"
 # Per docs/LINUX_PORT_PLAN.md's own test-box finding: FUSE is available on

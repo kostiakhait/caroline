@@ -71,12 +71,22 @@ def _guarded_action(tool_name: str) -> bool:
     request_info, before anything was drafted, and the user got nothing)."""
     return _SEND_TOOL_NAME_MARKER in tool_name.lower() or tool_name in _FINANCIAL_TOOLS
 
-FAST_PATH_TIMEOUT_S = 0.5
+# Per explicit instruction (2026-10-30): a call waits this long for its own result before answering "running".
+# It was 0.5 s, so every tool that took a little longer cost a second model call (check_operation_status) that
+# re-read the whole context: 142 of 482 tool calls in one tab over two days, 94 of them answering "done" at
+# once. The wait is under CHECK_OPERATION_WAIT_S and the sw engine's STALL_TIMEOUT_S (120 s of no progress).
+FAST_PATH_TIMEOUT_S = 30.0
 # A completion notice for an operation the caller walked away from waits
 # this long first; if the model has meanwhile collected the result itself
 # with check_operation_status, the notice is not sent (see
 # _notify_unless_collected).
 NOTIFY_GRACE_S = 10.0
+# Per explicit instruction (2026-10-29): check_operation_status waits up to this long for
+# a running operation to finish before answering "running". It used to answer at once, and
+# every answer is a whole model call with the whole context: the 2-hourly mail report polled
+# 169 times in one day, each poll ~740k tokens of context. Under the sw engine's
+# STALL_TIMEOUT_S (120 s of no progress) so a wait never reads as a stalled turn.
+CHECK_OPERATION_WAIT_S = 60.0
 
 # Per explicit instruction (2026-10-12): every tool whose successful
 # completion means "Caroline just sent a message on a channel" -- the hook
@@ -289,7 +299,7 @@ async def dispatch(
         if send_blocked_reason:
             log_event(f"plugin:{plugin_name}", "operation_blocked_unapproved_send", tool=tool_name, reason=send_blocked_reason)
             return {"operation_id": "", "status": "error", "error": f"Blocked: {send_blocked_reason} Ask the user explicitly and wait for a real answer before trying this again."}
-    # A local file leaving the machine, or a received one being written (2026-10-22):
+    # A local file leaving the machine (2026-10-22; saving received files is not checked, 2026-11-10):
     # the session's turn.file.transfer microagent decides, from what is known about
     # the path (app/file_facts.py) and the conversation.
     if file_transfers_in(tool_name, args):
@@ -453,6 +463,13 @@ async def _wait_to_end(plugin_name: str, tool_name: str, op: Operation) -> dict[
     return {"operation_id": op.id, "status": "done", "result": result}
 
 
+async def wait_for_operation(op: Operation) -> None:
+    """A status check's wait (CHECK_OPERATION_WAIT_S): returns as soon as the
+    operation finishes, or when the wait is up with it still running."""
+    if op.status == "running" and op.task is not None and not op.task.done():
+        await asyncio.wait({op.task}, timeout=CHECK_OPERATION_WAIT_S)
+
+
 def _operation_to_dict(op: Operation) -> dict[str, Any]:
     body: dict[str, Any] = {"operation_id": op.id, "status": op.status}
     if op.partial is not None:
@@ -467,9 +484,11 @@ def _operation_to_dict(op: Operation) -> dict[str, Any]:
 @sdk_tool(
     "check_operation_status",
     "Checks the status of a previously started long-running tool operation (one whose "
-    "start returned status=\"running\" instead of \"done\"). Returns the current status "
-    "(running/done/error/cancelled), any partial/intermediate data reported so far, and "
-    "the final result once done.",
+    "start returned status=\"running\" instead of \"done\"). Waits for it to finish, up to "
+    f"{int(CHECK_OPERATION_WAIT_S)} seconds, so call it once and you get the final result "
+    "as soon as there is one -- no need to call it again right away. Returns the current "
+    "status (running/done/error/cancelled), any partial/intermediate data reported so far, "
+    "and the final result once done.",
     {"operation_id": str},
 )
 async def check_operation_status(args: dict[str, Any]) -> dict[str, Any]:
@@ -477,6 +496,7 @@ async def check_operation_status(args: dict[str, Any]) -> dict[str, Any]:
     if op is None:
         log_event("engine", "check_operation_status_unknown", operation_id=args["operation_id"])
         return {"content": [{"type": "text", "text": "Unknown or already-completed operation_id."}], "is_error": True}
+    await wait_for_operation(op)
     body = _operation_to_dict(op)
     if op.status in ("done", "error", "cancelled"):
         log_event("engine", "check_operation_status_final", operation_id=op.id, tool=op.tool_name, status=op.status, error=op.error)

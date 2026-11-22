@@ -25,6 +25,10 @@ if __name__ == "__main__":
 
     import uvicorn
 
+    # A file the person attaches in the chat (up to 20 MB) travels as one base64 text frame, a third larger; uvicorn's own limit for a frame is 16 MiB, which closed
+    # the connection on a file of about 12 MB or more.
+    WS_MAX_SIZE = 48 * 1024 * 1024
+
     log_event("engine", "starting", port=PORT, remote_port=REMOTE_PORT, workspace_dir=WORKSPACE_DIR)
     seed_skills(WORKSPACE_DIR)
     # Bug fix (2026-09-27), per explicit instruction, found live (backend
@@ -55,7 +59,7 @@ if __name__ == "__main__":
         # 0.0.0.0, etc. is a real possibility on a machine this wasn't
         # tested on, and remote control is a bonus feature, not something
         # the local app should regress over. Caught and logged, not raised.
-        remote = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=REMOTE_PORT, log_level="info"))
+        remote = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=REMOTE_PORT, log_level="info", ws_max_size=WS_MAX_SIZE))
         try:
             await remote.serve()
         except BaseException as exc:
@@ -74,7 +78,7 @@ if __name__ == "__main__":
             log_event("engine", "remote_listener_failed", port=REMOTE_PORT, error=str(exc))
 
     async def _serve_both() -> None:
-        local = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PORT, log_level="info"))
+        local = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PORT, log_level="info", ws_max_size=WS_MAX_SIZE))
         # Decided 2026-10-25: the backend listens only on this machine (127.0.0.1). The second listener on 0.0.0.0
         # is OFF unless CAROLINE_REMOTE_ACCESS=1 is set on purpose: with it on, Windows asked for a firewall exception
         # for pythonw.exe at every new install path (three Public-profile allow rules appeared in one day).

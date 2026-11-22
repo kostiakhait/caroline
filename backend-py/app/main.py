@@ -13,9 +13,10 @@ import re
 import webbrowser
 import mimetypes
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
@@ -28,7 +29,7 @@ from app.chat_session import ChatSession, STARTUP_GREETING_NUDGE_TEMPLATE, clear
 # edition:cut claude cli
 from app.cli_control import auth_logout as cli_auth_logout, mcp_add as cli_mcp_add, mcp_list as cli_mcp_list, mcp_remove as cli_mcp_remove, spawn_auth_login as cli_spawn_auth_login
 # edition:end
-from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, load_chat_mode, load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
+from app.durability import clear_pending_api_retry, clear_pending_one_shot_followup, clear_pending_operation, dehydrated_dir, has_chat_mode, load_chat_mode,load_tab_session_id, peek_pending_api_retry, peek_pending_one_shot_followup, peek_pending_operations, peek_pending_turn, save_chat_mode, unwrap_resume_note
 from app.archive_prune import prune_workspace_archives
 from app.stt_adaptation import apply_adaptation, observe_user_message
 from app.stt_sanity import STT_SANITY_MODEL, STT_SANITY_REASONING, check_transcript
@@ -37,7 +38,7 @@ from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 # edition:end
 from app.history import read_archived_entries, read_recent_history_for_session
-from app import settings_mirror, vault_backup, wizard
+from app import settings_mirror, transcript_journal, vault_backup, wizard
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
@@ -73,6 +74,8 @@ from app.plugins.scheduler_plugin import BACKUP_KIND, start_due_check_loop
 from app.plugins.sw_api import get_session_user, mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, speech_needs_cleanup, synthesize_speech, transcribe_audio, voice_for_gender
+from app import akinakes_channel, akinakes_org_settings
+from app.update_service import UpdateService
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
 from app.slack_channel import get_slack_channel_status, start_slack_channel
 from app.telegram_channel import get_telegram_channel_status, start_telegram_channel
@@ -223,6 +226,7 @@ async def _websocket_rejection(websocket: WebSocket) -> str | None:
 
 
 sessions: dict[str, ChatSession] = {}
+update_service = UpdateService()
 # Per explicit instruction (2026-10-19): lets chat_session_mixins/watchdog.py
 # (a ChatSession mixin, which cannot import main.py -- see pseudo_tab.py's
 # own module docstring) resolve a background activity's owning real tab back
@@ -278,6 +282,31 @@ _ratatosk_turn_replied_group_ids: set[str] = set()
 # since which tabs existed last run isn't known until each one's WS
 # connection arrives and says its own tabId.
 _has_greeted = False
+
+# Per explicit instruction (2026-10-30): the startup greeting is a whole model turn that rewrites the cold context to
+# the cache (~100k+ tokens), and most restarts happen in the middle of the day with nobody waiting for a "hello".
+# It is said only after the owner has been away this long, and never when anything is waiting to be resumed after the
+# restart -- those notes (the interrupted turn, background operations, an API retry) are the model's way back into
+# the work and a greeting next to them is a second, competing thing to answer.
+STARTUP_GREETING_MIN_ABSENCE_S = 3600
+
+
+def _startup_greeting_wanted(tab_id: str) -> bool:
+    try:
+        if peek_pending_operations(WORKSPACE_DIR, tab_id) or peek_pending_api_retry(WORKSPACE_DIR, tab_id)                 or peek_pending_one_shot_followup(WORKSPACE_DIR, tab_id):
+            log_event("engine", "startup_greeting_skipped", tab_id=tab_id, why="work to resume")
+            return False
+        from app import dialogue_log
+
+        entries = dialogue_log.read_entries(WORKSPACE_DIR, tab_id)
+        if entries and time.time() - entries[-1].get("ms", 0) / 1000 < STARTUP_GREETING_MIN_ABSENCE_S:
+            log_event("engine", "startup_greeting_skipped", tab_id=tab_id, why="recent conversation")
+            return False
+    except Exception as exc:  # noqa: BLE001 -- on any doubt, greet as before
+        log_event("engine", "startup_greeting_check_failed", tab_id=tab_id, error=str(exc)[:200])
+    return True
+
+
 _has_sent_visual_mode_config = False
 _resumed_unfinished_turn_for_tab: set[str] = set()
 # Same "once per process, not per reconnect" shape -- see
@@ -304,6 +333,38 @@ _forced_startup_compaction_for_tab: set[str] = set()
 # directly: it never existed at all. Now every tab gets its own refresh
 # once per process, same "once, not per reconnect" shape as the sets above.
 _language_refreshed_for_tab: set[str] = set()
+
+
+REMINDER_DIALOGUE_WINDOW_MINUTES = 24 * 60
+
+
+def _owner_dialogue_for_reminder(real_tab_id: str) -> str:
+    """The owner's dialogue in the tab that scheduled the reminder, last 24 hours, as the window showed it.
+
+    2026-11-19, live: a reminder fires into a FRESH pseudo-session (fresh=True below), whose own dialogue files are
+    empty, so the 18:00 mail report asked again about a court motion the owner had settled at 12:18 ("ничего не
+    делаем") and a LinkedIn contact he had dismissed at 14:04 ("неинтересно, проехали"). lastReport carries only
+    what Caroline said last time, never what the owner answered. Withheld text is left out: the owner never saw it."""
+    from app import dialogue_log
+
+    try:
+        entries = dialogue_log.read_entries(WORKSPACE_DIR, real_tab_id)
+        picked = dialogue_log.select(
+            entries, limit=dialogue_log.MAX_LIMIT, since_minutes=REMINDER_DIALOGUE_WINDOW_MINUTES, include_withheld=False,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the reminder still runs, as before, without it
+        log_event("engine", "reminder_owner_dialogue_failed", tab_id=real_tab_id, error=str(exc)[:200])
+        return ""
+    if not picked:
+        return ""
+    return (
+        "\n\nYour dialogue with the owner in their chat over the last 24 hours (both sides, as the window showed "
+        "it, oldest first). What the owner decided, answered, declined or closed there stands: never ask again "
+        "about a matter he already answered or dismissed, and never put it in the report as something waiting for "
+        "his decision. Mention such a matter only if something actually new about it arrived after his answer, and "
+        "then say what is new. Matters you already reported in this dialogue are not new either, unless they "
+        f"changed:\n---\n{dialogue_log.render(picked)}\n---"
+    )
 
 
 def _on_reminder_due(reminder: dict[str, Any]) -> bool:
@@ -342,7 +403,9 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # sessions): a recurring reminder reuses its own id every firing, so
     # each firing's pseudo-session is a fresh instance of "this reminder's
     # own thread" -- never shared with a DIFFERENT reminder or sub-agent.
-    pseudo = pseudo_tab.get_or_create_pseudo_session_sync(real_tab_id, reminder["id"], sessions.get)
+    # fresh=True (2026-10-29): every firing is a new conversation, not the next turn of all
+    # the earlier ones; lastReport below is what it keeps of them.
+    pseudo = pseudo_tab.get_or_create_pseudo_session_sync(real_tab_id, reminder["id"], sessions.get, fresh=True)
     if pseudo is None:
         return False  # still starting up -- the scheduler retries on its own next tick
     # Bug fix (2026-09-11), per explicit instruction: used to pass
@@ -386,6 +449,8 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     # So check_background_relay_worth (deliver_relayed_reply) can judge the
     # eventual result against what was actually asked, not in isolation.
     pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, reminder.get("note"))
+    if event_type == "user":
+        pseudo_tab.set_pseudo_turn_always_relay(pseudo.tab_id)
     # A firing resumed after a restart (scheduler_plugin.set_reminder_awaiting_retry):
     # its dueAtIso has already moved on to the next time, so it is named by
     # when the usage cap interrupted it instead.
@@ -393,8 +458,15 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
         f"a firing interrupted by the usage cap at {reminder['awaitingRetry']}, resumed now"
         if reminder.get("awaitingRetry") else f"you scheduled this for {reminder.get('dueAtIso')}"
     )
+    last_report = reminder.get("lastReport") or {}
+    previous = (
+        f"\n\nWhat you reported for this reminder last time ({last_report.get('atIso')}) -- for telling what is new "
+        f"since then; check everything fresh, as of now:\n{last_report['text']}"
+        if last_report.get("text") else ""
+    )
+    owner_dialogue = _owner_dialogue_for_reminder(real_tab_id) if event_type == "user" else ""
     delivered = pseudo.inject_proactive(
-        f"⏰ Reminder due ({when}): {reminder.get('note')}\n\n{instruction}",
+        f"⏰ Reminder due ({when}): {reminder.get('note')}{previous}{owner_dialogue}\n\n{instruction}",
         suppress_narration=True,
     )
     if delivered:
@@ -552,6 +624,18 @@ async def _start_ratatosk_background_loops() -> None:
     asyncio.create_task(settings_mirror.run_forever(WORKSPACE_DIR))
     # The memory backup to Notes, by code, no model (app/vault_backup.py): restore after a login, then hourly.
     asyncio.create_task(vault_backup.run_forever(WORKSPACE_DIR))
+    # The update client (app/update_service.py): looks for a signed release, downloads and verifies it; the platform installs it. CAROLINE_UPDATE_DISABLE=1: off.
+    if os.environ.get("CAROLINE_UPDATE_DISABLE") != "1":
+        asyncio.create_task(update_service.run_forever())
+    # Agent Bus channel (akinakes): active only when BUS_URL and AGENT_UID are set. Role persona and the organization's
+    # settings are applied first so the first task already runs as that agent.
+    if akinakes_channel.load_config() is not None:
+        akinakes_org_settings.apply_persona_from_env(WORKSPACE_DIR)
+        try:
+            await _akinakes_before_task()
+        except Exception as exc:  # noqa: BLE001 -- applied again before every task
+            log_event("engine", "akinakes_org_settings_startup_failed", error=str(exc))
+        akinakes_channel.start_akinakes_channel(_inject_from_akinakes, _akinakes_before_task)
     start_ratatosk_owner_channel(WORKSPACE_DIR, _inject_from_ratatosk_owner, _inject_from_ratatosk_owner_account, _ratatosk_stop_session)
     start_ratatosk_presence_heartbeat(WORKSPACE_DIR)
     # Slack Socket Mode connection (docs/MESSENGER_INTEGRATIONS_PLAN.md,
@@ -688,6 +772,50 @@ async def get_status() -> JSONResponse:
         "workspaceDiskUsage": dict(_workspace_disk_usage_cache),
     }
     return JSONResponse(body)
+
+
+def _update_activity() -> dict[str, Any]:
+    from app.continuous_dialogue import is_enabled as continuous_dialogue_enabled
+    from app.update_activity import snapshot
+    return snapshot(list(sessions.values()), WORKSPACE_DIR, continuous_dialogue_enabled(WORKSPACE_DIR))
+
+
+@app.get("/api/update/activity")
+async def get_update_activity() -> JSONResponse:
+    """{busy, reasons[], idle_s}: whether Caroline is in use, for the updaters of every platform (app/update_activity.py)."""
+    return JSONResponse({"ok": True, **_update_activity()})
+
+
+def _update_body() -> dict[str, Any]:
+    activity = _update_activity()
+    return {"ok": True, **update_service.status(), **activity, "action": update_service.action(activity["busy"])}
+
+
+@app.get("/api/update/status")
+async def get_update_status() -> JSONResponse:
+    """The update client's state and what the platform does with it now (`action`: install | ask | none), app/update_service.py."""
+    return JSONResponse(_update_body())
+
+
+@app.post("/api/update/check")
+async def post_update_check() -> JSONResponse:
+    """Looks for a release now (and downloads it); the same answer as /api/update/status."""
+    await asyncio.to_thread(update_service.run_once)
+    return JSONResponse(_update_body())
+
+
+@app.post("/api/update/confirm")
+async def post_update_confirm() -> JSONResponse:
+    """The owner said yes to an update while Caroline was in use: the platform may install it now."""
+    update_service.confirm()
+    return JSONResponse(_update_body())
+
+
+@app.post("/api/update/installing")
+async def post_update_installing() -> JSONResponse:
+    """The platform is about to start the install (Caroline restarts): the verified file is spent."""
+    update_service.mark_installed()
+    return JSONResponse(_update_body())
 
 
 class MessageBody(BaseModel):
@@ -1104,6 +1232,50 @@ async def get_or_create_ratatosk_session() -> ChatSession:
     return session
 
 
+def akinakes_tab_id(chain_id: str) -> str:
+    return f"{akinakes_channel.TAB_PREFIX}{chain_id}"
+
+
+def _akinakes_session_send_for(chain_id: str) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    async def _send(event: dict[str, Any]) -> None:
+        """`send` for one chain's headless session: nothing renders it. The only event that matters is a turn's
+        `result`: if the chain has no published result by then, akinakes_channel publishes system.skill_blocked."""
+        if event.get("type") != "sdk_message":
+            return
+        message = event.get("message") or {}
+        if message.get("type") == "result" and not event.get("wasInternalCheckReply"):
+            await akinakes_channel.on_turn_end(chain_id)
+    return _send
+
+
+async def get_or_create_akinakes_session(chain_id: str) -> ChatSession:
+    """One headless ChatSession per Agent Bus chainId, all sharing this agent's workspace (and so its memory).
+    Kept for the process lifetime: a later message of the same chain continues the same conversation."""
+    tab_id = akinakes_tab_id(chain_id)
+    existing = sessions.get(tab_id)
+    if existing is not None and not existing.ended:
+        return existing
+    if not has_chat_mode(WORKSPACE_DIR, tab_id):
+        save_chat_mode(WORKSPACE_DIR, tab_id, akinakes_channel.chat_mode())
+    session = ChatSession(tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=_akinakes_session_send_for(chain_id), headless=True)
+    session.proactive_turns_are_tasks = True
+    sessions[tab_id] = session
+    await session.start()
+    return session
+
+
+def _inject_from_akinakes(chain_id: str, text: str, request_text: str | None = None, relay: bool = False) -> None:
+    async def _do() -> None:
+        session = await get_or_create_akinakes_session(chain_id)
+        session.inject_proactive(text, request_text=request_text, relay=relay)
+
+    asyncio.create_task(_do())
+
+
+async def _akinakes_before_task() -> None:
+    await akinakes_org_settings.apply_org_settings(WORKSPACE_DIR)
+
+
 def _inject_from_ratatosk_owner(text: str, origin_group_ids: list[str]) -> None:
     _ratatosk_turn_origin_group_ids.clear()
     _ratatosk_turn_origin_group_ids.extend(origin_group_ids)
@@ -1171,10 +1343,46 @@ def _inject_from_signal(text: str) -> None:
     _inject_messenger_proactive(text)
 
 
+# A note about a message in Caroline's OWN account (not the owner's) says so in these words (the channels' own text).
+_OWN_ACCOUNT_MARKERS = ("Caroline's own separate", "separate Discord bot account, not the user's")
+OWN_CHAT_INSTRUCTION = (
+    "\n\nThis is Caroline's own chat: answer the correspondent yourself, right now, with the send tool of this account, "
+    "as Caroline. Do not wait for the owner and do not ask him unless the matter truly needs his decision. Then report "
+    "to the owner in ONE short line: who wrote, what about, and what you answered (or what you need from him)."
+)
+
+
+def is_own_account_note(text: str) -> bool:
+    return any(marker in text for marker in _OWN_ACCOUNT_MARKERS)
+
+
+async def _answer_own_chat_in_background(primary: "ChatSession", text: str) -> None:
+    """Owner's order (2026-11-20): a message in Caroline's OWN chats is answered at once, not queued behind whatever the
+    owner's conversation is doing. It runs in a background session of its own (app/pseudo_tab.py); only its one-line
+    report reaches the owner's window. Any failure falls back to the old path (the owner's session)."""
+    import hashlib
+
+    try:
+        pseudo = await pseudo_tab.get_or_create_pseudo_session(
+            primary.tab_id, "ownchat-" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:12], sessions.get)
+        pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, "Answer a message in your own chat, then report to the owner in one line")
+        pseudo_tab.set_pseudo_turn_always_relay(pseudo.tab_id)
+        if pseudo.inject_proactive(text + OWN_CHAT_INSTRUCTION, suppress_narration=True):
+            log_event("engine", "own_chat_background_answer", tab_id=primary.tab_id, pseudo_id=pseudo.tab_id)
+            return
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "own_chat_background_failed", tab_id=primary.tab_id, error=str(exc)[:200], error_type=type(exc).__name__)
+    primary.inject_proactive(text)
+
+
 def _inject_messenger_proactive(text: str) -> None:
     primary = primary_session()
-    if primary is not None:
-        primary.inject_proactive(text)
+    if primary is None:
+        return
+    if is_own_account_note(text):
+        asyncio.create_task(_answer_own_chat_in_background(primary, text))
+        return
+    primary.inject_proactive(text)
 
 
 def _ratatosk_stop_session() -> bool:
@@ -1256,8 +1464,34 @@ async def _handle_control_request_inner(
     if op == "visible_transcript_set":
         entries = parsed.get("entries")
         if isinstance(entries, list) and session is not None:
+            transcript_journal.append_entries(WORKSPACE_DIR, session.tab_id, entries)
             save_visible_transcript(WORKSPACE_DIR, session.tab_id, entries)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "transcript_reconcile":
+        # 2026-10-30: the window's own transcript (localStorage) is a cache that can lose entries; the journal
+        # and the session file are not. Sends back what the window lacks -- see app/transcript_journal.py.
+        history_tab = (session.tab_id if session is not None else None) or parsed.get("tabId") or PRIMARY_TAB_ID
+        client_entries = parsed.get("entries")
+        client_entries = client_entries if isinstance(client_entries, list) else []
+        history_session_id = (session.last_saved_session_id if session is not None else None) or load_tab_session_id(WORKSPACE_DIR, history_tab)
+        try:
+            transcript_journal.append_entries(WORKSPACE_DIR, history_tab, client_entries)
+            if history_session_id:
+                # only what came after the window's newest entry: the session file also holds lines the window
+                # never showed as bubbles (progress notes, command echoes), and those must not flood back in
+                newest = max((transcript_journal._ts_ms(e) for e in client_entries if isinstance(e, dict)), default=0)
+                transcript_journal.append_entries(
+                    WORKSPACE_DIR, history_tab,
+                    [h for h in read_recent_history_for_session(WORKSPACE_DIR, history_session_id, limit=600) if transcript_journal._ts_ms(h) > newest],
+                )
+            missing = transcript_journal.missing_for_client(
+                transcript_journal.read_entries(WORKSPACE_DIR, history_tab), client_entries
+            )
+        except Exception as exc:  # noqa: BLE001 -- recovery must never break the chat
+            log_event("engine", "transcript_reconcile_failed", tab_id=history_tab, error=str(exc)[:200])
+            return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc)[:200], "requestId": request_id}
+        log_event("engine", "transcript_reconcile", tab_id=history_tab, client=len(client_entries), missing=len(missing))
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(missing), "requestId": request_id}
     if op == "tab_list_set":
         # WPF's MainWindow.xaml.cs's own SyncTabListToBackend() -- tab id +
         # display name are otherwise known ONLY there (a WebView2 connects
@@ -1366,6 +1600,12 @@ async def _handle_control_request_inner(
             return {"type": "control_response", "op": op, "ok": False, "stderr": str(exc), "requestId": request_id}
         log_event("engine", "tts_done", request_id=request_id, audio_bytes=len(audio_b64))
         return {"type": "control_response", "op": op, "ok": True, "stdout": audio_b64, "requestId": request_id}
+    if op == "ferret_tool_result":
+        # The Ferret browser editor's page answering a tool call of plugins/ferret_editor_plugin.py. Only a backend started with
+        # CAROLINE_FERRET_EDITOR=1 ever sends the call, so on every other deployment nothing waits and nothing sends this.
+        from app.plugins import ferret_editor_plugin
+        taken = bool(request_id) and ferret_editor_plugin.resolve(request_id, bool(parsed.get("ok")), parsed.get("result"), parsed.get("error"))
+        return {"type": "control_response", "op": op, "ok": taken, "stderr": None if taken else "no ferret tool call is waiting for this answer", "requestId": request_id}
     if op == "editor_result":
         outcome, path = parsed.get("outcome"), parsed.get("path")
         if not request_id or not outcome or not path:
@@ -2130,7 +2370,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     # share that single result, so there is no second read left to disagree
     # with the first.
     pending_turn_for_primary = peek_pending_turn(WORKSPACE_DIR, PRIMARY_TAB_ID) if tab_id == PRIMARY_TAB_ID else None
-    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not pending_turn_for_primary:
+    if tab_id == PRIMARY_TAB_ID and not _has_greeted and not pending_turn_for_primary and _startup_greeting_wanted(tab_id):
         _has_greeted = True
 
         lang = current_language_name(PRIMARY_TAB_ID)
@@ -2208,6 +2448,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 "it never happened, and if it still needs doing, start it again from scratch (checking first, "
                 f"per above, whether it actually needs redoing). Reply in {resume_lang}, if you reply at all.]",
                 pending_text=original_text,
+                # The user's own request keeps its narrator (2026-11-01, confirmed live: inject_proactive's default
+                # suppressed it, and a resumed real task ran 8 minutes in silence); a resumed nudge stays without one.
+                suppress_narration=not unfinished_turn.is_real_user,
             )
             # Bug fix (2026-09-15), root-caused live: inject_proactive()
             # (called just above) always passes is_real_user=False to

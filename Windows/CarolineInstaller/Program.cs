@@ -108,7 +108,18 @@ internal static class Program
         }
 
         using var runMutex = new Mutex(initiallyOwned: false, InstallerRunMutexName);
-        if (!runMutex.WaitOne(0))
+        bool owned;
+        try
+        {
+            owned = runMutex.WaitOne(0);
+        }
+        catch (AbandonedMutexException)
+        {
+            // The previous installer died holding it: this one owns it now, and its Step 0 cleans up after that one.
+            Logger.Log("RunAsync: the previous installer ended without releasing the run lock -- taking it over");
+            owned = true;
+        }
+        if (!owned)
         {
             Logger.Log("RunAsync: another installer instance is already running this exact critical section -- backing off");
             window.SetStatus("An update is already in progress in another window…");
@@ -118,7 +129,13 @@ internal static class Program
         }
         try
         {
-            await RunCriticalSectionAsync(http, window, cts, silent);
+            // A silent update shows its window once the running Caroline is stopped: from then on nothing else is on the screen.
+            await RunCriticalSectionAsync(http, window, cts, silent, () =>
+            {
+                if (window.IsVisible) return;
+                window.Show();
+                app.MainWindow = window;
+            });
         }
         finally
         {
@@ -126,7 +143,14 @@ internal static class Program
         }
     }
 
-    private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts, bool silent)
+    // Order (2026-10-31, per explicit instruction, confirmed live with 1.0.1: Caroline closed first and the installer then downloaded
+    // 515 MB and ran npm for ~40 s, two minutes with nothing on the screen): everything that does not touch what a running Caroline uses
+    // comes FIRST, while she keeps working -- the zip (already downloaded and verified by her, --zip-path), its extraction into a new,
+    // not yet active app folder, that folder's npm installs. Only then is she stopped; the switch to the new folder and the launch follow,
+    // a few seconds, with the progress window showing even in a silent update.
+    // Per explicit instruction (2026-10-31): NOTHING is downloaded after the stop -- every dependency download (runtimes, Python
+    // packages, the speech model) is in PrepareDependenciesAsync, before it; after it only local steps run.
+    private static async Task RunCriticalSectionAsync(HttpClient http, ProgressWindow window, CancellationTokenSource cts, bool silent, Action showWindow)
     {
         var ct = cts.Token;
         var downloader = new Downloader(http);
@@ -145,19 +169,6 @@ internal static class Program
 
         AppPaths.EnsureRootExists();
 
-        // Size-cap sweep of workspace\dehydrated\ -- runs on every install/update,
-        // silent mode included, no UAC needed (the user's own per-user folder).
-        // See WorkspaceCleanup.cs for why this is the one piece of workspace\ the
-        // installer touches at all.
-        window.SetStatus("Cleaning up old data…");
-        await WithStepAsync(ErrorCodes.WorkspaceCleanup, "Cleaning up old data", () => WorkspaceCleanup.RunAsync(ct));
-
-        // Windows Defender exclusion for Caroline's own folders -- one UAC prompt, once, never
-        // in a --silent-update run, never fails the install. Placed before the heavy
-        // downloads/extraction so this very install benefits. See DefenderExclusion.cs.
-        window.SetStatus("Configuring Windows Defender…");
-        await DefenderExclusion.EnsureAsync(silent, ct);
-
         // Per explicit instruction (2026-09-18): check free disk space up
         // front, before spending any time downloading anything -- a full
         // drive used to only surface as a confusing late IOException deep
@@ -172,80 +183,11 @@ internal static class Program
         const long RequiredBaseFreeBytes = 6L * 1024 * 1024 * 1024;
         DiskSpace.RequireFreeSpace(AppPaths.Root, RequiredBaseFreeBytes, "install Caroline");
 
-        // Step 1: isolated runtimes. Node first -- Playwright's install step
-        // later needs it, and neither install touches the system otherwise,
-        // so order between Node/Python doesn't matter beyond that.
-        if (!NodeInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.NodeInstall, "Installing Node.js", () => NodeInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading Node.js…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("Node.js already present, skipping");
-        }
-
-        // Always called, not gated behind IsInstalled() -- PythonInstaller checks the
-        // runtime and its own required pip packages separately internally, so an
-        // existing install that already has the Python runtime but predates a newly
-        // added package still gets that package installed here instead of the whole
-        // step being skipped just because python.exe already exists.
-        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Downloading Python…", p),
-            ct));
-
-        if (!GitBashInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.GitBashInstall, "Installing Git Bash", () => GitBashInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading Git Bash…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("Git Bash already present, skipping");
-        }
-
-        if (!FfmpegInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.FfmpegInstall, "Installing ffmpeg", () => FfmpegInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading ffmpeg…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("ffmpeg already present, skipping");
-        }
-
-        // Bug fix (2026-09-22), per explicit instruction: a step that fails must
-        // stop the whole install with a clear, coded message box -- never continue
-        // silently into a partial install. (An earlier version of this step made
-        // Codex's own failure non-fatal, reasoning it was an "optional feature";
-        // that was my own unilateral call and the user overruled it: nothing
-        // installs partially, ever -- same WithStepAsync/ErrorCodes contract as
-        // every other dependency below.)
-        if (!CodexInstaller.IsInstalled())
-        {
-            await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
-                s => window.SetStatus(s),
-                p => window.SetDownloadProgress("Downloading OpenAI support…", p),
-                ct));
-        }
-        else
-        {
-            Logger.Log("Codex already present, skipping");
-        }
-
-        // Caroline's own window is a WebView2 host -- without the Runtime present,
-        // the app fails to show a window (or crashes) on first launch, AFTER this
-        // installer would otherwise have already reported success. See
-        // WebView2Installer's own doc comment.
-        await WithStepAsync(ErrorCodes.WebView2Install, "Installing the WebView2 Runtime",
-            () => WebView2Installer.InstallAsync(downloader, s => window.SetStatus(s), ct));
+        // Windows Defender exclusion for Caroline's own folders -- one UAC prompt, once, never
+        // in a --silent-update run, never fails the install. Placed before the heavy
+        // downloads/extraction so this very install benefits. See DefenderExclusion.cs.
+        window.SetStatus("Configuring Windows Defender…");
+        await DefenderExclusion.EnsureAsync(silent, ct);
 
         // Step 2: the Caroline app itself.
         window.SetStatus("Checking for the latest version…");
@@ -267,6 +209,10 @@ internal static class Program
         var alreadyInstalled = File.Exists(AppPaths.ClientExe)
             && string.Equals(installState.InstalledSha256, info.Sha256Hex, StringComparison.OrdinalIgnoreCase);
 
+        // Everything that downloads happens here, while Caroline still runs (see the order above).
+        await PrepareDependenciesAsync(downloader, http, window, ct);
+
+        string? newDirName = null, zipPath = null;
         if (alreadyInstalled)
         {
             Logger.Log($"Already up to date (sha256={info.Sha256Hex}) -- skipping download and extraction entirely.");
@@ -274,66 +220,51 @@ internal static class Program
         }
         else
         {
-            window.SetStatus("Downloading Caroline…");
-            await WithStepAsync(ErrorCodes.Download, "Downloading Caroline", () => downloader.DownloadAsync(
-                DownloadsInfo.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
-                progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct));
-
-            Logger.Log("Stopping any running instance before extraction");
-            await Autostart.StopRunningClientAsync();
-            await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, info.Sha256Hex, ct));
+            zipPath = await ObtainZipAsync(downloader, info, window, ct);
+            newDirName = await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, zipPath, ct));
+            var newDir = Path.Combine(AppPaths.Root, newDirName);
+            try
+            {
+                await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct, newDir));
+                await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct, newDir));
+            }
+            catch
+            {
+                TryDeleteUnactivated(newDir);
+                throw;
+            }
         }
 
-        // Step 3 used to install Chromium through the Node browser MCP server's
-        // playwright-core. Gone (2026-10-24): that server no longer exists, and the
-        // Chromium Caroline uses ships inside Caroline.zip (dist/browsers, see the
-        // Makefile's .browsers.stamp and backend-py/app/web_browser.py).
+        // Only now the running Caroline stops (see the order above) -- and only for a new version, as before: already installed, she is left alone.
+        if (newDirName is not null)
+        {
+            Logger.Log("Stopping any running instance");
+            await Autostart.StopRunningClientAsync();
+            showWindow();
+            window.SetStatus("Updating Caroline…");
+        }
 
-        // Step 4 used to fetch Visual Mode's talking-head models here,
-        // unconditionally, on every install -- tens of GB, ~90% of a fresh
-        // install's disk footprint, even for the large majority of users
-        // who never turn Visual Mode on. Per explicit instruction
-        // (2026-10-05), removed: those models now download on demand, the
-        // first time the Settings toggle is turned on for a profile (see
-        // backend-py/app/visual_mode.py's BUILTIN_MODELS_BASE_URL and
-        // main.py's visual_mode_set), reusing the exact same resumable/
-        // verified downloader Windows/Caroline/Native/
-        // VisualModelDownloader.cs already had for a purchased model.
+        // Size-cap sweep of workspace\dehydrated\ -- runs on every install/update,
+        // silent mode included, no UAC needed (the user's own per-user folder).
+        // See WorkspaceCleanup.cs for why this is the one piece of workspace\ the
+        // installer touches at all.
+        window.SetStatus("Cleaning up old data…");
+        await WithStepAsync(ErrorCodes.WorkspaceCleanup, "Cleaning up old data", () => WorkspaceCleanup.RunAsync(ct));
 
-        // Step 4b: local speech-recognition model (~1.5GB, best-effort, unconditional --
-        // explicit instruction, 2026-09-26: ships with every install regardless of the
-        // Settings toggle, which stays off by default. See WhisperModelInstaller's own
-        // doc comment.
-        // Step 4c: Node.js runtime + the WhatsApp sidecar's own npm dependencies
-        // (app/whatsapp_channel.py, docs/MESSENGER_INTEGRATIONS_PLAN.md, 2026-10-06).
-        // NodeInstaller was unused since the legacy Node backend was removed --
-        // reactivated here for Baileys, which has no Python equivalent.
-        await WithStepAsync(ErrorCodes.NodeInstall, "Setting up Node.js", () => NodeInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Setting up Node.js…", p),
-            ct));
+        // Python packages PrepareDependenciesAsync downloaded for the runtime Caroline was running on: installed now, offline.
+        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.FinishPreparedAsync(s => window.SetStatus(s), ct));
+
+        if (newDirName is not null)
+        {
+            await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => Task.Run(() => ActivateAppDir(newDirName, info.Sha256Hex, zipPath!), ct));
+        }
+        // Put in place after the stop, from what was downloaded before it (never a download here): a newer speech model.
+        await WhisperModelInstaller.FinishPreparedAsync(s => window.SetStatus(s), ct);
+
+        // The sidecars of the now active app folder. For a new version they were set up in that folder before the stop (Node is
+        // provisioned before it, PrepareDependenciesAsync) -- these find them in place and do nothing.
         await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct));
-        // Step 4c-2: the Messenger sidecar's own npm dependencies
-        // (app/messenger_channel.py, docs/MESSENGER_INTEGRATIONS_PLAN.md) --
-        // same Node runtime provisioned just above, no separate runtime step.
         await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct));
-
-        // Step 4d: Java runtime + signal-cli (app/signal_channel.py, same plan
-        // as the WhatsApp sidecar above -- Signal has no official bot API at
-        // all, signal-cli is the standard way every such integration talks to it).
-        await WithStepAsync(ErrorCodes.JavaRuntimeInstall, "Setting up Java runtime", () => JavaRuntimeInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Setting up Java runtime…", p),
-            ct));
-        await WithStepAsync(ErrorCodes.SignalCliInstall, "Setting up Signal support", () => SignalCliInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Setting up Signal support…", p),
-            ct));
-
-        await WithStepAsync(ErrorCodes.WhisperModelInstall, "Downloading local speech-recognition model", () => WhisperModelInstaller.InstallAsync(downloader, http,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Downloading local speech-recognition model…", p),
-            ct));
 
         window.SetStatus("Creating shortcut…");
         await WithStepAsync(ErrorCodes.ShortcutOrAutostart, "Creating the desktop shortcut", () => Task.Run(ShortcutManager.CreateDesktopShortcut, ct));
@@ -398,6 +329,66 @@ internal static class Program
     /// itself, e.g. WebView2Installer's own "bootstrapper exit code"
     /// check) passes through unchanged rather than getting double-wrapped.
     /// </summary>
+    /// <summary>
+    /// Every dependency that has to be downloaded, while Caroline still runs (2026-10-31, per explicit instruction: nothing is
+    /// downloaded after she is stopped, she is stopped only for the switch). Each of these installs only what is not there yet --
+    /// and what is not there, a running Caroline is not using. The two that can replace something she does use only download here
+    /// and finish after the stop, offline: Python packages for her runtime (PythonInstaller.FinishPreparedAsync) and a newer
+    /// speech model (WhisperModelInstaller.FinishPreparedAsync). A failure here fails the install before Caroline was touched.
+    /// </summary>
+    private static async Task PrepareDependenciesAsync(Downloader downloader, HttpClient http, ProgressWindow window, CancellationToken ct)
+    {
+        // Node first -- the app folder's sidecars (npm) need it.
+        await WithStepAsync(ErrorCodes.NodeInstall, "Installing Node.js", () => NodeInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading Node.js…", p),
+            ct));
+
+        // Always called: PythonInstaller checks the runtime and its required packages separately, so a runtime that predates a
+        // newly added package still gets it.
+        await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.PrepareAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading Python…", p),
+            ct));
+
+        await WithStepAsync(ErrorCodes.GitBashInstall, "Installing Git Bash", () => GitBashInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading Git Bash…", p),
+            ct));
+
+        await WithStepAsync(ErrorCodes.FfmpegInstall, "Installing ffmpeg", () => FfmpegInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading ffmpeg…", p),
+            ct));
+
+        // Bug fix (2026-09-22), per explicit instruction: a step that fails must stop the whole install with a clear, coded
+        // message box -- nothing installs partially, ever, Codex included.
+        await WithStepAsync(ErrorCodes.CodexInstall, "Installing OpenAI support", () => CodexInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading OpenAI support…", p),
+            ct));
+
+        // Caroline's own window is a WebView2 host -- without the Runtime she fails to show a window on first launch.
+        await WithStepAsync(ErrorCodes.WebView2Install, "Installing the WebView2 Runtime",
+            () => WebView2Installer.InstallAsync(downloader, s => window.SetStatus(s), ct));
+
+        // Java runtime + signal-cli (app/signal_channel.py: Signal has no official bot API, signal-cli is the standard way).
+        await WithStepAsync(ErrorCodes.JavaRuntimeInstall, "Setting up Java runtime", () => JavaRuntimeInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Java runtime…", p),
+            ct));
+        await WithStepAsync(ErrorCodes.SignalCliInstall, "Setting up Signal support", () => SignalCliInstaller.InstallAsync(downloader,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Setting up Signal support…", p),
+            ct));
+
+        // Local speech-recognition model (~1.5GB, best-effort, unconditional -- explicit instruction, 2026-09-26).
+        await WithStepAsync(ErrorCodes.WhisperModelInstall, "Downloading local speech-recognition model", () => WhisperModelInstaller.InstallAsync(downloader, http,
+            s => window.SetStatus(s),
+            p => window.SetDownloadProgress("Downloading local speech-recognition model…", p),
+            ct));
+    }
+
     private static async Task WithStepAsync(string code, string stepDescription, Func<Task> step)
     {
         try
@@ -427,8 +418,8 @@ internal static class Program
     }
 
     /// <summary>
-    /// Extracts into a brand-new, uniquely-named directory under AppPaths.Root and, once
-    /// verified good, switches state.json's ActiveAppDir to it -- replacing the previous
+    /// Extracts into a brand-new, uniquely-named directory under AppPaths.Root (ActivateAppDir then
+    /// switches state.json's ActiveAppDir to it) -- replacing the previous
     /// approach of deleting AppDir and re-extracting directly into one fixed "app" folder.
     /// Confirmed live (2026-09-06), TWICE in one day including once after the
     /// graceful-shutdown-retry fix in StopRunningClientAsync had already run and confirmed
@@ -443,54 +434,93 @@ internal static class Program
     /// previous install until the swap below -- cannot hit this failure mode at all. No
     /// retry loop is needed here any more: the one operation that used to need one
     /// (touching the previously-occupied AppDir) no longer happens on this path.
+    ///
+    /// Split in two (2026-10-31): this extracts and verifies only, returning the new folder's name; ActivateAppDir switches to it.
+    /// The extraction now runs while the old Caroline is still working, and only the switch waits for her to stop.
     /// </summary>
-    private static async Task ExtractWithRetryAsync(ProgressWindow window, string newSha256, CancellationToken ct)
+    private static async Task<string> ExtractWithRetryAsync(ProgressWindow window, string zipPath, CancellationToken ct)
     {
-        var state = InstallStateStore.Load();
-        var previousAppDir = state.ActiveAppDir;
         var newDirName = "app-" + Guid.NewGuid().ToString("N")[..8];
         var newDir = Path.Combine(AppPaths.Root, newDirName);
 
         try
         {
             await Task.Run(() =>
-                ExtractWithProgress(AppPaths.DownloadZipPath, newDir,
+                ExtractWithProgress(zipPath, newDir,
                     progress => window.SetDownloadProgress("Installing…", progress), ct), ct);
 
             if (!File.Exists(Path.Combine(newDir, "Caroline.exe")))
             {
                 throw new InvalidOperationException($"Install verification failed: Caroline.exe not found in {newDir} after extracting.");
             }
-
-            // Only flipped once the new build is verified good -- a marker written before
-            // that could make a future run wrongly skip a broken install. Nothing above
-            // this point has touched the previously active directory at all, so any
-            // failure leaves the existing install completely untouched and still active.
-            state.ActiveAppDir = newDirName;
-            state.InstalledSha256 = newSha256;
-            if (previousAppDir != newDirName && !state.PendingDeletion.Contains(previousAppDir))
-            {
-                state.PendingDeletion.Add(previousAppDir);
-            }
-            InstallStateStore.Save(state);
-
-            File.Delete(AppPaths.DownloadZipPath);
-
-            // Quick, non-blocking best-effort attempt right away (most of the time the old
-            // process's files are already free by now) -- if this one doesn't clear it,
-            // TryCleanupPending's next caller (this installer's next run, or Caroline's own
-            // periodic retry once it's running) will keep trying for as long as it takes.
-            InstallStateStore.TryCleanupPending(state);
+            return newDirName;
         }
         catch
         {
-            try { if (Directory.Exists(newDir)) Directory.Delete(newDir, recursive: true); }
-            catch (Exception cleanupEx)
-            {
-                Logger.Log($"ExtractWithRetryAsync: cleanup of half-extracted {newDir} failed (ignored, harmless leftover): {cleanupEx.Message}");
-            }
+            TryDeleteUnactivated(newDir);
             throw;
         }
+    }
+
+    private static void TryDeleteUnactivated(string newDir)
+    {
+        try { if (Directory.Exists(newDir)) Directory.Delete(newDir, recursive: true); }
+        catch (Exception cleanupEx)
+        {
+            Logger.Log($"ExtractWithRetryAsync: cleanup of half-installed {newDir} failed (ignored, harmless leftover): {cleanupEx.Message}");
+        }
+    }
+
+    /// <summary>Makes the extracted, verified folder the active one (state.json), once the old Caroline has stopped.</summary>
+    private static void ActivateAppDir(string newDirName, string newSha256, string zipPath)
+    {
+        var state = InstallStateStore.Load();
+        var previousAppDir = state.ActiveAppDir;
+
+        // Only flipped once the new build is verified good -- a marker written before
+        // that could make a future run wrongly skip a broken install. Nothing before
+        // this point has touched the previously active directory at all, so any
+        // failure leaves the existing install completely untouched and still active.
+        state.ActiveAppDir = newDirName;
+        state.InstalledSha256 = newSha256;
+        if (previousAppDir != newDirName && !state.PendingDeletion.Contains(previousAppDir))
+        {
+            state.PendingDeletion.Add(previousAppDir);
+        }
+        InstallStateStore.Save(state);
+
+        // Our own download, or the one the running Caroline made (--zip-path): installed, it is not needed any more.
+        try { File.Delete(zipPath); }
+        catch (Exception ex) { Logger.Log($"ActivateAppDir: could not delete {zipPath} (ignored): {ex.Message}"); }
+
+        // Quick, non-blocking best-effort attempt right away (most of the time the old
+        // process's files are already free by now) -- if this one doesn't clear it,
+        // TryCleanupPending's next caller (this installer's next run, or Caroline's own
+        // periodic retry once it's running) will keep trying for as long as it takes.
+        InstallStateStore.TryCleanupPending(state);
+    }
+
+    /// <summary>
+    /// The verified zip to install: the one the running Caroline already downloaded (--zip-path) when its sha256 is the signed one,
+    /// else downloaded here as before.
+    /// </summary>
+    private static async Task<string> ObtainZipAsync(Downloader downloader, WindowsDownloadInfo info, ProgressWindow window, CancellationToken ct)
+    {
+        if (info.LocalZip is not null)
+        {
+            window.SetStatus("Checking the downloaded update…");
+            if (File.Exists(info.LocalZip) && await Downloader.HashMatchesAsync(info.LocalZip, info.Sha256Hex, ct))
+            {
+                Logger.Log($"Using the zip the running Caroline already downloaded: {info.LocalZip}");
+                return info.LocalZip;
+            }
+            Logger.Log($"{info.LocalZip} is missing or its sha256 differs from the signed one -- downloading it here");
+        }
+        window.SetStatus("Downloading Caroline…");
+        await WithStepAsync(ErrorCodes.Download, "Downloading Caroline", () => downloader.DownloadAsync(
+            info.ZipUrl, AppPaths.DownloadZipPath, info.Sha256Hex,
+            progress => window.SetDownloadProgress("Downloading Caroline…", progress), ct));
+        return AppPaths.DownloadZipPath;
     }
 
     /// <summary>

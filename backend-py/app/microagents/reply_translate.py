@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any, List, Optional
 
 from app.microagent_client import Microagent as M
+from app.microagents.format_echo import format_echo
 
 TRANSLATE = "reply.translate"
 
@@ -35,6 +36,9 @@ _OPTIONAL_STRING = {"type": ["string", "null"]}
 
 def _object(properties: dict, required: Optional[List[str]] = None) -> dict:
     return {"type": "object", "properties": properties, "required": list(properties) if required is None else required}
+
+
+_OUTPUT_SCHEMA = _object({"text": _STRING}, required=["text"])
 
 
 # Evolution-engine genome (2026-10-17): see PermissionGuard.py's own
@@ -87,7 +91,7 @@ def verify_translate(input: Any, output: Any) -> Optional[str]:
     text = output.get("text")
     if not isinstance(text, str) or not text.strip():
         return '"text" must be a non-empty string'
-    return None
+    return format_echo(input["text"], text, _OUTPUT_SCHEMA)
 
 
 def llm_agents() -> List[M.Agent]:
@@ -100,7 +104,7 @@ def llm_agents() -> List[M.Agent]:
                 {"text": _STRING, "language": _STRING, "task": _OPTIONAL_STRING, "instructions": _OPTIONAL_STRING},
                 required=["text", "language"],
             ),
-            output_schema=_object({"text": _STRING}, required=["text"]),
+            output_schema=_OUTPUT_SCHEMA,
             build_prompt=prompt_translate, verify=verify_translate, ladder=M.LADDER,
         ),
     ]

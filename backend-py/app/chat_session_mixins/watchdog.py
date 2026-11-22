@@ -105,10 +105,20 @@ class WatchdogMixin:
                 agent_registry.register(self.workspace_dir, self.tab_id, message.task_id, message.description, message.task_type, message.tool_use_id)
             elif isinstance(message, TaskNotificationMessage):
                 running = agent_registry.running(self.workspace_dir, self.tab_id)
-                description = (running.get(message.task_id) or {}).get("description")  # read BEFORE finish() pops it
+                entry = running.get(message.task_id) or {}  # read BEFORE finish() pops it
+                description = entry.get("description")
                 agent_registry.finish(self.workspace_dir, self.tab_id, message.task_id, message.status)
                 summary = (message.summary or "").strip()
-                if summary:
+                if summary and entry.get("task_type") == "local_bash" and self.turn_pending:
+                    # 2026-11-05, per explicit instruction (token spend): a background shell command finishing while the
+                    # session that started it is still in its turn reaches that turn by itself -- the CLI queues the
+                    # <task-notification> into it (seen in the transcripts: "Файлы готовы..." right after it). A fresh
+                    # pseudo-session for it re-read the ~45k base and redid or re-checked the same work: 373 of 377
+                    # background tasks in Nov 2-5 were shell commands, about half answered [[NO_UPDATE]]. Real sub-agents,
+                    # and a command finishing after its session went idle, still get their own thread below.
+                    log_event("engine", "background_report_left_to_live_turn", tab_id=self.tab_id, task_id=message.task_id,
+                              status=message.status)
+                elif summary:
                     real_tab_id = pseudo_tab.real_tab_id_from_pseudo(self.tab_id) if pseudo_tab.is_pseudo_tab_id(self.tab_id) else self.tab_id
                     notification_text = (
                         f"[Your sub-agent (agentId {message.task_id}"
@@ -165,13 +175,16 @@ class WatchdogMixin:
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
+                    self._turn_tool_call_count = getattr(self, "_turn_tool_call_count", 0) + 1
                     call_name, call_input = normalize_call(block.name, block.input)    # call_tool -> the real tool (app/tool_groups.py)
                     args_preview = json.dumps(call_input, ensure_ascii=False, default=str)[:120] if isinstance(call_input, dict) else str(call_input)[:120]
                     self._pending_tool_calls[block.id] = (call_name, args_preview)
+                    self._open_tool_calls[block.id] = (call_name, time.monotonic())
             return
         if isinstance(message, UserMessage) and isinstance(message.content, list):
             for block in message.content:
                 if isinstance(block, ToolResultBlock):
+                    self._open_tool_calls.pop(block.tool_use_id, None)
                     tool_name, args_preview = self._pending_tool_calls.pop(block.tool_use_id, None) or ("unknown_tool", "")
                     content = block.content
                     if isinstance(content, list):
@@ -192,6 +205,8 @@ class WatchdogMixin:
                         name=tool_name, is_error=bool(block.is_error), result_preview=preview,
                         arguments_preview=args_preview,
                     )
+                    self.turn_action_log.append((tool_name, args_preview, bool(block.is_error), preview[:160]))
+                    del self.turn_action_log[:-12]
     # edition:end
     # edition:cut claude-session code no longer reached
     def _turn_outcomes_summary(self) -> str:
@@ -280,8 +295,36 @@ class WatchdogMixin:
         if outcomes_summary:
             nudge = f"{nudge}\n\n{outcomes_summary}"
         log_event("engine", "post_turn_completion_check", tab_id=self.tab_id, has_tool_outcomes=bool(outcomes_summary))
+        # Per explicit instruction (2026-10-30): whether the work is finished is decided ONLY by the microagent
+        # (small_model_engine.verify_claude_attempt), never by asking the main model -- that is a turn which re-reads
+        # the whole context, and almost always answered [[NO_UPDATE]]. The model is told only when the microagent
+        # finds the work unfinished. The values are taken now: the turn's state is reset right after this call.
+        # The outcomes are scoped to the whole real-user episode, so a follow-up turn (a background result arriving) would
+        # carry the earlier turns' calls and hide that THIS reply did no work: with no call in this turn the trace is empty,
+        # which is what makes the verifier treat the reply's own announced next steps as not done (2026-10-31, live: "Дальше
+        # по плану: проставлю дату, подготовлю письмо" was passed as finished).
+        if getattr(self, "_turn_tool_call_count", 1) > 0:
+            trace = [f"- {o.name} -> {'ERROR (' + o.result_preview + ')' if o.is_error else 'ok'}" for o in self.turn_tool_outcomes.values()]
+        else:
+            trace = []
+        asyncio.ensure_future(self._post_turn_microagent_verdict(
+            nudge, (self.last_real_user_question or "").strip(), self._turn_last_visible_text or "", trace,
+        ))
+    async def _post_turn_microagent_verdict(self, nudge: str, task: str, reply: str, trace: list[str]) -> None:
+        try:
+            from app.small_model_engine import verify_claude_attempt
+
+            action, note = await verify_claude_attempt(task, reply, trace, True, self.tab_id, self._ladder_recent_dialogue())
+        except Exception as exc:  # noqa: BLE001 -- no verdict is "finished": nothing is sent to the model
+            log_event("engine", "post_turn_microagent_check_failed", tab_id=self.tab_id, error=str(exc)[:200])
+            return
+        if self.ended or self._post_turn_checks_halted:
+            return
+        log_event("engine", "post_turn_microagent_verdict", tab_id=self.tab_id, action=action, note=note[:200])
+        if action != "up":
+            return
         self._awaiting_post_turn_check_reply = True
-        self.inject_proactive(nudge)
+        self.inject_proactive(f"{nudge}\n\nAn independent check found: {note or 'the work is not finished'}.")
     # edition:end
     async def _check_hang(self) -> None:
         if load_chat_mode(self.workspace_dir, self.tab_id) == "sw":
@@ -315,24 +358,29 @@ class WatchdogMixin:
         # never silently mean "assume hung", so the fallback also restores
         # the tool_in_flight extended leash from the previous version of
         # this fix, as a second safety net for exactly that degraded case.
+        # Bug fix (2026-10-30), per explicit instruction, confirmed live (tab 1,
+        # 23:17 and 23:26): a tool call the CLI started and has not answered
+        # counts as in flight in EITHER mode below. The process-activity mode
+        # used to say "no tool" always, so a PowerShell call waiting 10 minutes
+        # on ChatGPT was interrupted as an empty turn after 90s.
+        open_call = min(self._open_tool_calls.values(), key=lambda c: c[1], default=None)
         monitor = self._process_activity_monitor
         if monitor is not None and monitor.available:
             monitor.sample()
             elapsed = monitor.seconds_since_last_activity()
             signal_source = "process_activity"
-            effective_timeout_s = (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS) / 1000
-            tool_in_flight = False
+            tool_in_flight = open_call is not None
         else:
             elapsed = time.monotonic() - self.last_activity
             signal_source = "last_sdk_message_fallback"
-            tool_in_flight = (
+            tool_in_flight = open_call is not None or (
                 self.last_tool_use_started_at is not None
                 and time.monotonic() - self.last_tool_use_started_at <= elapsed + 1
             )
-            effective_timeout_s = (
-                HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS if tool_in_flight
-                else (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS)
-            ) / 1000
+        effective_timeout_s = (
+            HANG_TIMEOUT_WITH_TOOL_IN_FLIGHT_MS if tool_in_flight
+            else (HANG_TIMEOUT_MS if self.has_seen_init else STARTUP_TIMEOUT_MS)
+        ) / 1000
         # Bug fix (2026-09-16), per explicit instruction: hard backstop on
         # top of the activity signal -- see HANG_ABSOLUTE_CEILING_MS's own
         # comment for the incident (a real turn stuck 15.5 minutes,
@@ -356,9 +404,15 @@ class WatchdogMixin:
         # EMPTY_TURN_CEILING_MS's own comment: a turn that has produced
         # neither a tool call nor visible text since it started gets the
         # shorter ceiling, not the full 900s one.
+        #
+        # Not for a turn a message joined mid-way (turn_joined_running, 2026-10-30,
+        # per explicit instruction, confirmed live): submit() resets the visible-
+        # text flag for that message while the turn's clock keeps running, so a
+        # busy turn became "empty" the moment the user wrote into it.
         turn_is_empty = (
             self.turn_pending and not tool_in_flight and not self.turn_saw_any_visible_text
             and not self.turn_tool_outcomes and self.turn_pending_since is not None
+            and not self.turn_joined_running
         )
         past_absolute_ceiling = (
             turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
@@ -370,7 +424,8 @@ class WatchdogMixin:
             last_activity_s=round(elapsed, 1), hang_count=self.hang_count,
             hang_interrupted_at=self.hang_interrupted_at, has_seen_init=self.has_seen_init,
             effective_timeout_s=effective_timeout_s, signal_source=signal_source,
-            tool_in_flight=tool_in_flight, tool_in_flight_name=self.last_tool_use_name if tool_in_flight else None,
+            tool_in_flight=tool_in_flight,
+            tool_in_flight_name=(open_call[0] if open_call else self.last_tool_use_name) if tool_in_flight else None,
             turn_elapsed_s=round(turn_elapsed_s, 1), connecting_elapsed_s=round(connecting_elapsed_s, 1),
             past_absolute_ceiling=past_absolute_ceiling, turn_is_empty=turn_is_empty,
             # Bug fix (2026-09-16): raw numbers behind the activity
@@ -384,6 +439,7 @@ class WatchdogMixin:
         )
         if not self.turn_pending and self.has_seen_init:
             self.hang_interrupted_at = None
+            self.hang_interrupt_reason = None
             return
 
         # --- Phase 2: already soft-interrupted, waiting on escalation ------
@@ -436,12 +492,31 @@ class WatchdogMixin:
         # is always False when the process-activity monitor is the one
         # driving this, since real work reaching the full 90s of genuine
         # process inactivity would itself now be a real hang either way).
-        if tool_in_flight:
+        if open_call is not None:
+            self.hang_interrupted_tool_name = open_call[0]
+            self.hang_interrupted_tool_elapsed_s = time.monotonic() - open_call[1]
+        elif tool_in_flight:
             self.hang_interrupted_tool_name = self.last_tool_use_name
             self.hang_interrupted_tool_elapsed_s = time.monotonic() - self.last_tool_use_started_at
         else:
             self.hang_interrupted_tool_name = None
             self.hang_interrupted_tool_elapsed_s = None
+        # Per explicit instruction (2026-10-30): the model is told the interrupt was
+        # automatic, and why -- see _hang_interrupt_note.
+        if connecting_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000:
+            reason = f"the engine had not finished starting after {round(connecting_elapsed_s)}s"
+        elif turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000:
+            reason = f"the turn had run {round(turn_elapsed_s)}s, past the {HANG_ABSOLUTE_CEILING_MS // 1000}s limit for one turn"
+        elif past_absolute_ceiling:
+            reason = f"for {round(turn_elapsed_s)}s the turn produced no reply and no tool call"
+        else:
+            reason = f"the engine process showed no activity (CPU, memory, I/O) for {round(elapsed)}s"
+        if self.hang_interrupted_tool_name:
+            reason += (
+                f"; the tool call '{self.hang_interrupted_tool_name}' had been running "
+                f"{round(self.hang_interrupted_tool_elapsed_s or 0)}s and was stopped"
+            )
+        self.hang_interrupt_reason = reason
         if self.hang_count >= 2:
             log_event("engine", "hang_repeat_force_close", tab_id=self.tab_id, hang_count=self.hang_count)
             self.hang_interrupt_result_pending = True
@@ -488,6 +563,21 @@ class WatchdogMixin:
         cancelled = REGISTRY.cancel_for_tab(self.tab_id)
         if cancelled:
             log_event("engine", "hang_soft_interrupt_cancelled_operations", tab_id=self.tab_id, count=cancelled)
+        if self.hang_interrupt_result_pending:  # the interrupt reached the CLI
+            self.inject_proactive(self._hang_interrupt_note())
+
+    def _hang_interrupt_note(self) -> str:
+        """Per explicit instruction (2026-10-30), confirmed live: the CLI records the
+        watchdog's interrupt as the USER rejecting the running tool ("STOP ... wait for
+        the user"), and the model then told the user "you stopped me". This says who
+        really stopped it, and why."""
+        return (
+            "[System note: the action was interrupted by Caroline's automatic execution control "
+            "(the hang watchdog), NOT by the user -- if it shows as rejected or interrupted by the user, "
+            f"that is this automatic interrupt; the user did not stop or reject anything. Reason: "
+            f"{self.hang_interrupt_reason or 'no progress'}. If the work is still needed, continue it -- "
+            "if it was a call that stalled, try a different approach rather than repeating it unchanged.]"
+        )
     # edition:cut claude-session code no longer reached
     async def _handle_failure(self, exc: BaseException, extra_note: str | None = None) -> None:
         # See _format_exception_chain's own docstring for the incident this
@@ -639,6 +729,11 @@ class WatchdogMixin:
                 )
             self.hang_interrupted_tool_name = None
             self.hang_interrupted_tool_elapsed_s = None
+            if self.hang_interrupt_reason:
+                # The watchdog itself ended this stream: say so, and why (2026-10-30).
+                # Already injected once at the soft interrupt (inject_proactive); only the reason rides here.
+                tool_note = f" The hang watchdog ended the stream: {self.hang_interrupt_reason}."
+                self.hang_interrupt_reason = None
             watchdog_note = (
                 f"[System note: this session just recovered from an internal failure (hangCount={self.hang_count}):"
                 f"{tool_note} {exc}.{(' ' + extra_note) if extra_note else ''} This is Caroline's own infrastructure "
@@ -647,7 +742,7 @@ class WatchdogMixin:
             )
         if self.pending_user_text is not None:
             log_event("engine", "handle_failure_replay_pending", tab_id=self.tab_id, text_len=len(self.pending_user_text))
-            self._push_message(f"{watchdog_note}\n\n{self.pending_user_text}", self.pending_attachments, False)
+            self._push_message(self.pending_user_text, self.pending_attachments, False, internal_note=watchdog_note)
         else:
             # current_language_name() is synchronous/instant (2026-09-09
             # redesign) -- this pending_user_text re-check is kept regardless

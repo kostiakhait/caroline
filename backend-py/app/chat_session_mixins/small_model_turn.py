@@ -4,7 +4,8 @@ from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's ow
 
 
 class SmallModelTurnMixin:
-    def _start_small_model_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False) -> None:
+    def _start_small_model_turn(self, text: str, attachments: list[Any], is_real_user: bool, is_voice: bool, suppress_narration: bool = False,
+                                request_text: str | None = None, relay: bool = False) -> None:
         self.small_model_turn_is_real_user = is_real_user
         # Bug fix (2026-10-28), confirmed live ("вкладка 2, нет нарратора", a typed request answered by sw
         # after the tab switched from claude): submit() hands every sw turn to _route_sw_turn BEFORE it
@@ -46,6 +47,7 @@ class SmallModelTurnMixin:
         self.consecutive_narration_count = 0
         self._pending_tool_calls = {}
         self.turn_tool_outcomes = {}
+        self.turn_action_log = []
         if is_real_user:
             self._dr_begin_sw(text)
         else:
@@ -69,7 +71,7 @@ class SmallModelTurnMixin:
         self.small_model_activity = []
         self._reset_voice_narration()
         self._narration_turn_started_at = time.monotonic()
-        self._small_model_task = asyncio.create_task(self._run_small_model_turn(model_text, is_voice, is_real_user))
+        self._small_model_task = asyncio.create_task(self._run_small_model_turn(model_text, is_voice, is_real_user, request_text, relay))
     def _end_small_model_turn(self, start_queued_real_turn: bool = True) -> None:
         self.small_model_active = False
         self.turn_is_voice = False
@@ -81,7 +83,8 @@ class SmallModelTurnMixin:
             text, attachments, is_voice = self.small_model_queued_real_turns.pop(0)
             log_event("engine", "small_model_queued_real_turn_starting", tab_id=self.tab_id, text_len=len(text), remaining=len(self.small_model_queued_real_turns))
             self._start_small_model_turn(text, attachments, True, is_voice)
-    async def _run_small_model_turn(self, text: str, is_voice: bool, is_real_user: bool = True) -> None:
+    async def _run_small_model_turn(self, text: str, is_voice: bool, is_real_user: bool = True, request_text: str | None = None,
+                                  relay: bool = False) -> None:
         # Bug fix (2026-10-15), confirmed live ("вкладка 2, где нарратор?"):
         # same root cause as the "sw chat mode" fix just above this method
         # (search its own comment for "LOOKED dead while it wasn't") --
@@ -209,7 +212,8 @@ class SmallModelTurnMixin:
                     start_tier=start_tier, is_voice=is_voice,
                     history_messages=history_messages, history_summary=history_summary,
                     recorder=self._sw_turn_recorder,
-                    formalize_request=is_real_user,
+                    formalize_request=is_real_user or self.proactive_turns_are_tasks,
+                    request_text=request_text, relay=relay,
                     # Review of a tier's answer runs alongside its verification (_review_ahead);
                     # the voice narrator holds back meanwhile (_answer_being_checked).
                     on_candidate=(

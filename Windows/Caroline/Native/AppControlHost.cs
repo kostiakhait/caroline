@@ -165,7 +165,7 @@ public sealed class AppControlHost : IDisposable
                 // Give the HTTP response below a moment to actually reach the caller before
                 // this process starts tearing itself down.
                 await Task.Delay(200);
-                System.Windows.Application.Current.Dispatcher.Invoke(() => System.Windows.Application.Current.Shutdown());
+                App.RequestShutdown("app-control-host /shutdown (installer asking Caroline to exit)");
             });
             return (200, JsonSerializer.Serialize(new { ok = true }));
         }

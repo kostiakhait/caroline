@@ -26,6 +26,11 @@ RUNGS: tuple[str, ...] = ("haiku", "sonnet", "opus")
 TRACE_RESULT_CHARS = 4500
 TRACE_LINES_KEPT = 40
 NO_UPDATE_SENTINEL = "[[NO_UPDATE]]"
+# A model switch makes the whole context be written to the cache again at the new model's price (~12x a cache
+# read), so a hot cache is not given up for a short turn. The cache lives about this long without a request.
+CACHE_TTL_S = 300
+# Calls made on the raised rungs after which going back down pays for the rewrite (a turn is ~12 calls).
+DESCEND_MIN_CALLS = 6
 
 
 @dataclass
@@ -44,6 +49,8 @@ class LadderTurn:
     trace: list[str] = field(default_factory=list)
     open_calls: dict[str, tuple[str, str]] = field(default_factory=dict)
     escalations: list[str] = field(default_factory=list)
+    # Model calls made in this turn (all rungs), for may_descend.
+    calls: int = 0
 
     @property
     def model(self) -> str:
@@ -55,9 +62,11 @@ class LadderTurn:
 
     def observe(self, wire: dict[str, Any]) -> None:
         """Records the real tool calls and their results of this rung, for the verifier."""
-        content = (wire.get("message") or {}).get("content")
+        content = _wire_content(wire)
         if not isinstance(content, list) or wire.get("parent_tool_use_id"):
             return
+        if wire.get("type") == "assistant":
+            self.calls += 1
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -86,8 +95,26 @@ class LadderTurn:
         self.open_calls = {}
 
 
+def rung_index(model: str | None) -> int | None:
+    return RUNGS.index(model) if model in RUNGS else None
+
+
+def may_descend(cache_cold: bool, real_user: bool, raised_calls: int) -> bool:
+    """Whether a turn may start on a cheaper rung than the one the session is on. When the cache has gone cold
+    the rewrite is due anyway, so the cheapest rung is free. On a hot cache only a real user's message goes down,
+    and only after the raised rungs did a turn's worth of work; internal notes (a check, a reminder, a
+    greeting: one or two calls) keep the model they find."""
+    return cache_cold or (real_user and raised_calls >= DESCEND_MIN_CALLS)
+
+
+def _wire_content(wire: dict[str, Any]) -> Any:
+    """The content of a wire message; `message` may be a plain string (a user note), then there are no blocks."""
+    message = wire.get("message")
+    return message.get("content") if isinstance(message, dict) else None
+
+
 def visible_text(wire: dict[str, Any]) -> str:
-    content = (wire.get("message") or {}).get("content")
+    content = _wire_content(wire)
     if not isinstance(content, list):
         return ""
     return "\n".join(
@@ -116,12 +143,22 @@ def candidate_text(turn: LadderTurn, result_text: str | None) -> str:
     return ""
 
 
+def awaits_user(candidate: str) -> bool:
+    """A reply that shows a draft (a quoted block) and ends with a question to the user is a finished turn: it waits
+    for the owner's word. Judging it as unfinished work threw such drafts away and handed the turn to a stronger model
+    that then acted on a yes the owner had given before the draft existed (2026-11-20)."""
+    text = (candidate or "").strip()
+    if not text or text[-1] not in "?？":
+        return False
+    return any(line.lstrip().startswith(">") for line in text.splitlines())
+
+
 def needs_verdict(turn: LadderTurn, candidate: str, is_error: bool) -> bool:
     """False for what has nothing to judge: the top rung (nobody is left to hand it to), an
-    error result, and a deliberately silent internal turn."""
+    error result, a deliberately silent internal turn, and a draft that waits for the user's yes."""
     if turn.is_top or is_error:
         return False
-    return NO_UPDATE_SENTINEL not in candidate
+    return NO_UPDATE_SENTINEL not in candidate and not awaits_user(candidate)
 
 
 def continuation_note(turn: LadderTurn, missing: str) -> str:

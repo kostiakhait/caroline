@@ -84,3 +84,28 @@ def test_the_microagent_check():
     assert sw_memory_need.verify_memory_need({}, {**ok, "queries": ["a"] * 4}) is not None
     assert sw_memory_need.verify_memory_need({}, {"needs_memory": False, "why": "w", "queries": []}) is None
     assert "NEW MESSAGE:\nhi" in sw_memory_need.prompt_memory_need({"message": "hi", "dialogue": []}, None)
+
+
+def test_a_question_or_a_note_to_remember_gets_the_do_nothing_else_rule_even_without_memory(env):
+    for kind in ("answer", "remember", "discuss"):
+        env["agent"] = {"status": "ok", "output": {"needs_memory": False, "why": "w", "queries": [], "request_kind": kind}}
+        block = run(memory_advisor.memory_block("Что пишет Лиа?", [], "t"))
+        assert block.startswith("[Request kind:") and "do not send" in block and env["searches"] == []
+
+
+def test_the_rule_comes_after_the_memory_facts(env):
+    env["agent"] = {"status": "ok", "output": {"needs_memory": True, "why": "w", "queries": ["q"], "request_kind": "answer"}}
+    block = run(memory_advisor.memory_block("Кто это?", [], "t"))
+    assert block.index("owner is Konstantin") < block.index("[Request kind:")
+
+
+def test_an_order_or_an_unknown_kind_adds_no_restriction(env):
+    for out in ({"request_kind": "do"}, {}):
+        env["agent"] = {"status": "ok", "output": {"needs_memory": False, "why": "w", "queries": [], **out}}
+        assert run(memory_advisor.memory_block("Отправь", [], "t")) == ""
+
+
+def test_the_kind_is_checked_by_the_microagent():
+    ok = {"needs_memory": False, "why": "w", "queries": []}
+    assert sw_memory_need.verify_memory_need({}, {**ok, "request_kind": "answer"}) is None
+    assert sw_memory_need.verify_memory_need({}, {**ok, "request_kind": "act"}) is not None

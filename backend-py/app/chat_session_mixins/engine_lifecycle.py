@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
-from app import skills
+from app import action_ledger, product_role, skills
 
 
 class EngineLifecycleMixin:
@@ -111,6 +111,8 @@ class EngineLifecycleMixin:
         so the SW turns written to the old one vanished from the history the
         next turn reads -- "remember 4711" was forgotten one turn later."""
         mode = load_chat_mode(self.workspace_dir, self.tab_id)
+        if mode != "sw" and self._hand_sw_turn_over():
+            return "switching"
         if mode == "sw":
             wanted = "sw"
             if self.client is None:
@@ -150,6 +152,43 @@ class EngineLifecycleMixin:
         self.restart_engine_switch = (self.engine_kind, wanted)
         self.force_restart()
         return "switching"
+    def _hand_sw_turn_over(self) -> bool:
+        """Bug fix (2026-10-29), confirmed live (tab 2, a LinkedIn vacancy): the tab
+        was switched to Claude 7 s after an sw turn had started, and nothing stopped
+        that turn -- switch_engine_if_needed returned "unchanged" (an sw tab has no
+        agent process), so the sw cascade went on for 17 minutes up to Sonnet over
+        OpenRouter ($6.44) while the user's next messages already went to Claude:
+        the same task on two engines at once. A switch away from sw now stops the
+        running sw turn (as Stop does) and gives its task -- the user's request,
+        what they added while it ran, real turns queued behind it -- to the new
+        engine. Returns False when no sw turn is running."""
+        task = self._small_model_task
+        if not self.small_model_active or task is None or task.done():
+            return False
+        handover = []
+        if self.small_model_turn_is_real_user and (self.last_real_user_question or "").strip():
+            handover.append(self.last_real_user_question.strip())
+        handover += [c for c in self.small_model_pending_comments if not c.startswith(_SYNTHETIC_TURN_MARKER)]
+        queued, self.small_model_queued_real_turns = self.small_model_queued_real_turns, []
+        is_voice = self.turn_is_voice
+        log_event("engine", "engine_switch_sw_turn_handed_over", tab_id=self.tab_id, handover_parts=len(handover), queued=len(queued))
+        task.cancel()
+
+        async def resubmit() -> None:
+            await asyncio.wait({task})
+            if self._small_model_task is task:
+                # Cancelled before it ever ran, so its own CancelledError handler never cleaned up.
+                self.turn_pending = False
+                self._end_small_model_turn(start_queued_real_turn=False)
+            if self.ended:
+                return
+            if handover:
+                self.submit(SW_HANDOVER_NOTE + "\n\n" + "\n\n".join(handover), [], True, is_voice)
+            for text, attachments, voice in queued:
+                self.submit(text, attachments, True, voice)
+
+        asyncio.create_task(resubmit())
+        return True
     async def _safe_interrupt(self) -> None:
         try:
             if self.client:
@@ -430,6 +469,7 @@ class EngineLifecycleMixin:
                 await self._queue_event.wait()
                 continue
             item = self.queue.pop(0)
+            self._input_preparing = True
             self.turn_is_voice = self.turn_is_voice or item["is_voice"]
             self._rung_advice_begin(item)    # runs alongside the memory advisor; _ladder_before_yield waits for it
             if item.get("memory_advice_for"):
@@ -438,7 +478,17 @@ class EngineLifecycleMixin:
             self._dr_begin(item)
             await self._ladder_before_yield(item)
             self._inflight_begin()
+            self._input_preparing = False
             yield item["message"]
+    def _result_precedes_pending_input(self) -> bool:
+        """True: the ResultMessage just received ends an EARLIER CLI turn, while input of the pending turn is still
+        queued or being prepared. See _input_preparing's own __init__ comment."""
+        if getattr(self, "engine_kind", "") != "claude":
+            return False
+        stale = bool(self.queue) or self._input_preparing
+        if stale:
+            log_event("engine", "result_precedes_pending_input", tab_id=self.tab_id, queued=len(self.queue), preparing=self._input_preparing)
+        return stale
     async def _glue_memory_advice(self, item: dict[str, Any]) -> None:
         """The memory advisor (app/memory_advisor.py) for a real user message of the Claude/Codex engines: the
         block goes in as one more text block of the message. Never raises -- the message goes on unchanged."""
@@ -679,9 +729,11 @@ class EngineLifecycleMixin:
                 self._system_prompt_language = current_language_name(self.tab_id)
                 system_prompt_parts = [
                     persona_system_prompt_append(get_persona(self.workspace_dir)),
+                    product_role.role_clause(),  # opt-in: CAROLINE_PRODUCT_ROLE_FILE, set only by a host of one product (app/product_role.py)
                     owner_profile_system_prompt_clause(get_owner_profile(self.workspace_dir)),
                     instruction_memory_system_prompt_clause(self.workspace_dir),
                     working_memory_system_prompt_clause(load_working_memory(self.workspace_dir)),
+                    action_ledger.system_prompt_clause(self.workspace_dir),
                     memory_topics_system_prompt_clause(self.workspace_dir, self.tab_id),
                     *[fn() for fn in ALWAYS_ON_INSTRUCTIONS],
                     continuity_pointer_instruction(load_tab_continuity_archive(self.workspace_dir, self.tab_id)),
@@ -733,7 +785,10 @@ class EngineLifecycleMixin:
                     # and agents reached for them (an external email MCP) instead of Caroline's own tools. A
                     # structural fix with no names or lists in it; applies to subagents too. Verified with a real
                     # probe that the Claude login is unaffected.
-                    "extra_args": {"strict-mcp-config": None},
+                    # CAROLINE_NO_NATIVE_TOOLS=1 (a hosted deployment with a fixed tool set, the Ferret editor): the Claude CLI's own
+                    # tools for shell and files are switched off; its web tools (WebSearch, WebFetch) stay -- the owner, 2026-11-10: the editor's
+                    # Caroline in Claude mode must reach the internet. Unset: nothing changes.
+                    "extra_args": {"strict-mcp-config": None, **({"tools": "WebSearch,WebFetch"} if os.environ.get("CAROLINE_NO_NATIVE_TOOLS") == "1" else {})},
                     # Caroline's own definition of the default agent -- carries her rules, which a subagent does
                     # NOT inherit from --append-system-prompt. See agent_definitions.py.
                     "agents": caroline_agents(),
@@ -792,6 +847,8 @@ class EngineLifecycleMixin:
                     options_kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code"}
                 query_started_at = time.monotonic()
                 log_event("engine", "query_creating", tab_id=self.tab_id, resume=resume_session_id, chat_source=self.current_chat_source, engine=self.engine_kind)
+                self._open_tool_calls = {}  # a new stream: no call of the old one can still answer
+                self._input_preparing = False
                 if self.engine_kind == "openai":
                     self.client = CodexEngine(build_codex_options(self.workspace_dir, system_prompt_append, mcp_servers, resume_session_id))
                 else:
@@ -908,6 +965,12 @@ class EngineLifecycleMixin:
                                 "not_logged_in",
                                 "You don't have an active Claude Code login or a SquirrelWisdom account "
                                 "signed in -- please sign in to one of them to continue.",
+                                # Bug fix (2026-11-02), confirmed live: without this the failed
+                                # turn's own trailing ResultMessage reset the state to "connected"
+                                # 12 ms later, so the status bar showed the error for an instant
+                                # and went back to "ready" -- the tab looked deaf. The next turn's
+                                # init/result clears it the usual way.
+                                arm_ignore_next_result=True,
                             )
                             continue
 
@@ -1144,7 +1207,21 @@ class EngineLifecycleMixin:
                         if await self._ladder_on_result(message):
                             continue  # the attempt was rejected: the next model has the turn, nothing of this one is shown
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending or self.clear_tab_result_pending
-                        if not result_is_fake:
+                        # Bug fix (2026-10-30), per explicit instruction, confirmed live (tab 1): an
+                        # earlier CLI turn's result closed the pending turn of a message the CLI had
+                        # not started yet -- at 23:19:18 the message was still with the memory
+                        # advisor (and the refusal guard then re-ran it through SW: two engines
+                        # answering one message). See _input_preparing's own __init__ comment.
+                        # Claude engine only (see _result_precedes_pending_input).
+                        #
+                        # Bug fix (2026-11-03), confirmed live (tab 1, 22 crashes since 2026-10-31):
+                        # the two flags below are read further down for EVERY result (the result
+                        # envelope's wasInternalCheckReply), so a stale result, which skips the
+                        # block that sets them, raised UnboundLocalError and restarted the session.
+                        was_real_user_turn = False
+                        was_awaiting_post_turn_check_reply = False
+                        result_is_stale = not result_is_fake and self._result_precedes_pending_input()
+                        if not result_is_fake and not result_is_stale:
                             was_real_user_turn = self.pending_is_real_user
                             # Captured (and consumed) BEFORE the checks below can
                             # re-arm it for the NEXT turn -- see this flag's own
@@ -1507,7 +1584,7 @@ class EngineLifecycleMixin:
                                 log_event("engine", "clear_tab_result_discarded", tab_id=self.tab_id, subtype=message.subtype)
                             else:
                                 log_event("engine", "fake_result_message_preserved", tab_id=self.tab_id)
-                        else:
+                        elif not result_is_stale:  # a stale result: voice and the delivery report belong to the pending input
                             # One long-lived client now -- the turn is done,
                             # but the stream stays open for the next queued
                             # turn (_input_stream yields it). No per-turn

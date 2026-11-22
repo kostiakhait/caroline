@@ -276,3 +276,54 @@ def test_verifier_prompt_lets_a_permitted_question_through_for_a_claude_attempt(
     assert "NOT unfinished work" in claude and "Never OK a reply that asks the user something" not in claude
     cascade = sme._build_verification_prompt(tracker, "Send it?", True, ["- x -> ok"])
     assert "Never OK a reply that asks the user something" in cascade and "NOT unfinished work" not in cascade
+
+
+# --- a hot cache is not given up for a short turn ------------------------------
+
+def internal_item(text="check"):
+    item = user_item(text)
+    item["memory_advice_for"] = None
+    return item
+
+
+def test_may_descend_rules():
+    assert cl.may_descend(True, False, 0)                    # cold cache: the rewrite is due anyway
+    assert not cl.may_descend(False, False, 99)              # internal notes keep the model they find
+    assert not cl.may_descend(False, True, cl.DESCEND_MIN_CALLS - 1)
+    assert cl.may_descend(False, True, cl.DESCEND_MIN_CALLS)
+
+
+def test_turn_counts_calls():
+    turn = cl.LadderTurn(user_text="x")
+    turn.observe(tool_wire("a"))
+    turn.observe(text_wire("b"))
+    assert turn.calls == 2
+
+
+def test_internal_note_on_hot_cache_keeps_raised_model():
+    import time
+
+    s = Session()
+    s._ladder_model, s._ladder_last_result_at = "sonnet", time.monotonic()
+    run(s._ladder_before_yield(internal_item()))
+    assert s.client.models == [] and s._ladder.model == "sonnet"
+
+
+def test_internal_note_on_cold_cache_goes_down():
+    s = Session()
+    s._ladder_model, s._ladder_last_result_at = "opus", None
+    run(s._ladder_before_yield(internal_item()))
+    assert s.client.models == ["haiku"]
+
+
+def test_real_message_descends_only_after_raised_work(monkeypatch):
+    import time
+
+    s = Session()
+    s._ladder_model, s._ladder_last_result_at, s._ladder_raised_calls = "sonnet", time.monotonic(), 2
+    run(s._ladder_before_yield(user_item()))
+    assert s.client.models == []
+    s._ladder = None
+    s._ladder_raised_calls = 8
+    run(s._ladder_before_yield(user_item()))
+    assert s.client.models == ["haiku"] and s._ladder_raised_calls == 0

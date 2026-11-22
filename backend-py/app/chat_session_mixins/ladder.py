@@ -17,6 +17,8 @@ class LadderMixin:
 
     _ladder: claude_ladder.LadderTurn | None = None
     _ladder_model: str | None = None     # the model the live client is set to (None: the CLI's own default)
+    _ladder_last_result_at: float | None = None   # monotonic time of the last turn result: the cache's last use
+    _ladder_raised_calls: int = 0         # calls made on raised rungs since the session last stood on the bottom one
     _codex_effort: str | None = None     # the effort the live Codex thread was last given (None: Codex's own)
     _codex_turn: dict[str, Any] | None = None     # a real user's Codex turn waiting for its result (rung history)
     _reaction_task: "asyncio.Future[Any] | None" = None     # turn.reaction.score of the latest real message (submit())
@@ -24,6 +26,8 @@ class LadderMixin:
     def _ladder_reset(self) -> None:
         self._ladder = None
         self._ladder_model = None
+        self._ladder_last_result_at = None
+        self._ladder_raised_calls = 0
         self._codex_effort = None
         self._codex_turn = None
 
@@ -90,6 +94,8 @@ class LadderMixin:
             log_event("engine", "claude_ladder_set_model_failed", tab_id=self.tab_id, model=model, error=str(exc)[:200])
             return False
         self._ladder_model = model
+        if model == claude_ladder.RUNGS[0]:
+            self._ladder_raised_calls = 0
         return True
 
     async def _ladder_before_yield(self, item: dict[str, Any]) -> None:
@@ -117,8 +123,17 @@ class LadderMixin:
                 return
             text = claude_ladder.user_text_of(item["message"]) or item.get("memory_advice_for") or ""
             rung, why = await self._rung_advice_result(item)
-            turn = claude_ladder.LadderTurn(user_text=text, rung=rung or 0, start_rung=rung or 0,
-                                            real_user=bool(item.get("memory_advice_for")))
+            real_user = bool(item.get("memory_advice_for"))
+            rung = rung or 0
+            current = claude_ladder.rung_index(self._ladder_model)
+            if current is not None and rung < current:
+                last = self._ladder_last_result_at
+                cold = last is None or time.monotonic() - last > claude_ladder.CACHE_TTL_S
+                if not claude_ladder.may_descend(cold, real_user, self._ladder_raised_calls):
+                    log_event("engine", "claude_ladder_kept_rung", tab_id=self.tab_id, kept=claude_ladder.RUNGS[current],
+                              wanted=claude_ladder.RUNGS[rung], real_user=real_user)
+                    rung = current
+            turn = claude_ladder.LadderTurn(user_text=text, rung=rung, start_rung=rung, real_user=real_user)
             if await self._ladder_set_model(turn.model):
                 self._ladder = turn
                 log_event("engine", "claude_ladder_turn_started", tab_id=self.tab_id, model=turn.model,
@@ -170,6 +185,8 @@ class LadderMixin:
             rung_advice.record(self.workspace_dir, self.tab_id, "codex", codex_turn["request"], rung_advice.CODEX_EFFORTS,
                                codex_turn["rung"], codex_turn["rung"])
         turn = self._ladder
+        if not fake:
+            self._ladder_last_result_at = time.monotonic()
         if turn is None or not turn.active or fake:
             return False
         try:
@@ -195,6 +212,8 @@ class LadderMixin:
         except Exception as exc:  # noqa: BLE001 -- the reply must still go out
             log_event("engine", "claude_ladder_result_failed", tab_id=self.tab_id, error=str(exc)[:200])
         turn.active = False
+        if turn.rung > 0:
+            self._ladder_raised_calls += turn.calls
         if turn.real_user:
             rung_advice.record(self.workspace_dir, self.tab_id, "claude", turn.user_text, rung_advice.CLAUDE_LADDER,
                                turn.start_rung, turn.rung, turn.escalations)

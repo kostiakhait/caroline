@@ -392,6 +392,27 @@ async def translate_text(
     return translated
 
 
+# A remark opening with an answer ("Да, ...", "Yes, ...", "Подтверждаю") or an order in the "ты" form
+# ("отправляй", "send it") speaks FOR the user or TO someone -- never what Caroline reports about her own work.
+_USER_VOICE_OPENER = re.compile(
+    r"^\W*(?:да|нет|ага|угу|ок|окей|хорошо|согласн\w*|подтвержда\w*|конечно|yes|yeah|yep|no|nope|ok|okay|sure|agreed|confirmed?)\b"
+    r"|^\W*(?:отправляй|отправь|пиши|напиши|делай|сделай|шли|пошли|отвечай|ответь|давай|send|go ahead|do it|reply)\b",
+    re.IGNORECASE,
+)
+
+
+def _answers_for_the_user(original: str, revised: str) -> bool:
+    """True when `revised` is a reply of the user's (or an order) put in place of Caroline's own text:
+    it opens like an answer/command the original did not, or the original asked the user something
+    ('?' or an ask-the-user phrase) and the revision no longer asks anything."""
+    revised = revised.strip()
+    if revised == original.strip() or revised == "[[NO_UPDATE]]":
+        return False
+    if _USER_VOICE_OPENER.search(revised) and not _USER_VOICE_OPENER.search(original.strip()):
+        return True
+    return bool(_ASKS_USER.search(original)) and not _ASKS_USER.search(revised) and len(revised) < len(original) // 4
+
+
 async def review_reply(text: str, task: str, session: str | None = None, timeout: float = 15.0) -> str | None:
     """Per explicit instruction (2026-10-11): every piece of outbound text
     (a progress-narration remark or a real final reply) must be checked for
@@ -435,6 +456,13 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
         log_event("plugin:voice", "review_reply_failed", reason="empty")
         return None
     revised = output["text"]
+    # Deterministic backstop (2026-11-13), confirmed live: a 1653-char reply with a drafted email and the question
+    # "send it?" came back as "Да, отправляй ответ как написано." -- the user's answer, in the user's voice, shown as
+    # Caroline's own message. The prompt forbids it and the reviewer's own check passed it, so no model is trusted
+    # with this: a revision that answers or commands where the original asked is thrown away.
+    if _answers_for_the_user(text, revised):
+        log_event("plugin:voice", "review_reply_rejected_answers_for_user", original=text[:300], revised=revised[:300])
+        return text
     # The reviewer's own sanitizer (2026-10-24): a revision that says something the
     # original did not is thrown away -- the user sees Caroline's own text instead of
     # words the reviewer made up. Nothing to check when the text is unchanged or the
@@ -1024,7 +1052,7 @@ async def check_delivery_completeness(final_text: str, recent_dialogue: str) -> 
     if not isinstance(output, dict) or not isinstance(output.get("complete"), bool):
         log_event("plugin:voice", "check_delivery_completeness_failed", reason="malformed")
         return None
-    return {"complete": output["complete"], "missing": str(output.get("missing") or "")}
+    return {"complete": output["complete"], "missing": str(output.get("missing") or ""), "pointer": str(output.get("pointer") or "")}
 
 
 async def check_question_already_answered(final_text: str, recent_dialogue: str) -> dict[str, Any] | None:
@@ -1036,11 +1064,14 @@ async def check_question_already_answered(final_text: str, recent_dialogue: str)
     dialogue_transcript.py on EVERY outbound text block, same pipeline
     check_delivery_completeness runs on.
 
-    Returns {"already_answered": bool, "answer": str}, or None on any
-    error/malformed response -- fail-open: the caller treats None as "not
-    already answered" (an infrastructure hiccup must never itself suppress
-    a real question the user hasn't actually answered yet)."""
-    from app.microagents.question_already_answered import ALREADY_ANSWERED
+    Returns {"already_answered": bool, "answer": str, "question": str}, or
+    None on any error/malformed response -- fail-open: the caller treats
+    None as "not already answered" (an infrastructure hiccup must never
+    itself suppress a real question the user hasn't actually answered yet).
+    A claimed match whose quotes are not really in the message and the
+    dialogue becomes "not already answered" here (2026-10-30, see
+    unconfirmed_reason)."""
+    from app.microagents.question_already_answered import ALREADY_ANSWERED, unconfirmed_reason
 
     try:
         result = await _run_local_microagent(
@@ -1057,7 +1088,15 @@ async def check_question_already_answered(final_text: str, recent_dialogue: str)
     if not isinstance(output, dict) or not isinstance(output.get("already_answered"), bool):
         log_event("plugin:voice", "check_question_already_answered_failed", reason="malformed")
         return None
-    return {"already_answered": output["already_answered"], "answer": str(output.get("answer") or "")}
+    if output["already_answered"]:
+        reason = unconfirmed_reason(output, final_text, recent_dialogue)
+        if reason:
+            log_event("plugin:voice", "question_already_answered_unconfirmed", reason=reason, answer=output.get("answer"))
+            return {"already_answered": False, "answer": "", "question": ""}
+    return {
+        "already_answered": output["already_answered"], "answer": str(output.get("answer") or ""),
+        "question": str(output.get("question") or ""),
+    }
 
 
 async def score_reaction(
@@ -1498,6 +1537,24 @@ _FINISH_CLAIM = re.compile(
 )
 
 
+# 2026-11-05: the narrator is a one-way aside -- nobody can answer it, and the real work goes on by itself. A remark that
+# asks the user for something, gives them a task or puts a question to them ("please log in", "введите код", "вам нужно
+# подтвердить") is invented: Caroline is doing the job herself. Such a remark is dropped (treated as "nothing to say").
+_ASKS_USER = re.compile(
+    r"\?|¿|"
+    r"\b(?:please|let me know|tell me|could you|would you|can you|you (?:need|should|must|have to|can|may|will need)|"
+    r"your (?:turn|choice|input|help)|"
+    r"пожалуйста|будь\s+ласка|прошу|скажите|скажи|сообщите|подскажите|ответьте|дайте\s+знать|"
+    r"(?:вам|тебе|вы|ты)\s+(?:нужно|надо|необходимо|следует|стоит|можете|можешь)|"
+    r"(?:вам|тобі|ти|ви)\s+(?:потрібно|треба|можете|можеш))(?!\w)|"
+    r"(?:^|[.!;:—-]\s*)(?:(?:now|then|next|теперь|потом|затем|тепер)\s+)?(?:введите|введи|войдите|зайдите|откройте|нажмите|подтвердите|выберите|укажите|уточните|"
+    r"пришлите|отправьте|проверьте|подождите|дождитесь|"
+    r"введіть|відкрийте|натисніть|підтвердіть|оберіть|"
+    r"enter|click|tap|open|log\s*in|sign\s*in|confirm|choose|select|pick|provide|send|check|wait|approve|type)(?!\w)",
+    re.IGNORECASE,
+)
+
+
 def _is_echo_of_prompt_example(text: str) -> bool:
     return any(
         _normalized_overlap(text, example)
@@ -1703,6 +1760,15 @@ def _progress_comment_prompt(
         "machinery -- describe the progress of the task itself, in the terms the user used.\n"
         "Use only what is in TASK and STATUS. Never invent results, names, numbers, dates or details; never "
         "guess the user's intent or mood; never promise or plan next steps.\n"
+        "STATUS lists the actions of the task in the order they happened; its LAST lines are what is happening "
+        "now. Say concretely what the last one or two actions are (what is being opened, filled, searched, "
+        "written), never a vague \"still working\". A line saying what you already told the user is only there "
+        "so you do not repeat or contradict it.\n"
+        "You are doing the work yourself and nobody can answer you: NEVER ask the user a question, never ask or "
+        "tell them to do, check, choose, enter, confirm or wait for anything, never say what they \"need to\" "
+        "do -- even if STATUS or a result mentions a login, a code, a confirmation or a question. Report only "
+        "what YOU are doing or have found.\n"
+        "Never mention timed-out checks, waiting for a status, or saving notes.\n"
         "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
         "progress -- describe it that way.\n"
         "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
@@ -1923,6 +1989,11 @@ async def generate_progress_comment(
         # tense as if it were still in progress. Per explicit instruction:
         # match tense/mood to what STATUS actually shows instead of forcing
         # one tense for everything.
+        "STATUS lists the actions of the task in the order they happened; its LAST lines are what is happening "
+        "now. Say concretely what the last one or two actions are (what is being opened, filled, searched, "
+        "written), never a vague \"still working\". Do not repeat or contradict what you already told the "
+        "user (the last STATUS line says what that was). Never mention timed-out checks, waiting for a "
+        "status, or saving notes. "
         "Match your tense/mood to what STATUS actually shows: a step STATUS marks done is described as done "
         "(past tense is fine -- \"I sent it\", \"I found it\"); a step STATUS shows is still running is "
         "described as ongoing (\"I'm still working on X\"); a step that hasn't started yet but STATUS shows is "
@@ -2055,6 +2126,9 @@ async def generate_progress_comment(
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300])
         return None
+    if _ASKS_USER.search(text) or _USER_VOICE_OPENER.search(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_asks_user", text=text[:300])
+        return None
     if already_said and any(_is_repeat(text, prev) for prev in already_said):
         log_event("plugin:voice", "generate_progress_comment_rejected_repeat", text=text[:300])
         return None
@@ -2150,6 +2224,9 @@ async def generate_progress_comment_direct(
         return ""
     if _FINISH_CLAIM.search(text):
         log_event("plugin:voice", "generate_progress_comment_rejected_finish_claim", text=text[:300], direct=True)
+        return ""
+    if _ASKS_USER.search(text) or _USER_VOICE_OPENER.search(text):
+        log_event("plugin:voice", "generate_progress_comment_rejected_asks_user", text=text[:300], direct=True)
         return ""
     if _states_figure_as_settled(text, activity, task):
         log_event("plugin:voice", "generate_progress_comment_rejected_settled_figure", text=text[:300], direct=True)

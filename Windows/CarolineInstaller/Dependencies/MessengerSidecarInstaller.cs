@@ -16,17 +16,18 @@ namespace CarolineInstaller.Dependencies;
 /// </summary>
 internal static class MessengerSidecarInstaller
 {
-    private static string SidecarDir => Path.Combine(AppPaths.AppDir, "messenger-sidecar");
-    private static string NodeModulesMarker => Path.Combine(SidecarDir, "node_modules", ".caroline-installed");
-
-    public static async Task InstallAsync(CancellationToken ct)
+    /// <param name="appDir">The app folder to set up; null: the active one. An update sets up the new folder before Caroline stops
+    /// (2026-10-31), while the running one is still in use.</param>
+    public static async Task InstallAsync(CancellationToken ct, string? appDir = null)
     {
-        if (!Directory.Exists(SidecarDir))
+        var sidecarDir = Path.Combine(appDir ?? AppPaths.AppDir, "messenger-sidecar");
+        var nodeModulesMarker = Path.Combine(sidecarDir, "node_modules", ".caroline-installed");
+        if (!Directory.Exists(sidecarDir))
         {
-            Logger.Log($"MessengerSidecarInstaller: {SidecarDir} not found (older build without the sidecar?) -- skipping, Messenger just won't be available.");
+            Logger.Log($"MessengerSidecarInstaller: {sidecarDir} not found (older build without the sidecar?) -- skipping, Messenger just won't be available.");
             return;
         }
-        if (File.Exists(NodeModulesMarker))
+        if (File.Exists(nodeModulesMarker))
         {
             Logger.Log("MessengerSidecarInstaller: already installed, skipping");
             return;
@@ -41,7 +42,7 @@ internal static class MessengerSidecarInstaller
         var psi = new ProcessStartInfo
         {
             FileName = AppPaths.NodeExe,
-            WorkingDirectory = SidecarDir,
+            WorkingDirectory = sidecarDir,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -53,7 +54,7 @@ internal static class MessengerSidecarInstaller
         psi.ArgumentList.Add("--no-fund");
         psi.ArgumentList.Add("--omit=dev");
 
-        Logger.Log($"MessengerSidecarInstaller: running npm install in {SidecarDir}");
+        Logger.Log($"MessengerSidecarInstaller: running npm install in {sidecarDir}");
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("failed to start node.exe for npm install");
         var stdout = await proc.StandardOutput.ReadToEndAsync(ct);
         var stderr = await proc.StandardError.ReadToEndAsync(ct);
@@ -64,8 +65,8 @@ internal static class MessengerSidecarInstaller
             throw new InvalidOperationException($"npm install failed (exit {proc.ExitCode}): {stderr}\n{stdout}");
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(NodeModulesMarker)!);
-        await File.WriteAllTextAsync(NodeModulesMarker, DateTime.UtcNow.ToString("O"), ct);
+        Directory.CreateDirectory(Path.GetDirectoryName(nodeModulesMarker)!);
+        await File.WriteAllTextAsync(nodeModulesMarker, DateTime.UtcNow.ToString("O"), ct);
         Logger.Log("MessengerSidecarInstaller: npm install complete");
     }
 }

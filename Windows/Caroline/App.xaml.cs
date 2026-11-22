@@ -45,22 +45,34 @@ public partial class App : System.Windows.Application
         // anything else can throw.
         InstallGlobalExceptionLogging();
 
-        Logger.Log("=== Caroline starting ===");
+        // Watchdog role of this same exe (see Native/Watchdog.cs): no windows, no backend,
+        // just keeps the shell running. Decided before anything shell-specific is touched.
+        if (e.Args.Contains("--watchdog"))
+        {
+            _ = RunWatchdogModeAsync();
+            return;
+        }
+
+        Logger.Log($"=== Caroline starting{(e.Args.Length > 0 ? " (" + string.Join(' ', e.Args) + ")" : "")} ===");
 
         _singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out _isFirstInstance);
         if (!_isFirstInstance)
         {
             System.Windows.MessageBox.Show("Caroline is already running.", "Caroline",
                 MessageBoxButton.OK, MessageBoxImage.Information);
-            Shutdown();
+            // announce: false -- this process is not the one the watchdog is watching.
+            RequestShutdown("second instance started while Caroline is already running", announce: false);
             return;
         }
+
+        CrashJournal.MarkStarted();
+        WatchdogClient.Start();
 
         _settingsService = new SettingsService();
         _settings = _settingsService.Load();
 
         _mainWindow = new MainWindow(_settings, _settingsService);
-        _mainWindow.ExitRequested += (_, _) => Shutdown();
+        _mainWindow.ExitRequested += (_, _) => RequestShutdown("tray menu: Exit");
         // "Update to ..." stays available from the tray even after the user
         // dismisses the one-time MessageBox prompt (see UpdateChecker) --
         // clicking it is itself the go-ahead, no second confirmation dialog.
@@ -158,6 +170,11 @@ public partial class App : System.Windows.Application
         NativeMethods.SetForegroundWindow(new WindowInteropHelper(_mainWindow).Handle);
 
         _updateChecker.Start();
+
+        // The watchdog brought us back after an exit nobody asked for: say so once.
+        if (e.Args.Contains("--restarted") && CrashJournal.LatestWithin(TimeSpan.FromMinutes(2)) is { } crash)
+            _mainWindow.ShowRestartedNotice(
+                $"Caroline stopped unexpectedly at {crash.Time:HH:mm} and was restarted. Details: {CrashJournal.JournalPath}");
 
         // Per explicit instruction (2026-09-06): the installer can only try so many times
         // to remove a just-replaced install directory before it has to exit -- this
@@ -291,6 +308,7 @@ public partial class App : System.Windows.Application
         AppDomain.CurrentDomain.UnhandledException += (_, args) =>
         {
             Logger.Log($"UNHANDLED (non-UI thread, terminating={args.IsTerminating}): {args.ExceptionObject}");
+            Logger.Flush(); // the crash line must be on disk before the process dies (Log only queues)
         };
         TaskScheduler.UnobservedTaskException += (_, args) =>
         {
@@ -299,15 +317,82 @@ public partial class App : System.Windows.Application
         };
     }
 
+    private static string? _shutdownReason;
+
+    /// <summary>
+    /// The only way Caroline should shut itself down: logs who asked and why,
+    /// with the caller's stack, before calling Shutdown(). Confirmed live
+    /// (2026-10-29 23:55): the app closed mid-work with nothing in
+    /// caroline.log but "exiting (code 0)" -- the tray Exit path logged
+    /// nothing, and Shutdown() is posted to the dispatcher, so OnExit itself
+    /// can't see who called it.
+    /// </summary>
+    public static void RequestShutdown(string reason, bool announce = true)
+    {
+        _shutdownReason ??= reason;
+        Logger.Log($"[App] shutdown requested: {reason}\n{Environment.StackTrace}");
+        // An exit somebody asked for: tell the watchdog, or it would restart us.
+        if (announce) WatchdogClient.SignalCleanShutdown();
+        Current.Dispatcher.Invoke(() => Current.Shutdown());
+    }
+
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        _shutdownReason ??= $"Windows session ending ({e.ReasonSessionEnding})";
+        Logger.Log($"[App] {_shutdownReason}");
+        WatchdogClient.SignalCleanShutdown();
+        base.OnSessionEnding(e);
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
-        Logger.Log($"=== Caroline exiting (code {e.ApplicationExitCode}) ===");
+        Logger.Log($"=== Caroline exiting (code {e.ApplicationExitCode}, reason: {_shutdownReason ?? "UNKNOWN -- Shutdown() called directly, not via App.RequestShutdown"}) ===");
         if (_isFirstInstance)
         {
             _mainWindow?.Cleanup();
+            // An orderly exit with no known reason was not announced to the watchdog, so it will
+            // treat it as unclean and restart us; leave the run marker so the exit is not lost.
+            if (_shutdownReason != null) CrashJournal.MarkStopped();
             _singleInstanceMutex?.ReleaseMutex();
         }
         _singleInstanceMutex?.Dispose();
         base.OnExit(e);
+    }
+
+    /// <summary>The watchdog role (--watchdog): runs until the shell exits cleanly or the
+    /// watchdog gives up, then ends the process. Blocking waits run off the UI thread.</summary>
+    private async Task RunWatchdogModeAsync()
+    {
+        int code = 1;
+        try
+        {
+            var exe = Environment.ProcessPath!;
+            code = await Task.Run(() => WatchdogRunner.RunAsync(new WatchdogOptions
+            {
+                MainImagePath = exe,
+                LaunchMain = restarted =>
+                {
+                    try
+                    {
+                        return Process.Start(new ProcessStartInfo(exe)
+                        {
+                            Arguments = restarted ? "--restarted" : "",
+                            UseShellExecute = false,
+                            WorkingDirectory = System.IO.Path.GetDirectoryName(exe)!,
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Log($"[watchdog] could not start the shell: {ex.Message}");
+                        return null;
+                    }
+                },
+                OnGiveUp = msg => Dispatcher.Invoke(() =>
+                    System.Windows.MessageBox.Show(msg, "Caroline", MessageBoxButton.OK, MessageBoxImage.Warning)),
+            }));
+        }
+        catch (Exception ex) { Logger.Log($"[watchdog] failed: {ex}"); }
+        Logger.Log($"[watchdog] exiting (code {code})");
+        Shutdown(code);
     }
 }

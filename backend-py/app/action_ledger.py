@@ -12,8 +12,10 @@ recorded as pending.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +123,114 @@ def checker_note(workspace_dir: str, hours: float = 24.0, limit: int = 8) -> str
     return (
         "ACTIONS ALREADY DONE (from the system's action log). A message about one of these reports a finished matter: "
         "it never lacks a 'draft to send', and nothing about it is waiting for approval:\n" + "\n".join(lines)
+    )
+
+
+_ADDRESS = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_SUBJECT_PREFIX = re.compile(r"^\s*((re|fw|fwd|aw|sv|ответ|пересл)\s*:\s*)+", re.IGNORECASE)
+
+
+def _addresses(text: Any) -> set[str]:
+    return {a.lower() for _, a in getaddresses([str(text or "")]) if a} | {a.lower() for a in _ADDRESS.findall(str(text or ""))}
+
+
+def _subject_key(subject: Any) -> str:
+    return " ".join(_SUBJECT_PREFIX.sub("", str(subject or "")).lower().split())
+
+
+def sent_to(workspace_dir: str, sender: Any, subject: Any, days: float = 30.0, limit: int = 3) -> list[dict[str, Any]]:
+    """What Caroline sent to this sender, or in this thread (the same subject without Re:/Fwd:): the entries of the action log.
+    For a mail she reads -- see note_for_mail. Never raises."""
+    try:
+        senders = _addresses(sender)
+        key = _subject_key(subject)
+        found = []
+        for e in recent(workspace_dir, days * 24):
+            same_person = bool(senders & _addresses(e.get("to")))
+            same_thread = bool(key) and key == _subject_key(e.get("subject"))
+            if same_person or same_thread:
+                found.append(e)
+        return found[-limit:]
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "action_ledger_sent_to_failed", error=str(exc)[:200])
+        return []
+
+
+def note_for_mail(workspace_dir: str, sender: Any, subject: Any, text_chars: int = 500) -> str:
+    """The line under a mail Caroline has just read (2026-11-04, explicit instruction: the reply of Anita Frohlich to a letter
+    Caroline herself had written was taken for a message she did not know -- and the owner was asked whether HE had written it):
+    done by code at the moment of reading, so it does not depend on the model remembering to look in Sent."""
+    entries = sent_to(workspace_dir, sender, subject)
+    if not entries:
+        return ""
+    lines = []
+    for e in entries:
+        text = " ".join(str(e.get("text") or "").split())
+        said = f': "{text[:text_chars]}{"..." if len(text) > text_chars else ""}"' if text else ""
+        subject_part = f' subject "{e["subject"]}"' if e.get("subject") else ""
+        lines.append(f"- {e.get('when')}: you sent {e.get('tool')} to {e.get('to', '?')}{subject_part}{said}")
+    return (
+        "[Action log: this mail is from someone you wrote to, or belongs to a thread you wrote in. What you sent -- you wrote "
+        "it yourself, on the owner's instruction -- so this mail may be an answer to it; read it in that light and do not ask the "
+        "owner whether he wrote it:\n" + "\n".join(lines) + "]"
+    )
+
+
+def short_mark_for_mail(workspace_dir: str, sender: Any, subject: Any) -> str:
+    """One short marker for a line of a mail list."""
+    entries = sent_to(workspace_dir, sender, subject, limit=1)
+    if not entries:
+        return ""
+    e = entries[-1]
+    return f"you wrote to this sender/thread on {e.get('when')}: " + " ".join(str(e.get("text") or "").split())[:120]
+
+
+BULK_RUN = 3                 # this many sends in a row by the same tool, close in time, are one mailing
+BULK_GAP_S = 600
+
+
+def _groups(entries: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Consecutive sends by one tool, minutes apart, grouped: a mailing to fifty shops must not push a letter to one person out."""
+    groups: list[list[dict[str, Any]]] = []
+    for e in entries:
+        last = groups[-1] if groups else None
+        if last and last[-1].get("tool") == e.get("tool") and e.get("ms", 0) - last[-1].get("ms", 0) <= BULK_GAP_S * 1000:
+            last.append(e)
+        else:
+            groups.append([e])
+    return groups
+
+
+def _line(e: dict[str, Any], text_chars: int) -> str:
+    subject = f' subject "{e["subject"]}"' if e.get("subject") else ""
+    sender = f" from {e['from']}" if e.get("from") else ""
+    text = " ".join(str(e.get("text") or "").split())
+    said = f': "{text[:text_chars]}{"..." if len(text) > text_chars else ""}"' if text else ""
+    return f"- {e.get('when')}: {e.get('tool')}{sender} to {e.get('to', '?')}{subject}{said}"
+
+
+def system_prompt_clause(workspace_dir: str, days: float = 7.0, limit: int = 5, text_chars: int = 160) -> str:
+    """For the main model's system prompt, rebuilt at every engine start: what Caroline herself has sent in the last days,
+    with the words that went out (2026-11-04, explicit instruction: she wrote to Anita Frohlich about Tuesday 10:00 and, after
+    several compactions and restarts, asked the user whether HE had written that). Nothing about a sent message may depend on the
+    conversation still holding it; a reply to it must be recognised as a reply to her own message."""
+    groups = _groups(recent(workspace_dir, days * 24))[-limit:]
+    if not groups:
+        return ""
+    lines = []
+    for group in groups:
+        if len(group) < BULK_RUN:
+            lines.extend(_line(e, text_chars) for e in group)
+            continue
+        recipients = ", ".join(str(e.get("to", "?")) for e in group[:4]) + (", ..." if len(group) > 4 else "")
+        lines.append(f"- {group[0].get('when')} .. {group[-1].get('when')}: {len(group)} messages by {group[0].get('tool')}, "
+                     f"one mailing (to {recipients}); the first one: " + _line(group[0], 200)[2:].split(": ", 1)[-1])
+    return (
+        "WHAT YOU HAVE SENT RECENTLY (from the system's action log, oldest first): you wrote and sent each of these yourself, "
+        "on the owner's instruction, and the words below are what really went out. When someone answers one of them, it is an "
+        "answer to YOUR message: take what you proposed or promised in it as the starting point, and never ask the owner whether "
+        "he wrote it. Older ones, and replies to them, show up as a note under a mail you read, and are in the Sent folder.\n"
+        + "\n".join(lines)
     )
 
 

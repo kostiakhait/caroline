@@ -202,6 +202,59 @@ internal static class PythonInstaller
         return Directory.Exists(Path.Combine(sitePackagesDir, normalizedPrefix));
     }
 
+    // Wheels of the packages an update adds, downloaded by PrepareAsync while Caroline still runs on this very runtime (2026-10-31, per
+    // explicit instruction: nothing is downloaded after Caroline is stopped); InstallAsync installs them from here, offline.
+    private static string WheelCacheDir => Path.Combine(AppPaths.Root, "python-wheels.prepared");
+
+    private static string[] MissingPackages()
+    {
+        var sitePackagesDir = Path.Combine(AppPaths.PythonDir, "Lib", "site-packages");
+        return PythonPackages.Where(pkg => !IsPackageImportable(sitePackagesDir, pkg)).ToArray();
+    }
+
+    /// <summary>Runs while Caroline is still running. No runtime or no pip yet (nothing can be using it): the whole install now. A
+    /// runtime in use that lacks packages: only their wheels are downloaded (pip verifies them), for InstallAsync after the stop.</summary>
+    public static async Task PrepareAsync(Downloader downloader,
+        Action<string> onStatus, Action<DownloadProgress> onProgress, CancellationToken ct)
+    {
+        if (!IsInstalled() || !File.Exists(PipExe))
+        {
+            await InstallAsync(downloader, onStatus, onProgress, ct);
+            return;
+        }
+        var missing = MissingPackages();
+        if (missing.Length == 0) return;
+        onStatus("Downloading Python packages…");
+        Directory.CreateDirectory(WheelCacheDir);
+        foreach (var package in missing)
+        {
+            await RunPythonAsync(["-m", "pip", "download", "--dest", WheelCacheDir, package], $"pip download {package}", ct);
+        }
+    }
+
+    /// <summary>After Caroline is stopped: installs what PrepareAsync downloaded, from the local wheels only (--no-index).</summary>
+    public static async Task FinishPreparedAsync(Action<string> onStatus, CancellationToken ct)
+    {
+        var missing = MissingPackages();
+        if (missing.Length == 0) return;
+        if (!Directory.Exists(WheelCacheDir))
+        {
+            throw new InvalidOperationException($"Python packages missing after the stop and none prepared: {string.Join(", ", missing)}");
+        }
+        onStatus("Setting up Python packages…");
+        foreach (var package in missing)
+        {
+            await RunPythonAsync(["-m", "pip", "install", "--no-index", "--find-links", WheelCacheDir, "--no-warn-script-location", package],
+                $"pip install (offline) {package}", ct);
+        }
+        if (!ArePackagesInstalled())
+        {
+            throw new InvalidOperationException("Python package install verification failed: not all required packages found in site-packages after install.");
+        }
+        try { Directory.Delete(WheelCacheDir, recursive: true); }
+        catch (Exception ex) { Logger.Log($"PythonInstaller: cleanup of {WheelCacheDir} failed (ignored): {ex.Message}"); }
+    }
+
     public static async Task InstallAsync(Downloader downloader,
         Action<string> onStatus, Action<DownloadProgress> onProgress, CancellationToken ct)
     {

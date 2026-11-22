@@ -130,7 +130,7 @@ async def _channel_tick(
     tick_label = f"{account} tick #{status.tick_count}"
     try:
         if account == DEFAULT_ACCOUNT:
-            has_own = has_own_ratatosk_account(workspace_dir)
+            has_own = await asyncio.to_thread(has_own_ratatosk_account, workspace_dir)   # disk/DPAPI: not on the loop thread
             status.enabled = has_own
             if not has_own:
                 status.last_tick_outcome = "skipped (no own Ratatosk account yet)"

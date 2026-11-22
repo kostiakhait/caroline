@@ -20,7 +20,9 @@ logging or their own polling/cancellation plumbing.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
+import os
 import pkgutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,6 +218,9 @@ def discover_plugins() -> list[Plugin]:
     Called fresh on every query() build -- see this module's own doc
     comment for why that alone is enough for hot-plugging."""
     plugins: list[Plugin] = []
+    excluded = excluded_plugin_names()
+    only = only_plugin_names()
+    left_out_tools = excluded_tool_names()
     package_dir = Path(__file__).parent
     for module_info in pkgutil.iter_modules([str(package_dir)]):
         if module_info.name in ("loader",) or module_info.name.startswith("_"):
@@ -245,9 +250,39 @@ def discover_plugins() -> list[Plugin]:
         if plugin is None:
             log_event("engine", "plugin_skipped", module=module_info.name, reason="no PLUGIN object")
             continue
+        if plugin.name in excluded or (only is not None and plugin.name not in only):
+            log_event("engine", "plugin_excluded", plugin=plugin.name)
+            continue
+        if left_out_tools:
+            plugin = dataclasses.replace(plugin, tools=[t for t in plugin.tools if t.name not in left_out_tools])
         plugins.append(plugin)
         log_event("engine", "plugin_loaded", plugin=plugin.name, tool_count=len(plugin.tools))
     return plugins
+
+
+def excluded_plugin_names() -> set[str]:
+    """Plugin names this deployment leaves out, from CAROLINE_EXCLUDED_PLUGINS (comma separated, plugin.name values).
+    Unset means nothing is left out, so the desktop app is unaffected. A headless deployment (the akinakes agent
+    containers) lists what cannot work without a display, e.g. "voice-playback,visual-models"."""
+    raw = os.environ.get("CAROLINE_EXCLUDED_PLUGINS", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def only_plugin_names() -> set[str] | None:
+    """When CAROLINE_ONLY_PLUGINS is set (comma separated plugin.name values), exactly these plugins are loaded and every other one
+    is left out; unset means no such limit, so every other deployment is unaffected. A hosted deployment with a fixed, small tool
+    set (the Ferret browser editor) lists its plugins here, so a plugin added later never joins it unasked."""
+    raw = os.environ.get("CAROLINE_ONLY_PLUGINS")
+    if raw is None or not raw.strip():
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def excluded_tool_names() -> set[str]:
+    """Tool names (not plugins) this deployment takes out of the plugins it loads, from CAROLINE_EXCLUDED_TOOLS (comma separated).
+    Unset means no tool is taken out."""
+    raw = os.environ.get("CAROLINE_EXCLUDED_TOOLS", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
 
 
 def build_mcp_servers() -> dict[str, McpServerConfig]:
@@ -352,7 +387,7 @@ def _build_group_tools_server(plugins: list[Plugin]) -> McpServerConfig:
         if refusal:
             log_event("engine", "tool_groups_call_refused", tool=name, reason=refusal[:200])
             return reply(refusal, error=True)
-        plugin, plugin_tool = tool_groups.find_tool(plugins, name)  # type: ignore[misc]
+        plugin, plugin_tool = tool_groups.find_callable_tool(plugins, name)  # type: ignore[misc]
         if name not in wrapped:
             wrapped[name] = wrap_tool(plugin.name, plugin_tool)
         return await wrapped[name].handler(inner)
