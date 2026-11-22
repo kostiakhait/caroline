@@ -3,6 +3,7 @@ Run: python -m pytest test_vault_backup.py -q"""
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -45,12 +46,12 @@ class FakeNotes:
     async def attach_file(self, session, note_id, local_file_path, original_name=None):
         entry = {"filename": f"f{len(self.attachments)}", "originalName": original_name, "noteId": note_id}
         self.attachments.append(entry)
-        self.blobs[entry["filename"]] = open(local_file_path, "rb").read()
+        self.blobs[entry["filename"]] = Path(local_file_path).read_bytes()   # closed at once (ResourceWarning)
         return entry
 
     async def download_attachment(self, session, filename, save_path):
         data = self.blobs[filename]
-        open(save_path, "wb").write(data)
+        Path(save_path).write_bytes(data)
         return len(data)
 
 
