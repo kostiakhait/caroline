@@ -130,6 +130,9 @@ def workspace(tmp_path, monkeypatch):
     from app import chat_session_shared as shared
 
     monkeypatch.setattr(shared, "WORKSPACE_DIR", str(tmp_path))
+    # Fresh language caches per test: they are keyed by tab id only, so another test's "2" carried over.
+    monkeypatch.setattr(shared, "_language_cache", {})
+    monkeypatch.setattr(shared, "_language_guess_cache", {})
     return shared, str(tmp_path)
 
 

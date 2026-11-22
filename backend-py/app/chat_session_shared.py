@@ -1058,7 +1058,21 @@ def _last_language_path(tab_id: str) -> Path:
 # _save_persisted_language refreshes it.
 _LANGUAGE_TTL_S = 15.0
 _language_cache: dict[str, tuple[float, str | None]] = {}
-_language_guess_cache: dict[str, tuple[float, str]] = {}
+# The guess from the dialogue also remembers the dialogue record it was made from (size, mtime): a tick
+# that asked before the user's first message cached "English", and for the next 15 s a Russian first
+# message was answered in English -- the 2026-10-26 incident test_dialogue_log guards against (2026-11-22).
+_language_guess_cache: dict[str, tuple[float, str, tuple[int, int] | None]] = {}
+
+
+def _dialogue_stamp(tab_id: str) -> tuple[int, int] | None:
+    """Size and mtime of the tab's dialogue record -- a stat, not a read."""
+    try:
+        from app import dialogue_log
+
+        stat = dialogue_log.log_path(WORKSPACE_DIR, tab_id).stat()
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None
 
 
 def _load_persisted_language(tab_id: str) -> str | None:
@@ -1552,10 +1566,11 @@ def current_language_name(tab_id: str) -> str:
         return persisted
     hit = _language_guess_cache.get(tab_id)
     now = time.monotonic()
-    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S:
+    stamp = _dialogue_stamp(tab_id)
+    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S and hit[2] == stamp:
         return hit[1]
     guess = _language_from_recent_user_messages(tab_id) or "English"
-    _language_guess_cache[tab_id] = (now, guess)
+    _language_guess_cache[tab_id] = (now, guess, stamp)
     return guess
 
 

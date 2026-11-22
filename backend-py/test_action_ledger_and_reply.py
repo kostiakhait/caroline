@@ -155,14 +155,19 @@ def test_checker_note_marks_sent_actions_for_the_delivery_check(tmp_path):
     assert "ALREADY SENT" in note and "oksana@x.org" in note and "never lacks a 'draft to send'" in note
 
 
-def test_system_prompt_clause_carries_what_went_out_for_days(tmp_path):
+def test_system_prompt_clause_carries_what_went_out_for_days(tmp_path, monkeypatch):
     ws = str(tmp_path)
     assert al.system_prompt_clause(ws) == ""
     al.append(ws, "1", "email_send_reply", {"address": "me@x.org", "to": "anita@x.org", "subject": "Re: Next steps",
                                            "text": "Tuesdays at 10 am work best for me."})
     clause = al.system_prompt_clause(ws)
     assert "anita@x.org" in clause and "Tuesdays at 10 am" in clause and "never ask the owner whether" in clause
-    assert al.system_prompt_clause(ws, days=0.0000001) == ""
+    # An hour later, a half-hour window no longer holds it. (It used to be days=0.0000001 -- 8.6 ms -- right after
+    # the send: on a fast machine the send was still inside that window and the test failed.)
+    an_hour_later = al.time.time() + 3600
+    with monkeypatch.context() as m:
+        m.setattr(al.time, "time", lambda: an_hour_later)
+        assert al.system_prompt_clause(ws, days=0.5 / 24) == ""
     al.append(ws, "1", "email_send", {"to": "b@x.org", "text": "x" * 500})
     assert "..." in al.system_prompt_clause(ws, text_chars=50)
 

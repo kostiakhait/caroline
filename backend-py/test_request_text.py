@@ -26,8 +26,13 @@ def formalized(monkeypatch):
     async def no_model():
         return None  # the turn ends right after the formalizer has been started
 
+    async def no_key():
+        return None  # no wallet check: on a machine logged in to SquirrelWisdom it read the real wallet, and an
+                     # empty one ended the turn before the formalizer started (2026-11-22)
+
     monkeypatch.setattr(sw_request_spec, "formalize", fake_formalize)
     monkeypatch.setattr(sme, "_model_ai", no_model)
+    monkeypatch.setattr(sme, "get_model_provider_key", no_key)
     return seen
 
 
