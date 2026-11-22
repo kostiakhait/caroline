@@ -319,6 +319,9 @@ public partial class App : System.Windows.Application
 
     private static string? _shutdownReason;
 
+    /// <summary>True once an orderly exit has begun (RequestShutdown or Windows ending the session).</summary>
+    public static bool IsShuttingDown => _shutdownReason != null;
+
     /// <summary>
     /// The only way Caroline should shut itself down: logs who asked and why,
     /// with the caller's stack, before calling Shutdown(). Confirmed live
@@ -341,6 +344,10 @@ public partial class App : System.Windows.Application
         _shutdownReason ??= $"Windows session ending ({e.ReasonSessionEnding})";
         Logger.Log($"[App] {_shutdownReason}");
         WatchdogClient.SignalCleanShutdown();
+        // Now, not in OnExit: Windows terminates the backend first and the shell soon after, before
+        // OnExit's Cleanup gets far (2026-11-15..20: every Windows shutdown left the marker behind and
+        // the next start journaled a "crash" for a run that had logged "Windows session ending").
+        if (_isFirstInstance) CrashJournal.MarkStopped();
         base.OnSessionEnding(e);
     }
 
@@ -349,10 +356,12 @@ public partial class App : System.Windows.Application
         Logger.Log($"=== Caroline exiting (code {e.ApplicationExitCode}, reason: {_shutdownReason ?? "UNKNOWN -- Shutdown() called directly, not via App.RequestShutdown"}) ===");
         if (_isFirstInstance)
         {
-            _mainWindow?.Cleanup();
             // An orderly exit with no known reason was not announced to the watchdog, so it will
             // treat it as unclean and restart us; leave the run marker so the exit is not lost.
+            // Before Cleanup: it disposes WebViews and kills the supervisor tree, and a process ended
+            // during it still exited in order.
             if (_shutdownReason != null) CrashJournal.MarkStopped();
+            _mainWindow?.Cleanup();
             _singleInstanceMutex?.ReleaseMutex();
         }
         _singleInstanceMutex?.Dispose();
@@ -393,6 +402,8 @@ public partial class App : System.Windows.Application
         }
         catch (Exception ex) { Logger.Log($"[watchdog] failed: {ex}"); }
         Logger.Log($"[watchdog] exiting (code {code})");
+        // Its own OnExit logged "reason: UNKNOWN -- Shutdown() called directly" after every update.
+        _shutdownReason ??= $"watchdog role finished (code {code})";
         Shutdown(code);
     }
 }

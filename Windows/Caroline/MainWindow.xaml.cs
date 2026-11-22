@@ -215,6 +215,14 @@ public partial class MainWindow : Window
         // anymore -- try relaunching it once.
         _supervisor.Crashed += () => Dispatcher.BeginInvoke(() =>
         {
+            // Windows ending the session terminates the supervisor (0x40010004) just before the shell:
+            // a relaunch then started a new backend in the middle of the shutdown and kept the UI
+            // thread busy while OnExit should have run (2026-11-15..20, every Windows shutdown).
+            if (App.IsShuttingDown)
+            {
+                Logger.Log("MainWindow: supervisor process exited during shutdown -- not relaunching");
+                return;
+            }
             Logger.Log("MainWindow: supervisor process exited unexpectedly -- relaunching");
             // A supervisor that dies at once, again and again, is not fixed
             // by another try (2026-10-28: 1493 relaunches in 13 minutes
