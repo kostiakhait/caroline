@@ -287,7 +287,7 @@ public partial class MainWindow : Window
         if (status.Value.TryGetProperty("gaveUp", out var gaveUp) && gaveUp.ValueKind == JsonValueKind.True)
         {
             _gaveUpErrorShown = true;
-            Dispatcher.BeginInvoke(() =>
+            _ = Dispatcher.BeginInvoke(() =>   // posted to the UI thread on purpose, not awaited (CS4014)
             {
                 Logger.Log("MainWindow: supervisor reports it has given up auto-restarting the backend");
                 ShowError("Caroline's backend keeps failing. Check caroline.log, or restart the app.\n\n" + Logger.LogPath);
