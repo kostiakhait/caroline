@@ -75,3 +75,4 @@ dist-intellicat/
 Claude outputs/
 dist_release/
 .build/
+.build-ferret/
