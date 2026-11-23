@@ -47,11 +47,26 @@ from app.workspace_dir import WORKSPACE_DIR
 DEFAULT_ACCOUNT = "self"
 
 
-async def resolve_ratatosk_session(account: str) -> tuple[str, str]:
+async def resolve_ratatosk_session(account: str, background: bool = False) -> tuple[str, str]:
     """Per explicit instruction (2026-10-13): renamed from _resolve_session
     (parameter `as_`) and exported (no longer private) so ratatosk_channel.py
     can reuse the exact same gate+credentials+mint_v2_session logic for the
-    owner account's own automatic polling, instead of duplicating it."""
+    owner account's own automatic polling, instead of duplicating it.
+
+    `background`: the channel's poll loop, outside any ChatSession turn. There get_send() raised, so every
+    owner tick from 2026-10-13 to 2026-11-22 ended "skipped (No active session send() context ...)" -- the
+    owner's account was never polled once. With no window to open from there, it is signed in or not, and the
+    session is the shared cached one (login_api.get_cached_v2_session), not a fresh login every 15 s."""
+    if account == "owner" and background:
+        from app.login_api import get_cached_v2_session
+
+        creds = load_credentials()
+        if creds is None:
+            raise RuntimeError("the owner is not signed in to SquirrelWisdom")
+        session = await get_cached_v2_session()
+        if not session:
+            raise RuntimeError("no SquirrelWisdom session for the owner right now")
+        return session, creds["email"]
     if account == "owner":
         gate = await require_sw_or_prompt(get_send())
         if not gate.ok:

@@ -30,6 +30,7 @@ from app.plugins.ratatosk_api import get_recent_messages, get_server_now, list_c
 from app.plugins.ratatosk_own_account import get_own_v2_session, has_own_ratatosk_account, own_ratatosk_email
 from app.plugins.ratatosk_plugin import resolve_ratatosk_session
 from app.task_supervisor import supervise
+from app.untrusted_text import third_party_label, third_party_text
 
 ACCOUNTS = ("self", "owner")
 DEFAULT_ACCOUNT = "self"
@@ -61,6 +62,46 @@ POLL_INTERVAL_MS = 15_000
 # "self"-only concept (Caroline's own online status) -- unaffected by this
 # change.
 PRESENCE_INTERVAL_MS = 5_000
+
+# A quiet outcome (skipped, nothing new, the same error again) is logged when it changes, and otherwise once
+# per TICK_LOG_REPEAT_S with how many identical ticks it stands for. 2026-11-22: the two "skipped" outcomes,
+# repeated every 15 s, were 60% of caroline.log (19,167 lines in two days) and all of the log tail each
+# crashes.jsonl entry carries. Ticks that hand messages on are always logged; get_ratatosk_channel_status()
+# still has every tick's outcome.
+TICK_LOG_REPEAT_S = 1800.0
+_quiet_logged: dict[tuple[str, str], tuple[str, float, int]] = {}   # (account, event) -> (key, logged at, ticks since)
+
+# The group list changes far less often than messages arrive: re-read every CONVERSATIONS_REFRESH_S instead of
+# every tick (one group:getUserGroups plus one group:get per group, each time).
+CONVERSATIONS_REFRESH_S = 300.0
+_conversations_cache: dict[str, tuple[float, str, list[dict[str, Any]]]] = {}   # account -> (read at, email, groups)
+
+
+def _log_quiet(account: str, event: str, key: str, **fields: Any) -> None:
+    now = time.monotonic()
+    last = _quiet_logged.get((account, event))
+    if last is not None and last[0] == key and now - last[1] < TICK_LOG_REPEAT_S:
+        _quiet_logged[(account, event)] = (key, last[1], last[2] + 1)
+        return
+    if last is not None and last[0] == key and last[2]:
+        fields["same_ticks_since_last_line"] = last[2]
+    log_event("plugin:ratatosk-channel", event, **fields)
+    _quiet_logged[(account, event)] = (key, now, 0)
+
+
+async def _conversations(account: str, session: str, email: str) -> list[dict[str, Any]]:
+    hit = _conversations_cache.get(account)
+    if hit is not None and hit[1] == email and time.monotonic() - hit[0] < CONVERSATIONS_REFRESH_S:
+        return hit[2]
+    conversations = await list_conversations(session, email)
+    _conversations_cache[account] = (time.monotonic(), email, conversations)
+    return conversations
+
+
+def _group_text(group: dict[str, Any], texts: list[str]) -> str:
+    """Other people's messages (and the group's name, which a member can set) as data, the way every other
+    messenger channel hands them on (app/untrusted_text.py)."""
+    return third_party_text("\n".join(texts), third_party_label(group.get("name")))
 
 
 def _cursors_path(workspace_dir: str, account: str) -> Path:
@@ -134,21 +175,21 @@ async def _channel_tick(
             status.enabled = has_own
             if not has_own:
                 status.last_tick_outcome = "skipped (no own Ratatosk account yet)"
-                log_event("plugin:ratatosk-channel", "tick", label=tick_label, outcome=status.last_tick_outcome)
+                _log_quiet(account, "tick", status.last_tick_outcome, label=tick_label, outcome=status.last_tick_outcome)
                 return
         else:
             status.enabled = True  # the owner side just needs an SW login, checked by resolve_ratatosk_session's own gate
         try:
-            session, email = await resolve_ratatosk_session(account)
+            session, email = await resolve_ratatosk_session(account, background=True)
         except Exception as exc:
             status.last_tick_outcome = f"skipped ({exc})"
-            log_event("plugin:ratatosk-channel", "tick", label=tick_label, outcome=status.last_tick_outcome)
+            _log_quiet(account, "tick", status.last_tick_outcome, label=tick_label, outcome=status.last_tick_outcome)
             return
         status.email = email
 
-        conversations = await list_conversations(session, email)
+        conversations = await _conversations(account, session, email)
         status.monitored_group_count = len(conversations)
-        log_event("plugin:ratatosk-channel", "tick_monitoring", label=tick_label, group_count=len(conversations))
+        _log_quiet(account, "tick_monitoring", str(len(conversations)), label=tick_label, group_count=len(conversations))
 
         cursors = _load_cursors(workspace_dir, account)
         per_group_new: list[tuple[dict[str, Any], list[str]]] = []
@@ -211,7 +252,7 @@ async def _channel_tick(
 
         if not per_group_new:
             status.last_tick_outcome = "no new messages in any monitored group since last cursor"
-            log_event("plugin:ratatosk-channel", "tick", label=tick_label, outcome=status.last_tick_outcome)
+            _log_quiet(account, "tick", status.last_tick_outcome, label=tick_label, outcome=status.last_tick_outcome)
             return
 
         status.last_tick_outcome = f"{total_new} new message(s) across {len(per_group_new)} group(s), injecting"
@@ -225,9 +266,9 @@ async def _channel_tick(
             # lands in the wrong conversation. Spelled out once per group, not
             # once for the whole batch, since multiple groups can be pending.
             sections = [
-                f'Group "{group["name"]}" (groupId="{group["groupId"]}") -- reply here via ratatosk_send_message '
-                f'account:"self" groupId:"{group["groupId"]}" (this exact groupId, not one from earlier in your own '
-                f"history/memory):\n" + "\n".join(texts)
+                f'Group "{third_party_label(group.get("name"))}" (groupId="{group["groupId"]}") -- reply here via '
+                f'ratatosk_send_message account:"self" groupId:"{group["groupId"]}" (this exact groupId, not one from '
+                f"earlier in your own history/memory):\n" + _group_text(group, texts)
                 for group, texts in per_group_new
             ]
             inject_self(
@@ -242,7 +283,7 @@ async def _channel_tick(
             # the owner about it if it matters; never reply as them unless
             # they have explicitly asked for this specific reply.
             sections = [
-                f'Group "{group["name"]}" (groupId="{group["groupId"]}"):\n' + "\n".join(texts)
+                f'Group "{third_party_label(group.get("name"))}" (groupId="{group["groupId"]}"):\n' + _group_text(group, texts)
                 for group, texts in per_group_new
             ]
             inject_owner_readonly(
@@ -256,7 +297,13 @@ async def _channel_tick(
         status.last_error = str(exc)
         status.last_error_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         status.last_tick_outcome = f"threw: {status.last_error}"
-        log_event("plugin:ratatosk-channel", "tick_failed", label=tick_label, error=status.last_error)
+        _log_quiet(account, "tick_failed", status.last_error, label=tick_label, error=status.last_error)
+        _conversations_cache.pop(account, None)   # read the groups afresh next time
+        if account != DEFAULT_ACCOUNT and "session" in status.last_error.lower():
+            # The owner's session is the shared cached one: a rejected one would otherwise be reused every tick.
+            from app.login_api import get_cached_v2_session
+
+            await get_cached_v2_session(force_refresh=True)
 
 
 def start_ratatosk_owner_channel(
