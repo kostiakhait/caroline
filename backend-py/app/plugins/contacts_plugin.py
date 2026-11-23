@@ -209,6 +209,8 @@ async def _address_book(command: str, doing: str, **params: Any) -> dict[str, An
     if refused:
         return refused
     reply = await memory._memory(command, traceId=uuid.uuid4().hex, language=memory._language(), **params)
+    if reply.get("status") == "queued":    # background work accepted by the server (contact:put with background)
+        return reply
     reaction = await memory._react_to_status(reply)
     failure = memory._failure_text(reply, doing)
     if failure:
@@ -271,7 +273,11 @@ async def upsert_contacts_from_emails(pairs: list[tuple[str | None, str]], exclu
     showing up as a "recipient" or "sender" on their own mail is not a new contact to learn.
 
     Fire-and-forget by design: never worth failing (or even delaying) a real email send/read
-    over this side-channel bookkeeping, so every failure is logged, never raised."""
+    over this side-channel bookkeeping, so every failure is logged, never raised.
+
+    Sent as background work ("background": true, 2026-11-22): the server queues it in its
+    background pool and answers at once. A mail sweep sends dozens of these together; as live
+    requests they once took every slot of the server's memory and 131 of them timed out."""
     exclude_lower = {e.strip().lower() for e in (exclude or set()) if e}
     seen: set[str] = set()
     for name, addr in pairs:
@@ -287,7 +293,7 @@ async def upsert_contacts_from_emails(pairs: list[tuple[str | None, str]], exclu
         if known is not None and (known == contact["name"] or contact["name"].lower() == key):
             continue
         try:
-            reply = await _address_book("contact:put", "Saving a contact seen in email", contact=contact)
+            reply = await _address_book("contact:put", "Saving a contact seen in email", contact=contact, background=True)
             if reply.get("is_error"):
                 log_event("plugin", "contacts_email_autosave_failed", address=key, error=reply.get("text"))
             else:
