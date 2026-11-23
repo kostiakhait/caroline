@@ -29,6 +29,9 @@ if __name__ == "__main__":
     # the connection on a file of about 12 MB or more.
     WS_MAX_SIZE = 48 * 1024 * 1024
 
+    from app import quiet_access_log
+
+    quiet_access_log.install()   # status polls that answered fine are not logged (app/quiet_access_log.py)
     log_event("engine", "starting", port=PORT, remote_port=REMOTE_PORT, workspace_dir=WORKSPACE_DIR)
     seed_skills(WORKSPACE_DIR)
     # Bug fix (2026-09-27), per explicit instruction, found live (backend

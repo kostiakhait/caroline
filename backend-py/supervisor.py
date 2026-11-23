@@ -486,4 +486,7 @@ async def post_restart() -> JSONResponse:
 if __name__ == "__main__":
     if sys.platform != "win32":
         _set_parent_death_signal()
+    from app import quiet_access_log
+
+    quiet_access_log.install()   # the shell's /status polls that answered fine are not logged
     uvicorn.run(app, host="127.0.0.1", port=SUPERVISOR_PORT)
