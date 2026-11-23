@@ -3476,6 +3476,10 @@ async def run_small_model_turn(
     tier_advice_task = asyncio.ensure_future(_tags_and_tier_advice(
         request, [cfg.AI_MODEL_SMALL, cfg.AI_MODEL_MINI, cfg.AI_MODEL_ALTERNATE, cfg.AI_MODEL_OPUS], workspace_dir, tab_id,
     )) if formalize_request and not relay else None
+    # The one-word complexity call, when the fast lane has not decided the start already: it reads only the
+    # request, yet waited for the request spec and ran after it (2026-11-23: 3.5 s median, 7.3 s p90 between
+    # small_model_resolved and small_model_complexity over 569 own calls, Oct-Nov) -- now alongside it.
+    start_tier_task = asyncio.ensure_future(_start_tier_index(ai, cfg, request)) if start_tier is None else None
 
     registry = build_tool_registry()
     system = "\n\n".join([
@@ -3741,7 +3745,7 @@ async def run_small_model_turn(
         start_index = start_tier  # already decided by the fast lane's decline
         log_event("engine", "small_model_complexity", start_tier=start_index, source="fast_lane")
     else:
-        start_index = await _start_tier_index(ai, cfg, request)
+        start_index = await start_tier_task
         if tracker.looks_multi_target:
             # "check every mailbox" is a fan-out task, not necessarily a
             # COMPLEX dependent chain in _COMPLEXITY_PROMPT's own sense -- see
