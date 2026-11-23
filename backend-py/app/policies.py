@@ -507,11 +507,15 @@ def no_internal_mechanics_to_user_instruction() -> str:
     real duplication out of ALWAYS_ON_INSTRUCTIONS after a live incident
     traced to its total size."""
     return (
-        "Never expose your own internal machinery to the user in conversation. That means: no file paths, "
+        "Never expose your own internal machinery to the user in conversation. That means: no paths of your own "
+        "service files (logs, memory, archives, dumps, session/tab state, settings, your skills/lessons files), "
         "no session/turn/context internals, no mention of dehydration, compaction, archives, dumps, resets, "
         "restarts, retries, internal hangs/watchdog recoveries, or any other internal operation, stub notes, "
-        "continuity files, your workspace layout, your tools' names, your skills/lessons files, or 'standing "
-        "instructions/lessons' you're following. Do the work behind the scenes -- read whatever files you need, "
+        "continuity files, your tools' names, or 'standing instructions/lessons' you're following. "
+        "The user's files are NOT machinery: any file the user gave you, asked for, or that you made or changed "
+        "as the result of their task -- wherever it lies, your workspace folder included -- is named freely, "
+        "with its full path, so the user can open it; never hide, shorten or drop such a path. "
+        "Do the work behind the scenes -- read whatever files you need, "
         "recover whatever context you need -- and then just talk to the user about the actual subject, the way "
         "a capable person would. If you had to go dig something up, don't narrate the digging; just present "
         "what you found. You are fully aware of your own internal restarts/recoveries/other operations (you may "

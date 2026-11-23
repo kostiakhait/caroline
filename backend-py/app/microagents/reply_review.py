@@ -51,10 +51,17 @@ REVIEW_RULES_TEXT = (
         "1. RELEVANT TO THE TASK: the text must actually be about the task below, not a non sequitur or a "
         "generic filler line that could apply to any task.\n\n"
         "2. NO INTERNAL MACHINERY: never expose the assistant's own internal implementation. That means no "
-        "file paths, no session/turn/context internals, no mention of dehydration, compaction, archives, "
-        "dumps, resets, restarts, retries, internal hangs or watchdog recoveries, stub notes, continuity "
-        "files, the assistant's own workspace layout, the literal names of its tools, agents or plugins, or "
-        "any 'standing instruction/lesson' it is following. This is about the ASSISTANT's own plumbing, not "
+        "paths of the assistant's own service files (its logs, memory, archives, dumps, session/tab state, "
+        "settings, skills/lessons files), no session/turn/context internals, no mention of dehydration, "
+        "compaction, archives, dumps, resets, restarts, retries, internal hangs or watchdog recoveries, stub "
+        "notes, continuity files, the literal names of its tools, agents or plugins, or any 'standing "
+        "instruction/lesson' it is following.\n"
+        "The USER's files are never machinery: a path to a file the user gave, asked for, or that the assistant "
+        "made or changed as the result of the user's task stays exactly as written, wherever the file lies -- "
+        "the assistant's own workspace folder included (confirmed live, 2026-11-22: the path of a plan file "
+        "the assistant had just written for the user, in its workspace folder, was stripped four times, "
+        "leaving the user unable to find the file). When unsure whether a path is the user's file or the "
+        "assistant's own service file, keep it. This is about the ASSISTANT's own plumbing, not "
         "about the task's own subject matter -- if the task itself is about encoding/decoding video, or about "
         "backing up the user's own phone memory, those words are the task's own legitimate vocabulary and must "
         "stay; only strip or rephrase around words that describe the ASSISTANT's internal workings, not the "
@@ -138,7 +145,9 @@ def llm_agents() -> List[M.Agent]:
         M.Agent(
             # "2" (2026-10-24): the credential-masking rule was removed -- a new version is what
             # re-seeds the server's genome (evolvable_roles_client.seed_genome).
-            REVIEW, "2",
+            # "3" (2026-11-22): the user's own file paths are no longer "internal machinery" --
+            # only the assistant's own service files are; re-seeds the genome with that rule.
+            REVIEW, "3",
             "Checks one piece of outbound assistant text for task relevance, absence of internal "
             "implementation details, and human-sounding tone -- rewriting it only if it fails one of those.",
             input_schema=_object({"text": _STRING, "task": _STRING}, required=["text", "task"]),
