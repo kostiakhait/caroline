@@ -285,6 +285,31 @@ def _sanitize_text(text: str) -> str:
     return text
 
 
+def _split_between_words(sentence: str, max_chars: int) -> list[str]:
+    """Pieces of at most max_chars, cut at whitespace; only a single word longer than that is cut inside."""
+    pieces: list[str] = []
+    piece = ""
+    for word in sentence.split():
+        while len(word) > max_chars:
+            if piece:
+                pieces.append(piece)
+                piece = ""
+            pieces.append(word[:max_chars])
+            word = word[max_chars:]
+        if not word:
+            continue
+        if not piece:
+            piece = word
+        elif len(piece) + 1 + len(word) <= max_chars:
+            piece = f"{piece} {word}"
+        else:
+            pieces.append(piece)
+            piece = word
+    if piece:
+        pieces.append(piece)
+    return pieces
+
+
 def _chunk_by_sentences(text: str, max_chars: int) -> list[str]:
     text = text.strip()
     if not text:
@@ -298,10 +323,13 @@ def _chunk_by_sentences(text: str, max_chars: int) -> list[str]:
     for sentence in sentences:
         sentence_len = len(sentence)
         if sentence_len > max_chars:
-            for start in range(0, sentence_len, max_chars):
-                piece = sentence[start:start + max_chars].strip()
-                if piece:
-                    chunks.append(piece)
+            # What came before it goes first -- it was held in `current` and spoken AFTER the long sentence --
+            # and the long one is cut between words, not inside them (2026-11-22: "сп|исок", "т|очек").
+            # A text without sentence ends (a list on separate lines) is one such "sentence".
+            if current:
+                chunks.append(" ".join(current))
+                current, current_len = [], 0
+            chunks.extend(_split_between_words(sentence, max_chars))
             continue
         if current_len + (1 if current else 0) + sentence_len <= max_chars:
             current.append(sentence)
