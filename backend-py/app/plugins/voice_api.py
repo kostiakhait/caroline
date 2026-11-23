@@ -386,7 +386,7 @@ async def translate_text(
     # constant, since a real reply being translated can legitimately be
     # much longer than a narration aside.
     max_chars = max(_NARRATION_MAX_CHARS, len(text) * 3)
-    if _looks_like_narration_garbage(translated, language, max_chars=max_chars):
+    if _looks_like_narration_garbage(translated, language, max_chars=max_chars, source=text):
         log_event("plugin:voice", "translate_text_failed", reason="rejected_garbage", text=translated[:300])
         return None
     return translated
@@ -1164,13 +1164,23 @@ async def score_reaction(
 #   "<narration>" tag vocabulary, "which one should I") rather than a
 #   genuine cross-content failure (refusal, JSON leak, catalog/error
 #   leak) that can show up in any piece of text regardless of its origin.
-_GENERAL_GARBAGE_PATTERNS = [
+# The refusal tells of the general set, in either language: a translation is only checked for them when its source is
+# not itself an apology or a refusal (translate_text's `source`, 2026-11-23) -- "I'm sorry, I can't open the file: it is
+# damaged" translates to "Извините, не могу открыть файл..." and that was thrown away, the English going out instead.
+_REFUSAL_GARBAGE_PATTERNS = [
     re.compile(r"\bi(?:'m| am)\s+sorry\b", re.IGNORECASE),
     re.compile(r"\bi\s+(?:can(?:'t|not)|won'?t|am unable to|cannot)\s+(?:help|assist|do that|provide|comply)", re.IGNORECASE),
     re.compile(r"\bas an? (?:ai|language model)\b", re.IGNORECASE),
     re.compile(r"\bне могу (?:помочь|это сделать|выполнить)\b", re.IGNORECASE),
     re.compile(r"\bизвини(?:те)?[,.\s].{0,40}\bне могу\b", re.IGNORECASE),
     re.compile(r"\bкак (?:ИИ|языковая модель)\b", re.IGNORECASE),
+]
+# A source that apologises or refuses on its own, in any of the languages the replies come in.
+_SOURCE_APOLOGY_OR_REFUSAL = re.compile(
+    r"\b(?:sorry|apologi[sz]e|unable to|can(?:'t|not)|won'?t|could(?:n'?t| not)|as an? (?:ai|language model)"
+    r"|извин|прост(?:и|ите)\b|не мог(?:у|ла|ли)?\b|не удалось|не получ|вибач|не можу)", re.IGNORECASE)
+_GENERAL_GARBAGE_PATTERNS = [
+    *_REFUSAL_GARBAGE_PATTERNS,
     re.compile(r"\bmatching entry\b", re.IGNORECASE),
     re.compile(r"\bavailable catalog\b", re.IGNORECASE),
     re.compile(r"\berrcode\b", re.IGNORECASE),
@@ -1279,13 +1289,18 @@ _NOT_RUSSIAN_LETTER_RE = re.compile(r"[іїєґІЇЄҐ]")  # Ukrainian letters 
 
 def _looks_like_narration_garbage(
     text: str, language: str = "", max_chars: int = _NARRATION_MAX_CHARS, draft_only: bool = False,
+    source: str | None = None,
 ) -> bool:
     """`draft_only=True` is for generate_progress_comment's own raw,
     pre-translation small-model draft, where the fuller set of narration-
     specific tells (self-reference, third-person recap, prompt-vocabulary
     echoes) applies. Every other caller (translate_text's post-translation
     check, applied to arbitrary real text) gets the narrower general set --
-    see the two pattern lists' own comments for why."""
+    see the two pattern lists' own comments for why.
+
+    `source`: the text `text` was translated from. A tell the source has too -- an apology or a refusal, a bracket
+    opening the text, a tool-call shape, a word with Ukrainian letters (a shop's or a person's name) -- belongs to
+    the reply, not to a broken translation (2026-11-23)."""
     if len(text) > max_chars:
         return True
     if _CJK_RE.search(text) and not re.search(r"chin|japan|korea|mandarin|中文", language, re.IGNORECASE):
@@ -1308,10 +1323,20 @@ def _looks_like_narration_garbage(
     # Russian text with letters Russian does not have (2026-10-29): reading Ukrainian shop pages,
     # the narrator said "Перейшла на сторінку Foxtrot ..." and "Сторінка Foxtrot не відкривається"
     # in a Russian conversation. Cyrillic either way, so the check above let it through.
-    if re.search(r"russ", language, re.IGNORECASE) and _NOT_RUSSIAN_LETTER_RE.search(text):
+    if re.search(r"russ", language, re.IGNORECASE) and _NOT_RUSSIAN_LETTER_RE.search(text) \
+            and not (source is not None and _NOT_RUSSIAN_LETTER_RE.search(source)):
         return True
     patterns = _NARRATION_DRAFT_GARBAGE_PATTERNS if draft_only else _GENERAL_GARBAGE_PATTERNS
-    return any(p.search(text) for p in patterns)
+
+    def inherited(p: "re.Pattern[str]") -> bool:
+        if source is None:
+            return False
+        if p in _REFUSAL_GARBAGE_PATTERNS:
+            # the translator's own refusal is short; a translation of an apologising reply is about as long as the reply
+            return len(text) >= 0.5 * len(source) and bool(_SOURCE_APOLOGY_OR_REFUSAL.search(source))
+        return bool(p.search(source))
+
+    return any(p.search(text) and not inherited(p) for p in patterns)
 
 
 # Bug fix (2026-09-16), confirmed live: an echo of an ENGLISH prompt
