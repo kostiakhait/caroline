@@ -4,7 +4,7 @@ events are never left to chance. A reminder is set at once (no question), and th
 Flow: the text (a message of the owner; a letter or messenger note Caroline read) -> reminder.extract judges what is
 significant -> code schedules each through the scheduler (whose reminder.advisor refuses a duplicate of an existing
 reminder) -> one notice line to the tab's window. A text is looked at once: its hash is remembered
-(<workspace>/auto-reminders-seen.json). Fail-open and silent on any error: a missed auto-reminder is a missed
+(<workspace>/auto-reminders-seen.json) once reminder.extract has answered for it (see MAX_EXTRACT_FAILURES). Fail-open and silent on any error: a missed auto-reminder is a missed
 convenience, never a broken turn."""
 
 from __future__ import annotations
@@ -32,21 +32,42 @@ def _digest(text: str) -> str:
     return hashlib.sha1(" ".join(text.split())[:3000].encode("utf-8")).hexdigest()
 
 
-def first_time(workspace_dir: str, text: str) -> bool:
-    """True once per text; remembers it."""
-    digest = _digest(text)
+def _seen(workspace_dir: str) -> list[str]:
     try:
         seen = json.loads(_seen_path(workspace_dir).read_text(encoding="utf-8"))
-        seen = seen if isinstance(seen, list) else []
+        return seen if isinstance(seen, list) else []
     except (FileNotFoundError, ValueError):
-        seen = []
+        return []
+
+
+def already_seen(workspace_dir: str, text: str) -> bool:
+    return _digest(text) in _seen(workspace_dir)
+
+
+def remember(workspace_dir: str, text: str) -> None:
+    digest, seen = _digest(text), _seen(workspace_dir)
     if digest in seen:
-        return False
+        return
     try:
         _seen_path(workspace_dir).write_text(json.dumps((seen + [digest])[-SEEN_KEEP:]), encoding="utf-8")
     except OSError:
         pass
+
+
+def first_time(workspace_dir: str, text: str) -> bool:
+    """True once per text; remembers it."""
+    if already_seen(workspace_dir, text):
+        return False
+    remember(workspace_dir, text)
     return True
+
+
+# A text whose extraction did not answer (timeout, no runtime, the ladder exhausted) is looked at again the next time it
+# comes up, up to MAX_EXTRACT_FAILURES times (2026-11-23): its hash used to be remembered BEFORE the extraction, so one
+# failed call dropped the letter's reminders for good. In-memory: a restart gives a text its tries again.
+MAX_EXTRACT_FAILURES = 3
+_failures: dict[str, int] = {}
+_in_flight: set[str] = set()
 
 
 def worth_looking_at(text: str) -> bool:
@@ -54,14 +75,17 @@ def worth_looking_at(text: str) -> bool:
     return len(text) >= MIN_TEXT_CHARS and not text.startswith(_SKIP_PREFIXES)
 
 
-async def _extract(text: str, source: str) -> list[dict[str, Any]]:
+async def _extract(text: str, source: str) -> list[dict[str, Any]] | None:
+    """The reminders the agent found ([] for none); None when the agent did not answer."""
     from app.microagents.reminder_extract import REMINDER_EXTRACT
     from app.plugins.voice_api import _run_local_microagent
 
     result = await _run_local_microagent(REMINDER_EXTRACT, "app.microagents.reminder_extract",
                                          {"text": text, "source": source, "now": datetime.now().astimezone().isoformat(timespec="minutes")})
     output = (result or {}).get("output") if (result or {}).get("status") == "ok" else None
-    items = output.get("reminders") if isinstance(output, dict) else None
+    if not isinstance(output, dict):
+        return None
+    items = output.get("reminders")
     return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
 
 
@@ -92,9 +116,22 @@ async def consider(text: str, source: str, tab_id: str | None, workspace_dir: st
         from app.workspace_dir import WORKSPACE_DIR
 
         ws = workspace_dir or WORKSPACE_DIR
-        if not worth_looking_at(text) or not first_time(ws, text):
+        digest = _digest(text)
+        if not worth_looking_at(text) or digest in _in_flight or already_seen(ws, text):
             return 0
-        items = await _extract(text, source)
+        _in_flight.add(digest)
+        try:
+            items = await _extract(text, source)
+        finally:
+            _in_flight.discard(digest)
+        if items is None:
+            _failures[digest] = _failures.get(digest, 0) + 1
+            log_event("engine", "auto_reminder_extract_unanswered", tab_id=tab_id, source=source[:60], tries=_failures[digest])
+            if _failures[digest] >= MAX_EXTRACT_FAILURES:
+                remember(ws, text)
+            return 0
+        _failures.pop(digest, None)
+        remember(ws, text)
         notices = []
         for item in items:
             reply = await schedule_reminder({"due_at_iso": item["remind_at_iso"], "note": item["note"], "event_type": "user",

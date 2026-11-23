@@ -9,6 +9,30 @@ NOW = "2026-11-20T11:00-05:00"
 TEXT = "Hello, I can see you on Friday November 20 at 1 PM at my office, please confirm."
 
 
+def test_an_unanswered_extraction_is_tried_again_then_given_up(tmp_path, monkeypatch):
+    """2026-11-23: the text's hash was remembered before the extraction, so one failed call lost its reminders."""
+    calls = []
+
+    async def no_answer(text, source):
+        calls.append(text)
+        return None
+
+    async def answered(text, source):
+        calls.append(text)
+        return []
+
+    monkeypatch.setattr(ar, "_failures", {})
+    monkeypatch.setattr(ar, "_extract", no_answer)
+    for _ in range(ar.MAX_EXTRACT_FAILURES + 2):
+        assert asyncio.run(ar.consider(TEXT, "a letter", None, workspace_dir=str(tmp_path))) == 0
+    assert len(calls) == ar.MAX_EXTRACT_FAILURES and ar.already_seen(str(tmp_path), TEXT)   # tried, then given up
+    other = TEXT + " See you."
+    monkeypatch.setattr(ar, "_extract", answered)
+    asyncio.run(ar.consider(other, "a letter", None, workspace_dir=str(tmp_path)))
+    asyncio.run(ar.consider(other, "a letter", None, workspace_dir=str(tmp_path)))
+    assert calls.count(other) == 1                                                          # an answer, even "none", is final
+
+
 def test_a_text_is_looked_at_once(tmp_path):
     assert ar.first_time(str(tmp_path), TEXT)
     assert not ar.first_time(str(tmp_path), "  " + TEXT.replace(" ", "  "))   # same words, other spacing
