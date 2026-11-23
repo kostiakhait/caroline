@@ -12,7 +12,8 @@ are never touched -- only paths this tool wrote itself are ever removed.
 
   python tools/stage_source.py --repo . --dest .build/src --paths Windows backend-py ... \
       --local backend-py/app/sw_service_keys_local.py
-Writes DEST/.stage-commit (short HEAD) for the release manifest.
+--ref stages another commit or branch without checking it out (the constructor's variant lives
+on the branch `ferret`). Writes DEST/.stage-commit (the short commit) for the release manifest.
 """
 
 from __future__ import annotations
@@ -31,9 +32,9 @@ def git(repo: Path, *args: str) -> bytes:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True).stdout
 
 
-def tree(repo: Path, paths: list[str]) -> dict[str, str]:
-    """path -> blob id of every tracked file of HEAD under the given paths."""
-    out = git(repo, "ls-tree", "-r", "-z", "HEAD", "--", *paths)
+def tree(repo: Path, ref: str, paths: list[str]) -> dict[str, str]:
+    """path -> blob id of every tracked file of REF under the given paths."""
+    out = git(repo, "ls-tree", "-r", "-z", ref, "--", *paths)
     files = {}
     for entry in out.split(b"\0"):
         if not entry:
@@ -81,6 +82,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--dest", required=True)
+    ap.add_argument("--ref", default="HEAD", help="commit or branch to stage (default HEAD), e.g. ferret")
     ap.add_argument("--paths", nargs="+", required=True, help="top-level paths of HEAD to stage")
     ap.add_argument("--local", nargs="*", default=[], help="untracked files a release still needs, copied from the working tree")
     args = ap.parse_args()
@@ -93,7 +95,7 @@ def main() -> int:
     except (OSError, ValueError):
         old = {}
 
-    new = tree(repo, args.paths)
+    new = tree(repo, args.ref, args.paths)
     stale = [p for p, b in new.items() if old.get(p) != b or not (dest / p).is_file()]
     contents = read_blobs(repo, sorted({new[p] for p in stale}))
     written = sum(write_if_changed(dest / p, contents[new[p]]) for p in stale)
@@ -120,7 +122,7 @@ def main() -> int:
             removed += 1
 
     index_file.write_text(json.dumps(new, indent=0, sort_keys=True), encoding="utf-8")
-    commit = git(repo, "rev-parse", "--short", "HEAD").decode("ascii").strip()
+    commit = git(repo, "rev-parse", "--short", args.ref + "^{commit}").decode("ascii").strip()
     write_if_changed(dest / ".stage-commit", (commit + "\n").encode("ascii"))
     print(f"staged {commit}: {len(new)} files, {written} written, {removed} removed -> {dest}")
     return 0
