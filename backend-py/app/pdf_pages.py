@@ -21,15 +21,22 @@ bloat/whole-document problem one layer down.
 
 from __future__ import annotations
 
-import pymupdf
+# pymupdf is imported on first use, not with the module: chat_session_shared imports this module at startup, and
+# pymupdf was 160 ms of every backend start (python -X importtime, 2026-11-22) for a PDF that may never come.
 
 
 class PdfPageError(Exception):
     pass
 
 
+def _pymupdf():
+    import pymupdf  # noqa: PLC0415
+
+    return pymupdf
+
+
 def pdf_page_count(pdf_bytes: bytes) -> int:
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    doc = _pymupdf().open(stream=pdf_bytes, filetype="pdf")
     try:
         return doc.page_count
     finally:
@@ -49,7 +56,7 @@ def extract_pdf_page_texts(pdf_bytes: bytes, page_start: int = 1, page_count: in
     extractable text (a scanned/image-only page -- not OCR'd here, out of
     scope for this fix)."""
     try:
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        doc = _pymupdf().open(stream=pdf_bytes, filetype="pdf")
     except Exception as exc:
         raise PdfPageError(f"Could not open PDF: {exc}") from exc
     try:
