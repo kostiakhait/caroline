@@ -14,6 +14,7 @@ Page text reaches these agents as data, never as instructions."""
 
 from __future__ import annotations
 
+import re
 from typing import Any, List, Optional
 
 from app.microagent_client import Microagent as M
@@ -209,6 +210,17 @@ def prompt_answer(input: Any, context: Any) -> str:
                                  question=input["question"], incomplete=incomplete, facts=_listing(rows))
 
 
+_CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def cited_labels(answer: str) -> List[str]:
+    """The fact numbers an answer cites in its text ("[2]", "[2][5]", "[2, 5]"), in the order they first appear."""
+    labels: List[str] = []
+    for match in _CITATION.finditer(answer or ""):
+        labels.extend(part.strip() for part in match.group(1).split(","))
+    return list(dict.fromkeys(labels))
+
+
 def verify_answer(input: Any, output: Any) -> Optional[str]:
     if not str(output.get("answer") or "").strip():
         return '"answer" is empty'
@@ -219,6 +231,11 @@ def verify_answer(input: Any, output: Any) -> Optional[str]:
     unknown = [label for label in used if label not in offered]
     if unknown:
         return f"fact number(s) {unknown} do not exist"
+    # The answer goes out with its [n] marks and a source line for each; a mark with no fact behind it is a
+    # citation of nothing (2026-11-22: only "used" was checked, never the text).
+    invented = [label for label in cited_labels(output["answer"]) if label not in offered]
+    if invented:
+        return f"the answer cites fact number(s) {invented} that do not exist"
     return None
 
 

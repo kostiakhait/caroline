@@ -87,6 +87,17 @@ class ResearchResult:
     all_facts: int = 0
 
 
+def cited_facts(answer: str, used: list, facts: list[Fact]) -> list[Fact]:
+    """The facts behind the answer's [n] marks, in the order the text cites them, then any other fact "used"
+    names. 2026-11-22: the source lines came from "used" alone, so a mark the model left out of "used" went
+    out with no source under it."""
+    from app.microagents.web_research_agents import cited_labels
+
+    by_label = {f.label: f for f in facts}
+    order = dict.fromkeys([*cited_labels(answer), *(str(label) for label in used)])
+    return [by_label[label] for label in order if label in by_label]
+
+
 @dataclass
 class _State:
     question: str
@@ -345,8 +356,7 @@ async def research(question: str, language: str | None = None,
         }, RESEARCH_TIME_LIMIT_S)
         if answer:
             answer_text = str(answer["answer"]).strip()
-            by_label = {f.label: f for f in state.facts}
-            cited = [by_label[label] for label in dict.fromkeys(answer.get("used") or []) if label in by_label]
+            cited = cited_facts(answer_text, answer.get("used") or [], state.facts)
     seconds = time.monotonic() - started
     log_event("plugin:web", "research_done", stopped_because=stopped_because, incomplete=incomplete, rounds=rounds,
               queries=len(state.tried), pages_read=state.pages_read, facts=len(state.facts), cited=len(cited),
