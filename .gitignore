@@ -74,3 +74,4 @@ dist-linux/
 dist-intellicat/
 Claude outputs/
 dist_release/
+.build/

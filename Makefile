@@ -26,7 +26,16 @@ SHELL := C:/Program Files/Git/bin/bash.exe
 .SHELLFLAGS := -ec
 
 SCRIPT_DIR := $(CURDIR)
-BACKEND_PY_DIR := $(SCRIPT_DIR)/backend-py
+# Where the sources are read from and where the outputs go (2026-11-22). A plain `make build`
+# reads the working tree and writes dist/ etc. next to it, as always. A release (deploy.mk)
+# builds from HEAD alone: tools/stage_source.py writes the committed sources into
+# .build/src, and the release outputs live in .build/ -- never mixed with a dev build's stamps,
+# never carrying anyone's uncommitted edits.
+SRC ?= $(SCRIPT_DIR)
+BUILD_ROOT ?= $(SCRIPT_DIR)
+BACKEND_PY_DIR := $(SRC)/backend-py
+# The bundled Python (gitignored, never staged) is only ever read from the real checkout.
+PYTHON_RUNTIME_DIR := $(SCRIPT_DIR)/backend-py/python-runtime
 
 # Any local clone of the `reforce` repo that has the `caroline` branch reachable
 # (as a local branch or via a remote, e.g. origin/caroline) -- pulled via `git show
@@ -35,15 +44,15 @@ BACKEND_PY_DIR := $(SCRIPT_DIR)/backend-py
 # (`make build CAMERLENGO_REPO=...`) for a non-default sibling layout.
 CAMERLENGO_REPO ?= $(SCRIPT_DIR)/../reforce
 CAMERLENGO_VENDOR_STUBS := $(BACKEND_PY_DIR)/camerlengo-vendor-stubs
-CAROLINE_DIR := $(SCRIPT_DIR)/Windows/Caroline
-NATIVEHOST_DIR := $(SCRIPT_DIR)/Windows/Caroline.NativeHost
-INSTALLER_DIR := $(SCRIPT_DIR)/Windows/CarolineInstaller
-XCFA_DIR := $(SCRIPT_DIR)/vendor/XcfaRenderer
+CAROLINE_DIR := $(SRC)/Windows/Caroline
+NATIVEHOST_DIR := $(SRC)/Windows/Caroline.NativeHost
+INSTALLER_DIR := $(SRC)/Windows/CarolineInstaller
+XCFA_DIR := $(SRC)/vendor/XcfaRenderer
 PROJECT := $(CAROLINE_DIR)/Caroline.csproj
 NATIVEHOST_PROJECT := $(NATIVEHOST_DIR)/Caroline.NativeHost.csproj
 INSTALLER_PROJECT := $(INSTALLER_DIR)/CarolineInstaller.csproj
-OUT := $(SCRIPT_DIR)/dist
-INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
+OUT := $(BUILD_ROOT)/dist
+INSTALLER_OUT := $(BUILD_ROOT)/dist_installer
 
 # --- Real source-file dependencies, so a target only rebuilds when something
 # it actually reads has changed -- not on every invocation. bin/obj are each
@@ -62,11 +71,11 @@ NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' 
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
 XCFA_SRC := $(shell find "$(XCFA_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' -not -path '*/XcfaRenderer.Tests/*' -not -path '*/Demo/*' \( -name '*.cs' -o -name '*.csproj' \) 2>/dev/null)
 
-LINUX_SHELL_DIR := $(SCRIPT_DIR)/linux-shell
+LINUX_SHELL_DIR := $(SRC)/linux-shell
 LINUX_SHELL_SRC := $(shell find "$(LINUX_SHELL_DIR)" -type f 2>/dev/null)
 WWWROOT_DIR := $(CAROLINE_DIR)/wwwroot
-OUT_LINUX := $(SCRIPT_DIR)/dist-linux
-OUT_INTELLICAT := $(SCRIPT_DIR)/dist-intellicat
+OUT_LINUX := $(BUILD_ROOT)/dist-linux
+OUT_INTELLICAT := $(BUILD_ROOT)/dist-intellicat
 PYTHON ?= python
 # the maintainer-only deploy rules (paths of that machine); a build on another host passes DEPLOY_MK=/dev/null
 DEPLOY_MK ?= deploy.mk
@@ -185,19 +194,19 @@ $(OUT)/.backend-py.stamp: $(BACKEND_PY_SRC) $(SKILLS_SRC)
 	cp -r "$(BACKEND_PY_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
 	touch -m "$@"
 
-$(OUT)/.whatsapp-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js
+$(OUT)/.whatsapp-sidecar.stamp: $(SRC)/companion-apps/whatsapp-sidecar/package.json $(SRC)/companion-apps/whatsapp-sidecar/index.js
 	@echo "--- whatsapp-sidecar (Baileys, Node -- see app/whatsapp_channel.py) ---"
 	mkdir -p "$(OUT)/whatsapp-sidecar"
-	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(OUT)/whatsapp-sidecar/package.json"
-	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
+	cp "$(SRC)/companion-apps/whatsapp-sidecar/package.json" "$(OUT)/whatsapp-sidecar/package.json"
+	cp "$(SRC)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
 	touch -m "$@"
 
-$(OUT)/.messenger-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
+$(OUT)/.messenger-sidecar.stamp: $(SRC)/companion-apps/messenger-sidecar/package.json $(SRC)/companion-apps/messenger-sidecar/index.js $(SRC)/companion-apps/messenger-sidecar/fca-config.json
 	@echo "--- messenger-sidecar (fca-unofficial, Node -- see app/messenger_channel.py) ---"
 	mkdir -p "$(OUT)/messenger-sidecar"
-	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json" "$(OUT)/messenger-sidecar/package.json"
-	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js" "$(OUT)/messenger-sidecar/index.js"
-	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT)/messenger-sidecar/fca-config.json"
+	cp "$(SRC)/companion-apps/messenger-sidecar/package.json" "$(OUT)/messenger-sidecar/package.json"
+	cp "$(SRC)/companion-apps/messenger-sidecar/index.js" "$(OUT)/messenger-sidecar/index.js"
+	cp "$(SRC)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT)/messenger-sidecar/fca-config.json"
 	touch -m "$@"
 
 # Caroline's own web-search browser (app/web_browser.py, decided 2026-10-23: "вшить
@@ -206,12 +215,12 @@ $(OUT)/.messenger-sidecar.stamp: $(SCRIPT_DIR)/companion-apps/messenger-sidecar/
 # search engines, seen live 2026-10-24), installed into dist/browsers -- shipped inside Caroline.zip and launched by its
 # explicit path, so nothing depends on the user's own Playwright caches. Redone only when
 # the Playwright version (its browsers.json) changes.
-PLAYWRIGHT_BROWSERS_JSON := $(BACKEND_PY_DIR)/python-runtime/Lib/site-packages/playwright/driver/package/browsers.json
+PLAYWRIGHT_BROWSERS_JSON := $(PYTHON_RUNTIME_DIR)/Lib/site-packages/playwright/driver/package/browsers.json
 $(OUT)/.browsers.stamp: $(PLAYWRIGHT_BROWSERS_JSON)
 	@echo "--- browsers (headless Chromium for web search -- see app/web_browser.py) ---"
 	rm -rf "$(OUT)/browsers"
 	mkdir -p "$(OUT)/browsers"
-	PLAYWRIGHT_BROWSERS_PATH="$(OUT)/browsers" "$(BACKEND_PY_DIR)/python-runtime/python.exe" -m playwright install --no-shell chromium
+	PLAYWRIGHT_BROWSERS_PATH="$(OUT)/browsers" "$(PYTHON_RUNTIME_DIR)/python.exe" -m playwright install --no-shell chromium
 	ls "$(OUT)"/browsers/chromium-*/chrome-win64/chrome.exe
 	touch -m "$@"
 
@@ -232,7 +241,7 @@ build: $(OUT)/Caroline.exe
 # itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
 # back into Windows/Caroline/), matching caroline_shell.py's own
 # _default_wwwroot() packaged-install lookup.
-$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC) $(SKILLS_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json $(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json $(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js $(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(filter %/wwwroot/%,$(CAROLINE_SRC)) $(wildcard $(INSTALLER_DIR)/Assets/Banners/*.png) $(BACKEND_PY_SRC) $(SKILLS_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SRC)/companion-apps/whatsapp-sidecar/package.json $(SRC)/companion-apps/whatsapp-sidecar/index.js $(SRC)/companion-apps/messenger-sidecar/package.json $(SRC)/companion-apps/messenger-sidecar/index.js $(SRC)/companion-apps/messenger-sidecar/fca-config.json
 	@echo "=== Caroline Linux shell package ==="
 	rm -rf "$(OUT_LINUX)"
 	mkdir -p "$(OUT_LINUX)/linux-shell"
@@ -257,8 +266,8 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(BACKEND_PY_SRC)
 	cp "$(CAMERLENGO_VENDOR_STUBS)/AI.py" "$(CAMERLENGO_VENDOR_STUBS)/Cache.py" "$(CAMERLENGO_VENDOR_STUBS)/Logger.py" "$(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py" "$(CAMERLENGO_VENDOR_STUBS)/Microagent.py" "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/"
 	@echo "--- whatsapp-sidecar / messenger-sidecar (Node, same source the Windows build ships -- added 2026-10-21, Linux parity pass) ---"
 	mkdir -p "$(OUT_LINUX)/whatsapp-sidecar" "$(OUT_LINUX)/messenger-sidecar"
-	cp "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/package.json" "$(SCRIPT_DIR)/companion-apps/whatsapp-sidecar/index.js" "$(OUT_LINUX)/whatsapp-sidecar/"
-	cp "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/package.json" "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/index.js" "$(SCRIPT_DIR)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT_LINUX)/messenger-sidecar/"
+	cp "$(SRC)/companion-apps/whatsapp-sidecar/package.json" "$(SRC)/companion-apps/whatsapp-sidecar/index.js" "$(OUT_LINUX)/whatsapp-sidecar/"
+	cp "$(SRC)/companion-apps/messenger-sidecar/package.json" "$(SRC)/companion-apps/messenger-sidecar/index.js" "$(SRC)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT_LINUX)/messenger-sidecar/"
 	@echo "Linux shell package complete: $(OUT_LINUX)"
 	@echo "NOTE: runtime/python, runtime/codex, runtime/node, and runtime/signal-cli are NOT"
 	@echo "      produced by this recipe (it's plain file copying, cross-platform by design), and"
@@ -276,13 +285,16 @@ dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
 # The IntelliCat edition (SquirrelWisdom only): the dist-linux tree with everything that serves the Claude and
 # OpenAI answer sources removed -- files listed in tools/edition_cut_files.txt, and the regions marked
 # "edition:cut" in the sources (tools/edition_build.py explains the markers). The default build is not affected.
-dist-intellicat: dist-linux
+# A real file target (2026-11-22): redone only when the Linux tree or the edition's cut rules changed.
+$(OUT_INTELLICAT)/EDITION: $(OUT_LINUX)/linux-shell/caroline_shell.py $(SRC)/tools/edition_build.py $(SRC)/tools/edition_cut_files.txt
 	@echo "=== Caroline, IntelliCat edition (SquirrelWisdom only) ==="
 	rm -rf "$(OUT_INTELLICAT)"
 	cp -r "$(OUT_LINUX)" "$(OUT_INTELLICAT)"
-	"$(PYTHON)" "$(SCRIPT_DIR)/tools/edition_build.py" "$(OUT_INTELLICAT)"
+	"$(PYTHON)" "$(SRC)/tools/edition_build.py" "$(OUT_INTELLICAT)"
 	echo intellicat > "$(OUT_INTELLICAT)/EDITION"
 	@echo "IntelliCat edition complete: $(OUT_INTELLICAT)"
+
+dist-intellicat: $(OUT_INTELLICAT)/EDITION
 
 # AppImage wrapping (Phase 5 of docs/LINUX_PORT_PLAN.md) -- same "can't run
 # the real tool from Windows" shape as provision_runtime.sh above: appimagetool
@@ -319,7 +331,9 @@ $(INSTALLER_OUT)/Caroline.zip: $(OUT)/Caroline.exe
 $(INSTALLER_OUT)/Caroline.zip.sha256 $(INSTALLER_OUT)/Caroline.zip.version: $(INSTALLER_OUT)/Caroline.zip
 
 # --- 6. Installer publish (was build_installer.bat, steps 3-4) -------------
-$(INSTALLER_OUT)/CarolineInstaller.exe: $(INSTALLER_SRC) $(INSTALLER_OUT)/Caroline.zip $(INSTALLER_OUT)/Caroline.zip.sha256 $(INSTALLER_OUT)/Caroline.zip.version
+# Depends on its own sources only (2026-11-22): the installer downloads Caroline.zip at run
+# time (DownloadsInfo.cs) and embeds nothing of it, so a new zip is no reason to republish it.
+$(INSTALLER_OUT)/CarolineInstaller.exe: $(INSTALLER_SRC)
 	dotnet publish "$(INSTALLER_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "$(INSTALLER_OUT)"
 	powershell -NoProfile -Command "(Get-FileHash '$(INSTALLER_OUT)/CarolineInstaller.exe' -Algorithm SHA256).Hash.ToLower()" > "$(INSTALLER_OUT)/CarolineInstaller.exe.sha256"
 	@echo ""
@@ -327,10 +341,10 @@ $(INSTALLER_OUT)/CarolineInstaller.exe: $(INSTALLER_SRC) $(INSTALLER_OUT)/Caroli
 
 $(INSTALLER_OUT)/CarolineInstaller.exe.sha256: $(INSTALLER_OUT)/CarolineInstaller.exe
 
-installer: $(INSTALLER_OUT)/CarolineInstaller.exe
+installer: $(INSTALLER_OUT)/CarolineInstaller.exe $(INSTALLER_OUT)/Caroline.zip
 
 clean:
-	rm -rf "$(OUT)" "$(INSTALLER_OUT)" "$(OUT_LINUX)"
+	rm -rf "$(OUT)" "$(INSTALLER_OUT)" "$(OUT_LINUX)" "$(OUT_INTELLICAT)"
 
 # --- 7. Deploy targets (private) ---------------------------------------------
 #
