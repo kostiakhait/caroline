@@ -178,12 +178,12 @@ class SmallModelTurnMixin:
         task_completed = False
         review_text = text
         try:
+            raw_text, memory_task = text, None
             if is_real_user:
                 # The memory advisor (app/memory_advisor.py): before ANY tier answers, including the fast lane that
-                # answers without tools, the code searches memory when the message implies it.
-                from app.memory_advisor import memory_block
-
-                block = await memory_block(text, recent_dialogue_lines[-6:], self.tab_id)
+                # answers without tools, the code searches memory when the message implies it -- usually already
+                # done inside the merge window (_start_memory_ahead, 2026-11-23).
+                block, memory_task = await self._memory_block_for_turn(text, recent_dialogue_lines[-MEMORY_ADVISOR_DIALOGUE_LINES:])
                 if block:
                     text = f"{text}\n\n{block}"
             fast = None
@@ -192,7 +192,7 @@ class SmallModelTurnMixin:
             # real user questions only, and not with attachments (those need tools).
             if is_real_user and "[The user attached these files" not in text:
                 fast, start_tier, first_remark, first_audio = await self._fast_lane_for_turn(
-                    persona, text, recent_dialogue_lines, language, is_voice,
+                    persona, text, recent_dialogue_lines, language, is_voice, raw_text=raw_text, memory_task=memory_task,
                 )
                 if fast is None and first_remark and self._voice_narration_applies():
                     self._first_voice_remark = first_remark

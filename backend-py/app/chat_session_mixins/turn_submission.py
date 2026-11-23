@@ -320,6 +320,7 @@ class TurnSubmissionMixin:
             self._held_user_flush.cancel()
         self._held_user_flush = asyncio.get_running_loop().call_later(USER_MESSAGE_MERGE_WINDOW_S, self._flush_held_user_messages)
         log_event("engine", "user_message_held", tab_id=self.tab_id, held=len(self._held_user_messages), text_len=len(text))
+        self._start_memory_ahead()
         self._start_fast_lane_ahead()
     def _with_interim_notes(self, text: str) -> str:
         """`text` as submit() hands it on: led by the narration remarks of the previous
@@ -332,6 +333,54 @@ class TurnSubmissionMixin:
             "marked as progress updates -- your own past words, do not repeat them as news:\n"
             f"{notes}]\n\n{text}"
         )
+    def _start_memory_ahead(self) -> None:
+        """The memory advisor's block (app/memory_advisor.py) for what is held, started inside the merge window
+        (2026-11-23), typed or spoken. It ran when the window closed, before the fast lane could start: 2.8-5.5 s
+        (median 4.0) after the 5 s window on every real message (caroline.log, Oct-Nov). _memory_block_for_turn takes
+        it if the turn asks about exactly this text and dialogue."""
+        if self._memory_ahead is not None:
+            self._memory_ahead[1].cancel()
+            self._memory_ahead = None
+        if self._memory_ahead_timer is not None:
+            self._memory_ahead_timer.cancel()
+            self._memory_ahead_timer = None
+        if self.ended or self.small_model_active:
+            return
+        held = self._held_user_messages
+        if not held or any(attachments for _text, attachments, _voice in held):
+            return
+        if load_chat_mode(self.workspace_dir, self.tab_id) != "sw":
+            return
+        if not any(voice for _text, _attachments, voice in held):
+            # typed: once the burst has paused (see MEMORY_AHEAD_TYPED_DELAY_S)
+            self._memory_ahead_timer = asyncio.get_running_loop().call_later(MEMORY_AHEAD_TYPED_DELAY_S, self._launch_memory_ahead)
+            return
+        self._launch_memory_ahead()
+    def _launch_memory_ahead(self) -> None:
+        self._memory_ahead_timer = None
+        held = self._held_user_messages
+        if not held or self.ended or self.small_model_active:
+            return
+        from app.memory_advisor import memory_block
+
+        text = self._with_interim_notes("\n\n".join(item_text for item_text, _attachments, _voice in held if item_text))
+        lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW)
+        dialogue = lines[-MEMORY_ADVISOR_DIALOGUE_LINES:]
+        self._memory_ahead = ((text, tuple(dialogue)), asyncio.create_task(memory_block(text, dialogue, self.tab_id)))
+    async def _memory_block_for_turn(self, text: str, dialogue: list[str]) -> tuple[str, asyncio.Task[str] | None]:
+        """memory_block for the turn starting now, and the call made ahead in the merge window it came from (None when
+        asked now): taken from that call when it asked about exactly this text and dialogue."""
+        from app.memory_advisor import memory_block
+
+        ahead, self._memory_ahead = self._memory_ahead, None
+        if ahead is not None:
+            key, task = ahead
+            if key == (text, tuple(dialogue)):
+                log_event("engine", "memory_ahead_used", tab_id=self.tab_id, ready=task.done())
+                return await task, task
+            log_event("engine", "memory_ahead_discarded", tab_id=self.tab_id)
+            task.cancel()
+        return await memory_block(text, dialogue, self.tab_id), None
     def _start_fast_lane_ahead(self) -> None:
         """See FAST_LANE_DURING_MERGE_WINDOW. Asks the fast lane exactly what
         _run_small_model_turn will ask if nothing changes before the window closes;
@@ -350,11 +399,18 @@ class TurnSubmissionMixin:
         lines = _read_recent_dialogue_lines(self.last_saved_session_id, self.tab_id, self.workspace_dir, RECENT_DIALOGUE_WINDOW)
         language = current_language_name(self.tab_id)
         log_event("engine", "fast_lane_ahead_started", tab_id=self.tab_id, text_len=len(text), held=len(held))
-        task = asyncio.create_task(self._fast_lane_ahead_body(get_persona(self.workspace_dir), text, lines, language))
-        self._fast_lane_ahead = ((text, language, tuple(lines)), task)
+        # The memory block the turn will glue to the text, from the call started just before for this same text
+        # (2026-11-23): asked without it, the fast lane's answer was discarded whenever memory added a block and
+        # asked again after the window, its review and speech thrown away with it.
+        memory = self._memory_ahead
+        memory_task = memory[1] if memory is not None and memory[0] == (text, tuple(lines[-MEMORY_ADVISOR_DIALOGUE_LINES:])) else None
+        task = asyncio.create_task(self._fast_lane_ahead_body(get_persona(self.workspace_dir), text, lines, language, memory_task))
+        self._fast_lane_ahead = ((text, language, tuple(lines)), task, memory_task)
     async def _fast_lane_ahead_body(
-        self, persona: Any, text: str, lines: list[str], language: str,
+        self, persona: Any, text: str, lines: list[str], language: str, memory_task: asyncio.Task[str] | None = None,
     ) -> tuple[str | None, int | None, str | None, asyncio.Task[str | None] | None]:
+        block = await memory_task if memory_task is not None else ""
+        text = f"{text}\n\n{block}" if block else text   # what the turn will ask, as small_model_turn glues it
         fast, start_tier, first_remark = await try_fast_answer(self.workspace_dir, persona, text, lines, language, True)
         # The answer's review as well, inside the window: it is the text that will be
         # reviewed when the turn starts (the review comes before any translation).
@@ -417,14 +473,21 @@ class TurnSubmissionMixin:
         return await review_reply(text, task=task)
     async def _fast_lane_for_turn(
         self, persona: Any, text: str, lines: list[str], language: str, is_voice: bool,
+        raw_text: str | None = None, memory_task: asyncio.Task[str] | None = None,
     ) -> tuple[str | None, int | None, str | None, asyncio.Task[str | None] | None]:
         """try_fast_answer for the turn starting now -- taken from the call made ahead
         during the merge window when that one asked exactly this question of exactly
-        this dialogue; otherwise asked now."""
+        this dialogue; otherwise asked now. `text` is what the turn asks (its memory
+        block glued on); `raw_text` the message before it and `memory_task` the call
+        made ahead the block came from, if it did."""
         ahead, self._fast_lane_ahead = self._fast_lane_ahead, None
         if ahead is not None:
-            key, task = ahead
-            if is_voice and key == (text, language, tuple(lines)):
+            key, task, ahead_memory = ahead
+            # Asked ahead with a memory block: the same question only if it is the very call the turn's block
+            # came from (so the block is the same); asked without one: the old rule, exactly this text.
+            same = (key == (raw_text if raw_text is not None else text, language, tuple(lines)) and ahead_memory is memory_task
+                    if ahead_memory is not None else key == (text, language, tuple(lines)))
+            if is_voice and same:
                 log_event("engine", "fast_lane_ahead_used", tab_id=self.tab_id, ready=task.done())
                 return await task
             log_event("engine", "fast_lane_ahead_discarded", tab_id=self.tab_id)

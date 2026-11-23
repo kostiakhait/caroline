@@ -149,7 +149,10 @@ class ChatSession(
         self._reviews_ahead: dict[tuple[str, str], asyncio.Task[str | None]] = {}
         # The fast lane already running on what is held (see _start_fast_lane_ahead):
         # what it was asked, and the task answering it.
-        self._fast_lane_ahead: tuple[tuple[Any, ...], asyncio.Task[Any]] | None = None
+        self._fast_lane_ahead: tuple[tuple[Any, ...], asyncio.Task[Any], asyncio.Task[str] | None] | None = None
+        # The memory advisor's block already running on what is held (see _start_memory_ahead): (text, dialogue), the call.
+        self._memory_ahead: tuple[tuple[Any, ...], asyncio.Task[str]] | None = None
+        self._memory_ahead_timer: asyncio.TimerHandle | None = None
         self.turn_is_voice = False
         self.classifier_refusal_retry_count = 0
         # Backing field for the turn_pending property (defined below,

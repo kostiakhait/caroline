@@ -618,6 +618,12 @@ USER_MESSAGE_MERGE_WINDOW_S = 5.0
 # wasted fast-lane call. Typed messages are left out, they are the ones that come in
 # bursts. False runs the fast lane after the window, as before.
 FAST_LANE_DURING_MERGE_WINDOW = True
+# The memory advisor's block is started inside the merge window too (2026-11-23, _start_memory_ahead): at once for a
+# spoken message, MEMORY_AHEAD_TYPED_DELAY_S after the last one of a typed burst -- typed ones come in bursts, and each
+# new message would cost another advisor call and memory search. The advisor reads the last
+# MEMORY_ADVISOR_DIALOGUE_LINES lines of the dialogue.
+MEMORY_AHEAD_TYPED_DELAY_S = 1.5
+MEMORY_ADVISOR_DIALOGUE_LINES = 6
 # Per explicit instruction (2026-10-10): a compaction loses whatever the
 # model learned and never saved, so an hourly/growth compaction is preceded
 # by a service turn asking it to save first (see _check_forced_compaction).
@@ -1992,6 +1998,8 @@ __all__ = [
     'COMPACTION_STUCK_TIMEOUT_S',
     'USER_MESSAGE_MERGE_WINDOW_S',
     'FAST_LANE_DURING_MERGE_WINDOW',
+    'MEMORY_AHEAD_TYPED_DELAY_S',
+    'MEMORY_ADVISOR_DIALOGUE_LINES',
     'MEMORY_FLUSH_BEFORE_COMPACTION_TEXT',
     'FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD',
     'FORCED_COMPACTION_MIN_INTERVAL_MS',
