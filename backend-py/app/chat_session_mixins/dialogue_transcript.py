@@ -255,10 +255,22 @@ class DialogueTranscriptMixin:
             # under the RECEIVING tab's own real language, in deliver_relayed_reply.
             if not is_silent and not self.headless:
                 try:
-                    translated = await translate_text(
-                        text, language, gender=get_persona_gender(self.workspace_dir),
-                        addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
-                    )
+                    # Quoted runs (the draft of an outgoing message) go out verbatim: see own_identity_gate.split_quoted.
+                    from app.own_identity_gate import split_quoted
+
+                    parts = []
+                    for is_quote, chunk in split_quoted(text):
+                        if is_quote or not chunk.strip():
+                            parts.append(chunk)
+                            continue
+                        lead = chunk[:len(chunk) - len(chunk.lstrip())]
+                        tail = chunk[len(chunk.rstrip()):]
+                        done = await translate_text(
+                            chunk.strip(), language, gender=get_persona_gender(self.workspace_dir),
+                            addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
+                        )
+                        parts.append(lead + (done or chunk.strip()) + tail)
+                    translated = "".join(parts)
                 except Exception as exc:
                     log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
                     translated = None

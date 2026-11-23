@@ -37,6 +37,20 @@ def normalize(text: str) -> str:
     return _SPACE.sub(" ", text).strip().lower()
 
 
+def split_quoted(text: str) -> list[tuple[bool, str]]:
+    """Splits a message into (is_quote, chunk) runs; a quote is a run of lines starting with '>'. Quoted runs are the
+    draft of an outgoing message and are shown to the user verbatim: the translation layer must not touch them, or the
+    window shows a translation of the body while the send carries the original, and the gate can never match."""
+    runs: list[tuple[bool, list[str]]] = []
+    for line in (text or "").splitlines(keepends=True):
+        quoted = line.lstrip().startswith(">")
+        if runs and runs[-1][0] == quoted:
+            runs[-1][1].append(line)
+        else:
+            runs.append((quoted, [line]))
+    return [(q, "".join(lines)) for q, lines in runs]
+
+
 def body_of(args: dict[str, Any] | None) -> str:
     """The message body of a send call's arguments (the first body-like argument that is a non-empty string)."""
     for key in BODY_KEYS:
@@ -70,8 +84,10 @@ def missing_reason(body: str, shown: Optional[dict[str, Any]], answers: list[str
         return None  # nothing textual to compare (a file-only send is the file-transfer guard's business)
     if shown is None:
         return ("this goes out under the user's own identity and its exact final text has not been shown to the user yet. "
-                "Show the user the complete final text (recipient, subject, body), end your turn, and send only after "
-                "the user answers yes to that text.")
+                "Show the user the complete final text (recipient, subject, body) as a markdown blockquote (every line "
+                "starting with '> '), in the language it will be sent in, word for word as it will go out; quoted text is "
+                "displayed verbatim and never translated. Then end your turn, and send only after the user answers yes to "
+                "that text.")
     if not answers:
         return ("the final text was shown, but the user has not answered since. End your turn and wait for the user's "
                 "yes; a yes given before the text was shown does not count.")

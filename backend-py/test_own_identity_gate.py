@@ -55,3 +55,14 @@ def test_a_draft_waiting_for_a_yes_is_not_judged_by_the_ladder():
     assert not cl.needs_verdict(cl.LadderTurn(user_text="x", rung=0), "Показываю.\n\n> Hello\n\nОтправить в таком виде?", False)
     assert not cl.awaits_user("Что вы имеете в виду?")          # a plain question is still judged
     assert not cl.awaits_user("> quoted\n\nГотово.")
+
+
+def test_quoted_draft_is_split_out_so_it_is_never_translated():
+    text = "Вот письмо:\n\n> Hi Krunal,\n> Thanks for reaching out.\n\nОтправить?"
+    runs = g.split_quoted(text)
+    assert [q for q, _ in runs] == [False, True, False]
+    assert runs[1][1] == "> Hi Krunal,\n> Thanks for reaching out.\n\n"[:len(runs[1][1])] or "Hi Krunal" in runs[1][1]
+    assert "".join(c for _, c in runs) == text
+    # shown verbatim, the English body matches what email_send carries
+    log = [entry("assistant", text, 10)]
+    assert g.shown_entry(log, "Hi Krunal,\nThanks for reaching out.") is not None
