@@ -46,6 +46,10 @@ T = TypeVar("T")
 # by every single caller, while still recovering by itself once it can.
 FAILURE_RETRY_PAUSE_S = 30.0
 
+# A refresh is logged when the value changed (or is the first one) or the fetch was slow. 2026-11-22: every
+# refresh was logged, ~80 s apart, changed or not -- 4,254 lines in a week, half of them claude_auth_status.
+SLOW_REFRESH_LOG_MS = 2000
+
 
 class CachedAsyncValue(Generic[T]):
     def __init__(self, name: str, fetch: Callable[[], Awaitable[T]]) -> None:
@@ -124,9 +128,12 @@ class CachedAsyncValue(Generic[T]):
             if self._has_value:
                 return self._value  # type: ignore[return-value]
             raise
+        changed = not self._has_value or value != self._value
         self._value = value
         self._has_value = True
         self._fetched_at = time.monotonic()
         self._last_failure_at = None
-        log_event("engine", "account_state_refreshed", name=self.name, ms=round((self._fetched_at - started) * 1000))
+        ms = round((self._fetched_at - started) * 1000)
+        if changed or ms >= SLOW_REFRESH_LOG_MS:
+            log_event("engine", "account_state_refreshed", name=self.name, ms=ms, changed=changed)
         return value
