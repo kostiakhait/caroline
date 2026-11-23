@@ -41,14 +41,18 @@ RESEARCH_TIME_LIMIT_S = 90.0   # the user's limit (2026-10-23): one web_research
 
 
 def _normalized(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip().casefold()
+    # typography folded as sw.result.facts does it (2026-11-23): a quote with ’ against a page with ' -- the same
+    # words -- was dropped as not in the page
+    from app.microagents.sw_result_facts import _norm
+
+    return _norm(text or "").casefold()
 
 
 def quote_in_text(quote: str, text: str) -> bool:
     """A quote counts only when it really is in the page: same characters,
-    whitespace and case aside."""
-    wanted = _normalized(quote).strip(" .\"'«»“”")
-    return bool(wanted) and wanted in _normalized(text)
+    whitespace, case and typography (quote marks, dashes) aside."""
+    wanted = _normalized(quote).strip(" .\"'")
+    return bool(re.search(r"\w", wanted)) and wanted in _normalized(text)
 
 
 def chunks_of(text: str, size: int = ITEM_MAX_CHARS) -> list[str]:

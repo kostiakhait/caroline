@@ -84,9 +84,12 @@ def verify_completeness(input: Any, output: Any) -> Optional[str]:
     if not output["complete"]:
         # The complaint must rest on the message's own words (2026-11-17: the checker once "found missing" a user's
         # confirmation, and once took an offer for a promise). A pointer that is not in the message is not a complaint.
-        pointer = " ".join(str(output.get("pointer") or "").split())
-        text = " ".join(str(input.get("final_text") or "").split())
-        if len(pointer) < 4 or pointer.lower() not in text.lower():
+        # typography folded (2026-11-23): «Вот черновик» copied as "Вот черновик" is the same words
+        from app.microagents.sw_result_facts import _norm
+
+        pointer = _norm(str(output.get("pointer") or ""))
+        text = _norm(str(input.get("final_text") or ""))
+        if len(pointer) < 4 or pointer not in text:
             return '"pointer" must be a phrase copied word for word from the message when complete is false'
     return None
 

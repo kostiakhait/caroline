@@ -135,7 +135,8 @@ def kept_quotes(input: Any, output: Any) -> tuple[list[str], list[str]]:
     """The quotes that really are in the part, and the ones that are not."""
     result = _norm(str(input.get("result") or ""))
     quotes = [str(item.get("quote") or "") for item in output.get("found") or [] if str(item.get("quote") or "").strip()]
-    kept = [q for q in quotes if _norm(q) in result]
+    # A quote that normalizes to nothing ("**", "__") is in every text: it supports nothing (2026-11-23).
+    kept = [q for q in quotes if re.search(r"\w", _norm(q)) and _norm(q) in result]
     return kept, [q for q in quotes if q not in kept]
 
 
