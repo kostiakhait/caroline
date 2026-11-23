@@ -19,9 +19,23 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from app.context_cap import LIST_MAX_COUNT, cap_count
 from app.plugins.loader import Plugin, PluginTool
 
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+# A NUL byte in the first BINARY_SNIFF_BYTES and no UTF-16 byte-order mark: not text. Such a file used to come
+# back as up to 200,000 characters of decoding garbage -- tens of thousands of tokens of nothing (2026-11-22).
+BINARY_SNIFF_BYTES = 8192
+
+
+def _decode_for_reading(data: bytes) -> str | None:
+    """The file's text, or None for a binary file."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    if b"\x00" in data[:BINARY_SNIFF_BYTES]:
+        return None
+    return data.decode("utf-8-sig", errors="replace")
 
 # Matches the Read tool's own read cap (roughly) so a huge log/data file
 # doesn't blow up the model's context in one call -- truncated rather than
@@ -113,11 +127,18 @@ async def read_file(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if office_text is not None:
         truncated = len(office_text) > MAX_READ_BYTES
         return {"text": office_text[:MAX_READ_BYTES] + (f"\n\n[... truncated, {len(office_text)} characters ...]" if truncated else "")}
-    data = p.read_bytes()
-    truncated = len(data) > MAX_READ_BYTES
-    text = data[:MAX_READ_BYTES].decode("utf-8", errors="replace")
-    if truncated:
-        text += f"\n\n[... truncated, file is {len(data)} bytes, only the first {MAX_READ_BYTES} shown ...]"
+    # Only what is shown is read: the whole file used to be read into memory first (a video or an archive of
+    # gigabytes, for 200 KB of it).
+    size = p.stat().st_size
+    with open(p, "rb") as f:
+        data = f.read(MAX_READ_BYTES)
+    text = _decode_for_reading(data)
+    if text is None:
+        return {"text": (f"{p} is not a text file ({size} bytes of binary data). For an image use describe_local_image, "
+                         "for a PDF read_document_pages, for a Word/Excel/PowerPoint file read_file reads its text; "
+                         "open_file opens anything in its own program.")}
+    if size > MAX_READ_BYTES:
+        text += f"\n\n[... truncated, file is {size} bytes, only the first {MAX_READ_BYTES} shown ...]"
     return {"text": text}
 
 
@@ -203,6 +224,8 @@ async def list_directory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     if not p.is_dir():
         raise NotADirectoryError(f"Not a directory: {p}")
     entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+    # A folder of thousands of entries (System32, node_modules) went into the model's context whole.
+    entries, not_shown = cap_count(entries, LIST_MAX_COUNT)
     lines = []
     for e in entries:
         try:
@@ -212,6 +235,9 @@ async def list_directory(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
         lines.append(f"{'[dir] ' if e.is_dir() else ''}{e.name}" + (f" ({size} bytes)" if size is not None else ""))
     if not lines:
         return {"text": f"{p} is empty."}
+    if not_shown:
+        lines.append(f"[... {not_shown} more entries not shown (folders first, then files, by name) -- "
+                     "list a subfolder, or open the folder for the owner with open_file ...]")
     return {"text": "\n".join(lines)}
 
 
