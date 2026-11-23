@@ -58,6 +58,13 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("ferret_build", "Build the .fex of the project without downloading it. -> {ok, bytes, report} or the issues", {"standalone": "boolean?"}),
     ("ferret_levels", "Build a level package (.ferret) of some levels without downloading it. {levels: [names]} -> {ok, name, bytes}",
      {"levels": "string[]"}),
+    ("fmdl_make", "Make a model package .fmdl from a glTF of the project (the new model format; what `ferret fmdl import` and `pack` do) and write it into the project: {glb, id, summary, kind, mass, materials, name?, tags?, category?, purpose?, out?}. summary ENGLISH (what it is); kind e.g. car, tree, prop; mass in kg; materials maps each glTF material name to a physics material name (`*` = every other). -> {path, id, version, bytes}. Then library_add the file.",
+     {"glb": "string", "id": "string", "summary": "string", "kind": "string", "mass": "number", "materials": "object", "name": "string?", "tags": "string[]?", "category": "string?", "purpose": "string?", "out": "string?"}),
+    ("fmdl_pack", "Pack a model folder of the project (model.json, glTF levels, description.json ...) into a .fmdl written into the project: {dir, out?} -> {path, id, version, bytes}.", {"dir": "string", "out": "string?"}),
+    ("library_search", "Search the Ferret asset library (REST GET api/search): {q, type?, rubric?, tags?, limit?}; q is ENGLISH words. -> candidate cards (id, uid, type, tags, description, versions ...): read them and pick.",
+     {"q": "string", "type": "string?", "rubric": "string?", "tags": "string?", "limit": "number?"}),
+    ("library_add", "Add or update an asset in the Ferret asset library (REST POST api/item) with the person's own SW session: {path, uid?, description?, rubric?}; path is a project file, a .ferret package or a zip of package.ferret [+ tiers/<tier>.ferret] [+ preview.webp]; description ENGLISH only. -> {uid, version, status}; to update an asset send its uid back.",
+     {"path": "string", "uid": "string?", "description": "string?", "rubric": "string?"}),
     ("viewer_restart", "Rebuild the project and restart the game in the viewer; waits until it runs or fails. -> {ok, level, errors}", {}),
     ("viewer_level", "Travel the viewer to a level of the project. {level}", {"level": "string"}),
     ("viewer_command", "Run one of the running game's engine commands. {name, args?}; 'help' lists them all. To TEST the game, play it: input.actions (what is bound), "
