@@ -712,8 +712,26 @@
     // A local document link -- clicking it asks the backend to open it in
     // the OS default app (see the "open_file" control op) rather than
     // trying to navigate the page itself to a file:// URL.
-    html = html.replace(/\[([^\]]+)\]\(file:\/\/\/([^\s)"']+)\)/g,
-      (_, label, path) => stash(`<a href="#" class="doc-link" data-path="${attrEscape(safeDecodeURIComponent(unescapeHtml(path)))}">📄 ${label}</a>`));
+    //
+    // 2026-11-24, explicit instruction: a file Caroline gives the person is
+    // always downloadable right from the chat. Every file link gets a ⬇ that
+    // fetches the bytes over this tab's own WebSocket (control op
+    // file_download, in chunks) -- the one channel every host has, the
+    // Ferret editor's included, where her backend's HTTP is not reachable.
+    // Where the host has no desktop to open a file on (window.
+    // carolineDownloadOnly, set by the editor's bridge) the link itself
+    // downloads too. A path with spaces may be written <file:///...>.
+    // project:<path> (a file of the open Ferret project) and ferret-build:fex
+    // (the project's game, built on click) are the host's: the click goes to
+    // the native host, which downloads it.
+    const fileLink = (label, path) => {
+      const p = attrEscape(safeDecodeURIComponent(unescapeHtml(path)));
+      return stash(`<span class="file-ref"><a href="#" class="doc-link" data-path="${p}">📄 ${label}</a> <a href="#" class="file-download" data-path="${p}" title="Download">⬇</a></span>`);
+    };
+    html = html.replace(/\[([^\]]+)\]\(&lt;file:\/\/\/(.+?)&gt;\)/g, (_, label, path) => fileLink(label, path));
+    html = html.replace(/\[([^\]]+)\]\(file:\/\/\/([^\s)"']+)\)/g, (_, label, path) => fileLink(label, path));
+    html = html.replace(/\[([^\]]+)\]\((?:&lt;)?(project|ferret-build):(.*?)(?:&gt;)?\)/g,
+      (_, label, kind, target) => stash(`<a href="#" class="host-download" data-kind="${kind}" data-target="${attrEscape(safeDecodeURIComponent(unescapeHtml(target)))}" title="Download">⬇ ${label}</a>`));
 
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
       (_, label, url) => stash(`<a href="${attrValue(url)}" target="_blank" rel="noopener">${label}</a>`));
@@ -2234,6 +2252,12 @@
       if (!evt.ok) addBanner(`Could not transcribe audio: ${evt.stderr || "unknown error"}`);
     } else if (evt.op === "open_file") {
       if (!evt.ok) addBanner(`Could not open that file: ${evt.stderr || "unknown error"}`);
+    } else if (evt.op === "file_download") {
+      const cb = pendingDownloadRequests.get(evt.requestId);
+      pendingDownloadRequests.delete(evt.requestId);
+      let parsed = null;
+      try { parsed = evt.ok ? JSON.parse(evt.stdout || "null") : null; } catch { parsed = null; }
+      cb?.(evt.ok, parsed, evt.stderr);
     } else if (evt.op === "expand_dehydrated_ref") {
       const cb = pendingExpandRequests.get(evt.requestId);
       pendingExpandRequests.delete(evt.requestId);
@@ -2250,11 +2274,57 @@
   }
 
   messagesEl.addEventListener("click", (e) => {
+    const hostLink = e.target.closest(".host-download");
+    if (hostLink) {
+      e.preventDefault();
+      if (window.chrome?.webview) window.chrome.webview.postMessage({ type: "host_download", tabId, kind: hostLink.dataset.kind, target: hostLink.dataset.target });
+      else addBanner("This link can only be downloaded inside the Ferret editor.");
+      return;
+    }
+    const dl = e.target.closest(".file-download");
     const link = e.target.closest(".doc-link");
-    if (!link) return;
+    if (!dl && !link) return;
     e.preventDefault();
-    sendControl("open_file", { path: link.dataset.path });
+    if (dl || window.carolineDownloadOnly) downloadBackendFile((dl || link).dataset.path);
+    else sendControl("open_file", { path: link.dataset.path });
   });
+
+  // file_download: the bytes of a file of her backend's machine, chunk by
+  // chunk over this tab's WebSocket, then saved by the browser as a download.
+  const pendingDownloadRequests = new Map(); // requestId -> callback(ok, parsedStdout, stderr)
+  let downloadSeq = 0;
+  function requestDownloadChunk(path, offset) {
+    return new Promise((resolve) => {
+      const requestId = `dl-${++downloadSeq}`;
+      pendingDownloadRequests.set(requestId, (ok, parsed, stderr) => resolve({ ok, parsed, stderr }));
+      sendControl("file_download", { path, offset, requestId });
+    });
+  }
+  async function downloadBackendFile(path) {
+    if (!wsConnected) { addBanner("Not connected to Caroline -- the file cannot be downloaded right now."); return; }
+    const parts = [];
+    let offset = 0, name = "file", mimeType = "application/octet-stream";
+    for (;;) {
+      const { ok, parsed, stderr } = await requestDownloadChunk(path, offset);
+      if (!ok || !parsed) { addBanner(`Could not download ${path}: ${stderr || "unknown error"}`); return; }
+      name = parsed.name || name; mimeType = parsed.mimeType || mimeType;
+      const bin = atob(parsed.dataBase64 || "");
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      parts.push(bytes);
+      offset += bytes.length;
+      if (parsed.size) setStatusBarText(`Downloading ${name}... ${Math.round((offset / parsed.size) * 100)}%`);
+      if (parsed.done || bytes.length === 0) break;
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(parts, { type: mimeType }));
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+    setStatusBarText(`Downloaded ${name}.`, 4000);
+  }
 
   // edition:cut claude cli mcp management
   // "name: command args - status" (one per line, from `claude mcp list`) ->
@@ -2887,7 +2957,11 @@
   if (window.chrome?.webview) {
     window.chrome.webview.addEventListener("message", (e) => {
       const data = e.data;
-      if (data && data.type === "editor_result") {
+      if (data && data.type === "host_download_result") {
+        // the native host's answer to a host_download click (the Ferret editor: a project file or the built game)
+        if (data.ok) setStatusBarText(`Downloaded ${data.name || "the file"}.`, 4000);
+        else addBanner(`Could not download ${data.name || "the file"}: ${data.error || "unknown error"}`);
+      } else if (data && data.type === "editor_result") {
         sendControl("editor_result", { requestId: data.requestId, outcome: data.outcome, path: data.path, message: data.message });
       } else if (data && data.type === "login_result") {
         // The credentials never touch the model -- this goes straight to the

@@ -55,7 +55,7 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("project_move", "Rename or move a file. {from, to}", {"from": "string", "to": "string"}),
     ("api_docs", "The release's Ferret API docs and types. {topic?} lists the topics when omitted.", {"topic": "string?"}),
     ("ferret_check", "Check the project as the compiler does (manifest, levels, code, engine sources refused). -> {ok, issues}", {}),
-    ("ferret_build", "Build the .fex of the project without downloading it. -> {ok, bytes, report} or the issues", {"standalone": "boolean?"}),
+    ("ferret_build", "Build the .fex of the project (a check that it builds). -> {ok, name, bytes, report, download} or the issues. `download` is the Markdown link [<name>.fex](ferret-build:fex) -- put it in your reply as it is: the person clicks it and the editor builds the game and downloads the .fex to their computer. Give that link whenever they ask for the game, the .fex or a build.", {"standalone": "boolean?"}),
     ("ferret_levels", "Build a level package (.ferret) of some levels without downloading it. {levels: [names]} -> {ok, name, bytes}",
      {"levels": "string[]"}),
     ("fmdl_make", "Make a model package .fmdl from a glTF of the project (the new model format; what `ferret fmdl import` and `pack` do) and write it into the project: {glb, id, summary, kind, mass, materials, name?, tags?, category?, purpose?, out?}. summary ENGLISH (what it is); kind e.g. car, tree, prop; mass in kg; materials maps each glTF material name to a physics material name (`*` = every other). -> {path, id, version, bytes}. Then library_add the file.",
