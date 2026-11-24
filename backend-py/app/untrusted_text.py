@@ -21,7 +21,9 @@ _LABEL_MAX = 80
 
 def third_party_label(name: str | None) -> str:
     """A sender or chat name for a note's header: one line, no quotes or brackets."""
-    text = re.sub(r"[\[\]\"<>{}\r\n\t]+", " ", str(name or "")).strip()
+    # \s, not only \r\n\t (2026-11-24): \x0b, \x0c, \x85, U+2028 and U+2029 also break a line for the model;
+    # other control characters go too.
+    text = re.sub(r"[\[\]\"<>{}\s\x00-\x1f\x7f]+", " ", str(name or "")).strip()
     text = re.sub(r"\s{2,}", " ", text)
     return text[:_LABEL_MAX] or "unknown"
 

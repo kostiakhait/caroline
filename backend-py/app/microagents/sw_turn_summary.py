@@ -72,7 +72,7 @@ def verify_turn_tools_summary(input: Any, output: Any) -> Optional[str]:
     summary = (output.get("summary") or "").strip()
     if not summary:
         return '"summary" must be a non-empty string'
-    refs = [c.get("ref") for c in (input.get("calls") or []) if c.get("ref")]
+    refs = [str(c.get("ref")) for c in (input.get("calls") or []) if c.get("ref")]   # a non-string ref raised TypeError
     if refs and not any(ref in summary for ref in refs):
         return "every line must end with the link of the call(s) it describes, exactly as given"
     return None

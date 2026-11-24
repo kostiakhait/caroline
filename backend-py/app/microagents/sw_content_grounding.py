@@ -22,6 +22,7 @@ Client-side only: run through the local microagent ladder."""
 
 from __future__ import annotations
 
+import re
 from typing import Any, List, Optional
 
 from app.microagent_client import Microagent as M
@@ -91,7 +92,8 @@ def asked(task: str, output: dict[str, Any]) -> bool:
     """True when the agent's quote is non-empty and really occurs in the task -- a quote the
     task does not contain is not evidence (decided here, by code, not by the model)."""
     quote = _squash(output.get("quote") or "").strip(" .\"'«»")
-    return bool(quote) and quote in _squash(task)
+    # at least three characters with a letter or digit (2026-11-24): "to" or "?" is in nearly any task
+    return len(quote) >= 3 and bool(re.search(r"\w", quote)) and quote in _squash(task)
 
 
 REQUEST_MATCHES = "sw.request.matches"

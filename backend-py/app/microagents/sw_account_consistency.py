@@ -21,6 +21,7 @@ Client-side only: run through the local microagent ladder."""
 
 from __future__ import annotations
 
+import re
 from typing import Any, List, Optional
 
 from app.microagent_client import Microagent as M
@@ -77,7 +78,8 @@ def switched(output: dict[str, Any], args: str = "") -> bool:
     name ("run_python") for a call that names no identity, and a correct call was refused."""
     earlier = str(output["earlier_identity"]).strip().lower()
     this = str(output["this_identity"]).strip().lower()
-    if this not in str(args).lower():
+    # as a whole word, not inside another (2026-11-24): "me" was found in "some" and a correct call refused
+    if not this or not re.search(r"(?<!\w)" + re.escape(this) + r"(?!\w)", str(args).lower()):
         return False
     return NOT_STATED not in (earlier, this) and earlier != this
 
