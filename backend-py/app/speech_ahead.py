@@ -27,6 +27,9 @@ from app.logging_setup import log_event
 PIECE_MAX_CHARS = 240
 VISUAL_PIECE_MAX_CHARS = 300
 FIRST_PIECE_MIN_CHARS = 60
+# chat.js: SPEECH_SPLIT_SHORT_MIN_CHARS (2026-11-24) -- a reply this long or longer, of more than one piece, is read in
+# pieces even when it is short: spoken whole, its first word waited for its slowest sentence.
+SPLIT_SHORT_MIN_CHARS = 120
 # The first two pieces: the second is what chat.js prefetches while the first plays.
 PIECES_AHEAD = 2
 AHEAD_TTL_S = 120.0
@@ -60,8 +63,11 @@ def split_for_speech(text: str, max_chars: int = PIECE_MAX_CHARS) -> list[str]:
 def pieces_for(text: str) -> list[str]:
     """The pieces chat.js may ask for, for a reply spoken on its own: the reply whole
     when it is short, else its first pieces as split for plain audio and for Visual
-    Mode (which one applies is chat.js's to know; asking for both costs a call at most)."""
-    if len(text) <= PIECE_MAX_CHARS:
+    Mode (which one applies is chat.js's to know; asking for both costs a call at most).
+    The same rule as chat.js's speechPieces: whole below SPLIT_SHORT_MIN_CHARS or when it is one piece."""
+    if len(text) < SPLIT_SHORT_MIN_CHARS:
+        return [text]
+    if len(text) <= PIECE_MAX_CHARS and len(split_for_speech(text, PIECE_MAX_CHARS)) < 2:
         return [text]
     seen: list[str] = []
     for max_chars in (VISUAL_PIECE_MAX_CHARS, PIECE_MAX_CHARS):

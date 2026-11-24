@@ -1216,6 +1216,17 @@
   // live, a 7-char first piece ("Конечно.") played in under a second and left a 13s
   // gap before a 401-char second one. Sentences are joined until it reaches this.
   const SPEECH_FIRST_PIECE_MIN_CHARS = 60;
+  // A short reply of more than one sentence is read in pieces too (2026-11-24): spoken whole, its first word
+  // waited for the slowest of its sentences (measured on new text: one sentence 2.9 s, three 4.1 s median).
+  // Below this length the second piece would be a scrap: such a reply stays whole.
+  const SPEECH_SPLIT_SHORT_MIN_CHARS = 120;
+  // Whether a reply is read in pieces, and which: the same rule as speech_ahead.pieces_for.
+  function speechPieces(text, maxChars) {
+    if (text.length > SPEECH_PIECE_MAX_CHARS) return splitForSpeech(text, maxChars);
+    if (text.length < SPEECH_SPLIT_SHORT_MIN_CHARS) return null;
+    const pieces = splitForSpeech(text, maxChars);
+    return pieces.length > 1 ? pieces : null;
+  }
   function splitForSpeech(text, maxChars = SPEECH_PIECE_MAX_CHARS) {
     const sentences = text
       .split(/\n+/)
@@ -1241,8 +1252,9 @@
   function speak(text, btn, opts) {
     const narration = !!opts?.narration;
     if (!narration && !btn) dropQueuedNarration();
-    if (!btn && !narration && !opts?.audioBase64 && text.length > SPEECH_PIECE_MAX_CHARS) {
-      const pieces = splitForSpeech(text, shouldUseVisualMode(btn) ? VISUAL_SPEECH_PIECE_MAX_CHARS : SPEECH_PIECE_MAX_CHARS);
+    const pieces = !btn && !narration && !opts?.audioBase64
+      ? speechPieces(text, shouldUseVisualMode(btn) ? VISUAL_SPEECH_PIECE_MAX_CHARS : SPEECH_PIECE_MAX_CHARS) : null;
+    if (pieces) {
       clog(`speaking reply in ${pieces.length} piece(s), ${text.length} chars`);
       for (const piece of pieces) speechQueue.push({ text: piece, btn: null, narration: false });
       if (speechQueueRunning) prefetchSpeech(speechQueue[0]);
