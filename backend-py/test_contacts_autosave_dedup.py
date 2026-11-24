@@ -8,9 +8,10 @@ from app.plugins import contacts_plugin as cp
 def test_known_address_is_not_written_again(monkeypatch, tmp_path):
     puts = []
 
-    async def fake_book(command, doing, contact):
+    async def fake_book(command, doing, contact, background=False):
+        assert background is True      # sent as background work: the server queues it and answers at once
         puts.append(contact)
-        return {"ok": True}
+        return {"status": "queued", "jobId": "j"}
 
     monkeypatch.setattr(cp, "_address_book", fake_book)
     monkeypatch.setattr(cp, "_autosaved_path", lambda: tmp_path / "contacts-autosaved.json")
@@ -33,7 +34,7 @@ def test_known_address_is_not_written_again(monkeypatch, tmp_path):
 def test_failed_write_is_tried_again(monkeypatch, tmp_path):
     puts = []
 
-    async def failing(command, doing, contact):
+    async def failing(command, doing, contact, background=False):
         puts.append(contact)
         return {"is_error": True, "text": "no funds"}
 

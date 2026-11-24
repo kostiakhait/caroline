@@ -44,6 +44,7 @@ seeded by skills_seed.py and read by every engine through app/skills.py
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -1147,6 +1148,34 @@ def prefer_own_backend_tools_instruction() -> str:
     )
 
 
+def file_download_link_instruction() -> str:
+    """Per explicit instruction (2026-11-24): when Caroline gives the person a file, the chat must carry a link to
+    download it -- after a run of turns in the Ferret editor where she built the .fex and had no way at all to hand it
+    over. chat.js puts a download button on every [name](file:///path) link (control op file_download, over the tab's
+    own WebSocket, so it works on every host); in the editor, [name](project:path) downloads a project file and
+    [name.fex](ferret-build:fex) builds the game and downloads it (the editor's bridge and caroline.js). ALWAYS_ON:
+    the point is that she never has to remember it."""
+    import os
+
+    text = (
+        "Whenever you give the person a file -- one you made, converted, downloaded or found for them, or one they "
+        "asked for -- put a download link to it in your reply, in this exact Markdown form: [file name](file:///absolute/path) "
+        "(Windows: file:///C:/Users/.../report.docx; Linux: file:///home/.../report.pdf; a path with spaces goes in angle "
+        "brackets: [report](<file:///C:/My Files/report.docx>)). The chat shows such a link with a download button that "
+        "saves the file on the person's own computer. Never answer only with a bare path, or with 'it is saved in ...': "
+        "the link is how they get it."
+    )
+    if os.environ.get("CAROLINE_FERRET_EDITOR") == "1":
+        text += (
+            " In the Ferret editor the person's files are the project's: a project file is given as [name](project:path/in/project) "
+            "(e.g. [shot.png](project:renders/shot.png)), and the game itself as [Game.fex](ferret-build:fex) -- or "
+            "[Game.fex](ferret-build:fex?standalone=1) for the standalone build -- which builds the project and downloads the "
+            ".fex when they click it; ferret_build answers with that link ready to paste. Whenever the person asks for the "
+            ".fex, the game, a build or a file of the project, give the link: never say it cannot be downloaded."
+        )
+    return text
+
+
 # Unconditionally appended to EVERY turn's system prompt (see
 # chat_session.py) -- deliberately small; everything tool-specific lives
 # in that tool's own plugin instead (see this module's docstring).
@@ -1174,6 +1203,7 @@ ALWAYS_ON_INSTRUCTIONS = (
     memory_check_first_instruction,
     event_memory_check_first_instruction,
     no_unrequested_send_confirmation_instruction,
+    file_download_link_instruction,
 )
 
 

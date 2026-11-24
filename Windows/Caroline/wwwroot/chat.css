@@ -89,6 +89,18 @@ html, body {
   text-decoration: underline;
 }
 
+/* the download button of a file link (chat.js renderMarkdown, fileLink) */
+.bubble a.file-download {
+  text-decoration: none;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.bubble a.file-download:hover,
+.bubble a.host-download:hover {
+  background: rgba(127, 127, 127, 0.18);
+}
+
 .bubble-time {
   font-size: 10px;
   margin-top: 4px;

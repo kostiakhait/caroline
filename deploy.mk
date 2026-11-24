@@ -32,7 +32,18 @@ DEPLOY_PORT ?= 41981
 MODELS_DIR := $(SCRIPT_DIR)/art/models
 MODEL_FILES := CarolineA.xcfa CarolineB.xcfa PeterA.xcfa PeterB.xcfa
 
-.PHONY: deploy deploy-legacy upload deploy-models release-version appimage-wsl release-stage release-publish
+.PHONY: deploy deploy-legacy upload deploy-models release-version stage appimage-wsl release-stage release-publish
+
+# A release is built from HEAD only (2026-11-22, after 1.0.20 went out with another session's
+# uncommitted edits): `stage` writes the committed sources into $(STAGE_SRC) (tools/stage_source.py,
+# incremental), and the release build reads them there and writes into $(RELEASE_ROOT) -- its own
+# outputs and stamps, apart from a dev `make build`. Only the files git deliberately does not hold
+# and a release needs come from the working tree (STAGE_LOCAL).
+RELEASE_ROOT := $(SCRIPT_DIR)/.build
+STAGE_SRC := $(RELEASE_ROOT)/src
+STAGE_PATHS := Windows backend-py companion-apps linux-shell vendor tools
+STAGE_LOCAL := backend-py/app/sw_service_keys_local.py
+RELEASE_MAKE = "$(MAKE)" SRC="$(STAGE_SRC)" BUILD_ROOT="$(RELEASE_ROOT)"
 
 # --- Deploy (was deploy.bat) -------------------------------------------------
 #
@@ -73,10 +84,14 @@ MODEL_FILES := CarolineA.xcfa CarolineB.xcfa PeterA.xcfa PeterB.xcfa
 # without uploading anything.
 deploy:
 	"$(MAKE)" release-version
-	"$(MAKE)" deploy-legacy
-	"$(MAKE)" release-publish
+	"$(MAKE)" stage
+	$(RELEASE_MAKE) deploy-legacy
+	$(RELEASE_MAKE) release-publish
 
-deploy-legacy: $(INSTALLER_OUT)/CarolineInstaller.exe $(INSTALLER_OUT)/CarolineInstaller.exe.sha256 upload
+stage:
+	"$(PYTHON)" "$(SCRIPT_DIR)/tools/stage_source.py" --repo "$(SCRIPT_DIR)" --dest "$(STAGE_SRC)" --paths $(STAGE_PATHS) --local $(STAGE_LOCAL)
+
+deploy-legacy: $(INSTALLER_OUT)/Caroline.zip $(INSTALLER_OUT)/CarolineInstaller.exe $(INSTALLER_OUT)/CarolineInstaller.exe.sha256 upload
 
 # --- Upload-only (no build dependency at all) --------------------------------
 #
@@ -87,6 +102,7 @@ deploy-legacy: $(INSTALLER_OUT)/CarolineInstaller.exe $(INSTALLER_OUT)/CarolineI
 # it is fresh, does not rebuild anything. Fails fast with a clear message if
 # the release files aren't there yet (first run needs a real `make deploy`
 # or `make installer` first).
+upload: INSTALLER_OUT := $(RELEASE_ROOT)/dist_installer
 upload: $(UPLOADER_EXE)
 	@for f in Caroline.zip Caroline.zip.sha256 Caroline.zip.version CarolineInstaller.exe CarolineInstaller.exe.sha256; do \
 		test -f "$(INSTALLER_OUT)/$$f" || { \
@@ -110,15 +126,19 @@ upload: $(UPLOADER_EXE)
 
 # --- Release (signed manifest, every platform built here) ---------------------
 RELEASE_KEY ?= ~/.caroline/release-signing.key
-RELEASE_DIR := $(SCRIPT_DIR)/dist_release
+RELEASE_DIR := $(BUILD_ROOT)/dist_release
 OVERLAY_RUNTIME ?= 1
 # An AppImage made elsewhere for this very version; empty: it is built in WSL (appimage-wsl). NO_APPIMAGE=1: none, the
 # release then has no linux-x86_64 entry.
 APPIMAGE ?=
 NO_APPIMAGE ?=
 
+# The new version is committed at once (only backend-py/VERSION, nothing else of the index or the
+# working tree), so the staged HEAD carries it and the manifest names that very commit.
 release-version:
-	@$(PYTHON) "$(SCRIPT_DIR)/tools/release.py" next-version --write | sed 's/^/Releasing version /'
+	@V=$$("$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" next-version --write); echo "Releasing version $$V"; \
+	if ! git -C "$(SCRIPT_DIR)" diff --quiet HEAD -- backend-py/VERSION; then \
+	  git -C "$(SCRIPT_DIR)" commit -q -m "Release $$V" -- backend-py/VERSION && echo "committed Release $$V"; fi
 
 # The AppImage in WSL (appimagetool is a Linux ELF): OUT is the file to make, as a Windows path. Only the code is copied each
 # time; the runtime is provisioned once and again when its definition changes (linux-shell/build_appimage_wsl.sh).
@@ -131,16 +151,16 @@ appimage-wsl: dist-linux
 # Builds what the manifest names, signs it and checks the result, in $(RELEASE_DIR); uploads nothing. Names are
 # versioned. xopek is the overlay of the Linux tree WITH sw_service_keys_local.py (its desktops have no other source of
 # the keys); beroun is the overlay of the IntelliCat edition WITHOUT it (its keys come from the device itself).
-release-stage: dist-linux dist-intellicat $(INSTALLER_OUT)/CarolineInstaller.exe
+release-stage: dist-linux dist-intellicat $(INSTALLER_OUT)/CarolineInstaller.exe $(INSTALLER_OUT)/Caroline.zip
 	@test -f "$$(echo $(RELEASE_KEY) | sed "s|^~|$$HOME|")" || { echo "ERROR: release key $(RELEASE_KEY) not found (RELEASE_KEY=...)"; exit 1; }
 	@V=$$(tr -d '[:space:]' < "$(BACKEND_PY_DIR)/VERSION"); echo "=== Release $$V ==="; \
 	rm -rf "$(RELEASE_DIR)" && mkdir -p "$(RELEASE_DIR)" && \
 	cp "$(INSTALLER_OUT)/CarolineInstaller.exe" "$(RELEASE_DIR)/CarolineInstaller-$$V.exe" && \
 	cp "$(INSTALLER_OUT)/Caroline.zip" "$(RELEASE_DIR)/Caroline-$$V.zip" && \
-	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" overlay "$(OUT_LINUX)" "$(RELEASE_DIR)/caroline-xopek-$$V.zip" && \
+	"$(PYTHON)" "$(SRC)/tools/release.py" overlay "$(OUT_LINUX)" "$(RELEASE_DIR)/caroline-xopek-$$V.zip" && \
 	rm -rf "$(RELEASE_DIR)/_beroun_tree" && cp -r "$(OUT_INTELLICAT)" "$(RELEASE_DIR)/_beroun_tree" && \
 	rm -f "$(RELEASE_DIR)/_beroun_tree/backend-py/app/sw_service_keys_local.py" && \
-	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" overlay "$(RELEASE_DIR)/_beroun_tree" "$(RELEASE_DIR)/caroline-beroun-$$V.zip" && \
+	"$(PYTHON)" "$(SRC)/tools/release.py" overlay "$(RELEASE_DIR)/_beroun_tree" "$(RELEASE_DIR)/caroline-beroun-$$V.zip" && \
 	rm -rf "$(RELEASE_DIR)/_beroun_tree" && \
 	LINUX_ART="" && \
 	if [ -n "$(APPIMAGE)" ]; then \
@@ -148,12 +168,13 @@ release-stage: dist-linux dist-intellicat $(INSTALLER_OUT)/CarolineInstaller.exe
 	elif [ "$(NO_APPIMAGE)" != "1" ]; then \
 	  "$(MAKE)" appimage-wsl OUT="$(RELEASE_DIR)/Caroline-$$V-x86_64.AppImage" && LINUX_ART="$(RELEASE_DIR)/Caroline-$$V-x86_64.AppImage"; \
 	fi && \
-	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" build --version "$$V" --key "$(RELEASE_KEY)" --out "$(RELEASE_DIR)" \
+	COMMIT=$$(cat "$(SRC)/.stage-commit" 2>/dev/null || git -C "$(SCRIPT_DIR)" rev-parse --short HEAD) && \
+	"$(PYTHON)" "$(SRC)/tools/release.py" build --version "$$V" --commit "$$COMMIT" --key "$(RELEASE_KEY)" --out "$(RELEASE_DIR)" \
 	  --artifact "windows=$(RELEASE_DIR)/CarolineInstaller-$$V.exe,payload=$(RELEASE_DIR)/Caroline-$$V.zip" \
 	  --artifact "xopek=$(RELEASE_DIR)/caroline-xopek-$$V.zip,runtime=$(OVERLAY_RUNTIME)" \
 	  --artifact "beroun=$(RELEASE_DIR)/caroline-beroun-$$V.zip,runtime=$(OVERLAY_RUNTIME)" \
 	  $${LINUX_ART:+--artifact "linux-x86_64=$$LINUX_ART"} && \
-	"$(PYTHON)" "$(SCRIPT_DIR)/tools/release.py" verify "$(RELEASE_DIR)"
+	"$(PYTHON)" "$(SRC)/tools/release.py" verify "$(RELEASE_DIR)"
 
 # Every artifact first, the manifest and its signature last: a client never sees a manifest whose files are missing.
 release-publish: release-stage $(UPLOADER_EXE)

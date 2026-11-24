@@ -51,6 +51,18 @@ internal static class WhatsappSidecarInstaller
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+        // Baileys pulls libsignal from a git URL, so npm needs a git.exe; a clean machine has none. Our own PortableGit
+        // (runtime\git, installed before this step) goes in front of this process's PATH only.
+        var gitDirs = new[] { Path.Combine(AppPaths.GitDir, "cmd"), Path.Combine(AppPaths.GitDir, "mingw64", "bin") }
+            .Where(Directory.Exists).ToArray();
+        if (gitDirs.Length > 0)
+        {
+            psi.Environment["PATH"] = string.Join(Path.PathSeparator, gitDirs) + Path.PathSeparator + (Environment.GetEnvironmentVariable("PATH") ?? "");
+        }
+        else
+        {
+            Logger.Log("WhatsappSidecarInstaller: no PortableGit under " + AppPaths.GitDir + " -- npm needs git for libsignal and may fail.");
+        }
         psi.ArgumentList.Add(npmCliJs);
         psi.ArgumentList.Add("install");
         psi.ArgumentList.Add("--no-audit");

@@ -52,6 +52,8 @@ class AppSettings:
     window_height: float | None = None
     open_tab_ids: list[str] = field(default_factory=lambda: ["1"])
     tab_names: dict[str, str] = field(default_factory=dict)
+    # Tabs closed while the backend could not be told (id -> name); see caroline_shell.close_tab.
+    pending_tab_closes: dict[str, str] = field(default_factory=dict)
 
 
 class SettingsService:
