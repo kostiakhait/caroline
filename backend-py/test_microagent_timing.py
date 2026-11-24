@@ -91,11 +91,12 @@ def test_the_advisors_steps_are_timed(events, monkeypatch):
     block = asyncio.run(memory_advisor.memory_block("Напиши Нику", ["User: hi"], "2"))
     assert "Nick Jiang is a distributor." in block
     decide = of(events, "memory_advisor_decide_timing")[0]
-    assert decide["ms"] >= 15 and decide["needed"] is True and decide["queries"] == 1 and decide["dialogue_lines"] == 1
+    # >= 10, not 15 (2026-11-24): a 20 ms asyncio sleep was measured as 14 ms on Windows (the loop clock steps ~15.6 ms)
+    assert decide["ms"] >= 10 and decide["needed"] is True and decide["queries"] == 1 and decide["dialogue_lines"] == 1
     search = of(events, "memory_advisor_search_timing")[0]
-    assert search["ms"] >= 15 and search["chars"] == len("Nick Jiang is a distributor.") and search["query"] == "who is Nick"
+    assert search["ms"] >= 10 and search["chars"] == len("Nick Jiang is a distributor.") and search["query"] == "who is Nick"
     done = of(events, "memory_advisor_searched")[0]
-    assert done["search_ms"] >= 15 and done["ms"] >= done["search_ms"]
+    assert done["search_ms"] >= 10 and done["ms"] >= done["search_ms"]
 
 
 def test_a_search_that_times_out_is_timed_too(events, monkeypatch):
