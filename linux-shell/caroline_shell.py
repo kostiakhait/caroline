@@ -623,7 +623,7 @@ class Shell:
 
         self.add_tab_button = Gtk.Button(label="+")
         self.add_tab_button.set_relief(Gtk.ReliefStyle.NONE)
-        self.add_tab_button.connect("clicked", lambda _b: self.add_tab(self._next_tab_id(), select=True))
+        self.add_tab_button.connect("clicked", lambda _b: self._on_add_tab_clicked())
 
     def prepare(self) -> None:
         """Creates the first tab (and its WebKit2.WebView, already navigating
@@ -960,11 +960,26 @@ class Shell:
             )
 
     def _next_tab_id(self) -> str:
-        for i in range(1, MAX_TABS + 1):
-            candidate = str(i)
-            if not any(t.id == candidate for t in self.tabs):
-                return candidate
+        # A number whose close the backend has not confirmed still holds the old conversation -- taken only when no
+        # other number is free (port of MainWindow.GenerateNextTabId).
+        pending = self.settings.pending_tab_closes
+        for skip_pending in (True, False):
+            for i in range(1, MAX_TABS + 1):
+                candidate = str(i)
+                if not any(t.id == candidate for t in self.tabs) and not (skip_pending and candidate in pending):
+                    return candidate
         raise RuntimeError("no free tab id")
+
+    def _on_add_tab_clicked(self) -> None:
+        """Retries the unconfirmed closes first (off the GTK thread), then opens the tab."""
+        if len(self.tabs) >= MAX_TABS:
+            return
+
+        def work() -> None:
+            self._flush_pending_tab_closes()
+            GLib.idle_add(lambda: (len(self.tabs) < MAX_TABS and self.add_tab(self._next_tab_id(), select=True)) and False)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _make_webview(self, tab: ChatTab) -> WebKit2.WebView:
         manager = WebKit2.UserContentManager()
@@ -1115,17 +1130,90 @@ class Shell:
         self.rebuild_tab_strip()
 
     def close_tab(self, tab: ChatTab) -> None:
+        """2026-11-24, explicit instruction: a closed tab's content is kept (the backend's closed-tabs archive) and a
+        new tab with the same number starts clean. Port of MainWindow.CloseTabAsync: the page's own transcript copy
+        (localStorage, shared by every tab's page) is taken and wiped while this tab's page is still alive, then the
+        backend is told (control op close_tab) and archives and clears the number."""
         if len(self.tabs) <= 1:
             return
         log(f"closing tab {tab.id}")
         self.tabs.remove(tab)
-        if tab.webview is not None:
-            self.content_stack.remove(tab.webview)
         if self.active_tab is tab:
             self.select_tab(self.tabs[0])
         else:
             self.rebuild_tab_strip()
+        self.settings.tab_names.pop(tab.id, None)
+        self.settings.pending_tab_closes[tab.id] = tab.name
         self._persist_open_tab_ids()
+        key_js = json.dumps(f"caroline:transcript:{tab.id}")
+
+        def finish(transcript_json: str | None) -> None:
+            if tab.webview is not None:
+                self.content_stack.remove(tab.webview)
+            # whatever the closing page wrote back in its last moment: wiped again through a page still open
+            survivor = next((t for t in self.tabs if t.webview is not None), None)
+            if survivor is not None:
+                survivor.webview.run_javascript(f"localStorage.removeItem({key_js});", None, None, None)
+            threading.Thread(target=self._send_close_tab, args=(tab.id, tab.name, transcript_json), daemon=True).start()
+
+        def on_js(webview, result, _data=None) -> None:
+            transcript_json = None
+            try:
+                value = webview.run_javascript_finish(result).get_js_value()
+                if value.is_string():
+                    transcript_json = value.to_string()
+            except Exception as exc:  # noqa: BLE001 -- the backend journal still has the conversation
+                log(f"close_tab({tab.id}): reading the page transcript failed: {exc}")
+            finish(transcript_json)
+
+        if tab.webview is None:
+            finish(None)
+            return
+        tab.webview.run_javascript(
+            f"(() => {{ const k = {key_js}; const v = localStorage.getItem(k); localStorage.removeItem(k); return v; }})()",
+            None, on_js, None,
+        )
+
+    def _send_close_tab(self, tab_id: str, name: str, transcript_json: str | None) -> bool:
+        """Background thread. Tells the backend a tab was closed; until it confirms, the tab stays in
+        settings.pending_tab_closes (port of MainWindow.SendCloseTabAsync)."""
+        payload: dict = {"op": "close_tab", "tabId": tab_id, "name": name}
+        if transcript_json:
+            try:
+                payload["entries"] = json.loads(transcript_json)
+            except ValueError as exc:
+                log(f"close_tab({tab_id}): page transcript unparseable, sent without it: {exc}")
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{BACKEND_PORT}/api/control?tab={urllib.parse.quote(tab_id)}",
+                data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                body = r.read().decode("utf-8")
+            if not json.loads(body).get("ok"):
+                log(f"close_tab({tab_id}): backend did not confirm: {body}")
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log(f"close_tab({tab_id}): failed, will retry: {exc}")
+            return False
+        log(f"close_tab({tab_id}): archived and cleared: {body}")
+
+        def drop_pending() -> bool:
+            if self.settings.pending_tab_closes.pop(tab_id, None) is not None:
+                self.settings_service.save(self.settings, caller="close_tab")
+            return False
+
+        GLib.idle_add(drop_pending)
+        return True
+
+    def _flush_pending_tab_closes(self) -> None:
+        """Background thread. Retries the closes the backend has not confirmed yet (it was down or restarting)."""
+        for tab_id, name in list(self.settings.pending_tab_closes.items()):
+            if any(t.id == tab_id for t in self.tabs):
+                # reopened under its old number before the close went through -- a live tab now
+                GLib.idle_add(lambda i=tab_id: (self.settings.pending_tab_closes.pop(i, None), self.settings_service.save(self.settings, caller="close_tab")) and False)
+                continue
+            self._send_close_tab(tab_id, name, None)
 
     def on_page_message(self, tab: ChatTab, js_result) -> None:
         if not _is_trusted_source(tab.webview.get_uri()):

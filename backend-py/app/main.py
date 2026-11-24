@@ -38,7 +38,8 @@ from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 # edition:end
 from app.history import read_archived_entries, read_recent_history_for_session
-from app import settings_mirror, transcript_journal, vault_backup, wizard
+from app import closed_tabs, settings_mirror, transcript_journal, vault_backup, wizard
+from app.operations import REGISTRY
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
 from app.origin_guard import is_cross_origin_browser_request, is_foreign_host
@@ -1953,6 +1954,30 @@ async def _handle_control_request_inner(
         else:
             clear_tab_disk_state(WORKSPACE_DIR, tab_id)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
+    if op == "close_tab":
+        # 2026-11-24, explicit instruction: a closed tab's content is kept (closed_tabs archive, reachable through
+        # list_closed_tabs/read_closed_tab) and a new tab with the same number starts clean. Sent by the shell
+        # (MainWindow.CloseTabAsync / caroline_shell.close_tab) after the tab's window is gone; `entries` is the
+        # window's own transcript, which may hold messages the journal has not got yet.
+        tab_id = str(parsed.get("tabId") or "")
+        if not tab_id:
+            return {"type": "control_response", "op": op, "ok": False, "stderr": "close_tab requires tabId", "requestId": request_id}
+        live = sessions.get(tab_id)
+        client_entries = parsed.get("entries") if isinstance(parsed.get("entries"), list) else None
+        try:
+            meta = closed_tabs.archive_tab(WORKSPACE_DIR, tab_id, parsed.get("name"), client_entries)
+        except Exception as exc:  # noqa: BLE001 -- not archived: nothing may be removed then
+            log_event("engine", "close_tab_archive_failed", tab_id=tab_id, error=str(exc)[:300])
+            return {"type": "control_response", "op": op, "ok": False, "stderr": f"archive failed: {exc}", "requestId": request_id}
+        if live is not None:
+            live.clear_tab()
+        else:
+            clear_tab_disk_state(WORKSPACE_DIR, tab_id)
+            REGISTRY.cancel_for_tab(tab_id)
+        closed_tabs.clear_tab_files(WORKSPACE_DIR, tab_id)
+        _resumed_unfinished_turn_for_tab.discard(tab_id)
+        log_event("engine", "close_tab", tab_id=tab_id, archive=(meta or {}).get("id"))
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(meta or {}), "requestId": request_id}
     # edition:cut claude-openai answer source (control ops)
     if op == "own_anthropic_key_get":
         key = get_own_anthropic_api_key(WORKSPACE_DIR)

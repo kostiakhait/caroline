@@ -357,6 +357,9 @@ public partial class MainWindow : Window
             Logger.Log($"MainWindow.InitTabsAsync: restored {_tabs.Count} of {idsToOpen.Count} tabs; keeping the saved tab list unchanged");
         }
         if (_tabs.Count > 0) SelectTab(_tabs[0]);
+        // Closes from the last run the backend never confirmed; retried again
+        // on every "+" if the backend is not up yet.
+        if (_settings.PendingTabCloses.Count > 0) await FlushPendingTabClosesAsync();
     }
 
     private bool _restoringTabs;
@@ -404,6 +407,13 @@ public partial class MainWindow : Window
 
     private string GenerateNextTabId()
     {
+        // A number whose close the backend has not confirmed still holds the
+        // old conversation -- taken only when no other number is free.
+        for (var i = 1; i <= MaxTabs; i++)
+        {
+            var id = i.ToString();
+            if (_tabs.All(t => t.Id != id) && !_settings.PendingTabCloses.ContainsKey(id)) return id;
+        }
         for (var i = 1; i <= MaxTabs; i++)
         {
             var id = i.ToString();
@@ -739,6 +749,8 @@ public partial class MainWindow : Window
         _addTabButton.Click += async (_, _) =>
         {
             if (_tabs.Count >= MaxTabs) return;
+            await FlushPendingTabClosesAsync();
+            if (_tabs.Count >= MaxTabs) return;
             await AddTabAsync(GenerateNextTabId(), selectAfter: true);
         };
         TabStrip.Children.Add(_addTabButton);
@@ -778,6 +790,27 @@ public partial class MainWindow : Window
         if (_tabs.Count <= 1) return; // never close the last tab
         Logger.Log($"MainWindow.CloseTabAsync: closing tab {tab.Id}");
 
+        // 2026-11-24, explicit instruction: a closed tab's content is kept (the
+        // backend's closed-tabs archive) and a new tab with the same number
+        // starts clean. The page's own transcript copy (localStorage, shared by
+        // every tab's page) is taken and wiped here, while this tab's page is
+        // still alive, and handed to the backend with the close.
+        string? transcriptJson = null;
+        var transcriptKeyJs = JsonSerializer.Serialize($"caroline:transcript:{tab.Id}");
+        try
+        {
+            if (tab.WebView?.CoreWebView2 != null)
+            {
+                var raw = await tab.WebView.CoreWebView2.ExecuteScriptAsync(
+                    $"(() => {{ const k = {transcriptKeyJs}; const v = localStorage.getItem(k); localStorage.removeItem(k); return v; }})()");
+                transcriptJson = JsonSerializer.Deserialize<string?>(raw);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"CloseTabAsync({tab.Id}): reading the page transcript failed (the backend journal still has it): {ex.Message}");
+        }
+
         var wasActive = tab == _activeTab;
         var index = _tabs.IndexOf(tab);
         _tabs.Remove(tab);
@@ -793,8 +826,85 @@ public partial class MainWindow : Window
         {
             RebuildTabStrip();
         }
+        // The name belonged to the closed conversation (it goes into the archive);
+        // a new tab with this number is "Tab N" again.
+        _settings.TabNames.Remove(tab.Id);
+        _settings.PendingTabCloses[tab.Id] = tab.Name;
         PersistOpenTabIds();
-        await Task.CompletedTask;
+
+        // Whatever the closing page wrote back in its last moment: wiped again
+        // through a page still open (same profile, same storage).
+        try
+        {
+            var survivor = _tabs.FirstOrDefault(t => t.WebView?.CoreWebView2 != null);
+            if (survivor != null)
+                await survivor.WebView!.CoreWebView2.ExecuteScriptAsync($"localStorage.removeItem({transcriptKeyJs});");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"CloseTabAsync({tab.Id}): second transcript wipe failed: {ex.Message}");
+        }
+
+        await SendCloseTabAsync(tab.Id, tab.Name, transcriptJson);
+    }
+
+    private readonly HttpClient _closeTabHttp = new() { Timeout = TimeSpan.FromSeconds(120) };
+
+    /// <summary>Tells the backend a tab was closed (control op close_tab): it
+    /// archives the tab's content and clears its number. Until it confirms, the
+    /// tab stays in AppSettings.PendingTabCloses.</summary>
+    private async Task<bool> SendCloseTabAsync(string tabId, string name, string? transcriptJson)
+    {
+        try
+        {
+            var payload = new System.Text.Json.Nodes.JsonObject
+            {
+                ["op"] = "close_tab",
+                ["tabId"] = tabId,
+                ["name"] = name,
+            };
+            if (!string.IsNullOrEmpty(transcriptJson))
+            {
+                try { payload["entries"] = System.Text.Json.Nodes.JsonNode.Parse(transcriptJson); }
+                catch (Exception ex) { Logger.Log($"SendCloseTabAsync({tabId}): page transcript unparseable, sent without it: {ex.Message}"); }
+            }
+            using var content = new StringContent(payload.ToJsonString(), System.Text.Encoding.UTF8, "application/json");
+            using var resp = await _closeTabHttp.PostAsync($"http://127.0.0.1:{BackendProcess.Port}/api/control?tab={Uri.EscapeDataString(tabId)}", content);
+            var body = await resp.Content.ReadAsStringAsync();
+            var ok = resp.IsSuccessStatusCode && JsonDocument.Parse(body).RootElement.TryGetProperty("ok", out var okEl) && okEl.GetBoolean();
+            if (!ok)
+            {
+                Logger.Log($"SendCloseTabAsync({tabId}): backend did not confirm ({(int)resp.StatusCode}): {body}");
+                return false;
+            }
+            Logger.Log($"SendCloseTabAsync({tabId}): archived and cleared: {body}");
+            if (_settings.PendingTabCloses.Remove(tabId)) _settingsService.Save(_settings);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"SendCloseTabAsync({tabId}): failed, will retry: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Retries the closes the backend has not confirmed yet (it was
+    /// down or restarting). The page transcript of those tabs is gone already;
+    /// the backend's own journal and session hold their conversation.</summary>
+    private async Task FlushPendingTabClosesAsync()
+    {
+        foreach (var (id, name) in _settings.PendingTabCloses.ToList())
+        {
+            if (_tabs.Any(t => t.Id == id))
+            {
+                // Reopened under its old number before the close went through
+                // (only when no other number was free) -- it is a live tab now.
+                _settings.PendingTabCloses.Remove(id);
+                _settingsService.Save(_settings);
+                continue;
+            }
+            await SendCloseTabAsync(id, name, null);
+        }
     }
 
     private void PersistOpenTabIds()

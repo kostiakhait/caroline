@@ -40,6 +40,13 @@ public class AppSettings
     // UI), keyed by tab id. A tab with no entry here just shows "Tab {id}"
     // (MainWindow.TabDisplayName's fallback) -- most tabs never get renamed.
     public Dictionary<string, string> TabNames { get; set; } = new();
+
+    // Tabs closed while the backend could not be told (id -> name). Closing a
+    // tab hands its content to the backend's closed-tabs archive (close_tab),
+    // which also clears everything under that number; until that succeeds the
+    // number is not reused for a new tab, and the close is retried (see
+    // MainWindow.FlushPendingTabClosesAsync).
+    public Dictionary<string, string> PendingTabCloses { get; set; } = new();
 }
 
 public static class NativeModifiers

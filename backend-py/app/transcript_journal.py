@@ -132,6 +132,18 @@ def append_entries(workspace_dir: str, tab_id: str, entries: Iterable[Any]) -> i
         return len(lines)
 
 
+def forget(workspace_dir: str, tab_id: str) -> None:
+    """Removes the tab's journal and its cached keys -- a closed tab's journal goes to its archive
+    (app/closed_tabs.py), and the next tab with this number starts a new one."""
+    path = journal_path(workspace_dir, tab_id)
+    with _lock:
+        _keys.pop(str(path), None)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log_event("engine", "transcript_journal_forget_failed", tab_id=tab_id, error=str(exc)[:200])
+
+
 def _ends_with_newline(path: Path) -> bool:
     with path.open("rb") as f:
         f.seek(-1, 2)
