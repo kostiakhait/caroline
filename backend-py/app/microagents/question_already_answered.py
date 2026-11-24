@@ -25,6 +25,7 @@ answered, not even once more before the correction lands."""
 
 from __future__ import annotations
 
+import re
 from typing import Any, List, Optional
 
 from app.microagent_client import Microagent as M
@@ -89,16 +90,25 @@ def unconfirmed_reason(output: dict, final_text: str, recent_dialogue: str) -> O
     whole report was hidden; almost all of the 23 hits since 2026-10-26 were reports and status lines like
     that. A match now stands only when both quotes are really there: a question with a question mark from
     the message, and the user's answer from the dialogue. Returns why a claimed match is discarded, None
-    when it is confirmed."""
+    when it is confirmed.
+
+    2026-11-23: a "question" of "?" alone was in every question, and the "answer" was looked for in the whole
+    dialogue -- Caroline's own lines too, her earlier asking of the same question among them: a quote of her own
+    words confirmed a match, and a question still open was hidden from the user. The question now needs two
+    words, the answer a word, and the answer is looked for outside Caroline's own lines."""
     question = _norm(output.get("question") or "")
     user_answer = _norm(output.get("user_answer") or "")
-    if "?" not in question:
+    if "?" not in question or len(re.findall(r"\w+", question)) < 2:
         return "no question quoted"
     if question not in _norm(final_text):
         return "quoted question is not in the message"
-    if not user_answer or user_answer not in _norm(recent_dialogue):
+    not_hers = "\n".join(line for line in (recent_dialogue or "").splitlines() if not _CAROLINE_LINE.match(line))
+    if not re.search(r"\w", user_answer) or user_answer not in _norm(not_hers):
         return "quoted answer is not in the dialogue"
     return None
+
+
+_CAROLINE_LINE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)?Caroline\b", re.IGNORECASE)
 
 
 def verify_already_answered(input: Any, output: Any) -> Optional[str]:

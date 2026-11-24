@@ -45,6 +45,16 @@ def test_quotes_must_really_be_there():
     assert unconfirmed_reason({**ok, "user_answer": ""}, text, DIALOGUE) == "quoted answer is not in the dialogue"
 
 
+def test_junk_quotes_confirm_nothing():
+    """2026-11-23: "?" alone passed as the question, and the answer was found in Caroline's own asking of it."""
+    text = "Какой аккаунт подключить: ваш или мой? Я также проверила почту: три неоплаченных счёта за март."
+    own = "Caroline: Какой аккаунт подключить: ваш или мой?\nUser: ок, спасибо"
+    assert unconfirmed_reason({"question": "?", "user_answer": "ваш или мой"}, text, own) == "no question quoted"
+    assert unconfirmed_reason({"question": "ваш или мой?", "user_answer": "ваш или мой"}, text, own) == "quoted answer is not in the dialogue"
+    assert unconfirmed_reason({"question": "ваш или мой?", "user_answer": "..."}, text, own) == "quoted answer is not in the dialogue"
+    assert unconfirmed_reason({"question": "ваш или мой?", "user_answer": "для моего"}, text, DIALOGUE) is None   # a real answer still counts
+
+
 def test_an_unconfirmed_match_is_turned_into_no_match(monkeypatch):
     async def fake_run(name, module, agent_input):
         return {"status": "ok", "output": {"already_answered": True, "answer": "Вы уже просили проверить почту.",
