@@ -68,8 +68,17 @@ def test_text_whitespace_differences_do_not_matter():
 def test_session_file_noise_is_not_journaled_and_the_time_stamp_is_dropped(tmp_path):
     ws = str(tmp_path)
     noise = ["<command-name>/model</command-name>", "<local-command-stdout>Set model</local-command-stdout>",
-             "[Request interrupted by user]", "You've hit your session limit · resets 3:10am", "[[NO_UPDATE]]"]
+             "[Request interrupted by user]", "You've hit your session limit · resets 3:10am",
+             "You've hit your weekly limit · resets Nov 29, 12am (UTC)", "You've hit your monthly spend limit", "[[NO_UPDATE]]"]
     assert tj.append_entries(ws, "1", [e("user", n, 1000 + i) for i, n in enumerate(noise)]) == 0
     assert tj.append_entries(ws, "1", [e("user", "[Sent: Fri, Oct 30, 2026, 12:43 PM EDT] ⁣привет", 9)]) == 1
     assert tj.read_entries(ws, "1")[0]["text"] == "привет"
     assert tj.missing_for_client(tj.read_entries(ws, "1"), [e("user", "привет", 9)]) == []
+
+
+def test_usage_cap_report_is_not_replayed_from_the_session_file():
+    import json
+    from app import history
+    lines = [json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}})
+             for t in ("You've hit your weekly limit · resets Nov 29, 12am (UTC)", "You've hit your session limit · resets 9:50am (UTC)", "Привет, всё готово")]
+    assert [x["text"] for x in history._extract_entries_from_lines(lines, "test")] == ["Привет, всё готово"]
