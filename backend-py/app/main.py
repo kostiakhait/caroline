@@ -83,6 +83,7 @@ from app.telegram_channel import get_telegram_channel_status, start_telegram_cha
 from app.discord_channel import get_discord_channel_status, start_discord_channel
 from app.whatsapp_channel import get_whatsapp_channel_status, start_whatsapp_channel
 from app.messenger_channel import get_messenger_channel_status, start_messenger_channel
+from app import web_service_channel
 from app.signal_channel import get_signal_channel_status, start_signal_channel
 # edition:cut claude-openai answer source
 from app.subscription_mode import (
@@ -647,6 +648,7 @@ async def _start_ratatosk_background_loops() -> None:
     start_discord_channel(WORKSPACE_DIR, _inject_from_discord)
     start_whatsapp_channel(WORKSPACE_DIR, _inject_from_whatsapp)
     start_messenger_channel(WORKSPACE_DIR, _inject_from_messenger)
+    web_service_channel.start_service_channels(WORKSPACE_DIR, _inject_from_messenger)   # Facebook, LinkedIn
     start_signal_channel(WORKSPACE_DIR, _inject_from_signal)
     # Checked every 20s (plus once immediately, catching anything that came
     # due while the app was closed); a reminder is only marked fired once
@@ -1676,6 +1678,9 @@ async def _handle_control_request_inner(
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
     if op == "messenger_channel_status":
         status = get_messenger_channel_status()
+        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
+    if op in ("facebook_channel_status", "linkedin_channel_status"):
+        status = web_service_channel.get_status(op.split("_")[0])
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
     if op == "signal_channel_status":
         status = get_signal_channel_status()
