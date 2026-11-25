@@ -97,6 +97,20 @@ def test_a_repeat_within_the_window_is_a_repeat_an_old_one_or_another_matter_is_
     assert session._recent_repeat_of(REPEAT) is False
 
 
+def test_what_the_same_turn_said_while_it_worked_is_not_a_repeat_of_its_closing_reply(session):
+    dl.append(session.workspace_dir, "2", dl.ASSISTANT, SHOWN, dl.SHOWN)             # before this turn: still a repeat
+    session.current_turn_started_at_ms = time.time() * 1000 + 5000
+    assert session._recent_repeat_of(REPEAT) is True
+    time.sleep(0.05)
+    session.current_turn_started_at_ms = time.time() * 1000                          # a new turn begins ...
+    remark = "Асфальт сделан темнее, небо ярче и голубее, свет сильнее, трава зеленее."
+    time.sleep(0.05)
+    dl.append(session.workspace_dir, "2", dl.ASSISTANT, remark, dl.SHOWN)            # ... and says this while it works
+    assert session._recent_repeat_of(remark) is False                                # its closing summary is not a repeat
+    session.current_turn_started_at_ms = None                                        # no turn known: the old behaviour
+    assert session._recent_repeat_of(remark) is True
+
+
 def test_a_background_session_has_no_repeat_gate(tmp_path):
     async def nothing(*a, **k):
         return None

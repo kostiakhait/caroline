@@ -121,6 +121,7 @@ class TurnSubmissionMixin:
         # user message still always wins immediately either way.
         if is_real_user or not self.turn_pending:
             self.pending_is_real_user = is_real_user
+            self.current_turn_started_at_ms = time.time() * 1000
             self._turn_last_visible_text = None
             self._turn_tool_call_count = 0
         # Same "only a genuinely new turn" guard as pending_is_real_user
