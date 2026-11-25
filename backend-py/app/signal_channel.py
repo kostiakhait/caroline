@@ -45,8 +45,8 @@ Exact signal-cli CLI flags and JSON-RPC method/notification shapes here
 follow its documented conventions as of this writing but have NOT been
 exercised against a live install in the environment this was written in
 -- verify against the actually-bundled signal-cli version before relying
-on this in production, same caveat as whatsapp-sidecar/index.js's own
-doc comment.
+on this in production, same caveat as any sidecar not yet
+tried live.
 """
 
 from __future__ import annotations

@@ -23,8 +23,8 @@ SquirrelWisdom wallet).
  +--------+----------------------+-----------------------------+
           |                      |
  +--------v--------+   +---------v----------+   +------------------------------+
- | claude CLI      |   | codex-app-server   |   | sidecars: WhatsApp (Baileys),|
- | (Agent SDK)     |   | (JSON-RPC / stdio) |   | Messenger (fca), signal-cli  |
+ | claude CLI      |   | codex-app-server   |   | signal-cli (sidecar);        |
+ | (Agent SDK)     |   | (JSON-RPC / stdio) |   | web services: own Chromium   |
  +-----------------+   +--------------------+   +------------------------------+
 ```
 
@@ -69,11 +69,10 @@ handed to the backend through `CAROLINE_*` environment variables (see [CONFIGURA
 | `backend-py/evals/` | Evaluation scripts for narrator, verifier, STT sanity and others |
 | `backend-py/test_*.py` | Unit tests (pytest), about 49 files |
 | `Windows/Caroline/` | WPF shell and the shared web UI (`wwwroot/`) |
-| `Windows/Caroline.NativeHost/` | Native helper host (framework-dependent .NET) |
 | `Windows/Caroline.Linux/` | Linux counterpart of the native pieces |
 | `Windows/CarolineInstaller/` | The bootstrapper |
 | `linux-shell/` | GTK shell, AppImage scripts, update checker, Visual Mode window |
-| `companion-apps/` | `whatsapp-sidecar`, `messenger-sidecar` (Node) and the `android` companion |
+| `companion-apps/` | the `android` companion |
 | `vendor/XcfaRenderer/` | The talking-head renderer used by Visual Mode (C#) |
 | `art/` | Icons, splash, banners, persona looks, talking-head models (large, not in git) |
 | `tools/` | Release and edition tooling (`release.py`, `edition_*.py`) |

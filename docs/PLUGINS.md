@@ -73,9 +73,9 @@ completion:
   own windows), `window_mouse_plugin`, `window_keyboard_plugin`, `window_screenshot_plugin`.
   Platform back ends are underscore-prefixed (never discovered as plugins): `_win32.py`,
   `_win32_chain.py` on Windows; `_x11_input.py`, `_x11_window.py`, `_x11_capture.py`,
-  `_linux_chain.py`, `_linux_app_browser.py` on Linux; `_image_util.py` shared.
+  `_linux_chain.py` on Linux; `_chromium_app_browser.py` (the browser windows, every platform); `_image_util.py` shared.
 * **Browser and web:** `app_browser_plugin` + `app_browser_cdp` (one persistent labelled
-  WebView2 / Linux browser window per site, driven over a real CDP connection),
+  window per site, a profile of the bundled Chromium, visible or headless, driven over a real CDP connection),
   `web_research_plugin`, `wikipedia_plugin`, `reforce_plugin`.
 * **Documents and files:** `files_plugin`, `viewer_plugin`, `office_editor` (embedded OnlyOffice for
   docx/xlsx/pptx/pdf), `document_service_plugin`, `summarize_plugin`, `image_gen_plugin`.

@@ -17,9 +17,9 @@ server helper stubs from a sibling `reforce` clone (`CAMERLENGO_REPO`, default `
 
 | Target | Result |
 | --- | --- |
-| `make build` | `dist/`: the portable app (WPF shell, `backend-py`, sidecars, Playwright Chromium) |
+| `make build` | `dist/`: the portable app (WPF shell, `backend-py`, Playwright Chromium) |
 | `make installer` | `dist_installer/`: `Caroline.zip`, `.sha256`, `.version`, `CarolineInstaller.exe`, `.sha256` |
-| `make dist-linux` | `dist-linux/`: Linux tree (GTK shell, backend, sidecars). Runtime provisioning and the AppImage are Linux-host steps |
+| `make dist-linux` | `dist-linux/`: Linux tree (GTK shell, backend). Runtime provisioning and the AppImage are Linux-host steps |
 | `make dist-intellicat` | `dist-intellicat/`: the Linux dist with the Claude/OpenAI code cut out |
 | `make appimage-linux` | Prints the two commands to run on a Linux host (`provision_runtime.sh`, `build_appimage.sh`) |
 | `make clean` | Removes `dist/`, `dist_installer/`, `dist-linux/` |
@@ -28,10 +28,8 @@ server helper stubs from a sibling `reforce` clone (`CAMERLENGO_REPO`, default `
 ### How `make build` is structured
 
 Independent stamp targets, each depending only on the inputs it reads, so a Python-only change skips
-both `dotnet publish` runs: `.dotnet.stamp` (Caroline + NativeHost + XcfaRenderer, published in
-parallel), `backend-py/camerlengo/.stamp` (vendored helper stubs), `.backend-py.stamp` (copies
-`backend-py/app` and `skills-src`), `.whatsapp-sidecar.stamp`, `.messenger-sidecar.stamp`,
-`.browsers.stamp` (Playwright's Chromium, from the pinned browsers JSON). `dist/Caroline.exe` is the
+both `dotnet publish` runs: `.dotnet.stamp` (Caroline + XcfaRenderer), `backend-py/camerlengo/.stamp` (vendored helper stubs), `.backend-py.stamp` (copies
+`backend-py/app` and `skills-src`), `.browsers.stamp` (Playwright's Chromium, from the pinned browsers JSON). `dist/Caroline.exe` is the
 final target. `-p:IncludeNativeLibrariesForSelfExtract=true` is deliberately **not** used for the
 shell: it silently drops `wwwroot/assets/**` from the publish.
 
@@ -86,8 +84,8 @@ older hash-compare path described there).
   versioned Windows installer and payload, the `xopek` overlay (with `sw_service_keys_local.py`) and the `beroun` overlay (without it) are uploaded, and
   `release.json` with its signature goes up last. The key is `RELEASE_KEY` (default `~/.caroline/release-signing.key`). `make release-stage` does everything
   up to and including `release.py verify` in `dist_release/` and uploads nothing. The AppImage is built in WSL by `make appimage-wsl OUT=path` (`linux-shell/build_appimage_wsl.sh`): only the code is copied each time, the runtime
-  (Python with its packages, Chromium, codex, node, signal-cli, the sidecars' node_modules) is provisioned in `~/.intellicat/lin-build/appimage/root` once and again only
-  when `requirements-linux.txt`, `provision_runtime.sh` or a sidecar `package.json` changes (first build about 8 minutes, later ones about 2). `APPIMAGE=path` takes an
+  (Python with its packages, Chromium, codex, signal-cli) is provisioned in `~/.intellicat/lin-build/appimage/root` once and again only
+  when `requirements-linux.txt`, `provision_runtime.sh` changes (first build about 8 minutes, later ones about 2). `APPIMAGE=path` takes an
   AppImage made elsewhere for that same version; `NO_APPIMAGE=1` leaves `linux-x86_64` out of the release. `VERSION` is changed in the working tree, not committed.
 
 ## Versioning notes

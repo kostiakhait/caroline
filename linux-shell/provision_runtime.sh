@@ -22,18 +22,6 @@ CODEX_ARCHIVE="codex-app-server-package-x86_64-unknown-linux-musl.tar.gz"
 CODEX_URL="https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ARCHIVE}"
 CODEX_SHA256="a1784b0f3991e4853caaddcc167d2bc8c540f12eddb1b5e40b1ec49f2dbcc024"
 
-# Added 2026-10-21 (Linux parity pass, messenger-integrations testing plan):
-# the WhatsApp/Messenger sidecars (whatsapp_channel.py/messenger_channel.py,
-# Node/Baileys and fca-unofficial respectively) need a Node.js runtime, and
-# Signal (signal_channel.py) needs signal-cli. Neither was provisioned here
-# before -- out of scope is standing up real LOGGED-IN accounts for any of
-# these (separate, not-yet-done work), but the interpreter/binary itself
-# must exist for the sidecar process to even start.
-NODE_VERSION="22.23.4"
-NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
-NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
-NODE_SHA256="1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce"
-
 # signal-cli's own "-Linux-native" build (GraalVM native-image) is fully
 # self-contained -- no separate JRE to provision/pin, unlike the plain
 # cross-platform .tar.gz distribution which needs Java on PATH. Checksum
@@ -71,7 +59,7 @@ rm -rf "$(dirname "$TMP_TARBALL")"
 echo "--- installing backend-py dependencies ---"
 "$RUNTIME_DIR/bin/pip" install -q -r "$REQUIREMENTS"
 
-echo "--- fetching playwright's own Chromium build (app_browser_cdp.py / _linux_app_browser.py) ---"
+echo "--- fetching playwright's own Chromium build (app_browser_cdp.py / _chromium_app_browser.py) ---"
 "$RUNTIME_DIR/bin/python3" -m playwright install chromium
 
 # Caroline's own web-search browser (app/web_browser.py, 2026-10-23): the full Chromium of
@@ -98,19 +86,6 @@ rm -rf "$CODEX_TMP"
 "$CODEX_DIR/bin/codex-app-server" --version
 
 echo "runtime/codex provisioned at $CODEX_DIR"
-
-NODE_DIR="$INSTALL_ROOT/runtime/node"
-rm -rf "$NODE_DIR"
-mkdir -p "$NODE_DIR"
-NODE_TMP="$(mktemp -d)"
-echo "--- downloading $NODE_ARCHIVE ---"
-curl -sL -o "$NODE_TMP/$NODE_ARCHIVE" "$NODE_URL"
-echo "$NODE_SHA256  $NODE_TMP/$NODE_ARCHIVE" | sha256sum -c -
-tar -xJf "$NODE_TMP/$NODE_ARCHIVE" -C "$NODE_DIR" --strip-components=1
-rm -rf "$NODE_TMP"
-"$NODE_DIR/bin/node" --version
-
-echo "runtime/node provisioned at $NODE_DIR"
 
 SIGNAL_CLI_DIR="$INSTALL_ROOT/runtime/signal-cli"
 rm -rf "$SIGNAL_CLI_DIR"

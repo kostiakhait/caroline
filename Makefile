@@ -45,11 +45,9 @@ PYTHON_RUNTIME_DIR := $(SCRIPT_DIR)/backend-py/python-runtime
 CAMERLENGO_REPO ?= $(SCRIPT_DIR)/../reforce
 CAMERLENGO_VENDOR_STUBS := $(BACKEND_PY_DIR)/camerlengo-vendor-stubs
 CAROLINE_DIR := $(SRC)/Windows/Caroline
-NATIVEHOST_DIR := $(SRC)/Windows/Caroline.NativeHost
 INSTALLER_DIR := $(SRC)/Windows/CarolineInstaller
 XCFA_DIR := $(SRC)/vendor/XcfaRenderer
 PROJECT := $(CAROLINE_DIR)/Caroline.csproj
-NATIVEHOST_PROJECT := $(NATIVEHOST_DIR)/Caroline.NativeHost.csproj
 INSTALLER_PROJECT := $(INSTALLER_DIR)/CarolineInstaller.csproj
 OUT := $(BUILD_ROOT)/dist
 INSTALLER_OUT := $(BUILD_ROOT)/dist_installer
@@ -67,7 +65,6 @@ INSTALLER_OUT := $(BUILD_ROOT)/dist_installer
 SKILLS_SRC := $(shell find "$(BACKEND_PY_DIR)/skills-src" -type f 2>/dev/null)
 BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(shell find "$(BACKEND_PY_DIR)/app/assets" -type f -name '*.html' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py $(BACKEND_PY_DIR)/VERSION
 CAROLINE_SRC := $(shell find "$(CAROLINE_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' -o -path '*/wwwroot/*' \) 2>/dev/null)
-NATIVEHOST_SRC := $(shell find "$(NATIVEHOST_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' \) 2>/dev/null)
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
 XCFA_SRC := $(shell find "$(XCFA_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' -not -path '*/XcfaRenderer.Tests/*' -not -path '*/Demo/*' \( -name '*.cs' -o -name '*.csproj' \) 2>/dev/null)
 
@@ -112,16 +109,6 @@ help:
 # (a bare `touch "$@"` on a stamp inside the folder its own recipe just
 # recreated could otherwise race a slow filesystem's own mtime granularity).
 #
-# The two dotnet publishes (Caroline.exe + NativeHost) are genuinely
-# independent of each other -- backgrounded with & + wait in ONE recipe
-# below, same pattern already used for the backend/ copy steps further
-# down, rather than splitting them into two Make targets and trusting
-# `make -j` for the parallelism: GnuWin32 Make 3.81 is old enough that this
-# file already had to work around real Windows CreateProcess flakiness once
-# ($(shell) calls above) -- explicit &/wait in a shell recipe this Make
-# version already runs correctly is the safer source of parallelism here,
-# not its own job-pool scheduler.
-#
 # NOTE: -p:IncludeNativeLibrariesForSelfExtract=true is deliberately NOT
 # passed here -- confirmed live it silently drops wwwroot/assets/** (the
 # persona reference photos) from the publish output entirely, with no
@@ -132,7 +119,7 @@ help:
 # publish as loose files next to Caroline.exe instead of being bundled into
 # the single-file exe for self-extraction -- harmless, still a working
 # self-contained single-file publish.
-$(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
+$(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(XCFA_SRC)
 	@echo "=== Caroline Build ==="
 	mkdir -p "$(OUT)"
 	# Bug fix (2026-10-12), confirmed live: dropping the old recipe's blanket
@@ -145,16 +132,10 @@ $(OUT)/.dotnet.stamp: $(CAROLINE_SRC) $(NATIVEHOST_SRC) $(XCFA_SRC)
 	# crashed on startup with System.DllNotFoundException. Clears everything
 	# dotnet publish itself owns at $(OUT)'s top level, WITHOUT touching the
 	# subtrees/stamps the other targets below own (backend/, backend-py/,
-	# whatsapp-sidecar/, every *.stamp file) -- same "narrower cleanup, same
+	# every *.stamp file) -- same "narrower cleanup, same
 	# effect, scoped" principle already applied to those, just missed here.
-	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend-py ! -name whatsapp-sidecar ! -name messenger-sidecar ! -name browsers ! -name "*.stamp" -exec rm -rf {} +
-	( rc=0; dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.caroline-exe.rc" ) & \
-	( echo "--- Caroline.NativeHost (embedded-browser host, see its own doc comment) ---"; \
-	  rc=0; dotnet publish "$(NATIVEHOST_PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)" || rc=$$?; echo $$rc > "$(OUT)/.nativehost.rc" ) & \
-	wait
-	test "$$(cat "$(OUT)/.caroline-exe.rc")" = "0"
-	test "$$(cat "$(OUT)/.nativehost.rc")" = "0"
-	rm -f "$(OUT)/.caroline-exe.rc" "$(OUT)/.nativehost.rc"
+	find "$(OUT)" -mindepth 1 -maxdepth 1 ! -name backend-py ! -name browsers ! -name "*.stamp" -exec rm -rf {} +
+	dotnet publish "$(PROJECT)" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$(OUT)"
 	touch -m "$@"
 
 # Vendored ONCE (2026-10-20, per explicit instruction: "Отказать. Скопировать
@@ -194,21 +175,6 @@ $(OUT)/.backend-py.stamp: $(BACKEND_PY_SRC) $(SKILLS_SRC)
 	cp -r "$(BACKEND_PY_DIR)/skills-src" "$(OUT)/backend-py/skills-src"
 	touch -m "$@"
 
-$(OUT)/.whatsapp-sidecar.stamp: $(SRC)/companion-apps/whatsapp-sidecar/package.json $(SRC)/companion-apps/whatsapp-sidecar/index.js
-	@echo "--- whatsapp-sidecar (Baileys, Node -- see app/whatsapp_channel.py) ---"
-	mkdir -p "$(OUT)/whatsapp-sidecar"
-	cp "$(SRC)/companion-apps/whatsapp-sidecar/package.json" "$(OUT)/whatsapp-sidecar/package.json"
-	cp "$(SRC)/companion-apps/whatsapp-sidecar/index.js" "$(OUT)/whatsapp-sidecar/index.js"
-	touch -m "$@"
-
-$(OUT)/.messenger-sidecar.stamp: $(SRC)/companion-apps/messenger-sidecar/package.json $(SRC)/companion-apps/messenger-sidecar/index.js $(SRC)/companion-apps/messenger-sidecar/fca-config.json
-	@echo "--- messenger-sidecar (fca-unofficial, Node -- see app/messenger_channel.py) ---"
-	mkdir -p "$(OUT)/messenger-sidecar"
-	cp "$(SRC)/companion-apps/messenger-sidecar/package.json" "$(OUT)/messenger-sidecar/package.json"
-	cp "$(SRC)/companion-apps/messenger-sidecar/index.js" "$(OUT)/messenger-sidecar/index.js"
-	cp "$(SRC)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT)/messenger-sidecar/fca-config.json"
-	touch -m "$@"
-
 # Caroline's own web-search browser (app/web_browser.py, decided 2026-10-23: "вшить
 # Chromium в установщик"): the FULL Chromium of the revision the bundled Playwright
 # expects (run in its "new" headless mode -- the separate headless shell is turned away by
@@ -224,7 +190,7 @@ $(OUT)/.browsers.stamp: $(PLAYWRIGHT_BROWSERS_JSON)
 	ls "$(OUT)"/browsers/chromium-*/chrome-win64/chrome.exe
 	touch -m "$@"
 
-$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/.browsers.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-py.stamp $(OUT)/.whatsapp-sidecar.stamp $(OUT)/.messenger-sidecar.stamp
+$(OUT)/Caroline.exe: $(OUT)/.dotnet.stamp $(OUT)/.browsers.stamp $(OUT)/backend-py/camerlengo/.stamp $(OUT)/.backend-py.stamp
 	@echo "Build complete: $(OUT)/Caroline.exe"
 	@touch -m "$@"
 
@@ -264,21 +230,10 @@ $(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(filter %/wwwroo
 	@echo "--- camerlengo (small-model primary path, vendored once -- see the Windows build's own stamp rule for why) ---"
 	mkdir -p "$(OUT_LINUX)/backend-py/camerlengo"
 	cp "$(CAMERLENGO_VENDOR_STUBS)/AI.py" "$(CAMERLENGO_VENDOR_STUBS)/Cache.py" "$(CAMERLENGO_VENDOR_STUBS)/Logger.py" "$(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py" "$(CAMERLENGO_VENDOR_STUBS)/Microagent.py" "$(CAMERLENGO_VENDOR_STUBS)/Config.py" "$(OUT_LINUX)/backend-py/camerlengo/"
-	@echo "--- whatsapp-sidecar / messenger-sidecar (Node, same source the Windows build ships -- added 2026-10-21, Linux parity pass) ---"
-	mkdir -p "$(OUT_LINUX)/whatsapp-sidecar" "$(OUT_LINUX)/messenger-sidecar"
-	cp "$(SRC)/companion-apps/whatsapp-sidecar/package.json" "$(SRC)/companion-apps/whatsapp-sidecar/index.js" "$(OUT_LINUX)/whatsapp-sidecar/"
-	cp "$(SRC)/companion-apps/messenger-sidecar/package.json" "$(SRC)/companion-apps/messenger-sidecar/index.js" "$(SRC)/companion-apps/messenger-sidecar/fca-config.json" "$(OUT_LINUX)/messenger-sidecar/"
 	@echo "Linux shell package complete: $(OUT_LINUX)"
-	@echo "NOTE: runtime/python, runtime/codex, runtime/node, and runtime/signal-cli are NOT"
-	@echo "      produced by this recipe (it's plain file copying, cross-platform by design), and"
-	@echo "      neither is whatsapp-sidecar/messenger-sidecar's own node_modules/ (needs npm"
-	@echo "      install against the provisioned runtime/node). Run on a Linux host:"
+	@echo "NOTE: runtime/python, runtime/codex and runtime/signal-cli are NOT produced by this recipe (it's plain"
+	@echo "      file copying, cross-platform by design). Run on a Linux host:"
 	@echo "      linux-shell/provision_runtime.sh $(OUT_LINUX)"
-	@echo "      PATH=\"$(OUT_LINUX)/runtime/node/bin:\$$PATH\" npm install --prefix $(OUT_LINUX)/whatsapp-sidecar"
-	@echo "      PATH=\"$(OUT_LINUX)/runtime/node/bin:\$$PATH\" npm install --prefix $(OUT_LINUX)/messenger-sidecar"
-	@echo "      (npm's own shebang needs \"node\" resolvable on PATH, not just npm's own absolute path --"
-	@echo "       confirmed live 2026-10-21: calling npm by its full runtime/node/bin path alone fails with"
-	@echo "       \"env: node: No such file or directory\")."
 
 dist-linux: $(OUT_LINUX)/linux-shell/caroline_shell.py
 

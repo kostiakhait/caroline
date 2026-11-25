@@ -4,7 +4,7 @@ namespace CarolineInstaller.Dependencies;
 
 /// <summary>
 /// Provisions an isolated JRE under AppPaths.JavaDir -- same isolation
-/// principle as NodeInstaller/PythonInstaller (never touches/relies on any
+/// principle as PythonInstaller (never touches/relies on any
 /// Java the machine might already have, nothing added to PATH). Needed for
 /// app/signal_channel.py's signal-cli daemon (docs/MESSENGER_INTEGRATIONS_
 /// PLAN.md, 2026-10-06) -- signal-cli is a JVM tool with no native Windows

@@ -18,9 +18,6 @@ namespace CarolineInstaller;
 ///                      compaction hook left 662 GB of it on one machine
 ///                      with the backend not running often enough to
 ///                      prune it away on its own
-///     runtime\node\    isolated Node.js, used only by Caroline's own
-///                      backend -- never added to PATH, never conflicts
-///                      with a system Node.js install
 ///     runtime\python\  isolated embeddable Python, same idea
 ///     runtime\git\     isolated PortableGit -- gives Claude Code's Bash
 ///                      tool a bash.exe on machines without Git for
@@ -30,7 +27,7 @@ namespace CarolineInstaller;
 internal static class AppPaths
 {
     /// <summary>
-    /// Every runtime dependency (Node, Python, Git Bash) is mirrored here
+    /// Every runtime dependency (Python, Git Bash) is mirrored here
     /// rather than fetched from its own upstream project at
     /// install time -- confirmed live this was a real bus-factor risk: any
     /// one of those projects renaming a release asset, restructuring their
@@ -84,8 +81,6 @@ internal static class AppPaths
     public static string DehydratedDir => Path.Combine(Root, "workspace", "dehydrated");
 
     public static string RuntimeDir => Path.Combine(Root, "runtime");
-    public static string NodeDir => Path.Combine(RuntimeDir, "node");
-    public static string NodeExe => Path.Combine(NodeDir, "node.exe");
     // app/signal_channel.py's signal-cli daemon (docs/MESSENGER_INTEGRATIONS_PLAN.md,
     // 2026-10-06) -- signal-cli is a JVM tool, needs a real JRE.
     public static string JavaDir => Path.Combine(RuntimeDir, "java");

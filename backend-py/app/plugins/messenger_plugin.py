@@ -1,20 +1,16 @@
 """messenger -- LLM-facing tools over app/messenger_channel.py's Facebook
-Messenger connections. Fifth and last of the planned messenger integrations
-(docs/MESSENGER_INTEGRATIONS_PLAN.md, 2026-10-06).
+Messenger connections, run through Caroline's own browser (messenger.com): the person logs in
+once in a visible window of hers, then the same profile runs quietly in the background.
 
 TWO accounts, same split as every other messenger plugin here: "self"
 (default) is Caroline's own Messenger account -- she may read and reply
 there as herself, no extra permission needed; "owner" is the human owner's
 own personal Messenger account -- read freely, but only send AS the owner
-when they have explicitly asked for that specific message. Acts via an
-unofficial protocol library (fca-unofficial, Node sidecar) either way --
-there is no official API for a personal Messenger inbox, only for business
-Pages. Login is browser-based (changed 2026-10-19: 2FA is universal enough
-now that a direct email/password login isn't realistic) -- messenger_login
-just opens Caroline's own embedded browser window and the user logs in
-there BY HAND, same as any ordinary browser; see messenger_channel.py's own
-doc comment for the full flow (cookie-jar polling, appState export). No
-password or 2FA code ever passes through this plugin at all.
+when they have explicitly asked for that specific message. Both are
+messenger.com in a browser profile of her own. messenger_login opens that
+window and the user logs in there BY HAND, same as any ordinary browser (2FA
+and checkpoints included); see messenger_channel.py's own doc comment for
+the flow. No password or 2FA code ever passes through this plugin at all.
 
 Groups, attachments (2026-10-19), matching the WhatsApp/Telegram plugins'
 surface where Messenger's own protocol actually has an equivalent --
@@ -85,7 +81,7 @@ async def messenger_login(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 def _format_chat_row(chat: dict[str, Any]) -> dict[str, Any]:
-    """Converts the sidecar's raw epoch-ms "lastActivity" into an ISO-8601
+    """Converts the channel's raw epoch-ms "lastActivity" into an ISO-8601
     string -- per explicit instruction, the user wants each chat's last-
     activity date/time visible, not a bare millisecond number."""
     row = dict(chat)
@@ -361,10 +357,9 @@ def _usage_instructions() -> str:
         "Two accounts, same split as the other messenger plugins: `account=\"self\"` (default) is Caroline's own "
         "Messenger account -- read/reply there freely, no extra permission needed. `account=\"owner\"` is the "
         "human owner's own personal Messenger (their real chats) -- read freely, but only send AS the owner "
-        "when they have explicitly asked you to send that specific message; an unofficial protocol library "
-        "(fca-unofficial) either way, since there is no official API for a personal Messenger inbox, only for "
-        "business Pages. messenger_login(account=...) is one-time setup per account -- it opens Caroline's own "
-        "embedded browser window on facebook.com and the USER logs in there by hand (password, 2FA code, "
+        "when they have explicitly asked you to send that specific message; both are messenger.com in Caroline's "
+        "own browser. messenger_login(account=...) is one-time setup per account -- it opens a Messenger "
+        "window and the USER logs in there by hand (password, 2FA code, "
         "checkpoint -- whatever Facebook asks for, exactly like any ordinary browser login); no password or code "
         "ever passes through you at all. Call it only when the user has explicitly asked to connect that "
         "account, never on your own initiative -- after that, just tell them the window is open and to log in "

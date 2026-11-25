@@ -152,8 +152,8 @@ Rough roster by category:
   cross-plugin registry of Caroline's own open windows/tabs) and their window-targeted twins, plus
   Linux ports (`_x11_input.py`, `_x11_window.py`, excluded from discovery by their leading
   underscore).
-- **Browser** — `app_browser_plugin.py` + `app_browser_cdp.py`: one persistent, labeled WebView2
-  window per site, driven over a real CDP connection, not simulated input.
+- **Browser** — `app_browser_plugin.py` + `app_browser_cdp.py`: one persistent, labeled window per
+  site (a profile of the bundled Chromium, visible or headless), driven over a real CDP connection, not simulated input.
 - **Voice** — `voice_api.py` (TTS/STT/translation/reply-review/permission-guard calls — see below),
   `speech_plugin.py`, `voice_playback_plugin.py` (including Visual Mode talking-head playback),
   `visual_models_plugin.py` (buying/activating extra Visual Mode talking-head models through the

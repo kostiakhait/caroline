@@ -29,9 +29,8 @@ namespace Caroline.Native;
 public sealed class SupervisorClient : IDisposable
 {
     // Sibling of BackendProcess.Port (48765), AppControlHost.Port (8768, this
-    // process's own control surface), and Caroline.NativeHost's own
-    // AppBrowserHost.Port (8767, a separate process since 2026-10-03) --
-    // this project's own port registry.
+    // process's own control surface) -- this project's own port registry. 8767 was the
+    // embedded-browser host's, gone since 2026-11-25.
     public const int Port = 48766;
 
     private readonly string _backendPyDir;

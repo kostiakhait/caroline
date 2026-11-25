@@ -3,9 +3,9 @@ the web (agentic web search, decided with the user 2026-10-23; see
 app/web_research.py for the loop and app/plugins/web_research_plugin.py for
 the tools).
 
-A SEPARATE browser of the backend: not Caroline.NativeHost's WebView2, not
-the Linux embedded-browser windows (_linux_app_browser.py), not anything of
-the user's -- its own headless Chromium, its own empty profile, no window.
+A SEPARATE browser of the backend: not the embedded-browser windows
+(_chromium_app_browser.py, which use the same bundled Chromium but their own
+profiles), not anything of the user's -- its own headless Chromium, its own empty profile, no window.
 The Chromium build is bundled with Caroline (dist/browsers, put there by the
 Makefile on Windows and by linux-shell/provision_runtime.sh on Linux), the
 headless shell of the revision this Playwright version expects; it is

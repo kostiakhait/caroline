@@ -1,13 +1,13 @@
 """whatsapp -- LLM-facing tools over app/whatsapp_channel.py's WhatsApp
-connections. Fourth of the planned messenger integrations
-(docs/MESSENGER_INTEGRATIONS_PLAN.md, 2026-10-06).
+connections, run through Caroline's own browser (web.whatsapp.com): the person signs in once in a
+visible window of hers (a QR scan), then the same profile runs quietly in the background.
 
 TWO accounts, same split as Telegram's (2026-10-11): "self" (default) is
 Caroline's own WhatsApp account -- she may read and reply there as
 herself, no extra permission needed; "owner" is the human owner's own
 personal WhatsApp account -- read freely, but only send AS the owner when
 they have explicitly asked for that specific message. Acts via an
-unofficial protocol library (Baileys, Node sidecar) either way -- there is
+WhatsApp Web in Caroline's own browser either way -- there is
 no official API for a personal account. See whatsapp_channel.py's own doc
 comment for the real, stated risk (WhatsApp could restrict/ban an account
 at their discretion) and for why "self" needs an actual second phone
@@ -54,7 +54,7 @@ from app.plugins.messenger_search import find_by_name
 
 def _to_jid(raw: str) -> str:
     """Unlike Telegram, WhatsApp needs no prior contact/dialog to message a
-    number cold -- but Baileys still needs the full jid, not a bare phone
+    number cold -- but the channel still needs the full jid, not a bare phone
     number, to send to. A plain number (no "@") is turned into the
     standard individual jid form; anything already containing "@" (an
     individual jid, or a group's "...@g.us") is passed through unchanged."""
@@ -315,17 +315,17 @@ def _usage_instructions() -> str:
         "Two accounts, same split as Telegram's: `account=\"self\"` (default) is Caroline's own WhatsApp "
         "account -- read/reply there freely, no extra permission needed. `account=\"owner\"` is the human "
         "owner's own personal WhatsApp (their real chats) -- read freely, but only send AS the owner when "
-        "they have explicitly asked you to send that specific message; an unofficial protocol library "
-        "(Baileys) either way, since there is no official API for a personal WhatsApp account -- WhatsApp "
-        "could in principle restrict or ban the account for it at their own discretion. `to`/`jid`/"
+        "they have explicitly asked you to send that specific message; both run in WhatsApp Web inside Caroline's "
+        "own browser. `to`/`jid`/"
         "`participants` everywhere accept either the exact WhatsApp jid (from whatsapp_list_chats, a "
         "proactive notification, or a group's own jid) or a plain phone number -- converted to a jid "
-        "automatically, never a guessed name. whatsapp_login(account=...) is one-time setup per account (a QR "
-        "code image opens automatically to scan) -- call it only when the user has explicitly asked to "
-        "connect that account, and make sure they understand the risk stated above before doing so, never on "
-        "your own initiative. whatsapp_find_chat(query) finds a chat by name/description, judged by meaning -- "
-        "use it instead of whatsapp_list_chats when looking for one specific chat; both only ever see chats "
-        "already seen since that account's connection came up (Baileys keeps no history by default).\n"
+        "automatically, never a guessed name. whatsapp_login(account=...) is one-time setup per account (a WhatsApp "
+        "window opens with a QR code; the user scans it with the phone, and after that the window goes to the "
+        "background by itself) -- call it only when the user has explicitly asked to connect that account, "
+        "or when a note says the account has signed out, never on your own initiative. whatsapp_find_chat(query) finds a chat by name/description, judged by meaning -- "
+        "use it instead of whatsapp_list_chats when looking for one specific chat; both list the chats "
+        "WhatsApp Web shows. A chat whose jid is not known yet is listed with an id like \"Name@chat.name\" -- use "
+        "that id as `to` as it is.\n"
         "Unlike Telegram, WhatsApp needs no prior contact/dialog to message a number cold -- any registered "
         "number can be messaged directly, no add-contact step. whatsapp_check_number is purely an optional "
         "preflight (is this number even on WhatsApp); whatsapp_block_user/whatsapp_unblock_user are the real "
@@ -348,16 +348,16 @@ PLUGIN = Plugin(
     tools=[
         PluginTool(
             "whatsapp_login",
-            "Connects Caroline to a WhatsApp account: starts the connection and opens a QR code image to scan "
-            "with WhatsApp on the phone for that account (Linked Devices > Link a Device). `account`: \"self\" "
-            "to connect Caroline's own WhatsApp account, \"owner\" to connect the human owner's personal "
-            "account -- always confirm which one before calling this. Call only after making sure they "
-            "understand this uses an unofficial library.",
+            "Connects Caroline to a WhatsApp account: opens a WhatsApp window with a QR code to scan with "
+            "WhatsApp on the phone for that account (Linked Devices > Link a Device); once the chats show, the "
+            "window goes to the background and the account is handled quietly -- a sign-in needed only once. "
+            "`account`: \"self\" to connect Caroline's own WhatsApp account, \"owner\" to connect the human "
+            "owner's personal account -- always confirm which one before calling this.",
             {"account": str | None}, whatsapp_login,
         ),
         PluginTool(
             "whatsapp_list_chats",
-            "Lists an account's WhatsApp chats seen since the connection came up, each with its jid -- the id "
+            "Lists an account's WhatsApp chats as WhatsApp Web shows them (name, unread count, last message), each with its id -- the id "
             "to use for whatsapp_send_message. `account`: \"self\" (default) or \"owner\".",
             {"account": str | None}, whatsapp_list_chats,
         ),
