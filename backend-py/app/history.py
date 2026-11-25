@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from app.durability import claude_project_dir, session_transcript_path
-from app.failure_classification import CC_CLI_LIMIT_PATTERN
+from app.failure_classification import CC_CLI_LIMIT_PATTERN, detect_balance_exhaustion
 from app.logging_setup import log_event
 
 _ATTACHMENT_NOTE_PREFIXES = [
@@ -270,10 +270,10 @@ def _extract_entries_from_lines(lines: Iterable[str], source_label: str) -> list
                 # transcript.
                 if obj.get("type") == "assistant" and "[[NO_UPDATE]]" in text:
                     continue
-                # The CLI's own usage-cap report ("You've hit your weekly limit ...") is a status, shown in the status bar,
+                # The CLI's own usage-cap or empty-balance report ("You've hit your weekly limit ...", "Credit balance is too low") is a status, shown in the status bar,
                 # never a chat bubble (owner, 2026-11-25): the live path already drops it, and this replay must not
                 # bring it back on every reconnect.
-                if obj.get("type") == "assistant" and len(text) < 300 and CC_CLI_LIMIT_PATTERN.search(text):
+                if obj.get("type") == "assistant" and len(text) < 300 and (CC_CLI_LIMIT_PATTERN.search(text) or detect_balance_exhaustion(text)):
                     continue
                 ts_raw = obj.get("timestamp")
                 ts_ms: float | None = None

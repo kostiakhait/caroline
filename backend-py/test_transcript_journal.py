@@ -80,5 +80,5 @@ def test_usage_cap_report_is_not_replayed_from_the_session_file():
     import json
     from app import history
     lines = [json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}})
-             for t in ("You've hit your weekly limit · resets Nov 29, 12am (UTC)", "You've hit your session limit · resets 9:50am (UTC)", "Привет, всё готово")]
+             for t in ("You've hit your weekly limit · resets Nov 29, 12am (UTC)", "You've hit your session limit · resets 9:50am (UTC)", "Credit balance is too low", "Привет, всё готово")]
     assert [x["text"] for x in history._extract_entries_from_lines(lines, "test")] == ["Привет, всё готово"]
