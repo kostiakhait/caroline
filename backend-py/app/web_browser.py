@@ -92,6 +92,20 @@ def bundled_shell_path() -> Path | None:
     return None
 
 
+def bundled_chromium_path() -> Path | None:
+    """The bundled FULL Chromium (the one that can show windows), or None.
+    The headless shell is not it: it has no window."""
+    if not _BROWSERS_DIR.is_dir():
+        return None
+    found = sorted(_BROWSERS_DIR.glob(f"chromium-*/*/{_CHROME_NAME}"))
+    return found[-1] if found else None
+
+
+def browser_user_agent() -> str:
+    """The user agent every browser of Caroline's presents: the ordinary desktop Chrome."""
+    return _USER_AGENT
+
+
 @dataclass
 class SearchResult:
     title: str

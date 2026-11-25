@@ -61,13 +61,10 @@ from typing import Any, Callable
 
 from app.logging_setup import log_event
 from app.untrusted_text import third_party_label, third_party_text
-from app.plugins.app_browser_plugin import _call as _app_browser_call
+from app.plugins import _chromium_app_browser as _browser
 from app.secret_store import messenger_secrets_dir
 from app.sidecar_process import SidecarProcess
 from app.task_supervisor import supervise
-
-if sys.platform != "win32":
-    from app.plugins import _linux_app_browser as _linux_browser
 
 FACEBOOK_URL = "https://www.facebook.com/login"
 # GetCookiesAsync (AppBrowserHost.cs) scopes to one URL's cookie jar; the
@@ -128,30 +125,18 @@ def browser_label(account: str) -> str:
     return f"facebook_{account}"
 
 
-# Linux parity pass (2026-10-21): _app_browser_call always talks HTTP to
-# AppBrowserHost (Windows-only, see app_browser_plugin.py's own _call) --
-# it has no platform branch of its own, unlike the higher-level functions
-# that module exposes for other callers. These three thin wrappers are the
-# platform branch for the Facebook login flow specifically (open/poll-
-# cookies/close), routing to _linux_app_browser.py directly on Linux.
+# The Facebook login flow's three browser steps (open, poll cookies, close), on Caroline's own
+# Chromium windows -- the same on every platform.
 async def _login_browser_open(label: str, url: str) -> None:
-    if sys.platform != "win32":
-        await _linux_browser.open_window(label, url)
-    else:
-        await _app_browser_call("/open", {"label": label, "url": url}, timeout_s=90.0)
+    await _browser.open_window(label, url)
 
 
 async def _login_browser_get_cookies(label: str, uri: str) -> Any:
-    if sys.platform != "win32":
-        return await _linux_browser.get_cookies(label, uri)
-    return await _app_browser_call("/get_cookies", {"label": label, "uri": uri}, timeout_s=15.0)
+    return await _browser.get_cookies(label, uri)
 
 
 async def _login_browser_close(label: str) -> None:
-    if sys.platform != "win32":
-        await _linux_browser.close_window(label)
-    else:
-        await _app_browser_call("/close", {"label": label})
+    await _browser.close_window(label)
 
 
 @dataclass
