@@ -410,3 +410,23 @@ async def forget_profile(label: str) -> dict[str, Any]:
     await asyncio.sleep(0.5)   # the browser process lets go of its files
     shutil.rmtree(folder, ignore_errors=True)
     return {"label": label, "deleted": not folder.exists()}
+
+
+def get_page(label: str) -> Page | None:
+    """The live page of an open label (visible or headless), or None."""
+    window = _windows.get(label)
+    return window.page if window is not None and not window.page.is_closed() else None
+
+
+def is_headless(label: str) -> bool | None:
+    window = _windows.get(label)
+    return window.headless if window is not None else None
+
+
+def has_profile(label: str) -> bool:
+    """A profile folder with content exists for the label: a sign-in may be kept in it."""
+    folder = PROFILES_DIR / label
+    try:
+        return folder.is_dir() and any(folder.iterdir())
+    except OSError:
+        return False
