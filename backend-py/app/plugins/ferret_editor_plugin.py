@@ -78,24 +78,25 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("viewer_log", "The log under the viewer: build and game errors and messages. {n?} the last n lines (default 60).", {"n": "number?"}),
     ("viewer_screenshot", "A picture of the running game: -> the image", {"width": "number?", "height": "number?"}),
     ("gpu_render_page", "Render a page of the project in a browser with a GPU (WebGL, WebGPU, video) and bring back pictures or a video. "
-     "WHERE IT RUNS (all three gpu_ tools): on the Ferret companion app on the person's own computer when it is online (free, their GPU); with no app the tool does NOT start "
-     "a machine: it answers state 'needs-companion' with a download link, and you offer the person the app (see the answer's `next`); only if they decline do you call again with where:'cloud' "
-     "(the paid GPU machine). Never start the cloud by yourself and never say why a job failed beyond what the answer's `error`/`log` say. "
+     "WHERE IT RUNS (all gpu_ and machine_ tools) is the person's own setting \"Use GPU\" in the editor (Edit menu), never your choice, because the cloud costs their money: "
+     "\"On my PC\" (the default: the Ferret companion app on their computer, free, their GPU), \"Cloud GPU\" (the paid machine in the cloud) or \"No GPU\" (nothing runs). On \"On my PC\" "
+     "with no app the tool runs nothing and answers state 'needs-companion' with a download link: offer the person the app (see the answer's `next`); if they would rather pay for "
+     "the cloud, they switch the setting themselves. Do not judge from your memory whether the app is there: call the tool. Never say why a job failed beyond what the answer's `error`/`log` say. "
      "{dir?, entry?, width?, height?, seconds?, fps?, format?, out?}: `dir` is the folder holding the page (default the whole project), "
      "`entry` its HTML file (default index.html); format 'png' (one picture after `seconds`, default; the answer then CONTAINS the picture and a `picture` verdict: EMPTY means the page drew nothing, see `pageProblems`) or 'mp4' (a recording of `seconds` "
-     "at `fps`); results go to `out` (default renders/); `where`: auto (default) | companion | cloud. Waits up to ~3 minutes, then answers with the job id for gpu_status.",
+     "at `fps`); results go to `out` (default renders/); `where`: leave it out (the setting decides). Waits up to ~3 minutes, then answers with the job id for gpu_status.",
      {"dir": "string?", "entry": "string?", "width": "number?", "height": "number?", "seconds": "number?", "fps": "number?",
       "format": "string?", "out": "string?", "where": "string?"}),
     ("gpu_video", "Make or convert a video on the GPU (ffmpeg with the hardware encoder). {inputs?: [project paths], images?: "
      "'frames/f_%04d.png' (a numbered picture sequence from the project), output: 'name.mp4', fps?, video?: {codec: "
      "h264|h265|av1|vp9|gif|copy, quality?, scale?: 'WxH', start?, duration?}, audio?: {codec: aac|opus|mp3|copy|none, kbps?}, out?}. "
-     "The output goes to `out` (default renders/); `where` as for gpu_render_page.",
+     "The output goes to `out` (default renders/); where it runs as for gpu_render_page.",
      {"inputs": "string[]?", "images": "string?", "output": "string", "fps": "number?", "video": "object?", "audio": "object?", "out": "string?", "where": "string?"}),
     ("gpu_blender", "Run Blender in the background on the GPU (Cycles/OptiX). {blend?: path of a .blend in the project, script?: path of "
      "a Python script in the project, include?: [extra project paths: textures, models], frame? or range?: [first, last] to render, "
      "engine?: CYCLES|BLENDER_EEVEE_NEXT|BLENDER_WORKBENCH, format?: PNG|JPEG|OPEN_EXR, device?: OPTIX|CUDA|CPU, out?}. A script writes "
      "its files into the folder `out/` (relative path) to get them back, e.g. a glTF export: "
-     "bpy.ops.export_scene.gltf(filepath='out/model.glb'). Results go to `out` (default renders/); `where` as for gpu_render_page.",
+     "bpy.ops.export_scene.gltf(filepath='out/model.glb'). Results go to `out` (default renders/); where it runs as for gpu_render_page.",
      {"blend": "string?", "script": "string?", "include": "string[]?", "frame": "number?", "range": "number[]?", "engine": "string?",
       "format": "string?", "device": "string?", "out": "string?", "where": "string?"}),
     ("gpu_status", "GPU jobs of this person (on the companion app or the cloud machine): {id?} one job (and, when it is done, its outputs are brought into the project), or all of "
@@ -104,11 +105,11 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("gpu_install", "Install on the person's computer what the companion app lacks for GPU jobs: {tool: ffmpeg | blender}. ONLY after the person said yes to a question you asked when a gpu_ tool answered state 'needs-install' (it names the tool, its size and where it is downloaded from); never before, never on your own. Waits up to ~3 minutes, then answers with an id for gpu_status. After it, ask for the job again.", {"tool": "string"}),
     ("gpu_cancel", "Cancel a GPU job. {id}", {"id": "string"}),
     # Caroline's machine (PLAN-PLAYER 10.6.1): her shell, Python and desktop on the person's own computer through the companion app, after their yes in the chat;
-    # without the app, on their no to it, the person's container on the cloud machine. Never on the editor's server.
+    # or, when the person set "Use GPU" to "Cloud GPU" in the editor, their container on the cloud machine. Never on the editor's server.
     ("machine_shell", "Run a shell command on your machine. WHERE: the person's own computer through the Ferret companion app (Windows: PowerShell by default, or shell:'cmd'), "
      "ONLY with their permission for this session -- without it the tool answers state 'needs-permission' and runs nothing: ask them, and only on their yes call machine_allow "
-     "{allow:true}, then call again (a no is not kept: ask again next time). With no app it answers 'needs-companion' (offer the app; on their no call again with "
-     "where:'cloud': a Linux container on the cloud machine, bash, paid from their wallet). The working folder is a copy of the open project: what the command makes or "
+     "{allow:true}, then call again (a no is not kept: ask again next time). With no app it answers 'needs-companion' (offer the app). Where it runs is the person's "
+     "setting \"Use GPU\" as for gpu_render_page: on \"Cloud GPU\" it is a Linux container on the cloud machine, bash, paid from their wallet. The working folder is a copy of the open project: what the command makes or "
      "changes there comes back into the project (intoProject), what it removes of the project is removed from it; node_modules, .git, caches and virtual environments "
      "stay on the machine. {command, shell?: powershell|cmd|bash, cwd?: a folder (relative to the working folder, or absolute), timeoutS? (default 120, at most 1800 in the "
      "cloud, 3600 on the computer), where?} -> exitCode, stdout, stderr, intoProject, removedFromProject, leftOnTheMachine (too big to bring), workspace. "
