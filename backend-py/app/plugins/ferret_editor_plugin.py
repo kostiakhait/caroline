@@ -69,7 +69,9 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("viewer_level", "Travel the viewer to a level of the project. {level}", {"level": "string"}),
     ("viewer_command", "Run one of the running game's engine commands. {name, args?}; 'help' lists them all. To TEST the game, play it: input.actions (what is bound), "
      "input.hold {actions:[{action, down?, x?, y?}], seconds} (press the game's own actions for some game seconds), scene.entities / scene.node (positions and rotations before and after), "
-     "camera.view {name: front|back|left|right|top|iso|fit} (look from other sides, then viewer_screenshot).",
+     "camera.view {name: front|back|left|right|top|iso|fit} (look from other sides, then viewer_screenshot). Where timing or the game's state matters, "
+     "play it by a script: test.run {file: \"tests/<what>.ferretic\"} or {source} (Ferretic, the engine's test language: test.help, skill ferret-ferretic) "
+     "-> a report with failures, logged values and sample tables.",
      {"name": "string", "args": "object?"}),
     ("viewer_log", "The log under the viewer: build and game errors and messages. {n?} the last n lines (default 60).", {"n": "number?"}),
     ("viewer_screenshot", "A picture of the running game: -> the image", {"width": "number?", "height": "number?"}),
