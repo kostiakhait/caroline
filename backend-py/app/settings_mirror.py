@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from app.akinakes_channel import TAB_PREFIX as AKINAKES_TAB_PREFIX
+from app.closing_flush import TAB_PREFIX as CLOSING_FLUSH_TAB_PREFIX
 from app.logging_setup import log_event
 
 SETTINGS_FOLDER = os.environ.get("CAROLINE_SETTINGS_FOLDER", "Caroline:Settings")
@@ -84,8 +85,8 @@ def _items(workspace_dir: str, extra_names: tuple[str, ...] = ()) -> list[Item]:
     seen = {i.name for i in items}
     names = [p.stem for p in sorted(Path(workspace_dir).glob("chat-mode-*.json"))] + list(extra_names)
     for name in names:
-        if name.startswith("chat-mode-" + AKINAKES_TAB_PREFIX):
-            continue
+        if name.startswith("chat-mode-" + AKINAKES_TAB_PREFIX) or name.startswith("chat-mode-" + CLOSING_FLUSH_TAB_PREFIX):
+            continue   # a closed tab's hidden save copy (app/closing_flush.py) lives for one turn: never mirrored
         if name.startswith("chat-mode-") and _SAFE_NAME.match(name) and name not in seen:
             seen.add(name)
             items.append(Item(name, f"{name}.json"))

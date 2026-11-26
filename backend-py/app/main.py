@@ -38,7 +38,7 @@ from app import openai_account
 from app.openai_mode import get_own_openai_api_key, openai_available, set_own_openai_api_key
 # edition:end
 from app.history import read_archived_entries, read_recent_history_for_session
-from app import closed_tabs, file_download, settings_mirror, transcript_journal, vault_backup, wizard
+from app import closed_tabs, closing_flush, file_download, memory_nudge, settings_mirror, transcript_journal, vault_backup, wizard
 from app.operations import REGISTRY
 from app.login_api import clear_credentials, is_logged_in, logged_in_email, open_login_request, register_and_save_login, take_login_request, verify_and_save_login
 from app.logging_setup import log_event
@@ -1233,6 +1233,31 @@ async def get_or_create_ratatosk_session() -> ChatSession:
     return session
 
 
+async def _run_closing_flush(flush_tab: str) -> None:
+    """One headless service turn on the hidden copy of a closed tab: it saves its unsaved work with save_info
+    (app/closing_flush.py). The session is disposed and the copy removed when the turn is over."""
+    done = asyncio.Event()
+
+    async def _send(event: dict[str, Any]) -> None:
+        if event.get("type") == "sdk_message" and (event.get("message") or {}).get("type") == "result" and not event.get("wasInternalCheckReply"):
+            done.set()
+
+    session = ChatSession(tab_id=flush_tab, workspace_dir=WORKSPACE_DIR, send=_send, headless=True)
+    sessions[flush_tab] = session
+    try:
+        await session.start()
+        session.inject_proactive(closing_flush.FLUSH_TEXT)
+        await done.wait()
+        log_event("engine", "closing_flush_done", hidden=flush_tab)
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "closing_flush_failed", hidden=flush_tab, error=str(exc)[:300])
+    finally:
+        session.dispose()
+        if sessions.get(flush_tab) is session:
+            del sessions[flush_tab]
+        closing_flush.cleanup(WORKSPACE_DIR, flush_tab)
+
+
 def akinakes_tab_id(chain_id: str) -> str:
     return f"{akinakes_channel.TAB_PREFIX}{chain_id}"
 
@@ -1964,6 +1989,15 @@ async def _handle_control_request_inner(
             return {"type": "control_response", "op": op, "ok": False, "stderr": "close_tab requires tabId", "requestId": request_id}
         live = sessions.get(tab_id)
         client_entries = parsed.get("entries") if isinstance(parsed.get("entries"), list) else None
+        # 2026-11-26, explicit instruction: the closed tab is reached later only through memory, so what was done
+        # since the last save_info is saved first, by the model itself, in a hidden copy of the conversation
+        # (app/closing_flush.py) -- copied now, before the archive below clears the tab's files.
+        flush_tab = None
+        if memory_nudge.unsaved_state(tab_id) is not False:
+            try:
+                flush_tab = await closing_flush.seed(WORKSPACE_DIR, tab_id)
+            except Exception as exc:  # noqa: BLE001 -- the close itself goes on; the loss is logged
+                log_event("engine", "closing_flush_seed_failed", tab_id=tab_id, error=str(exc)[:300])
         try:
             meta = closed_tabs.archive_tab(WORKSPACE_DIR, tab_id, parsed.get("name"), client_entries)
         except Exception as exc:  # noqa: BLE001 -- not archived: nothing may be removed then
@@ -1976,7 +2010,10 @@ async def _handle_control_request_inner(
             REGISTRY.cancel_for_tab(tab_id)
         closed_tabs.clear_tab_files(WORKSPACE_DIR, tab_id)
         _resumed_unfinished_turn_for_tab.discard(tab_id)
-        log_event("engine", "close_tab", tab_id=tab_id, archive=(meta or {}).get("id"))
+        memory_nudge.forget(tab_id)
+        if flush_tab:
+            asyncio.create_task(_run_closing_flush(flush_tab))
+        log_event("engine", "close_tab", tab_id=tab_id, archive=(meta or {}).get("id"), flush=flush_tab)
         return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(meta or {}), "requestId": request_id}
     # edition:cut claude-openai answer source (control ops)
     if op == "own_anthropic_key_get":
