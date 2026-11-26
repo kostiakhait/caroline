@@ -61,8 +61,10 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("fmdl_make", "Make a model package .fmdl from a glTF of the project (the new model format; what `ferret fmdl import` and `pack` do) and write it into the project: {glb, id, summary, kind, mass, materials, name?, tags?, category?, purpose?, out?}. summary ENGLISH (what it is); kind e.g. car, tree, prop; mass in kg; materials maps each glTF material name to a physics material name (`*` = every other). -> {path, id, version, bytes}. Then library_add the file.",
      {"glb": "string", "id": "string", "summary": "string", "kind": "string", "mass": "number", "materials": "object", "name": "string?", "tags": "string[]?", "category": "string?", "purpose": "string?", "out": "string?"}),
     ("fmdl_pack", "Pack a model folder of the project (model.json, glTF levels, description.json ...) into a .fmdl written into the project: {dir, out?} -> {path, id, version, bytes}.", {"dir": "string", "out": "string?"}),
-    ("library_search", "Search the Ferret asset library (REST GET api/search): {q, type?, rubric?, tags?, limit?}; q is ENGLISH words. -> candidate cards (id, uid, type, tags, description, versions ...): read them and pick.",
-     {"q": "string", "type": "string?", "rubric": "string?", "tags": "string?", "limit": "number?"}),
+    ("library_search", "Search the Ferret asset library (REST GET api/search): {q, type?, rubric?, tags?, limit?, offset?}; q is ENGLISH words. -> {total, offset, next, cards}: "
+     "one page of cards (id, uid, type, tags, description, versions ...), the best match first; total is how many match in all, next the offset of the next page "
+     "(null at the end): call again with offset: next to read on. Read the cards and pick.",
+     {"q": "string", "type": "string?", "rubric": "string?", "tags": "string?", "limit": "number?", "offset": "number?"}),
     ("library_add", "Add or update an asset in the Ferret asset library (REST POST api/item) with the person's own SW session: {path, uid?, description?, rubric?}; path is a project file, a .ferret package or a zip of package.ferret [+ tiers/<tier>.ferret] [+ preview.webp]; description ENGLISH only. -> {uid, version, status}; to update an asset send its uid back.",
      {"path": "string", "uid": "string?", "description": "string?", "rubric": "string?"}),
     ("viewer_restart", "Rebuild the project and restart the game in the viewer; waits until it runs or fails. -> {ok, level, errors}", {}),
