@@ -55,3 +55,15 @@ def note_tool_call(tab_id: str | None, tool_name: str) -> str | None:
 def has_unsaved_work(tab_id: str) -> bool:
     """True when the tab called a working tool since its last save_info."""
     return _unsaved.get(tab_id, False)
+
+
+def unsaved_state(tab_id: str) -> bool | None:
+    """Like has_unsaved_work, but None when this process has seen no tool call of the tab (it ran before a restart,
+    so whether its work is saved is unknown)."""
+    return _unsaved.get(tab_id)
+
+
+def forget(tab_id: str) -> None:
+    """The tab is closed: a new tab with its number starts with nothing unsaved."""
+    _unsaved.pop(tab_id, None)
+    _calls_since_save.pop(tab_id, None)

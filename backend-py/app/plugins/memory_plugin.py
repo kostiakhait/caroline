@@ -1241,7 +1241,10 @@ PLUGIN = Plugin(
             "ALONE (an id from your own topic list) for that track's current state -- usually instant, from local "
             "cache; or \"topic\" and \"material\" ids from an earlier reply to read one letter/document in full; "
             "or \"document\" (and \"section\") ids to read a kept document's outline or one part of it. Call this "
-            "before searching Notes or mail for something you may already know.",
+            "before searching Notes or mail for something you may already know. When you are asked what was "
+            "done on a matter (\"what did we do in the closed tab?\"), answer from the topic's summary AND all its "
+            "results: every one of them, the latest done first, nothing left out; what the results no longer say "
+            "is not the current state. If the newest work is not in the topic, say so rather than guess.",
             {
                 "query": str | None, "history": int | None, "topic": str | None, "material": str | None,
                 "document": str | None, "section": str | None, "offset": int | None, "save_file_to": str | None,
