@@ -14,8 +14,6 @@ from app.microagent_client import Microagent as M
 
 LIBRARY_NEED = "sw.library.need"
 
-MAX_QUERIES = 5
-
 _STRING = {"type": "string"}
 
 
@@ -25,16 +23,19 @@ def _object(properties: dict, required: Optional[List[str]] = None) -> dict:
 
 _PROMPT = (
     "A game builder assistant makes 3D games and scenes from things taken out of a shared asset library: models "
-    "(vehicles, buildings, trees, props, characters), surface materials and textures (asphalt, grass, sand, "
+    "(vehicles, buildings, trees and plants, props, characters and people), surface materials and textures (asphalt, grass, sand, "
     "metal, wood, stone), sky and environment lighting (HDRI), sounds and music, effects (smoke, fire, dust). "
-    "Below is a new message from the user, with the last lines of the conversation. List the THINGS the work "
-    "asked for (or implied by it, including the setting: a race needs a road surface, a sky, an engine sound) "
-    "that the library may hold and that are not already settled in the conversation. Give 1 to "
-    f"{MAX_QUERIES} short ENGLISH search queries (the library is English only), each naming ONE thing with its "
-    "kind in one to four plain words (for example \"asphalt road texture\", \"overcast sky hdri\", \"engine "
-    "loop sound\", \"race car model\"). Translate from the language of the message. If the message is not about "
-    "making or changing something in a game or scene (a question, thanks, a bug report about the tool "
-    "itself, talk about something else) it needs nothing: answer false with no queries.\n\n"
+    "Below is a new message from the user, with the last lines of the conversation. List the THINGS the work will be "
+    "made of, in this order: FIRST every thing the message itself names (always, each one), THEN what a scene like this "
+    "always has or what a builder adds on its own to make it look real: the ground and its surface, plants and trees, "
+    "the roadside or shore, fences and barriers, buildings, people and crowds, the sky, the sounds and the effects of what "
+    "moves. (For a harbour, say: ship, water, pier, crane, rope, seagull, harbour sound, fog.) Leave out what the "
+    "conversation shows is already in the scene. "
+    "Give one short ENGLISH search query for each of those things (the library is English only), each ONE thing in one or two plain "
+    "words, the thing itself and not adjectives about it (\"race car\", \"asphalt\", \"tree\", \"grass\", \"crowd\", "
+    "\"sky\", \"engine sound\", \"smoke\"). Translate from the language of the message. If the message is not about making "
+    "or changing something in a game or scene (a question, thanks, a bug report about the tool itself, a balance or code change "
+    "that adds no new thing, talk about something else) it needs nothing: answer false with no queries.\n\n"
     "CONVERSATION (latest last):\n{dialogue}\n\n"
     "NEW MESSAGE:\n{message}\n\n"
     'Reply with a JSON object: {{"needs_library": true|false, "why": "<one short sentence>", "queries": ["...", ...]}}'
@@ -52,10 +53,10 @@ def verify_library_need(input: Any, output: Any) -> Optional[str]:
     if not str(output.get("why") or "").strip():
         return '"why" must say in one sentence why'
     queries = output.get("queries")
-    if not isinstance(queries, list) or len(queries) > MAX_QUERIES:
-        return f'"queries" must be a list of at most {MAX_QUERIES} queries'
-    if not all(isinstance(q, str) and q.strip() and len(q) <= 80 for q in queries):
-        return "every query must be a short non-empty string"
+    if not isinstance(queries, list):
+        return '"queries" must be a list of queries'
+    if not all(isinstance(q, str) and q.strip() for q in queries):
+        return "every query must be a non-empty string"
     if output["needs_library"] and not queries:
         return 'when the library is needed, "queries" must say what to look for'
     return None
