@@ -474,6 +474,7 @@ class EngineLifecycleMixin:
             self._rung_advice_begin(item)    # runs alongside the memory advisor; _ladder_before_yield waits for it
             if item.get("memory_advice_for"):
                 await self._glue_memory_advice(item)
+                await self._glue_library_advice(item)
             self._glue_context_recovery(item)
             self._dr_begin(item)
             await self._ladder_before_yield(item)
@@ -507,6 +508,23 @@ class EngineLifecycleMixin:
                 item["message"]["message"]["content"].append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + block})
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "memory_advisor_glue_failed", tab_id=self.tab_id, error=str(exc)[:200])
+    async def _glue_library_advice(self, item: dict[str, Any]) -> None:
+        """The library advisor (app/library_advisor.py), constructor deployment only: candidate library cards for the
+        things the request needs, glued as one more text block. Never raises."""
+        try:
+            from app.library_advisor import enabled, library_block
+
+            if not enabled():
+                return
+            dialogue = await asyncio.to_thread(
+                _read_recent_dialogue_lines, self.last_saved_session_id, self.tab_id, self.workspace_dir, 6,
+            )
+            block = await library_block(item["memory_advice_for"], dialogue, self.tab_id)
+            log_event("engine", "library_advisor_glue", tab_id=self.tab_id, block_chars=len(block))
+            if block:
+                item["message"]["message"]["content"].append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + block})
+        except Exception as exc:  # noqa: BLE001
+            log_event("engine", "library_advisor_glue_failed", tab_id=self.tab_id, error=str(exc)[:200])
     # edition:end
     async def _run_loop(self) -> None:
         set_send(lambda message: self.send(message))
