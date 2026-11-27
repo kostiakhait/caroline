@@ -114,3 +114,12 @@ def test_a_download_from_the_web_is_not_held_back_by_the_library(env, monkeypatc
     monkeypatch.setattr("httpx.AsyncClient", NoNet)
     run(plugin._project_import_url({"url": "https://dl.polyhaven.org/file/asphalt_02_diff_4k.jpg", "to": "assets/"}, None))
     assert fetched == [1] and env["searches"] == []
+
+
+def test_the_advisor_asks_for_what_may_be_useful_not_only_what_is_named():
+    """2026-11-27 (the owner): not "search for mountains" but "these ready items may be useful": other names, stand-ins,
+    materials; the block says so and says the library may hold a thing under another name."""
+    prompt = sw_library_need.prompt_library_need({"message": "Ограничь мир горами", "dialogue": []}, None)
+    assert "MAY BE USEFUL" in prompt and "stand in" in prompt and "cliff" in prompt
+    block = library_advisor.format_block([("cliff", ([{"id": "u-1", "type": "fmdl", "description": "Cliff", "versions": ["1.0.0"]}], 1))])
+    assert "may be useful" in block and "under another name" in block and "u-1@1.0.0" in block
