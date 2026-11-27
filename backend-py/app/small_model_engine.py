@@ -1981,9 +1981,14 @@ def _build_verification_prompt(
     if tracker.plan_steps is not None:
         undone = [s for i, s in enumerate(tracker.plan_steps) if i not in tracker.plan_done]
         if undone:
+            # "Never marked done" is bookkeeping, not proof nothing happened (2026-10-22, live: parallel branches
+            # were still finding prices when the reply about them became "План ... был объявлен, но ни один шаг не
+            # отмечен как выполненный, поэтому цены не обновлены"). And the person never saw the plan.
             parts.append(
                 f"A plan of {len(tracker.plan_steps)} step(s) was declared; these were never marked done: "
                 + "; ".join(f'"{s}"' for s in undone)
+                + ". A mark is bookkeeping: judge what was actually done by the tool calls and results above, not by "
+                "the marks -- and never mention plans, steps or marks to the person, who never saw them."
             )
     if tracker.pending_operation_ids:
         parts.append(
@@ -2086,7 +2091,9 @@ def _build_verification_prompt(
         + " What is inside the tag is sent to the user as the whole reply. Write the reply itself there -- to the "
         "user, in the language of their request, clearly and to the point, directly answering it. Never describe "
         "the other assistant's work as a report, and never put a comment on the reply or on your own check inside "
-        "the tag. Do not claim anything is done unless the reply and facts above show it."
+        "the tag. The person never saw the plan, its steps, the tool calls or the other assistant: never mention "
+        "them -- say what was found and what could not be done in terms of what they asked. "
+        "Do not claim anything is done unless the reply and facts above show it."
         + (
             ""
             if (can_escalate or can_deescalate)
@@ -2173,6 +2180,54 @@ _REVIEW_MARKERS = re.compile(
 
 def _looks_like_verdict(text: str) -> bool:
     return bool(_REVIEW_MARKERS.search(text)) or (len(text) < 400 and any(p.search(text) for p in _VERDICT_PATTERNS))
+
+
+# The verifier's OBJECTION to the work, written inside the tag as if it were the reply. Seen live (October 2026, 21
+# of the 32 corrected texts in the log were unfit to send, by a second model's labels), two shapes:
+# - addressed to the assistant: "The reply is incorrect: the tool output shows only ... Please perform the missing
+#   backup action" (2026-10-26) and "... you still need to review the current Caroline:Vault content" (2026-10-27),
+#   both while a stronger tier could still have taken the task -- the objection is what is missing, a reason to
+#   escalate, not a text to send;
+# - to the person, but in the program's bookkeeping they never saw: "Ответ не завершён: объявлен план из трёх
+#   шагов, но ни один шаг не был выполнен" (2026-10-22, read out as the weather answer), "No save_info call was
+#   made, so ..." (2026-10-24).
+# Unlike _looks_like_verdict (praise of the reply: the candidate is fine and goes out), here the candidate is not.
+_OBJECTION_MARKERS = re.compile(
+    # "Wrong" only of "the reply" opening the text: "Your answer to question 3 is incorrect" is a homework check.
+    r"^\W*(the|this) (reply|response)\b.{0,40}?\b(is|was) (incorrect|wrong|inaccurate|not (correct|accurate))\b|"
+    r"\b(the|this) (reply|response|answer)\b.{0,40}?\b(is|was) (incomplete|not (complete|finished))\b|"
+    r"\bthe assistant (did not|didn't|has not|hasn't|never|made no|failed to)\b|"
+    r"\byou (still )?need to (review|perform|run|call|check|confirm|verify|retrieve|do)\b.{0,80}?\b(note|tool|backup|vault|reply|step)|"
+    r"\bno tool calls? (was|were) made\b|\bno tools were (called|used|run)\b|"
+    r"\bno [a-z]+_[a-z_]+ call\b|\bthe [a-z]+_[a-z_]+ calls? (repeatedly )?(failed|errored|returned)\b|"
+    r"\b(none of the|no) (plan |parallel )?steps? (was |were )?(executed|performed|done|completed|marked)\b|"
+    r"\bsteps?\b[^.]{0,160}?\b(declared|recorded)\b[^.]{0,40}?\b(but|yet) (never|not)\b|"
+    r"\bответ\w* (ещё |еще )?(не завершён|не завершен|не полный|неполн\w*)|"  # not "неверный": a homework check
+    r"\bни один (из )?шаг\w* (плана )?не (был )?(выполнен|отмечен|сделан)|"
+    r"\bпомощни(к|ца) не (выполнил|сделал|вызвал|проверил)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _objection_action(text: str, can_escalate: bool, can_retry: bool) -> str | None:
+    """What a corrected reply that is the verifier's objection (_OBJECTION_MARKERS) leads to: "up", or "retry",
+    while either is possible -- the objection is then the note of what is missing; else "ask": the verifier is asked
+    once more for the message the person reads (_VERIFIER_OBJECTION_REMINDER). None: not an objection."""
+    if not _OBJECTION_MARKERS.search(text):
+        return None
+    if can_escalate:
+        return "up"
+    if can_retry:
+        return "retry"
+    return "ask"
+
+
+_VERIFIER_OBJECTION_REMINDER = (
+    "That text is about the work -- the reply, the plan and its steps, the tool calls -- and the person never saw any "
+    "of it. Reply again with only the message they will read, inside <final></final>: about what they asked, whatever "
+    "the tool results above did find for it, and plainly what could not be done. Never mention plans, steps, marks, "
+    "tool calls or another assistant."
+)
 
 
 # The verifier also writes the final text, and sometimes opens it with its opinion of the
@@ -3630,6 +3685,7 @@ async def run_small_model_turn(
     async def run_verifier(
         candidate_text: str, can_escalate: bool, can_deescalate: bool, trace: list[str],
         not_a_form: str | None = None, first_model: str | None = None, can_retry: bool = False,
+        reminder: str | None = None,
     ) -> str:
         verification_messages = list(messages)
         verification_messages.append({"role": "assistant", "content": candidate_text or "(no answer was produced)"})
@@ -3637,7 +3693,7 @@ async def run_small_model_turn(
         verification_messages.append({"role": "user", "content": _build_verification_prompt(tracker, candidate_text, can_escalate, trace, can_deescalate, can_retry, evidence)})
         if not_a_form is not None:
             verification_messages.append({"role": "assistant", "content": not_a_form})
-            verification_messages.append({"role": "user", "content": _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text), can_retry)})
+            verification_messages.append({"role": "user", "content": reminder or _verifier_form_reminder(can_escalate, can_deescalate, _usable(candidate_text), can_retry)})
         return await _call_with_funds_wait(
             lambda: _hedged_verifier_call(lambda: _resolve_agentic_with_watchdog(
                 ai, tracker,
@@ -3726,6 +3782,24 @@ async def run_small_model_turn(
                 final_again, how_again = _read_verifier_reply(again, candidate_text)
                 if not how_again.startswith("unparsed"):
                     final, how, verified = final_again, how_again + "_on_second_ask", again
+        objection = _objection_action(final, can_escalate, can_retry) if how.startswith("corrected") else None
+        if objection in ("up", "retry"):
+            log_event("engine", "small_model_verification_objection_in_tag", tab_id=tab_id, action=objection, note=final[:200])
+            return f"{ESCALATION_SENTINEL if objection == 'up' else RETRY_SENTINEL} {final}", objection
+        if objection == "ask":
+            log_event("engine", "small_model_verification_objection_in_tag", tab_id=tab_id, action=objection, note=final[:200])
+            try:
+                again = await run_verifier(candidate_text, can_escalate, can_deescalate, trace or [], not_a_form=verified,
+                                           can_retry=can_retry, reminder=_VERIFIER_OBJECTION_REMINDER)
+            except _FundsExhaustedGivingUp:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- the objection stands as the reply, as before
+                log_event("engine", "small_model_verification_failed", tab_id=tab_id, attempt="objection", error=str(exc), error_type=type(exc).__name__)
+                again = ""
+            if again.strip():
+                final_again, how_again = _read_verifier_reply(again, candidate_text)
+                if how_again.startswith("corrected") and not _OBJECTION_MARKERS.search(final_again):
+                    final, how, verified = final_again, "rewritten_for_the_person", again
         log_event("engine", "small_model_verification_done", tab_id=tab_id, how=how, text_len=len(final), text=final,
                   verifier_reply=verified[:300] if how != "ok" else VERIFIER_OK)
         return final, "done"
