@@ -81,12 +81,13 @@ def format_block(found: list[tuple[str, tuple[list[dict], int] | None]]) -> str:
     """The text block for the searched queries; "" when no search could be made at all."""
     if all(res is None for _q, res in found):
         return ""
-    lines = [BLOCK_HEADER + ": the asset library was searched for the things this work will be made of, also those a scene like "
-             "this usually has around it. The cards are ranked, the best match first. Take from the library what fits (refer to it "
-             "as id@version, see the ferret-scene-from-library skill), and of the items that fit take the most detailed one (a real "
-             "model over a simple one, a full PBR set over a plain colour). Where more match than are shown, read on with "
-             "library_search {q, offset}. Go to a website or build a thing yourself only for what the library does not have: "
-             "search it again with other words first.]"]
+    lines = [BLOCK_HEADER + ": these ready-made items of the asset library may be useful for this work: what it names, what could "
+             "stand in for it or be built from, its materials, and what a scene like this usually has around it. The cards are ranked, "
+             "the best match first, and the library may hold a thing under another name than the one you would search for (a "
+             "mountain as cliffs, rocks and scree). Take from the library what fits (refer to it as id@version, see the "
+             "ferret-scene-from-library skill), and of the items that fit take the most detailed one (a real model over a simple one, "
+             "a full PBR set over a plain colour). Where more match than are shown, read on with library_search {q, offset}. Go to a "
+             "website or build a thing yourself only for what these and other searches with other words do not give.]"]
     seen: set[str] = set()
     for query, res in found:
         if res is None:
