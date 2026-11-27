@@ -287,6 +287,20 @@ class DialogueTranscriptMixin:
                         original_text=text, translated_text=translated,
                     )
                     block["text"] = translated
+            # The words that refer to the speaker are put in the persona's grammatical gender (2026-11-27, the owner's command,
+            # after a woman's reply said "я заменил"): see voice_api.fix_gender. Quoted runs (a draft) go out verbatim.
+            if not is_silent and not self.headless:
+                try:
+                    from app.own_identity_gate import split_quoted
+                    from app.plugins.voice_api import fix_gender
+
+                    gender = get_persona_gender(self.workspace_dir)
+                    gparts = [c if (q or not c.strip()) else await fix_gender(c, gender) for q, c in split_quoted(block["text"])]
+                    gendered = "".join(gparts)
+                    if gendered != block["text"]:
+                        block["text"] = gendered
+                except Exception as exc:
+                    log_event("engine", "gender_fix_error", tab_id=self.tab_id, error=str(exc))
             # Per explicit instruction (2026-10-11): re-evaluate the permission
             # guard on every outbound message -- see _check_permission_guard's
             # own docstring for why this runs here too, not just in submit().

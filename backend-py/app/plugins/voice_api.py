@@ -509,6 +509,55 @@ async def _review_invented(original: str, revised: str, time_left_s: float) -> b
     return bool(output["invented"])
 
 
+def only_endings_changed(original: str, fixed: str) -> bool:
+    """A gender fix may change word endings and nothing else: the words and the spaces stay in place, and every changed word
+    keeps its first letters (its stem)."""
+    a, b = original.split(), fixed.split()
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if x != y and (len(x) < 3 or len(y) < 3 or x[:max(2, min(len(x), len(y)) - 3)] != y[:max(2, min(len(x), len(y)) - 3)]):
+            return False
+    return True
+
+
+async def fix_gender(text: str, gender: str | None, timeout: float = 25.0) -> str:
+    """reply.gender on the local microagent ladder: the words of a final reply that refer to the speaker come back in the
+    persona's grammatical gender (the model that wrote it drifts: a woman wrote "я заменил"). Fail-open: an error, a timeout or an
+    answer that changes more than word endings keeps the text as it was (logged)."""
+    if gender not in ("female", "male") or not text.strip():
+        return text
+    from app.microagent_client import build_local_runtime, new_budget, run_timed
+    from app.microagents import reply_gender
+
+    runtime = build_local_runtime()
+    if runtime is None:
+        log_event("plugin:voice", "gender_fix_skipped", reason="no_runtime")
+        return text
+    for agent in reply_gender.llm_agents():
+        runtime.register(agent)
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(
+            run_timed, runtime, reply_gender.GENDER, {"text": text, "gender": gender},
+            runtime.new_context(budget=new_budget()), time.monotonic()), timeout)
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        log_event("plugin:voice", "gender_fix_failed", error=f"{type(exc).__name__}: {exc}"[:300], ms=int((time.monotonic() - started) * 1000))
+        return text
+    output = (result or {}).get("output") or {}
+    fixed = str(output.get("text") or "").strip()
+    if (result or {}).get("status") != "ok" or reply_gender.verify_gender({}, output) is not None:
+        log_event("plugin:voice", "gender_fix_failed", error=(result or {}).get("error"))
+        return text
+    if fixed == text.strip():
+        return text
+    if not only_endings_changed(text.strip(), fixed):
+        log_event("plugin:voice", "gender_fix_rejected", original=text[:300], fixed=fixed[:300])
+        return text
+    log_event("plugin:voice", "gender_fix_applied", original=text[:300], fixed=fixed[:300], ms=int((time.monotonic() - started) * 1000))
+    return text[:len(text) - len(text.lstrip())] + fixed + text[len(text.rstrip()):]
+
+
 async def check_permission_guard(
     task: str, recent_dialogue: str, previous_block_reason: str | None = None,
     session: str | None = None, timeout: float = 190.0, facts: dict[str, Any] | None = None,
