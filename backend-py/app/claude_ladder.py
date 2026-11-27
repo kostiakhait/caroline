@@ -17,6 +17,7 @@ settings pins that model and turns the ladder off."""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -143,14 +144,24 @@ def candidate_text(turn: LadderTurn, result_text: str | None) -> str:
     return ""
 
 
+# A question, or the yes/send word named in quotes, after the draft.
+_ASKS_FOR_A_WORD = re.compile(r"[?？]|[«\"“'](?:да|yes|ок|ok|отправляй|отправить|шли|send(?: it)?)[»\"”'.!,]", re.IGNORECASE)
+
+
 def awaits_user(candidate: str) -> bool:
     """A reply that shows a draft (a quoted block) and ends with a question to the user is a finished turn: it waits
     for the owner's word. Judging it as unfinished work threw such drafts away and handed the turn to a stronger model
     that then acted on a yes the owner had given before the draft existed (2026-11-20)."""
     text = (candidate or "").strip()
-    if not text or text[-1] not in "?？":
+    lines = text.splitlines()
+    quoted = [i for i, line in enumerate(lines) if line.lstrip().startswith(">")]
+    if not quoted:
         return False
-    return any(line.lstrip().startswith(">") for line in text.splitlines())
+    if text[-1] in "?？":
+        return True
+    # Or what follows the draft asks for the word itself (2026-11-27, live: 'Отправляю после вашего «да».' was judged
+    # unfinished and the turn was handed to a stronger model for another minute).
+    return bool(_ASKS_FOR_A_WORD.search("\n".join(lines[quoted[-1] + 1:])))
 
 
 def needs_verdict(turn: LadderTurn, candidate: str, is_error: bool) -> bool:

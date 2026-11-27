@@ -20,12 +20,25 @@ import re
 # succeed -- a transient, request-scoped false positive, not real session
 # corruption.
 CLASSIFIER_REFUSAL_PATTERN = re.compile(r"can't help with this\.\s*Start a new session to continue", re.IGNORECASE)
-_CLASSIFIER_REFUSAL_CATEGORY_RE = re.compile(r"Details:\s*\[([^\]]+)\]", re.IGNORECASE)
+_CLASSIFIER_REFUSAL_CATEGORY_RE = re.compile(r"Details:\s*`?\[([^\]]+)\]", re.IGNORECASE)
+# The CLI's current wording (2026-11-27, live): "API Error: Haiku 5.5's safeguards flagged this message. ..."
+_SAFEGUARDS_REFUSAL_PATTERN = re.compile(r"^\s*API Error:.*safeguards flagged", re.IGNORECASE | re.DOTALL)
 
 
 def extract_classifier_refusal_category(text: str) -> str | None:
     m = _CLASSIFIER_REFUSAL_CATEGORY_RE.search(text)
     return m.group(1) if m else None
+
+
+def is_classifier_refusal(text: str, model: str | None, stop_reason: str | None) -> bool:
+    """True for the engine's own report that a safety classifier stopped the request: the synthetic message with
+    stop_reason "refusal", or one of its two known wordings. A real model's reply that merely quotes such a text
+    (a transcript being read, say) is not one."""
+    if model == "<synthetic>" and stop_reason == "refusal":
+        return True
+    if CLASSIFIER_REFUSAL_PATTERN.search(text or ""):
+        return True
+    return model in (None, "<synthetic>") and bool(_SAFEGUARDS_REFUSAL_PATTERN.search(text or ""))
 
 
 # --- billing / balance exhaustion ------------------------------------------

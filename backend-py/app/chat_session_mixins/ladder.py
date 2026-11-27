@@ -19,6 +19,8 @@ class LadderMixin:
     _ladder_model: str | None = None     # the model the live client is set to (None: the CLI's own default)
     _ladder_last_result_at: float | None = None   # monotonic time of the last turn result: the cache's last use
     _ladder_raised_calls: int = 0         # calls made on raised rungs since the session last stood on the bottom one
+    _refusal_pending: str | None = None  # a safety filter stopped this turn (its category): move up at the result
+    _refusal_floor: int = 0               # rungs below this were refused on this context: not started on again
     _codex_effort: str | None = None     # the effort the live Codex thread was last given (None: Codex's own)
     _codex_turn: dict[str, Any] | None = None     # a real user's Codex turn waiting for its result (rung history)
     _reaction_task: "asyncio.Future[Any] | None" = None     # turn.reaction.score of the latest real message (submit())
@@ -28,6 +30,8 @@ class LadderMixin:
         self._ladder_model = None
         self._ladder_last_result_at = None
         self._ladder_raised_calls = 0
+        self._refusal_pending = None
+        self._refusal_floor = 0
         self._codex_effort = None
         self._codex_turn = None
 
@@ -98,6 +102,50 @@ class LadderMixin:
             self._ladder_raised_calls = 0
         return True
 
+    def _refused_rung(self) -> int:
+        """The rung of the model that was just refused: the turn's own, else the one the client stands on, else the
+        pinned one. An unknown model counts as the one below the top, so there is exactly one more to try."""
+        turn = self._ladder
+        if turn is not None and turn.active:
+            return turn.rung
+        name = str(self._ladder_model or get_model_override(self.workspace_dir, "claude") or "").lower()
+        return next((i for i, rung in enumerate(claude_ladder.RUNGS) if rung in name), len(claude_ladder.RUNGS) - 2)
+
+    def _refusal_can_move_up(self) -> bool:
+        return getattr(self, "engine_kind", "") == "claude" and self._refused_rung() < len(claude_ladder.RUNGS) - 1
+
+    async def _refusal_on_result(self) -> bool:
+        """The result of a turn a safety filter stopped. True: the next model up has been given the turn (nothing of the
+        refused attempt is shown). A model pinned in Settings comes back with the next message (_ladder_before_yield)."""
+        category, self._refusal_pending = self._refusal_pending, None
+        if category is None:
+            return False
+        refused = self._refused_rung()
+        turn = self._ladder if self._ladder is not None and self._ladder.active else None
+        higher = claude_ladder.RUNGS[refused + 1]
+        if not await self._ladder_set_model(higher):
+            await self._send_refusal_explanation()  # no model to hand it to: never leave the user without a word
+            return False
+        self._refusal_floor = max(self._refusal_floor, refused + 1)
+        if turn is None:
+            turn = claude_ladder.LadderTurn(user_text=self._narration_task(), rung=refused)
+            self._ladder = turn
+        turn.next_rung(f"stopped by a safety filter ({category or 'no category'})")
+        log_event("engine", "classifier_refusal_moved_up", tab_id=self.tab_id, to=higher, category=category or None)
+        self._queue_note_for_next_rung(
+            "[Internal: the previous model's answer to the latest message was stopped by an automatic safety filter before "
+            "the user saw it. Answer the user's latest message now. Do not mention this note or the filter.]"
+        )
+        return True
+
+    async def _send_refusal_explanation(self) -> None:
+        wire = await self._translate_wire_visible_text({
+            "type": "assistant", "parent_tool_use_id": None,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": SAFETY_FILTER_EXPLANATION}]},
+        })
+        if wire is not None:
+            await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
+
     async def _ladder_before_yield(self, item: dict[str, Any]) -> None:
         """Called by _input_stream for each queued message just before the SDK gets it."""
         try:
@@ -124,7 +172,7 @@ class LadderMixin:
             text = claude_ladder.user_text_of(item["message"]) or item.get("memory_advice_for") or ""
             rung, why = await self._rung_advice_result(item)
             real_user = bool(item.get("memory_advice_for"))
-            rung = rung or 0
+            rung = max(rung or 0, self._refusal_floor)
             current = claude_ladder.rung_index(self._ladder_model)
             if current is not None and rung < current:
                 last = self._ladder_last_result_at
@@ -232,7 +280,10 @@ class LadderMixin:
             return ""
 
     def _ladder_queue_continuation(self, turn: claude_ladder.LadderTurn, note: str) -> None:
-        text = _SYNTHETIC_TURN_MARKER + claude_ladder.continuation_note(turn, note)
+        self._queue_note_for_next_rung(claude_ladder.continuation_note(turn, note))
+
+    def _queue_note_for_next_rung(self, note: str) -> None:
+        text = _SYNTHETIC_TURN_MARKER + note
         self.queue.insert(0, {
             "message": {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]},
                         "parent_tool_use_id": None},

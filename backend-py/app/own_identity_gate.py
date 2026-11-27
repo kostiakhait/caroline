@@ -26,6 +26,7 @@ _TAGS = re.compile(r"<[^>]+>")
 _MD = re.compile(r"[*_`#]+")
 _QUOTE_MARK = re.compile(r"(?m)^\s*>+ ?")
 _SPACE = re.compile(r"\s+")
+SAME_TEXT_WINDOW_MS = 24 * 3600 * 1000
 
 
 def normalize(text: str) -> str:
@@ -76,6 +77,38 @@ def shown_entry(entries: list[dict[str, Any]], body: str) -> Optional[dict[str, 
 def messages_after(entries: list[dict[str, Any]], shown_ms: int) -> list[str]:
     """What the user typed after the draft was on the screen, oldest first."""
     return [e["text"] for e in entries if e.get("role") == dialogue_log.USER and int(e.get("ms") or 0) > shown_ms]
+
+
+def _has_quote(text: str) -> bool:
+    return any(quoted and chunk.strip() for quoted, chunk in split_quoted(text))
+
+
+def approval_window(entries: list[dict[str, Any]], body: str, sent_ms: int = 0) -> tuple[Optional[dict[str, Any]], list[str]]:
+    """(the latest showing of the body, the user's messages that may answer it).
+
+    A repeat of the SAME text does not take back a yes given to it (2026-11-27, live: the draft was shown, the owner said
+    "Да", the same draft was shown again, and the gate counted only what came after the repeat -- twice in a row). So the
+    answers count from the earliest showing of this body in the last 24 hours that no OTHER quoted draft came after, and
+    never from before the last time this body was actually sent (`sent_ms`): one yes is one send."""
+    shown = shown_entry(entries, body)
+    if shown is None:
+        return None, []
+    wanted = normalize(body)
+    latest = int(shown.get("ms") or 0)
+    first = latest
+    position = next(i for i, e in enumerate(entries) if e is shown)
+    for entry in reversed(entries[:position]):
+        if entry.get("role") != dialogue_log.ASSISTANT or entry.get("kind") not in (dialogue_log.SHOWN, dialogue_log.REPORT):
+            continue
+        ms = int(entry.get("ms") or 0)
+        if ms <= sent_ms or latest - ms > SAME_TEXT_WINDOW_MS:
+            break
+        text = entry.get("text") or ""
+        if wanted in normalize(text):
+            first = ms
+        elif _has_quote(text):
+            break  # another draft stood on the screen: what was said then answered that one
+    return shown, messages_after(entries, max(first, sent_ms))
 
 
 def missing_reason(body: str, shown: Optional[dict[str, Any]], answers: list[str], approved: bool) -> Optional[str]:

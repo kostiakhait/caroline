@@ -52,7 +52,7 @@ from app.plugins import email_credentials
 from app.plugins.contacts_plugin import upsert_contacts_from_emails
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.sw_api import SessionManager, call_v2
-from app.policies import follow_explicit_parameters_instruction, notes_folder_fallback_instruction, read_content_not_headers_instruction
+from app.policies import follow_explicit_parameters_instruction, fresh_mail_check_instruction, notes_folder_fallback_instruction, read_content_not_headers_instruction
 
 _sessions = SessionManager()
 
@@ -148,7 +148,7 @@ async def email_list_messages(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     return {"text": json.dumps(messages, indent=2, ensure_ascii=False)}
 
 
-async def email_latest_uid(address: str, password: str, imap_host: str, folder: str = "INBOX") -> int | None:
+async def email_latest_uid(address: str, password: str, imap_host: str, folder: str = "INBOX", query: str | None = None) -> int | None:
     """Per explicit instruction (2026-10-12): the reply-expected auto-
     checker's own email probe (chat_session.py's _reply_watch_tick) needs
     to know whether NEW mail has landed in a mailbox since a message was
@@ -163,7 +163,7 @@ async def email_latest_uid(address: str, password: str, imap_host: str, folder: 
     async def do(session: str) -> Any:
         result = await call_v2(
             "email:listMessages", session=session, folder=folder, limit=1,
-            address=address, password=password, imapServer=imap_host,
+            address=address, password=password, imapServer=imap_host, **({"query": query} if query else {}),
         )
         messages = result.get("messages") or []
         return int(messages[0]["uid"]) if messages else None
@@ -537,6 +537,7 @@ def _usage_instructions() -> str:
         _credentials_convention_instruction(),
         notes_folder_fallback_instruction(),
         read_content_not_headers_instruction(),
+        fresh_mail_check_instruction(),
         _check_sent_mail_too_instruction(),
         _mark_discussed_emails_read_instruction(),
         follow_explicit_parameters_instruction(),

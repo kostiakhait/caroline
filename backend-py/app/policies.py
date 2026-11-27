@@ -488,6 +488,15 @@ def reuse_known_methods_instruction() -> str:
     )
 
 
+def fresh_mail_check_instruction() -> str:
+    """2026-11-27, live: "there is no answer from her yet", said without opening the mailbox, 14 minutes after the answer
+    had arrived."""
+    return (
+        "Never say that no reply or no new mail has arrived unless you listed that mailbox in THIS turn and saw it. When "
+        "the question is whether someone answered, look first, then speak."
+    )
+
+
 def no_internal_mechanics_to_user_instruction() -> str:
     """Per explicit instruction (2026-09-10): confirmed live -- Caroline
     kept narrating her own plumbing to the user ("let me look at what
@@ -512,6 +521,7 @@ def no_internal_mechanics_to_user_instruction() -> str:
         "service files (logs, memory, archives, dumps, session/tab state, settings, your skills/lessons files), "
         "no session/turn/context internals, no mention of dehydration, compaction, archives, dumps, resets, "
         "restarts, retries, internal hangs/watchdog recoveries, or any other internal operation, stub notes, "
+        "your own tool calls going wrong (a parameter's name, a rejected call, trying again), "
         "continuity files, your tools' names, or 'standing instructions/lessons' you're following. "
         "The user's files are NOT machinery: any file the user gave you, asked for, or that you made or changed "
         "as the result of their task -- wherever it lies, your workspace folder included -- is named freely, "

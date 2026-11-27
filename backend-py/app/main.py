@@ -338,6 +338,14 @@ _language_refreshed_for_tab: set[str] = set()
 
 REMINDER_DIALOGUE_WINDOW_MINUTES = 24 * 60
 
+# 2026-11-27, live: the turn of a reminder about a shop discount read the dialogue, took up the owner's unfinished letter
+# and tried to send it.
+REMINDER_SCOPE_RULE = (
+    "This turn is about THIS reminder and nothing else. Anything else you see (the owner's dialogue, open requests, "
+    "drafts, unanswered questions, errors) is context only and belongs to their own chat: do not continue it, retry it, "
+    "answer it, report on it or send anything for it. Send nothing to anyone unless this reminder itself asks for it."
+)
+
 
 def _owner_dialogue_for_reminder(real_tab_id: str) -> str:
     """The owner's dialogue in the tab that scheduled the reminder, last 24 hours, as the window showed it.
@@ -442,7 +450,7 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
             "Nobody prompted you for this -- it's a self-scheduled follow-up, acting on your own initiative. Act "
             "on it now. Don't narrate what you're doing while you work (no step-by-step \"now checking X\" "
             "commentary) -- when you're actually done, tell the user the outcome/result directly, in one clear "
-            "message."
+            "message. " + REMINDER_SCOPE_RULE
         )
     # Nobody's message is behind this turn: for the memory service's money
     # rules it is a turn of its own (memory_turns.py).

@@ -1,5 +1,6 @@
 """The final-text gate (app/own_identity_gate.py) and the ladder's draft rule. Run: python -m pytest test_own_identity_gate.py -q"""
 
+from app import action_ledger
 from app import claude_ladder as cl
 from app import own_identity_gate as g
 
@@ -41,6 +42,58 @@ def test_never_shown_is_blocked_and_shown_plus_yes_goes():
     shown = g.shown_entry(log, BODY)
     assert g.missing_reason(BODY, shown, g.messages_after(log, shown["ms"]), True) is None
     assert "not a yes" in g.missing_reason(BODY, shown, ["убери абзац"], False)
+
+
+def _may_send(log, sent_ms=0):
+    shown, answers = g.approval_window(log, BODY, sent_ms)
+    return g.missing_reason(BODY, shown, answers, "да" in [a.lower() for a in answers]) is None
+
+
+def test_a_repeat_of_the_same_draft_keeps_the_yes_given_to_it():
+    # 2026-11-27: shown, "Да", the same draft shown again -- and the gate blocked the send twice.
+    log = [entry("assistant", SHOWN_TEXT, 10), entry("user", "Да", 20), entry("assistant", SHOWN_TEXT, 30)]
+    assert g.approval_window(log, BODY)[1] == ["Да"]
+    assert _may_send(log)
+    log += [entry("user", "Да", 40), entry("assistant", SHOWN_TEXT, 50)]
+    assert _may_send(log)
+
+
+def test_a_yes_to_another_draft_in_between_does_not_count():
+    other = "Вот другое письмо:\n\n> Hello Boris, see you on Friday.\n\nОтправить?"
+    log = [entry("assistant", SHOWN_TEXT, 10), entry("assistant", other, 20), entry("user", "Да", 30),
+           entry("assistant", SHOWN_TEXT, 40)]
+    assert g.approval_window(log, BODY)[1] == []
+
+
+def test_a_plain_note_between_the_showings_changes_nothing():
+    log = [entry("assistant", SHOWN_TEXT, 10), entry("user", "Да", 20), entry("assistant", "Готовлю отправку.", 25),
+           entry("assistant", SHOWN_TEXT, 30)]
+    assert _may_send(log)
+
+
+def test_one_yes_is_one_send():
+    log = [entry("assistant", SHOWN_TEXT, 10), entry("user", "Да", 20), entry("assistant", SHOWN_TEXT, 40)]
+    assert g.approval_window(log, BODY, sent_ms=30)[1] == []
+    assert not _may_send(log, sent_ms=30)
+
+
+def test_a_showing_older_than_a_day_does_not_count():
+    day = g.SAME_TEXT_WINDOW_MS
+    log = [entry("assistant", SHOWN_TEXT, 10), entry("user", "Да", 20), entry("assistant", SHOWN_TEXT, day + 100)]
+    assert g.approval_window(log, BODY)[1] == []
+
+
+def test_the_ledger_tells_when_the_text_last_went_out(tmp_path):
+    assert action_ledger.last_sent_ms(str(tmp_path), BODY, g.normalize) == 0
+    action_ledger.append(str(tmp_path), "1", "email_send", {"to": "a@x.org", "subject": "s", "text": BODY})
+    assert action_ledger.last_sent_ms(str(tmp_path), BODY, g.normalize) > 0
+    assert action_ledger.last_sent_ms(str(tmp_path), "Something else", g.normalize) == 0
+
+
+def test_a_draft_followed_by_a_request_for_the_word_waits_for_the_owner():
+    assert cl.awaits_user("Текст:\n\n> Hello Anita\n\nОтправляю после вашего «да».")
+    assert cl.awaits_user("> Hello\n\nОтправить? Жду ответа.")
+    assert not cl.awaits_user("> Hello\n\nПисьмо отправлено.")
 
 
 def test_html_body_and_body_keys():

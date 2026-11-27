@@ -13,6 +13,7 @@ class Tab(WatchdogMixin):
         self.tab_id, self.workspace_dir, self.ended = "t", "ws", False
         self._post_turn_checks_halted = False
         self._awaiting_post_turn_check_reply = False
+        self._held_user_messages, self.last_real_user_question = [], "task"
         self.injected = []
 
     def inject_proactive(self, text, *a, **k):
@@ -34,6 +35,14 @@ def verdict(monkeypatch, answer):
 
 def run(tab):
     asyncio.run(tab._post_turn_microagent_verdict("NUDGE", "task", "reply", ["- Bash -> ok"]))
+
+
+def test_a_verdict_overtaken_by_a_new_message_is_dropped(monkeypatch):
+    tab = Tab()
+    verdict(monkeypatch, ("up", "not done"))
+    tab.last_real_user_question = "a newer request"
+    run(tab)
+    assert tab.injected == []
 
 
 def test_finished_work_sends_nothing_to_the_model(monkeypatch):

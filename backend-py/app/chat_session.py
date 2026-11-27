@@ -119,12 +119,6 @@ class ChatSession(
         self._memory_flushed_for_compaction = False
         self._stop_note_in_next_push = False
         self._memory_replay_timer: asyncio.TimerHandle | None = None
-        # See _arm_reply_watch/_reply_watch_tick: the one outstanding
-        # reply-expected watch for this tab (email only), and its flat
-        # re-arming timer. A later qualifying send replaces whatever watch
-        # was already running, same as _memory_replay_timer.
-        self._reply_watch: dict[str, Any] | None = None
-        self._reply_watch_timer: asyncio.TimerHandle | None = None
         memory_turns.set_upstream_no_funds_handler(tab_id, self._on_memory_upstream_no_funds)
 
         # edition:cut claude-openai engine
@@ -151,7 +145,6 @@ class ChatSession(
         # what it was asked, and the task answering it.
         self._fast_lane_ahead: tuple[tuple[Any, ...], asyncio.Task[Any]] | None = None
         self.turn_is_voice = False
-        self.classifier_refusal_retry_count = 0
         # Backing field for the turn_pending property (defined below,
         # outside __init__) -- set directly here, not via self.turn_pending
         # = False, so construction doesn't trigger a premature status

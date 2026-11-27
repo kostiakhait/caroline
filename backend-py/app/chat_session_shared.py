@@ -131,6 +131,7 @@ from app.failure_classification import (
     TOOL_CONCURRENCY_ERROR_PATTERN,
     detect_balance_exhaustion,
     extract_classifier_refusal_category,
+    is_classifier_refusal,
 )
 from app.logging_setup import log_event
 from app.login_api import is_logged_in
@@ -302,8 +303,20 @@ SILENT_USER_WAIT_NUDGE_MS = 90_000
 # actual cosmetic-comment mechanism this drives.
 PROGRESS_NARRATION_INTERVAL_MS = 60_000
 
+# How long a user's message waits for the memory advisor before it goes to the model without its block, which then follows
+# (2026-11-27, live: a turn stood still for the advisor's whole 25 seconds).
+MEMORY_ADVICE_HOLD_S = 8.0
+
+# What the user gets when a safety filter stopped the turn and no other model is left to take it (English like every
+# text in the code: it goes out through _translate_wire_visible_text).
+SAFETY_FILTER_EXPLANATION = (
+    "I couldn't answer the previous message: the AI provider's safety filter stopped every model I could try, most "
+    "likely a false positive unrelated to what we were discussing. Please rephrase the message or try again a little later."
+)
+
 # How submit() opens the interim-notes prefix -- _narration_task strips it back off.
 _INTERIM_NOTES_HEADER = "[Interim messages you already showed the user "
+_INTERIM_NOTES_BLOCK_PATTERN = re.compile(re.escape(_INTERIM_NOTES_HEADER) + r".*?\]\n\n", re.DOTALL)
 
 # Bug fix (2026-09-14): see consecutive_narration_count's own __init__
 # comment for the incident this caps -- a turn genuinely stuck for many
@@ -1058,7 +1071,7 @@ def _last_language_path(tab_id: str) -> Path:
 # _save_persisted_language refreshes it.
 _LANGUAGE_TTL_S = 15.0
 _language_cache: dict[str, tuple[float, str | None]] = {}
-_language_guess_cache: dict[str, tuple[float, str]] = {}
+_language_guess_cache: dict[str, tuple[tuple[str, int], str]] = {}
 
 
 def _load_persisted_language(tab_id: str) -> str | None:
@@ -1204,6 +1217,8 @@ def _usable_dialogue_lines(entries: list[dict[str, Any]], min_ts_ms: float | Non
         # never something to lose, just not something to re-inline into a
         # LATER window's own read of this same turn.
         clean_text = _INLINE_HOUR_CONTEXT_BLOCK_PATTERN.sub("", _HISTORY_STAMP_PATTERN.sub("", raw_text)).strip()
+        # The remarks submit() puts before a message are Caroline's own words, not the user's.
+        clean_text = _INTERIM_NOTES_BLOCK_PATTERN.sub("", clean_text).strip()
         if not clean_text or _is_synthetic_history_text(raw_text):
             continue
         if clean_text.startswith("[") and clean_text.endswith("]") and "\n" not in clean_text:
@@ -1392,6 +1407,34 @@ def _write_system_prompt_file(workspace_dir: str, tab_id: str, text: str) -> str
     return str(path)
 
 
+def context_tokens_of(usage: Any) -> int:
+    """The tokens in context according to ONE model call's usage (0: it does not say, e.g. a synthetic message)."""
+    if not isinstance(usage, dict):
+        return 0
+    return sum(
+        v for k, v in usage.items()
+        if k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens") and isinstance(v, int)
+    )
+
+
+def _shown_dialogue_lines(tab_id: str, workspace_dir: str, cutoff_ms: float) -> list[str]:
+    """The recent dialogue from the exact record (app/dialogue_log.py): what the user typed and what reached the window.
+    The engine's transcript also holds replies that were held back or rewritten and Caroline's own service notes inside
+    the user's messages; read back after a compaction they passed for things the user saw or said (2026-11-27). [] for a
+    session that keeps no record (a headless one): the transcript is read then."""
+    try:
+        from app import dialogue_log
+
+        entries = dialogue_log.read_entries(workspace_dir, tab_id)
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "recent_24h_dialogue_log_failed", tab_id=tab_id, error=str(exc)[:200])
+        return []
+    return [
+        f"{'User' if e.get('role') == dialogue_log.USER else 'Caroline'}: {e['text']}"
+        for e in entries if e.get("ms", 0) >= cutoff_ms and e.get("kind") != dialogue_log.WITHHELD
+    ]
+
+
 def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspace_dir: str) -> str:
     """Per explicit instruction (2026-09-14): see recent_dialogue_history_
     instruction's own docstring (policies.py) for the full feature this
@@ -1418,7 +1461,7 @@ def _write_recent_24h_dialogue_file(session_id: str | None, tab_id: str, workspa
     model can never read a half-written one while a refresh is in flight."""
     out_path = _recent_24h_dialogue_path(workspace_dir, tab_id)
     cutoff_ms = (time.time() - RECENT_HISTORY_FILE_WINDOW_HOURS * 3600) * 1000
-    lines = _gather_recent_usable_lines(session_id, tab_id, workspace_dir, cutoff_ms)
+    lines = _shown_dialogue_lines(tab_id, workspace_dir, cutoff_ms) or _gather_recent_usable_lines(session_id, tab_id, workspace_dir, cutoff_ms)
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         body = "\n".join(lines) if lines else "(No real messages between you and this user in the last 24 hours.)"
@@ -1550,13 +1593,26 @@ def current_language_name(tab_id: str) -> str:
     persisted = _load_persisted_language(tab_id)
     if persisted:
         return persisted
+    # A guess holds while the dialogue record stands unchanged: kept by time, the "English" guessed before a new tab's
+    # first message outlived that message and its reply was translated into English.
+    stamp = _dialogue_stamp(tab_id)
     hit = _language_guess_cache.get(tab_id)
-    now = time.monotonic()
-    if hit is not None and now - hit[0] < _LANGUAGE_TTL_S:
+    if hit is not None and hit[0] == stamp:
         return hit[1]
     guess = _language_from_recent_user_messages(tab_id) or "English"
-    _language_guess_cache[tab_id] = (now, guess)
+    _language_guess_cache[tab_id] = (stamp, guess)
     return guess
+
+
+def _dialogue_stamp(tab_id: str) -> tuple[str, int]:
+    """Which dialogue record and how long it is (-1: none yet) -- one stat, no read."""
+    try:
+        from app import dialogue_log
+
+        path = dialogue_log.log_path(WORKSPACE_DIR, tab_id)
+        return str(path), path.stat().st_size
+    except OSError:
+        return "", -1
 
 
 def _language_from_recent_user_messages(tab_id: str) -> str | None:
@@ -1856,6 +1912,7 @@ __all__ = [
     'TOOL_CONCURRENCY_ERROR_PATTERN',
     'detect_balance_exhaustion',
     'extract_classifier_refusal_category',
+    'is_classifier_refusal',
     'log_event',
     'is_logged_in',
     'build_mcp_servers',
@@ -1935,6 +1992,9 @@ __all__ = [
     'SILENT_USER_WAIT_NUDGE_MS',
     'PROGRESS_NARRATION_INTERVAL_MS',
     '_INTERIM_NOTES_HEADER',
+    'SAFETY_FILTER_EXPLANATION',
+    'context_tokens_of',
+    'MEMORY_ADVICE_HOLD_S',
     'MAX_CONSECUTIVE_NARRATION_COMMENTS',
     'NARRATION_GENERATION_RETRY_ATTEMPTS',
     'NARRATION_NETWORK_TIMEOUT_S',

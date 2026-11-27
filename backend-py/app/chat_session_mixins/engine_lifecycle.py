@@ -501,13 +501,37 @@ class EngineLifecycleMixin:
                 _read_recent_dialogue_lines, self.last_saved_session_id, self.tab_id, self.workspace_dir, 6,
             )
             dialogue_ms = round((time.monotonic() - started) * 1000)
-            block = await memory_block(item["memory_advice_for"], dialogue, self.tab_id)
+            question = self.last_real_user_question
+            lookup = asyncio.ensure_future(memory_block(item["memory_advice_for"], dialogue, self.tab_id))
+            done, _ = await asyncio.wait({lookup}, timeout=MEMORY_ADVICE_HOLD_S)
+            if not done:
+                # The message goes on now; what the look-up finds follows into the same turn, if it is still running.
+                log_event("engine", "memory_advisor_late", tab_id=self.tab_id, dialogue_read_ms=dialogue_ms)
+                lookup.add_done_callback(lambda task: self._deliver_late_memory(task, question))
+                return
+            block = lookup.result()
             log_event("engine", "memory_advisor_glue_timing", tab_id=self.tab_id, dialogue_read_ms=dialogue_ms,
                       total_ms=round((time.monotonic() - started) * 1000), block_chars=len(block))
             if block:
                 item["message"]["message"]["content"].append({"type": "text", "text": _SYNTHETIC_TURN_MARKER + block})
         except Exception as exc:  # noqa: BLE001
             log_event("engine", "memory_advisor_glue_failed", tab_id=self.tab_id, error=str(exc)[:200])
+
+    def _deliver_late_memory(self, task: Any, question: str | None) -> None:
+        """A memory look-up that outlived the hold: handed to the turn still working on that very message. A turn that
+        has ended is not reopened for it (each reopening re-reads the whole context and tends to repeat the reply)."""
+        if task.cancelled() or task.exception() is not None:
+            return
+        block = task.result()
+        if not block or self.ended or not self.turn_pending or self.last_real_user_question != question:
+            log_event("engine", "memory_advisor_late_dropped", tab_id=self.tab_id, block_chars=len(block or ""))
+            return
+        self.inject_proactive(
+            "[The memory look-up for the user's latest message finished after you got it. Use it in the reply you are "
+            "working on; never answer it separately. If that reply has already gone out and this changes nothing in it, "
+            "answer with exactly [[NO_UPDATE]].]\n" + block
+        )
+
     async def _glue_library_advice(self, item: dict[str, Any]) -> None:
         """The library advisor (app/library_advisor.py), constructor deployment only: candidate library cards for the
         things the request needs, glued as one more text block. Never raises."""
@@ -537,6 +561,7 @@ class EngineLifecycleMixin:
         register_action_closer(self.tab_id, self._on_action_send_completed)
         register_send_for_tab(self.tab_id, self.send)
         register_reply_watch(self.tab_id, self._on_outbound_message_sent)
+        self._restore_reply_watches()
         register_recent_real_user_directives(self.tab_id, self.recent_real_user_directives_text)
         # edition:cut claude cli pid
         set_cli_pid_sink(self._on_cli_process_spawned)
@@ -905,37 +930,22 @@ class EngineLifecycleMixin:
                     await self._track_background_tasks(message)
 
                     # --- classifier refusal ---
-                    if isinstance(message, AssistantMessage):
+                    # The raw API text never reaches the chat. With a stronger model left, the turn is handed to it when
+                    # its result arrives (ladder._refusal_on_result); on the strongest, the user gets a plain sentence.
+                    if isinstance(message, AssistantMessage) and not message.parent_tool_use_id:
                         refusal_text = next(
-                            (b.text for b in message.content if isinstance(b, TextBlock) and CLASSIFIER_REFUSAL_PATTERN.search(b.text)),
+                            (b.text for b in message.content if isinstance(b, TextBlock)
+                             and is_classifier_refusal(b.text, message.model, message.stop_reason)),
                             None,
                         )
-                        if refusal_text:
-                            category = extract_classifier_refusal_category(refusal_text)
-                            if self.classifier_refusal_retry_count == 0:
-                                self.classifier_refusal_retry_count += 1
-                                log_event("engine", "classifier_refusal_retry", tab_id=self.tab_id, category=category)
-                                self._push_message(
-                                    "[System note: your previous reply was blocked by an Anthropic API "
-                                    "content-classifier false positive (unrelated to the actual conversation) and "
-                                    "never reached the user. Please just try answering their last message again.]",
-                                    [], False,
-                                )
+                        if refusal_text or (message.model == "<synthetic>" and message.stop_reason == "refusal"):
+                            category = extract_classifier_refusal_category(refusal_text or "")
+                            if self._refusal_can_move_up():
+                                self._refusal_pending = category or ""
+                                log_event("engine", "classifier_refusal_will_retry_higher", tab_id=self.tab_id, category=category)
                                 continue
-                            log_event("engine", "classifier_refusal_recurred", tab_id=self.tab_id, category=category)
-                            # English like every text in the code: this becomes an
-                            # assistant message, which _translate_wire_visible_text
-                            # puts into the conversation's language before sending.
-                            explanation = (
-                                "I couldn't answer the previous message: Anthropic's internal safety filter was "
-                                "triggered" + (f" (category \"{category}\")" if category else "") +
-                                ", most likely a false positive unrelated to what we were discussing. The retry "
-                                "failed too. Please rephrase the message or try again a little later."
-                            )
-                            for block in message.content:
-                                if isinstance(block, TextBlock):
-                                    block.text = explanation
-                            self.classifier_refusal_retry_count = 0
+                            log_event("engine", "classifier_refusal_on_top_model", tab_id=self.tab_id, category=category)
+                            message.content = [TextBlock(text=SAFETY_FILTER_EXPLANATION)]
 
                     # --- billing_error (structured field) ---
                     if isinstance(message, AssistantMessage) and message.error == "billing_error":
@@ -1064,6 +1074,15 @@ class EngineLifecycleMixin:
                             self._handle_rate_limit_rejected("in-stream", info_dict)
                         continue
 
+                    # --- how much is in context right now (the growth and size triggers of compaction) ---
+                    # One call's own usage: what it read and wrote is the context. The turn result's usage is the SUM over
+                    # every call of the turn -- a turn of five calls on 70 thousand tokens read as 350 thousand and the
+                    # tab was compacted again and again (2026-11-27, live: four times in half an hour).
+                    if isinstance(message, AssistantMessage) and not message.parent_tool_use_id and not self.forced_compaction_result_pending:
+                        context_tokens = context_tokens_of(message.usage)
+                        if context_tokens:
+                            self.last_known_context_tokens = context_tokens
+
                     # --- system/status (compacting progress), only logged while
                     # WE triggered it -- see FORCED_COMPACTION_HOURLY_MS. Not a
                     # `continue` -- the wire-send suppression a few lines down
@@ -1089,6 +1108,7 @@ class EngineLifecycleMixin:
                     # tokens_at_last_forced_compaction's own __init__
                     # comment for why file bytes were the wrong signal).
                     if isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
+                        self._refusal_floor = 0  # what a filter objected to is summarized away: cheap models may be tried again
                         post_tokens = (message.data.get("compact_metadata") or {}).get("post_tokens")
                         log_event(
                             "engine", "compact_boundary_observed", tab_id=self.tab_id,
@@ -1161,30 +1181,6 @@ class EngineLifecycleMixin:
                         save_tab_session_id(self.workspace_dir, self.tab_id, sid, self.engine_kind)
 
                     if isinstance(message, ResultMessage):
-                        # Bug fix (2026-09-15): the live "how much is
-                        # actually in context right now" signal for the
-                        # growth trigger (see tokens_at_last_forced_
-                        # compaction's own __init__ comment) -- every real
-                        # turn's own ResultMessage.usage already reports
-                        # this, no separate query needed. Deliberately
-                        # OUTSIDE the result_is_fake check below: even a
-                        # hang-interrupted or otherwise "fake" turn's
-                        # ResultMessage still reflects a real API call
-                        # against the real current context, which is
-                        # exactly the number this is meant to track --
-                        # only the compaction command's OWN ResultMessage
-                        # would be misleading here, and that's excluded
-                        # explicitly (compaction's own token accounting
-                        # comes from compact_boundary instead, see above).
-                        usage = getattr(message, "usage", None)
-                        if isinstance(usage, dict) and not self.forced_compaction_result_pending:
-                            context_tokens = sum(
-                                v for k, v in usage.items()
-                                if k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-                                and isinstance(v, int)
-                            )
-                            if context_tokens:
-                                self.last_known_context_tokens = context_tokens
                         # Bug fix (2026-09-11): confirmed live -- a
                         # RateLimitEvent(rejected) sets
                         # ignore_next_result_recovery=True specifically so
@@ -1222,6 +1218,8 @@ class EngineLifecycleMixin:
                         # pending_attachments for something ELSE that got
                         # queued in the meantime.
                         self._inflight_end()
+                        if await self._refusal_on_result():
+                            continue  # stopped by a safety filter: the next model has the turn
                         if await self._ladder_on_result(message):
                             continue  # the attempt was rejected: the next model has the turn, nothing of this one is shown
                         result_is_fake = self.hang_interrupt_result_pending or self.ignore_next_result_recovery or self.forced_compaction_result_pending or self.clear_tab_result_pending
@@ -1400,7 +1398,6 @@ class EngineLifecycleMixin:
                                 self._fire_post_turn_completion_check()
                             if was_real_user_turn and not resumed_nudged:
                                 await self._check_refusal_and_maybe_retry()
-                        self.classifier_refusal_retry_count = 0
                         self.last_api_retry_error = None
                         self.consecutive_auth_retry_failures = 0
                         # Bug fix (2026-09-10): confirmed live -- a

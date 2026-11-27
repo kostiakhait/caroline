@@ -75,7 +75,6 @@ class TurnSubmissionMixin:
         if is_real_user:
             self._post_turn_check_rounds = 0
             self._post_turn_checks_halted = False
-        self.classifier_refusal_retry_count = 0
         # Bug fix (2026-10-17), confirmed live -- tab 1, a real incident: this
         # used to be unconditional, same root cause as pending_is_real_user's
         # own 2026-09-15 fix just below, but for the text itself. A real user
