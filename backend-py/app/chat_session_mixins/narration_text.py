@@ -386,6 +386,14 @@ class TextNarrationMixin:
                     original_text=comment, translated_text=translated,
                 )
                 comment = translated
+        # The words that refer to the speaker take the persona's grammatical gender (2026-11-27, the owner's command): the
+        # narrator wrote "Я получил" for a woman. Fail-open, short timeout (see voice_api.fix_gender).
+        try:
+            from app.plugins.voice_api import fix_gender
+
+            comment = await fix_gender(comment, get_persona_gender(self.workspace_dir), timeout=12.0)
+        except Exception as exc:
+            log_event("engine", "gender_fix_error", tab_id=self.tab_id, error=str(exc))
         # Per explicit instruction (2026-10-13): review_reply can itself decide
         # this remark is pure internal-mechanics (or off-task) and rewrite it
         # down to the [[NO_UPDATE]] sentinel or a known silent-reply paraphrase
