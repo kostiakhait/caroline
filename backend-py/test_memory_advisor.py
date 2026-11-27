@@ -84,6 +84,9 @@ def test_the_microagent_check():
     assert sw_memory_need.verify_memory_need({}, {**ok, "queries": ["a"] * 4}) is not None
     assert sw_memory_need.verify_memory_need({}, {"needs_memory": False, "why": "w", "queries": []}) is None
     assert "NEW MESSAGE:\nhi" in sw_memory_need.prompt_memory_need({"message": "hi", "dialogue": []}, None)
+    # a dislike of the assistant's own work asks for a change: "do", not "discuss" (2026-11-26, live: "I don't like the
+    # grass and trees" was taken for a question and she only asked which style)
+    assert "I don't like how the grass looks" in sw_memory_need.prompt_memory_need({"message": "x", "dialogue": []}, None)
 
 
 def test_a_question_or_a_note_to_remember_gets_the_do_nothing_else_rule_even_without_memory(env):

@@ -37,8 +37,8 @@ installed:
   (Settings), never by typing a key into chat.
 
 Everything else the app needs on the native-automation/messaging side --
-Node.js, Python, a JRE (for Signal), WebView2, ffmpeg, git-bash, Playwright's
-Chromium, `codex-app-server`, the WhatsApp sidecar -- is provisioned by
+Python, a JRE (for Signal), WebView2, ffmpeg, git-bash, Playwright's
+Chromium, `codex-app-server` -- is provisioned by
 `CarolineInstaller.exe` itself into `%LocalAppData%\Caroline\runtime\`
 (`Windows/CarolineInstaller/Dependencies/*Installer.cs`, one pinned,
 sha256-verified installer per dependency), never from system PATH and never

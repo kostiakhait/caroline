@@ -100,7 +100,7 @@ Handled by `handle_control_request` in `main.py` (op → purpose):
 `stt_adaptation.py`, `speech_ahead.py`, `filler_phrases.py`, `continuous_dialogue.py`, `visual_mode.py`.
 
 **Channels** — `*_channel.py` for Telegram, WhatsApp, Signal, Slack, Discord, Messenger, Ratatosk,
-Akinakes; `sidecar_process.py`, `secret_store.py`. See [MESSENGERS.md](MESSENGERS.md).
+Akinakes; `web_service_channel.py` (Facebook, LinkedIn), `sidecar_process.py` (signal-cli), `secret_store.py`. See [MESSENGERS.md](MESSENGERS.md).
 
 **Web** — `web_browser.py` (own headless Chromium), `web_research.py` (agentic search loop).
 

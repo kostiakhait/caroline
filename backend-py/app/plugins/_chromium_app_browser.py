@@ -1,63 +1,61 @@
-"""Linux port (2026-10-04), Phase 3 of docs/LINUX_PORT_PLAN.md: real,
-separate, per-label persistent Chromium windows replacing
-Caroline.NativeHost.exe/WebView2 entirely on this platform -- no separate
-host process at all, launched directly from backend-py via Playwright.
+"""Caroline's embedded browser on every platform: one persistent, labeled
+window per site ("whatsapp", "facebook", ...), each a separate process of the
+bundled Chromium (the build of web_browser.py, dist/browsers), launched through
+Playwright with its own profile folder.
 
-app_browser_cdp.py (snapshot/find/click/type/press_key/evaluate) is
-ALREADY fully platform-agnostic: it only ever takes a CDP port number and
-calls playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}") --
-it doesn't care whether that port belongs to WebView2 (Windows) or a
-launched Chromium (here), so it needs NO changes for this port. This
-module only replaces the OTHER half of app_browser_plugin.py: window
-LIFECYCLE (open/navigate/close/list) and the ops that went straight
-through AppBrowserHost's HTTP bridge instead of CDP (screenshot/scroll/
-click-by-coords/is_visible_on_top/fill_file_dialog/the "real" OS-level
-escalation for click/type/press_key).
+It is the single kind of browser Caroline has (owner, 2026-11-24): the Windows
+WebView2 windows of Caroline.NativeHost.exe were replaced by this, the way
+Linux had it since 2026-10-04. The same label's profile serves two modes:
+  * visible -- a window (`--app=<url>`: no address bar or tabs, so the
+    window's client area IS the page viewport); the person signs in here once;
+  * headless -- the same Chromium without a window, on the SAME profile folder,
+    so the sign-in, cookies and the site's storage carry over as they are.
+A profile folder can be open in one Chromium process only, so a label is in
+one mode at a time; set_mode() closes the one and opens the other on the same
+profile and page address.
 
-Each label's Chromium is launched with `--app=<url>` (removes the
-address bar/tabs/toolbar entirely) -- the direct visual analog of
-WebView2 being embedded with no browser chrome shown around it at all on
-Windows. This also makes the "real OS-level click" escalation's math
-exact rather than approximate: with zero chrome, the window's absolute
-screen rect IS the page viewport, offset (0, 0) -- no browser-toolbar-
-height estimate needed.
-
-A real, separate Chromium process per label is heavier than WebView2's
-shared-runtime model, but matches what the plan doc already decided
-("the only thing WebView2 added was *embedding* the window inside
-Caroline's own app chrome... a real, separate, per-label persistent
-Chromium window gives the same... behavior with far less new code").
+app_browser_cdp.py (snapshot/find/click/type/press_key/evaluate) takes only a
+CDP port number, so it works on any window of this module unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import socket
+import sys
 from pathlib import Path
 from typing import Any
 
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import async_playwright
 
-from app.plugins import _x11_input as x11
-from app.plugins import _x11_window as x11win
 from app.plugins import app_browser_cdp as cdp
+from app.web_browser import browser_user_agent, bundled_chromium_path
 from app.workspace_dir import WORKSPACE_DIR
+
+if sys.platform == "win32":
+    from app.plugins import _win32 as win32
+else:
+    from app.plugins import _x11_input as x11
+    from app.plugins import _x11_window as x11win
 
 PROFILES_DIR = Path(WORKSPACE_DIR) / "app_browser_profiles"
 
 
 class _Window:
-    __slots__ = ("label", "context", "page", "port")
+    __slots__ = ("label", "context", "page", "port", "headless")
 
-    def __init__(self, label: str, context: BrowserContext, page: Page, port: int) -> None:
+    def __init__(self, label: str, context: BrowserContext, page: Page, port: int, headless: bool) -> None:
         self.label = label
         self.context = context
         self.page = page
         self.port = port
+        self.headless = headless
 
 
 _windows: dict[str, _Window] = {}
+_modes: dict[str, bool] = {}   # label -> headless; a label keeps the mode it was last put in
 _open_lock = asyncio.Lock()
 _playwright_instance: Any = None
 _playwright_lock = asyncio.Lock()
@@ -77,42 +75,88 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-async def _open_window(label: str, url: str | None) -> _Window:
-    existing = _windows.get(label)
-    if existing is not None and not existing.page.is_closed():
-        if url:
-            await existing.page.goto(url)
-        return existing
-
+async def _launch(label: str, url: str | None, headless: bool) -> _Window:
     pw = await _get_playwright()
     profile_dir = PROFILES_DIR / label
     profile_dir.mkdir(parents=True, exist_ok=True)
     port = _free_port()
     target_url = url or "about:blank"
-    context = await pw.chromium.launch_persistent_context(
-        str(profile_dir),
-        headless=False,
-        # --disable-gpu: confirmed live (WSL2 + WSLg, 2026-10-04) that
-        # page.screenshot() fails outright ("Unable to capture
-        # screenshot") against this environment's GPU compositing path;
-        # forcing software rendering fixed it immediately. Keeping this
-        # on for every Linux desktop, not just WSLg, trades a bit of
-        # rendering performance for not depending on whatever GPU driver
-        # state happens to exist on an arbitrary end-user machine this
-        # installer can't control -- the same "design for a stranger's
-        # clean machine" posture the rest of this product follows.
-        args=[f"--remote-debugging-port={port}", f"--app={target_url}", "--disable-gpu"],
-    )
+    args = [f"--remote-debugging-port={port}", "--disable-blink-features=AutomationControlled"]
+    options: dict[str, Any] = {"headless": headless, "user_agent": browser_user_agent()}
+    if headless:
+        options["viewport"] = {"width": 1366, "height": 900}
+    else:
+        args.append(f"--app={target_url}")
+        options["no_viewport"] = True
+    # --disable-gpu: confirmed live (WSL2 + WSLg, 2026-10-04) that page.screenshot() fails against
+    # that GPU compositing path; software rendering fixed it. Kept for every Linux desktop so as
+    # not to depend on a stranger's GPU driver. Windows keeps the GPU.
+    if sys.platform != "win32":
+        args.append("--disable-gpu")
+    chromium = bundled_chromium_path()
+    if chromium is not None:
+        options["executable_path"] = str(chromium)   # a dev tree without it uses Playwright's own lookup
+    context = await pw.chromium.launch_persistent_context(str(profile_dir), args=args, **options)
     page = context.pages[0] if context.pages else await context.new_page()
-    window = _Window(label, context, page, port)
+    if headless and url:
+        await page.goto(url)
+    return _Window(label, context, page, port, headless)
+
+
+async def _close_window_process(window: _Window) -> None:
+    """Close the label's Chromium and wait until it lets go of the profile folder. A plain
+    context.close() hangs on a window opened with --app (measured 2026-11-25: 30 s and no end),
+    so it gets a few seconds, then the browser is asked to quit over CDP (Browser.close)."""
+    try:
+        await asyncio.wait_for(window.context.close(), 6)
+        return
+    except Exception:
+        pass
+    try:
+        pw = await _get_playwright()
+        remote = await asyncio.wait_for(pw.chromium.connect_over_cdp(f"http://127.0.0.1:{window.port}"), 10)
+        session = await remote.new_browser_cdp_session()
+        try:
+            await asyncio.wait_for(session.send("Browser.close"), 10)
+        except Exception:
+            pass   # the browser quits before it can answer
+    except Exception:
+        pass
+    await asyncio.sleep(1.0)
+
+
+async def _open_window(label: str, url: str | None, headless: bool | None = None) -> _Window:
+    want = _modes.get(label, False) if headless is None else headless
+    existing = _windows.get(label)
+    if existing is not None and existing.page.is_closed():
+        _windows.pop(label, None)
+        existing = None
+    if existing is not None and existing.headless == want:
+        if url:
+            await existing.page.goto(url)
+        return existing
+    if existing is not None:
+        # The other mode: the profile folder is released first, then reopened at the same page.
+        url = url or existing.page.url
+        _windows.pop(label, None)
+        await _close_window_process(existing)
+    window = await _launch(label, url, want)
     _windows[label] = window
+    _modes[label] = want
     return window
 
 
-async def open_window(label: str, url: str | None) -> dict[str, Any]:
+async def open_window(label: str, url: str | None, headless: bool | None = None) -> dict[str, Any]:
     async with _open_lock:
-        window = await _open_window(label, url)
-    return {"label": label, "cdpPort": window.port, "url": window.page.url}
+        window = await _open_window(label, url, headless)
+    return {"label": label, "cdpPort": window.port, "url": window.page.url, "headless": window.headless}
+
+
+async def set_mode(label: str, headless: bool) -> dict[str, Any]:
+    """Move a label between a visible window and the headless browser, on the same profile."""
+    async with _open_lock:
+        window = await _open_window(label, None, headless)
+    return {"label": label, "cdpPort": window.port, "url": window.page.url, "headless": window.headless}
 
 
 async def navigate(label: str, url: str) -> dict[str, Any]:
@@ -123,11 +167,9 @@ async def navigate(label: str, url: str) -> dict[str, Any]:
 
 async def close_window(label: str) -> dict[str, Any]:
     window = _windows.pop(label, None)
+    _modes.pop(label, None)
     if window is not None:
-        try:
-            await window.context.close()
-        except Exception:
-            pass
+        await _close_window_process(window)
     return {"label": label, "closed": window is not None}
 
 
@@ -137,7 +179,7 @@ async def list_windows() -> list[dict[str, Any]]:
         if window.page.is_closed():
             _windows.pop(label, None)
             continue
-        result.append({"label": label, "url": window.page.url})
+        result.append({"label": label, "url": window.page.url, "headless": window.headless})
     return result
 
 
@@ -248,35 +290,60 @@ async def real_os_click(label: str, ref: str | None, selector: str | None) -> di
         return await click_coords(label, cx_viewport, cy_viewport, None)
 
     cx, cy = target_window["x"] + cx_viewport, target_window["y"] + cy_viewport
-    await asyncio.to_thread(x11.click_mouse, cx, cy, "left")
+    if sys.platform == "win32":
+        await asyncio.to_thread(win32.click_mouse, "Left", 1, cx, cy)
+    else:
+        await asyncio.to_thread(x11.click_mouse, cx, cy, "left")
     return {"label": label, "clicked_os_level": [cx, cy]}
 
 
+def _win_client_origin(hwnd_hex: str) -> tuple[int, int] | None:
+    from ctypes import wintypes
+    point = wintypes.POINT(0, 0)
+    if not ctypes.windll.user32.ClientToScreen(win32.parse_hwnd(hwnd_hex), ctypes.byref(point)):
+        return None
+    return point.x, point.y
+
+
 async def _matching_os_window(window: _Window) -> dict[str, Any] | None:
+    """The OS window of this label: the one whose title matches its page's title (a window of
+    --app mode carries no browser chrome, so its client area is the page viewport at offset 0,0).
+    {"x", "y"} = the client area's screen position, or None when no window matches."""
+    if window.headless:
+        return None
     title = await window.page.title()
     if not title:
         return None
+    if sys.platform == "win32":
+        found = await asyncio.to_thread(win32.list_windows, title, "Chrome_WidgetWin", None, False)
+        if not found:
+            return None
+        origin = _win_client_origin(found[0]["hwnd"])
+        return {"x": origin[0], "y": origin[1], "hwnd": found[0]["hwnd"]} if origin else None
     found = await asyncio.to_thread(x11win.list_windows, title, None, None, False)
     return found[0] if found else None
 
 
 async def is_visible_on_top(label: str) -> dict[str, Any]:
-    """Simplification, documented rather than silently assumed: this
-    checks that the window is mapped/viewable, NOT that it's actually
-    the unobscured topmost window at its own position -- a true
-    stacking-order occlusion test needs _NET_CLIENT_LIST_STACKING, which
-    this WM doesn't set (confirmed live, same gap _x11_window.py's
-    module docstring already flags for enumeration), and the manual
-    XQueryTree-sibling-order fallback that would replace it wasn't
-    built for this first pass. A coordinate-based click guarded by this
-    check could still land on a covering window as a result -- a real,
-    not-yet-closed fidelity gap vs the Windows version's actual
-    occlusion check."""
+    """Visible and not covered at its centre. Windows: the window at the centre point of the
+    client area must be this window. Linux: only that the window is mapped (no stacking order
+    there; a documented gap)."""
     window = _windows.get(label)
     if window is None or window.page.is_closed():
         return {"label": label, "visible": False, "reason": "not open"}
+    if window.headless:
+        return {"label": label, "visible": False, "reason": "headless: no window"}
     found = await _matching_os_window(window)
-    return {"label": label, "visible": found is not None}
+    if found is None:
+        return {"label": label, "visible": False}
+    if sys.platform == "win32":
+        from ctypes import wintypes
+        size = await window.page.evaluate("[innerWidth, innerHeight]")
+        point = wintypes.POINT(found["x"] + size[0] // 2, found["y"] + size[1] // 2)
+        hit = ctypes.windll.user32.WindowFromPoint(point)
+        root = ctypes.windll.user32.GetAncestor(hit, 2) if hit else 0   # GA_ROOT
+        return {"label": label, "visible": root == win32.parse_hwnd(found["hwnd"])}
+    return {"label": label, "visible": True}
 
 
 async def fill_file_dialog(paths: list[str], _timeout_ms: int | None) -> dict[str, Any]:
@@ -307,3 +374,59 @@ async def fill_file_dialog(paths: list[str], _timeout_ms: int | None) -> dict[st
         await chooser.set_files(paths)
         return {"filled": True, "paths": paths}
     return {"filled": False, "reason": "no filechooser event observed"}
+
+
+async def download(label: str, ref: str | None, selector: str | None, save_path: str) -> dict[str, Any]:
+    """Click an element that starts a download and save the file to save_path."""
+    window = await _open_window(label, None)
+    locator = cdp._resolve_target(window.page, ref, selector)
+    async with window.page.expect_download(timeout=60000) as info:
+        await locator.click()
+    download_ = await info.value
+    target = Path(save_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await download_.save_as(str(target))
+    return {"label": label, "saved": str(target), "suggestedName": download_.suggested_filename}
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    """The labels that have a profile folder (a sign-in kept), open or not."""
+    if not PROFILES_DIR.is_dir():
+        return []
+    return [{"label": d.name, "open": d.name in _windows, "headless": _modes.get(d.name)}
+            for d in sorted(PROFILES_DIR.iterdir()) if d.is_dir()]
+
+
+async def forget_profile(label: str) -> dict[str, Any]:
+    """Close the label and delete its profile folder: the sign-in, cookies and site storage go."""
+    import re
+    import shutil
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", label) or label in (".", ".."):
+        return {"label": label, "deleted": False, "reason": "not a valid label"}
+    await close_window(label)
+    folder = PROFILES_DIR / label
+    if not folder.is_dir():
+        return {"label": label, "deleted": False, "reason": "no such profile"}
+    await asyncio.sleep(0.5)   # the browser process lets go of its files
+    shutil.rmtree(folder, ignore_errors=True)
+    return {"label": label, "deleted": not folder.exists()}
+
+
+def get_page(label: str) -> Page | None:
+    """The live page of an open label (visible or headless), or None."""
+    window = _windows.get(label)
+    return window.page if window is not None and not window.page.is_closed() else None
+
+
+def is_headless(label: str) -> bool | None:
+    window = _windows.get(label)
+    return window.headless if window is not None else None
+
+
+def has_profile(label: str) -> bool:
+    """A profile folder with content exists for the label: a sign-in may be kept in it."""
+    folder = PROFILES_DIR / label
+    try:
+        return folder.is_dir() and any(folder.iterdir())
+    except OSError:
+        return False

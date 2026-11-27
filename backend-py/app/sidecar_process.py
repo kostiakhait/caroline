@@ -11,7 +11,7 @@ just "one JSON object in, one JSON object out" per line -- a sidecar that
 needs a reply correlates it itself (e.g. an explicit "id" field it chose),
 this layer only ships bytes.
 
-First user: app/whatsapp_channel.py's Baileys (Node) sidecar. signal-cli
+A generic stdio transport for a sidecar process. signal-cli
 (app/signal_channel.py) does NOT use this -- its JSON-RPC runs over a local
 TCP socket, not stdio, so plain asyncio works there without the Windows
 subprocess-under-selector-loop caveat this module exists to route around.

@@ -11,10 +11,8 @@ Set by the shell / supervisor on every spawn (do not set these by hand on an ins
 | --- | --- |
 | `CAROLINE_APP_ROOT` | Root above the active `app-<hash>` folder (the shell passes the folder above its own base directory) |
 | `CAROLINE_PORT` / `CAROLINE_SUPERVISOR_PORT` | Backend port (default 48765) / supervisor port (48766) |
-| `CAROLINE_NODE_PATH`, `CAROLINE_PYTHON_PATH`, `CAROLINE_JAVA_HOME`, `CAROLINE_FFMPEG_PATH`, `CAROLINE_CODEX_PATH`, `CAROLINE_SIGNAL_CLI_BAT` | Locations of the isolated runtime tools under `%LocalAppData%\Caroline\runtime\` |
-| `CAROLINE_NATIVEHOST_EXE_PATH` | The native helper host, a sibling of `Caroline.exe` in the app folder |
+| `CAROLINE_PYTHON_PATH`, `CAROLINE_JAVA_HOME`, `CAROLINE_FFMPEG_PATH`, `CAROLINE_CODEX_PATH`, `CAROLINE_SIGNAL_CLI_BAT` | Locations of the isolated runtime tools under `%LocalAppData%\Caroline\runtime\` |
 | `CAROLINE_MODELS_DIR`, `CAROLINE_WHISPER_MODEL_PATH`, `CAROLINE_BROWSERS_DIR` | Visual Mode models (outside the app folder, survive updates), local Whisper model, bundled Chromium |
-| `CAROLINE_WHATSAPP_SIDECAR_DIR`, `CAROLINE_MESSENGER_SIDECAR_DIR` | Sidecar install locations |
 
 Operator / developer switches:
 

@@ -3,9 +3,9 @@ the web (agentic web search, decided with the user 2026-10-23; see
 app/web_research.py for the loop and app/plugins/web_research_plugin.py for
 the tools).
 
-A SEPARATE browser of the backend: not Caroline.NativeHost's WebView2, not
-the Linux embedded-browser windows (_linux_app_browser.py), not anything of
-the user's -- its own headless Chromium, its own empty profile, no window.
+A SEPARATE browser of the backend: not the embedded-browser windows
+(_chromium_app_browser.py, which use the same bundled Chromium but their own
+profiles), not anything of the user's -- its own headless Chromium, its own empty profile, no window.
 The Chromium build is bundled with Caroline (dist/browsers, put there by the
 Makefile on Windows and by linux-shell/provision_runtime.sh on Linux), the
 headless shell of the revision this Playwright version expects; it is
@@ -90,6 +90,20 @@ def bundled_shell_path() -> Path | None:
         if found:
             return found[-1]
     return None
+
+
+def bundled_chromium_path() -> Path | None:
+    """The bundled FULL Chromium (the one that can show windows), or None.
+    The headless shell is not it: it has no window."""
+    if not _BROWSERS_DIR.is_dir():
+        return None
+    found = sorted(_BROWSERS_DIR.glob(f"chromium-*/*/{_CHROME_NAME}"))
+    return found[-1] if found else None
+
+
+def browser_user_agent() -> str:
+    """The user agent every browser of Caroline's presents: the ordinary desktop Chrome."""
+    return _USER_AGENT
 
 
 @dataclass

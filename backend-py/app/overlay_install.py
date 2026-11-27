@@ -22,8 +22,6 @@ from pathlib import Path
 OWNED_DIRS = ("backend-py/app", "backend-py/skills-src", "wwwroot", "linux-shell")
 OWNED_FILES = (
     "backend-py/run_server.py", "backend-py/supervisor.py", "backend-py/VERSION", "backend-py/requirements-linux.txt",
-    "whatsapp-sidecar/index.js", "whatsapp-sidecar/package.json",
-    "messenger-sidecar/index.js", "messenger-sidecar/package.json", "messenger-sidecar/fca-config.json",
 )
 REQUIRED = "backend-py/app/main.py"
 MAX_UNPACKED_BYTES = 600 * 1024 * 1024

@@ -110,7 +110,7 @@ def decrypt_text_from_file(path: str | Path) -> str | None:
 def messenger_secrets_dir(workspace_dir: str, service: str) -> Path:
     """workspace_dir/messengers/<service>/ -- one directory per messenger
     integration (a token file, a session file, or a whole auth-state
-    folder for Baileys/signal-cli), per docs/MESSENGER_INTEGRATIONS_PLAN.md.
+    folder for the sign-in markers and signal-cli), per docs/MESSENGER_INTEGRATIONS_PLAN.md.
     Created on first use."""
     d = Path(workspace_dir) / "messengers" / service
     d.mkdir(parents=True, exist_ok=True)

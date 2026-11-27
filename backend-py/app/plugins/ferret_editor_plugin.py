@@ -61,37 +61,42 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("fmdl_make", "Make a model package .fmdl from a glTF of the project (the new model format; what `ferret fmdl import` and `pack` do) and write it into the project: {glb, id, summary, kind, mass, materials, name?, tags?, category?, purpose?, out?}. summary ENGLISH (what it is); kind e.g. car, tree, prop; mass in kg; materials maps each glTF material name to a physics material name (`*` = every other). -> {path, id, version, bytes}. Then library_add the file.",
      {"glb": "string", "id": "string", "summary": "string", "kind": "string", "mass": "number", "materials": "object", "name": "string?", "tags": "string[]?", "category": "string?", "purpose": "string?", "out": "string?"}),
     ("fmdl_pack", "Pack a model folder of the project (model.json, glTF levels, description.json ...) into a .fmdl written into the project: {dir, out?} -> {path, id, version, bytes}.", {"dir": "string", "out": "string?"}),
-    ("library_search", "Search the Ferret asset library (REST GET api/search): {q, type?, rubric?, tags?, limit?}; q is ENGLISH words. -> candidate cards (id, uid, type, tags, description, versions ...): read them and pick.",
-     {"q": "string", "type": "string?", "rubric": "string?", "tags": "string?", "limit": "number?"}),
+    ("library_search", "Search the Ferret asset library (REST GET api/search): {q, type?, rubric?, tags?, limit?, offset?}; q is ENGLISH words. -> {total, offset, next, cards}: "
+     "one page of cards (id, uid, type, tags, description, versions ...), the best match first; total is how many match in all, next the offset of the next page "
+     "(null at the end): call again with offset: next to read on. Read the cards and pick.",
+     {"q": "string", "type": "string?", "rubric": "string?", "tags": "string?", "limit": "number?", "offset": "number?"}),
     ("library_add", "Add or update an asset in the Ferret asset library (REST POST api/item) with the person's own SW session: {path, uid?, description?, rubric?}; path is a project file, a .ferret package or a zip of package.ferret [+ tiers/<tier>.ferret] [+ preview.webp]; description ENGLISH only. -> {uid, version, status}; to update an asset send its uid back.",
      {"path": "string", "uid": "string?", "description": "string?", "rubric": "string?"}),
     ("viewer_restart", "Rebuild the project and restart the game in the viewer; waits until it runs or fails. -> {ok, level, errors}", {}),
     ("viewer_level", "Travel the viewer to a level of the project. {level}", {"level": "string"}),
     ("viewer_command", "Run one of the running game's engine commands. {name, args?}; 'help' lists them all. To TEST the game, play it: input.actions (what is bound), "
      "input.hold {actions:[{action, down?, x?, y?}], seconds} (press the game's own actions for some game seconds), scene.entities / scene.node (positions and rotations before and after), "
-     "camera.view {name: front|back|left|right|top|iso|fit} (look from other sides, then viewer_screenshot).",
+     "camera.view {name: front|back|left|right|top|iso|fit} (look from other sides, then viewer_screenshot). Where timing or the game's state matters, "
+     "play it by a script: test.run {file: \"tests/<what>.ferretic\"} or {source} (Ferretic, the engine's test language: test.help, skill ferret-ferretic) "
+     "-> a report with failures, logged values and sample tables.",
      {"name": "string", "args": "object?"}),
     ("viewer_log", "The log under the viewer: build and game errors and messages. {n?} the last n lines (default 60).", {"n": "number?"}),
     ("viewer_screenshot", "A picture of the running game: -> the image", {"width": "number?", "height": "number?"}),
     ("gpu_render_page", "Render a page of the project in a browser with a GPU (WebGL, WebGPU, video) and bring back pictures or a video. "
-     "WHERE IT RUNS (all three gpu_ tools): on the Ferret companion app on the person's own computer when it is online (free, their GPU); with no app the tool does NOT start "
-     "a machine: it answers state 'needs-companion' with a download link, and you offer the person the app (see the answer's `next`); only if they decline do you call again with where:'cloud' "
-     "(the paid GPU machine). Never start the cloud by yourself and never say why a job failed beyond what the answer's `error`/`log` say. "
+     "WHERE IT RUNS (all gpu_ and machine_ tools) is the person's own setting \"Use GPU\" in the editor (Edit menu), never your choice, because the cloud costs their money: "
+     "\"On my PC\" (the default: the Ferret companion app on their computer, free, their GPU), \"Cloud GPU\" (the paid machine in the cloud) or \"No GPU\" (nothing runs). On \"On my PC\" "
+     "with no app the tool runs nothing and answers state 'needs-companion' with a download link: offer the person the app (see the answer's `next`); if they would rather pay for "
+     "the cloud, they switch the setting themselves. Do not judge from your memory whether the app is there: call the tool. Never say why a job failed beyond what the answer's `error`/`log` say. "
      "{dir?, entry?, width?, height?, seconds?, fps?, format?, out?}: `dir` is the folder holding the page (default the whole project), "
      "`entry` its HTML file (default index.html); format 'png' (one picture after `seconds`, default; the answer then CONTAINS the picture and a `picture` verdict: EMPTY means the page drew nothing, see `pageProblems`) or 'mp4' (a recording of `seconds` "
-     "at `fps`); results go to `out` (default renders/); `where`: auto (default) | companion | cloud. Waits up to ~3 minutes, then answers with the job id for gpu_status.",
+     "at `fps`); results go to `out` (default renders/); `where`: leave it out (the setting decides). Waits up to ~3 minutes, then answers with the job id for gpu_status.",
      {"dir": "string?", "entry": "string?", "width": "number?", "height": "number?", "seconds": "number?", "fps": "number?",
       "format": "string?", "out": "string?", "where": "string?"}),
     ("gpu_video", "Make or convert a video on the GPU (ffmpeg with the hardware encoder). {inputs?: [project paths], images?: "
      "'frames/f_%04d.png' (a numbered picture sequence from the project), output: 'name.mp4', fps?, video?: {codec: "
      "h264|h265|av1|vp9|gif|copy, quality?, scale?: 'WxH', start?, duration?}, audio?: {codec: aac|opus|mp3|copy|none, kbps?}, out?}. "
-     "The output goes to `out` (default renders/); `where` as for gpu_render_page.",
+     "The output goes to `out` (default renders/); where it runs as for gpu_render_page.",
      {"inputs": "string[]?", "images": "string?", "output": "string", "fps": "number?", "video": "object?", "audio": "object?", "out": "string?", "where": "string?"}),
     ("gpu_blender", "Run Blender in the background on the GPU (Cycles/OptiX). {blend?: path of a .blend in the project, script?: path of "
      "a Python script in the project, include?: [extra project paths: textures, models], frame? or range?: [first, last] to render, "
      "engine?: CYCLES|BLENDER_EEVEE_NEXT|BLENDER_WORKBENCH, format?: PNG|JPEG|OPEN_EXR, device?: OPTIX|CUDA|CPU, out?}. A script writes "
      "its files into the folder `out/` (relative path) to get them back, e.g. a glTF export: "
-     "bpy.ops.export_scene.gltf(filepath='out/model.glb'). Results go to `out` (default renders/); `where` as for gpu_render_page.",
+     "bpy.ops.export_scene.gltf(filepath='out/model.glb'). Results go to `out` (default renders/); where it runs as for gpu_render_page.",
      {"blend": "string?", "script": "string?", "include": "string[]?", "frame": "number?", "range": "number[]?", "engine": "string?",
       "format": "string?", "device": "string?", "out": "string?", "where": "string?"}),
     ("gpu_status", "GPU jobs of this person (on the companion app or the cloud machine): {id?} one job (and, when it is done, its outputs are brought into the project), or all of "
@@ -100,11 +105,11 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("gpu_install", "Install on the person's computer what the companion app lacks for GPU jobs: {tool: ffmpeg | blender}. ONLY after the person said yes to a question you asked when a gpu_ tool answered state 'needs-install' (it names the tool, its size and where it is downloaded from); never before, never on your own. Waits up to ~3 minutes, then answers with an id for gpu_status. After it, ask for the job again.", {"tool": "string"}),
     ("gpu_cancel", "Cancel a GPU job. {id}", {"id": "string"}),
     # Caroline's machine (PLAN-PLAYER 10.6.1): her shell, Python and desktop on the person's own computer through the companion app, after their yes in the chat;
-    # without the app, on their no to it, the person's container on the cloud machine. Never on the editor's server.
+    # or, when the person set "Use GPU" to "Cloud GPU" in the editor, their container on the cloud machine. Never on the editor's server.
     ("machine_shell", "Run a shell command on your machine. WHERE: the person's own computer through the Ferret companion app (Windows: PowerShell by default, or shell:'cmd'), "
      "ONLY with their permission for this session -- without it the tool answers state 'needs-permission' and runs nothing: ask them, and only on their yes call machine_allow "
-     "{allow:true}, then call again (a no is not kept: ask again next time). With no app it answers 'needs-companion' (offer the app; on their no call again with "
-     "where:'cloud': a Linux container on the cloud machine, bash, paid from their wallet). The working folder is a copy of the open project: what the command makes or "
+     "{allow:true}, then call again (a no is not kept: ask again next time). With no app it answers 'needs-companion' (offer the app). Where it runs is the person's "
+     "setting \"Use GPU\" as for gpu_render_page: on \"Cloud GPU\" it is a Linux container on the cloud machine, bash, paid from their wallet. The working folder is a copy of the open project: what the command makes or "
      "changes there comes back into the project (intoProject), what it removes of the project is removed from it; node_modules, .git, caches and virtual environments "
      "stay on the machine. {command, shell?: powershell|cmd|bash, cwd?: a folder (relative to the working folder, or absolute), timeoutS? (default 120, at most 1800 in the "
      "cloud, 3600 on the computer), where?} -> exitCode, stdout, stderr, intoProject, removedFromProject, leftOnTheMachine (too big to bring), workspace. "

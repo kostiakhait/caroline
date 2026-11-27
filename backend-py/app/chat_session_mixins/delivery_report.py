@@ -110,16 +110,19 @@ class DeliveryReportMixin:
 
     def _recent_repeat_of(self, text: str) -> bool:
         """True when `text` only repeats something the user was shown in the last REPEAT_WINDOW_S seconds (the same burst of
-        messages -- not a routine report that looks like the previous one an hour ago)."""
+        messages -- not a routine report that looks like the previous one an hour ago). What this very turn said while it
+        worked does not count: a turn's closing summary restates its own progress remarks, and hiding it left the user's
+        task without any answer (2026-11-25, live: the closing reply of an asphalt-and-sky task was dropped as a repeat)."""
         if getattr(self, "headless", False):
             return False
         try:
             from app import dialogue_log
 
             cutoff = (time.time() - self.REPEAT_WINDOW_S) * 1000
+            turn_start = getattr(self, "current_turn_started_at_ms", None) or float("inf")
             recent = [e["text"] for e in dialogue_log.read_entries(self.workspace_dir, self.tab_id)
                       if e.get("role") == dialogue_log.ASSISTANT and e.get("kind") in (dialogue_log.SHOWN, dialogue_log.REPORT)
-                      and e.get("ms", 0) >= cutoff]
+                      and cutoff <= e.get("ms", 0) < turn_start]
             return bool(recent) and delivery_report.is_duplicate(text, recent[-6:])
         except Exception:  # noqa: BLE001
             return False

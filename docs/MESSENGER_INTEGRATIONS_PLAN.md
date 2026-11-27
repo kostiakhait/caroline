@@ -1,3 +1,5 @@
+> **2026-11-25:** WhatsApp and Facebook Messenger no longer use the Baileys and fca-unofficial sidecars described below: both run in Caroline's own browser (sign in once in a visible window, then the same profile runs headless). See `MESSENGERS.md`. The sidecar sections are kept as the design history.
+
 # Caroline: мессенджер-интеграции (Slack, Telegram, Discord, WhatsApp, Signal, Messenger)
 
 ## Статус (2026-10-11, вечер) -- два аккаунта везде, кроме Discord

@@ -86,15 +86,12 @@ internal static class Autostart
 
     // Caroline\Native\AppControlHost.cs's own Port const -- kept as a separate literal here
     // (not shared code between the two projects) since this is the one place the installer
-    // needs it. Was 8767 (AppBrowserHost) before the 2026-10-03 extraction of the embedded
-    // browser into its own Caroline.NativeHost process -- see NativeHostPort below for that
-    // process's own (unchanged) port, which this installer now also has to ask nicely.
+    // needs it. Was 8767 (AppBrowserHost) in older versions. Older installed versions still run a separate
+    // Caroline.NativeHost process (the embedded browser's host, gone in newer versions), so an
+    // update still asks it to exit and stops it -- see NativeHostPort below.
     private const int AppControlHostPort = 8768;
 
-    // Caroline.NativeHost\AppBrowserHost.cs's own Port const, same "separate literal, not
-    // shared code" reasoning as above. This is now where Caroline's embedded browser windows
-    // (and their WebView2 profile locks) actually live, so asking it to exit gracefully before
-    // an update matters at least as much as it ever did for Caroline.exe itself.
+    // The old NativeHost's port (legacy: only older versions have that process).
     private const int NativeHostPort = 8767;
     private const string NativeHostProcessName = "Caroline.NativeHost";
 

@@ -21,7 +21,6 @@ framework-dependent and do need the .NET 8 Desktop Runtime.
 | `Services/SettingsService.cs`, `Models/AppSettings.cs`, `Services/AutoStartService.cs`, `Services/Logger.cs`, `Services/WebViewOriginGuard.cs` | Window geometry/hotkey/open tabs, autostart, logging to `caroline.log`, WebView origin restriction |
 | `wwwroot/` | The UI shared with Linux: `chat.html` + `chat.js`, `monaco_viewer.html` (code viewer; Monaco bundled under `vendor/monaco`), `office_editor.html` (OnlyOffice), `slideshow.html`, `visualmode.html` |
 
-`Windows/Caroline.NativeHost/` hosts the native automation helpers (built framework-dependent).
 `Windows/Caroline.Linux/` is the Linux counterpart of the native pieces.
 
 Start-up verification (also in `BUILD.md`): `%LOCALAPPDATA%\Caroline\caroline.log` should show
@@ -69,8 +68,8 @@ A thin WPF bootstrapper, per-user, **no elevation**. Re-running it updates.
    tracked in `state.json` by `InstallState.cs`, so an update does not delete the folder in use).
 4. Provisions the isolated runtime under `%LocalAppData%\Caroline\runtime\`, each dependency
    pinned, sha256-verified and idempotent, never touching system PATH (`Dependencies/`):
-   Python (embeddable), Node, a JRE and `signal-cli`, WebView2, ffmpeg, Git Bash, the Codex
-   app-server, and the WhatsApp / Messenger sidecars. Playwright's Chromium ships in `dist/browsers`.
+   Python (embeddable), a JRE and `signal-cli`, WebView2 (the shell's chat UI), ffmpeg, Git Bash, and the Codex
+   app-server. Playwright's Chromium ships in `dist/browsers`.
 5. Downloads the Whisper model (`WhisperModelInstaller.cs`) and the Visual Mode models into
    `art\` (kept across updates), adds a Microsoft Defender exclusion (`DefenderExclusion.cs`),
    autostart and a desktop shortcut (`Autostart.cs`, `ShortcutManager.cs`), and launches the app.

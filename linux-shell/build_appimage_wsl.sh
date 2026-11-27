@@ -28,24 +28,16 @@ done
 echo "--- code: $SRC -> $ROOT ---"
 for dir in linux-shell wwwroot SplashBanners backend-py; do
     mkdir -p "$ROOT/$dir"
-    # .cache holds the downloaded appimagetool, node_modules the sidecars' packages: kept across builds
+    # .cache holds the downloaded appimagetool: kept across builds
     rsync -a --delete --exclude .cache --exclude node_modules "$SRC/$dir/" "$ROOT/$dir/"
-done
-for dir in whatsapp-sidecar messenger-sidecar; do
-    mkdir -p "$ROOT/$dir"
-    rsync -a --delete --exclude node_modules "$SRC/$dir/" "$ROOT/$dir/"
 done
 # backend-py was replaced above; the provisioned runtime lives beside it and is untouched
 
-STAMP="$(cat "$SRC/backend-py/requirements-linux.txt" "$SRC/linux-shell/provision_runtime.sh" \
-    "$SRC/whatsapp-sidecar/package.json" "$SRC/messenger-sidecar/package.json" | sha256sum | cut -d' ' -f1)"
+STAMP="$(cat "$SRC/backend-py/requirements-linux.txt" "$SRC/linux-shell/provision_runtime.sh" | sha256sum | cut -d' ' -f1)"
 if [ "$(cat "$WORK/provisioned.stamp" 2>/dev/null || true)" != "$STAMP" ] || [ ! -d "$ROOT/runtime/python" ]; then
     echo "--- provisioning the runtime (first build, or its definition changed) ---"
     rm -f "$WORK/provisioned.stamp"
     bash "$ROOT/linux-shell/provision_runtime.sh" "$ROOT"
-    for sidecar in whatsapp-sidecar messenger-sidecar; do
-        PATH="$ROOT/runtime/node/bin:$PATH" npm install --prefix "$ROOT/$sidecar"
-    done
     echo "$STAMP" > "$WORK/provisioned.stamp"
 else
     echo "--- runtime up to date (stamp ${STAMP:0:12}) ---"

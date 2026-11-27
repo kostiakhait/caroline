@@ -12,9 +12,9 @@ public sealed record DownloadProgress(long BytesDownloaded, long TotalBytes, dou
 /// Downloads a single file with progress reporting, optional SHA-256
 /// verification, and retry with backoff. Ported from AppleKeyInstaller.
 /// Pass <paramref name="expectedSha256Hex"/> as null to skip verification
-/// (used for third-party downloads -- Node.js, Python -- whose publishers
+/// (used for third-party downloads -- Python -- whose publishers
 /// don't expose a simple co-located checksum file the way our own Caroline
-/// build does; see Dependencies/NodeInstaller.cs and PythonInstaller.cs).
+/// build does; see Dependencies/PythonInstaller.cs).
 /// </summary>
 internal sealed class Downloader
 {

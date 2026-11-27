@@ -436,6 +436,9 @@ class ChatSession(
         # site for why a separate one is needed (transcript timestamps on
         # disk are wall-clock, not process-uptime-relative).
         self.last_real_user_turn_started_at_ms: float | None = None
+        # When the turn now running began (any turn, real or internal): a reply is never a "repeat" of the same turn's own
+        # earlier remarks, see _recent_repeat_of.
+        self.current_turn_started_at_ms: float | None = None
         self.real_user_turn_answered = False
         self.silence_nudge_sent_for_turn = False
 

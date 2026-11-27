@@ -1,17 +1,14 @@
-"""app-browser -- ports backend/src/appBrowser.ts. Caroline's own embedded
-multi-window browser -- one persistent, labeled WebView2 window per site
-(e.g. "whatsapp", "telegram", "facebook", "slack"), living in its own
-standalone process (Caroline.NativeHost.exe, see this file's own
-_ensure_nativehost_running) rather than inside Caroline.exe itself or a
-separate per-window Chromium process. Window lifecycle (open/navigate/close/
-list/screenshot/scroll/is_visible_on_top/fill_file_dialog) and real OS-level
-input go through AppBrowserHost.cs's HTTP bridge (http://127.0.0.1:8767,
-unchanged by the 2026-10-03 extraction of that process out of Caroline.exe --
-see this repo's own plan doc, "Extract Caroline's embedded browser into a
-separate process"); page-content operations (snapshot/find/click/type/
-press_key/evaluate) go over a real CDP connection instead (app_browser_cdp.py),
-since CDP isn't subject to a page's own CSP the way ExecuteScriptAsync-
-injected script is.
+"""app-browser -- Caroline's own embedded multi-window browser: one persistent, labeled
+window per site (e.g. "whatsapp", "telegram", "facebook", "slack"), each a separate
+process of the bundled Chromium on its own profile folder (_chromium_app_browser.py),
+the same on every platform. Window lifecycle, screenshots, scrolling, OS-level clicks
+and the file chooser go through that module; page-content operations (snapshot/find/
+click/type/press_key/evaluate) go over a real CDP connection (app_browser_cdp.py),
+which a page's own CSP does not affect.
+
+A label can also run headless, on the same profile: the person signs in once in the
+visible window, then Caroline works in the same session without a window (open_app_browser
+with headless=true; headless=false brings the window back).
 
 This is Caroline's PRIMARY browsing tool -- see policies.py's
 prefer_own_backend_tools_instruction for why any other, non-backend-owned
@@ -20,21 +17,13 @@ browser tool she might see should never be used as a fallback for this one.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
-import subprocess
-import sys
-import time
-from pathlib import Path
 from typing import Any
 
-import httpx
-
 from app.context_cap import truncate
-from app.http_tls import ssl_context
 from app.logging_setup import log_event
 from app.memory_topics import get_current_topic
+from app.plugins import _chromium_app_browser as browser
 from app.plugins import app_browser_cdp as cdp
 from app.plugins.loader import Plugin, PluginTool
 from app.plugins.voice_api import describe_image_cheap
@@ -43,146 +32,18 @@ from app.session_context import get_tab_id
 from app.window_registry import register_window, unregister_window
 from app.workspace_dir import WORKSPACE_DIR
 
-if sys.platform != "win32":
-    from app.plugins import _linux_app_browser as linux_browser
-
-APP_BROWSER_HOST = "http://127.0.0.1:8767"
-
-# /open no longer blocks on a full page load, but a cold WebView2
-# environment for a brand-new profile can still take a while to spin up
-# its own runtime process, especially under system load.
-DEFAULT_TIMEOUT_S = 45.0
-OPEN_TIMEOUT_S = 90.0
-
-_ACCOUNT_HINT = (
-    "Embedded browser call failed: {exc}. Is Caroline's NativeHost process reachable? Do NOT fall "
-    "back to a different browser tool for this -- if it's not in describe_own_backend's own list, "
-    "it's not a substitute for your own embedded browser (see prefer_own_backend_tools_instruction). "
-    "Report the failure to the user instead."
-)
-
-# --- Caroline.NativeHost lazy launch -------------------------------------
-# The embedded browser used to live inside Caroline.exe itself; since the
-# 2026-10-03 extraction it's a separate process (Caroline.NativeHost.exe)
-# this backend launches on demand -- the first app_browser_* call in a
-# session that finds port 8767 not answering starts it, exactly mirroring
-# _get_cdp_port's own "open the window if it doesn't exist yet" shape one
-# level up (the whole HOST, not just one window). Caroline.exe is never
-# involved in launching or stopping it -- matches the user's own framing of
-# that task ("убрав его из фронтэнда"): the frontend no longer owns this
-# lifecycle at all, only this backend does. Normal process teardown (the
-# user quitting Caroline) already reaches it for free: supervisor.py's own
-# Dispose() kills ITS whole process tree, which this process (a child of
-# run_server.py, itself a child of supervisor.py) sits inside; no separate
-# cleanup hook is needed here for that path. A graceful per-window close on
-# an intentional UPDATE is CarolineInstaller's own job (Autostart.cs calls
-# this process's /shutdown directly before extracting a new install).
-_NATIVEHOST_START_LOCK = asyncio.Lock()
-_nativehost_process: subprocess.Popen[bytes] | None = None
-
-
-def _resolve_nativehost_exe() -> str | None:
-    """CAROLINE_NATIVEHOST_EXE_PATH is set by supervisor.py on every spawn (see its own
-    _child_env), a sibling of Caroline.exe in the same installed app-<hash> folder. No
-    dev-tree-relative fallback (unlike visual_mode.py's models_dir, say) -- a built exe's
-    output path varies by configuration/RID and isn't safely guessable the way a plain data
-    directory is; a dev run needs either a real install layout or Caroline.NativeHost started
-    by hand."""
-    from_env = os.environ.get("CAROLINE_NATIVEHOST_EXE_PATH")
-    if from_env and Path(from_env).is_file():
-        return from_env
-    return None
-
-
-async def _nativehost_is_up(timeout_s: float = 2.0) -> bool:
-    try:
-        async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout_s) as client:
-            res = await client.get(f"{APP_BROWSER_HOST}/list")
-            return res.status_code == 200
-    except Exception:
-        return False
-
-
-async def _ensure_nativehost_running() -> None:
-    global _nativehost_process
-    if await _nativehost_is_up():
-        return
-    async with _NATIVEHOST_START_LOCK:
-        if await _nativehost_is_up():  # another concurrent caller may have just started it
-            return
-        exe = _resolve_nativehost_exe()
-        if not exe:
-            raise RuntimeError(
-                "Caroline.NativeHost.exe not found (CAROLINE_NATIVEHOST_EXE_PATH is unset or stale) -- "
-                "the embedded browser can't start. This is expected in a dev-tree run unless "
-                "Caroline.NativeHost was built and started by hand; a real install always has it."
-            )
-        log_event("plugin:appbrowser", "nativehost_launch", exe=exe)
-        _nativehost_process = subprocess.Popen(
-            [exe],
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            if await _nativehost_is_up():
-                log_event("plugin:appbrowser", "nativehost_up", pid=_nativehost_process.pid)
-                return
-            await asyncio.sleep(0.3)
-        raise RuntimeError("Caroline.NativeHost.exe was launched but did not start answering on port 8767 within 15s.")
-
-
-async def _call(path: str, body: dict[str, Any] | None, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
-    try:
-        await _ensure_nativehost_running()
-        async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout_s) as client:
-            res = await client.post(f"{APP_BROWSER_HOST}{path}", json=body or {})
-            try:
-                return res.json()
-            except Exception:
-                return {}
-    except Exception as exc:
-        raise RuntimeError(_ACCOUNT_HINT.format(exc=exc)) from exc
-
-
-async def _get(path: str, timeout_s: float = 10.0) -> Any:
-    try:
-        await _ensure_nativehost_running()
-        async with httpx.AsyncClient(verify=ssl_context(), timeout=timeout_s) as client:
-            res = await client.get(f"{APP_BROWSER_HOST}{path}")
-            try:
-                return res.json()
-            except Exception:
-                return []
-    except Exception as exc:
-        raise RuntimeError(_ACCOUNT_HINT.format(exc=exc)) from exc
-
 
 async def _get_cdp_port(label: str) -> int:
-    """Every CDP-routed tool needs the label's window to exist first --
-    replicates AppBrowserHost's old lazy-open-if-needed behavior now that
-    these ops bypass that HTTP bridge entirely."""
-    if sys.platform != "win32":
-        port = await linux_browser.get_port(label)
-        if port is not None:
-            return port
-        opened = await linux_browser.open_window(label, None)
-        return opened["cdpPort"]
-    got = await _call("/get_port", {"label": label})
-    if "cdpPort" in got:
-        return got["cdpPort"]
-    opened = await _call("/open", {"label": label}, OPEN_TIMEOUT_S)
+    """Every CDP-routed tool needs the label's window to exist first: it is opened if not."""
+    port = await browser.get_port(label)
+    if port is not None:
+        return port
+    opened = await browser.open_window(label, None)
     return opened["cdpPort"]
 
 
 async def open_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.open_window(args["label"], args.get("url"))
-    else:
-        body: dict[str, Any] = {"label": args["label"]}
-        if args.get("url"):
-            body["url"] = args["url"]
-        result = await _call("/open", body, OPEN_TIMEOUT_S)
+    result = await browser.open_window(args["label"], args.get("url"), args.get("headless"))
     tab_id = get_tab_id()
     register_window(f"browser:{args['label']}", kind="browser", label=args["label"], purpose=args["purpose"], tab_id=tab_id,
                      topic_id=get_current_topic(WORKSPACE_DIR, tab_id))
@@ -190,10 +51,7 @@ async def open_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 async def app_browser_navigate(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.navigate(args["label"], args["url"])
-    else:
-        result = await _call("/navigate", {"label": args["label"], "url": args["url"]})
+    result = await browser.navigate(args["label"], args["url"])
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
@@ -230,21 +88,11 @@ async def app_browser_find(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 async def app_browser_click(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     label = args["label"]
-    if sys.platform != "win32":
-        if args.get("x") is not None and args.get("y") is not None:
-            result = await linux_browser.click_coords(label, args["x"], args["y"], args.get("button"))
-            return {"text": json.dumps(result, ensure_ascii=False)}
-        if args.get("real"):
-            result = await linux_browser.real_os_click(label, args.get("ref"), args.get("selector"))
-            return {"text": json.dumps(result, ensure_ascii=False)}
-        port = await _get_cdp_port(label)
-        result = await cdp.click(port, args.get("ref"), args.get("selector"))
-        return {"text": json.dumps({"result": result}, ensure_ascii=False)}
     if args.get("x") is not None and args.get("y") is not None:
-        result = await _call("/click", {"label": label, "x": args["x"], "y": args["y"]})
+        result = await browser.click_coords(label, args["x"], args["y"], args.get("button"))
         return {"text": json.dumps(result, ensure_ascii=False)}
     if args.get("real"):
-        result = await _call("/click", {"label": label, "ref": args.get("ref"), "selector": args.get("selector"), "real": True})
+        result = await browser.real_os_click(label, args.get("ref"), args.get("selector"))
         return {"text": json.dumps(result, ensure_ascii=False)}
     port = await _get_cdp_port(label)
     result = await cdp.click(port, args.get("ref"), args.get("selector"))
@@ -252,61 +100,26 @@ async def app_browser_click(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
 
 
 async def app_browser_scroll(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.scroll(args["label"], args.get("ref"), args.get("selector"), args.get("x"), args.get("y"), args.get("clicks"))
-        return {"text": json.dumps(result, ensure_ascii=False)}
-    body = {
-        "label": args["label"], "ref": args.get("ref"), "selector": args.get("selector"),
-        "x": args.get("x"), "y": args.get("y"), "clicks": args.get("clicks"),
-    }
-    result = await _call("/scroll", body)
+    result = await browser.scroll(args["label"], args.get("ref"), args.get("selector"), args.get("x"), args.get("y"), args.get("clicks"))
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def app_browser_type(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    label = args["label"]
-    if sys.platform != "win32":
-        # No separate OS-level "real" typing path on Linux yet (the posted-
-        # window text input _x11_input.py/_linux_app_browser.py would need
-        # is more involved to target correctly inside a real browser than
-        # the mouse-click case) -- CDP's keyboard.insertText fallback in
-        # app_browser_cdp.py's _type_with_fallback already covers the same
-        # "site rejects a plain .fill()" case real:true exists for on
-        # Windows, so route both paths through it for now.
-        port = await _get_cdp_port(label)
-        result = await cdp.type_text(port, args["text"], args.get("ref"), args.get("selector"))
-        return {"text": json.dumps({"result": result}, ensure_ascii=False)}
-    if args.get("real"):
-        result = await _call("/type", {"label": label, "ref": args.get("ref"), "selector": args.get("selector"), "text": args["text"], "real": True})
-        return {"text": json.dumps(result, ensure_ascii=False)}
-    port = await _get_cdp_port(label)
+    # No separate OS-level typing path: CDP's keyboard.insertText fallback in app_browser_cdp.py's
+    # _type_with_fallback covers a site that rejects a plain .fill(), so `real` takes the same route.
+    port = await _get_cdp_port(args["label"])
     result = await cdp.type_text(port, args["text"], args.get("ref"), args.get("selector"))
     return {"text": json.dumps({"result": result}, ensure_ascii=False)}
 
 
 async def app_browser_press_key(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    label = args["label"]
-    if sys.platform != "win32":
-        port = await _get_cdp_port(label)
-        result = await cdp.press_key(port, args["key"])
-        return {"text": result}
-    if args.get("real"):
-        result = await _call("/press_key", {"label": label, "key": args["key"], "real": True})
-        return {"text": json.dumps(result, ensure_ascii=False)}
-    port = await _get_cdp_port(label)
+    port = await _get_cdp_port(args["label"])
     result = await cdp.press_key(port, args["key"])
     return {"text": result}
 
 
 async def app_browser_screenshot(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.screenshot(args["label"], args.get("x"), args.get("y"), args.get("width"), args.get("height"), args.get("maxWidth"))
-    else:
-        body = {
-            "label": args["label"], "x": args.get("x"), "y": args.get("y"),
-            "width": args.get("width"), "height": args.get("height"), "maxWidth": args.get("maxWidth"),
-        }
-        result = await _call("/screenshot", body)
+    result = await browser.screenshot(args["label"], args.get("x"), args.get("y"), args.get("width"), args.get("height"), args.get("maxWidth"))
     image_b64 = result.get("imageBase64")
     if not image_b64:
         raise RuntimeError("No image returned")
@@ -314,10 +127,7 @@ async def app_browser_screenshot(args: dict[str, Any], _rp: Any) -> dict[str, An
 
 
 async def app_browser_describe(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.screenshot(args["label"], None, None, None, None, None)
-    else:
-        result = await _call("/screenshot", {"label": args["label"]})
+    result = await browser.screenshot(args["label"], None, None, None, None, None)
     image_b64 = result.get("imageBase64")
     if not image_b64:
         raise RuntimeError("No image returned")
@@ -335,36 +145,34 @@ async def app_browser_evaluate(args: dict[str, Any], _rp: Any) -> dict[str, Any]
 
 
 async def app_browser_is_visible_on_top(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.is_visible_on_top(args["label"])
-        return {"text": json.dumps(result, ensure_ascii=False)}
-    result = await _call("/is_visible_on_top", {"label": args["label"]})
+    result = await browser.is_visible_on_top(args["label"])
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def app_browser_fill_file_dialog(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.fill_file_dialog(args["paths"], args.get("timeoutMs"))
-        return {"text": json.dumps(result, ensure_ascii=False)}
-    body = {"paths": args["paths"], "timeoutMs": args.get("timeoutMs")}
-    result = await _call("/fill_file_dialog", body)
+    result = await browser.fill_file_dialog(args["paths"], args.get("timeoutMs"))
+    return {"text": json.dumps(result, ensure_ascii=False)}
+
+
+async def app_browser_download(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    result = await browser.download(args["label"], args.get("ref"), args.get("selector"), args["savePath"])
+    return {"text": json.dumps(result, ensure_ascii=False)}
+
+
+async def app_browser_forget(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    result = await browser.forget_profile(args["label"])
+    unregister_window(f"browser:{args['label']}")
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def close_app_browser(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.close_window(args["label"])
-    else:
-        result = await _call("/close", {"label": args["label"]})
+    result = await browser.close_window(args["label"])
     unregister_window(f"browser:{args['label']}")
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
 async def list_app_browsers(_args: dict[str, Any], _rp: Any) -> dict[str, Any]:
-    if sys.platform != "win32":
-        result = await linux_browser.list_windows()
-    else:
-        result = await _get("/list")
+    result = {"open": await browser.list_windows(), "profiles": browser.list_profiles()}
     return {"text": json.dumps(result, ensure_ascii=False)}
 
 
@@ -438,11 +246,11 @@ PLUGIN = Plugin(
             "MCP tool with the exact same purpose (its own bare tool name matching one of app_browser's) is "
             "auto-detected from the live tool list and hard-blocked at the SDK level (see durability.py's "
             "compute_foreign_tool_overlap), not just discouraged by prompt. "
-            "Each label is its own persistent window living inside the app, not a separate Chrome process. "
+            "Each label is its own persistent browser profile of the bundled Chromium: the window and the headless browser of one label share its sign-in, cookies and storage. headless=true works in the label without a window (what a person signed in to once is then handled quietly); headless=false shows the window again (sign-in, a check the site asks the person to do). Leave headless out to keep the label as it is. "
             "purpose is a short note on why you're opening/"
             "focusing it (e.g. \"checking WhatsApp for a reply\") -- recorded so list_my_windows can later tell "
             "you (or the user) what this window is for.",
-            {"label": str, "url": str | None, "purpose": str}, open_app_browser,
+            {"label": str, "url": str | None, "purpose": str, "headless": bool | None}, open_app_browser,
         ),
         PluginTool(
             "app_browser_navigate",
@@ -543,6 +351,18 @@ PLUGIN = Plugin(
             "close_app_browser",
             "Close the embedded browser window for a label you previously opened with open_app_browser.",
             {"label": str}, close_app_browser,
+        ),
+        PluginTool(
+            "app_browser_download",
+            "Click an element (ref from app_browser_snapshot/app_browser_find, or a CSS selector) that starts a "
+            "file download in the labeled browser, and save the file to savePath. Works in a headless label too.",
+            {"label": str, "ref": str | None, "selector": str | None, "savePath": str}, app_browser_download,
+        ),
+        PluginTool(
+            "app_browser_forget",
+            "Close a label and DELETE its profile: the sign-in, cookies and the site's stored data are gone "
+            "and the person must sign in again. Only when the person asks to forget a sign-in.",
+            {"label": str}, app_browser_forget,
         ),
         PluginTool(
             "list_app_browsers",

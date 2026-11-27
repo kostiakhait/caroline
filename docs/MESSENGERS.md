@@ -10,6 +10,12 @@ Every messenger follows one pattern, so a new one is mostly a copy:
 * Where the service needs a non-Python runtime, a **sidecar** process is driven over stdio by
   `sidecar_process.py` (newline-delimited JSON; blocking pipe I/O on plain threads bridged into
   asyncio, because `asyncio.create_subprocess_exec` is unreliable under the Windows selector loop).
+  Signal's `signal-cli` is the one left.
+* **Services that live in a web page** (WhatsApp, Messenger, Facebook, LinkedIn) go through
+  Caroline's own browser: the person signs in **once** in a visible window of her bundled Chromium,
+  then the same profile folder is opened **headless** and watched (`_chromium_app_browser.py`: one
+  profile, two modes). A signed-out session produces one note asking the person to sign in again.
+  Selectors and in-page scripts of each service sit in one table in its channel module.
 
 Most messengers have **two accounts**: `self` (Caroline's own, she may read and reply as herself)
 and `owner` (the human owner's, linked so Caroline can read it and act for the owner, which needs
@@ -18,11 +24,12 @@ explicit permission).
 | Service | Channel module | Transport | Notes |
 | --- | --- | --- | --- |
 | Telegram | `telegram_channel.py` | Telethon, MTProto *client* API (not a bot) | self + owner |
-| WhatsApp | `whatsapp_channel.py` | Node sidecar `companion-apps/whatsapp-sidecar` (Baileys, unofficial WhatsApp Web protocol) | QR login (`qrcode`, Pillow); self + owner |
+| WhatsApp | `whatsapp_channel.py` | web.whatsapp.com in her own browser (profiles `whatsapp_self`, `whatsapp_owner`) | QR scan once in a visible window; self + owner |
 | Signal | `signal_channel.py` | `signal-cli` as a JSON-RPC daemon over a local TCP socket (not stdio); needs a JRE | self + owner |
 | Slack | `slack_channel.py` | Socket Mode | First messenger built; proved the whole pattern |
 | Discord | `discord_channel.py` | discord.py gateway, **bot only** | A personal-account self-bot would violate Discord's ToS; sees only servers/DMs it is invited to |
-| Facebook Messenger | `messenger_channel.py` | Node sidecar `companion-apps/messenger-sidecar` (`fca-unofficial`) | Personal inbox; no official API exists |
+| Facebook Messenger | `messenger_channel.py` | messenger.com in her own browser (profiles `messenger_self`, `messenger_owner`) | Login once (2FA and checkpoints done by the person); self + owner |
+| Facebook, LinkedIn | `web_service_channel.py`, `plugins/facebook_plugin.py`, `plugins/linkedin_plugin.py` | The sites in her own browser (profiles `<service>_self`, `<service>_owner`) | Notifications, messages (LinkedIn), invitations, posts and comments; new items arrive as proactive notes |
 | Ratatosk | `ratatosk_channel.py`, `plugins/ratatosk_*.py` | SquirrelWisdom's own messenger | Watches both identities; Caroline's own account is auto-generated (`ratatosk_own_account.py`) |
 | Akinakes bus | `akinakes_channel.py`, `plugins/akinakes_bus_plugin.py` | HTTP long-poll to the agent bus | See below |
 
@@ -65,9 +72,9 @@ endpoint before the agent works.
 
 ## Embedded browser and web research
 
-* `plugins/app_browser_plugin.py` + `app_browser_cdp.py`: one persistent, labelled WebView2
-  window per site driven over CDP (Windows); `_linux_app_browser.py` is the Linux counterpart
-  (Playwright). `window_registry.py` tracks Caroline's own open windows so she can close "the rest".
+* `plugins/app_browser_plugin.py` + `app_browser_cdp.py`: one persistent, labelled window per site
+  driven over CDP, each a profile of the bundled Chromium (`_chromium_app_browser.py`, the same on
+  every platform; a label can run headless on the same profile). `window_registry.py` tracks Caroline's own open windows so she can close "the rest".
 * `web_browser.py` is a *separate* headless Chromium (own empty profile, no window, bundled under
   `dist/browsers`) used by `web_research.py`, the agentic search loop: plan → search → pick →
   read + extract → judge → answer, event-driven (pages are extracted as they arrive).

@@ -1,117 +1,173 @@
-"""app/whatsapp_channel.py -- WhatsApp personal-account connections via a
-Node sidecar (Baileys; see companion-apps/whatsapp-sidecar/index.js's own
-doc comment for the full wire protocol and why Node, not Python -- there
-is no official API for a personal WhatsApp account, Baileys is an
-unofficial reimplementation of the WhatsApp Web protocol). Fourth of the
-planned messenger integrations (docs/MESSENGER_INTEGRATIONS_PLAN.md,
-2026-10-06), and the first to need an external runtime -- see
-app/sidecar_process.py for the stdio transport this rides on.
+"""app/whatsapp_channel.py -- WhatsApp through Caroline's own browser (web.whatsapp.com).
 
-TWO separate accounts, not one (decision 2026-10-11, same shape as
-telegram_channel.py's own "self"/"owner" split, added after it became
-clear the single-account design shipped here was simply incomplete, not
-a real protocol limitation): "self" is Caroline's OWN WhatsApp account --
-her own number, linked once like any other WhatsApp Web device, she may
-read and reply there as herself, no extra permission needed; "owner" is
-the human owner's own personal WhatsApp account, linked so Caroline can
-read it and keep them posted, but may send AS the owner only when they
-have explicitly asked her to, for that specific message. Both run their
-own, fully independent Node sidecar PROCESS (one each -- Baileys/WhatsApp
-Web is one device-link per socket, there is no multi-account mode within
-a single connection), with their own auth-state directory, so one account
-can be linked and running while the other has never logged in, same as
-Telegram's two accounts. The ONE real external prerequisite, unlike
-Telegram (where the Caroline application itself was a one-time
-registration at my.telegram.org): WhatsApp has no "create a fresh account
-for free" option at all -- "self" needs an actual second phone number with
-an active WhatsApp installation to scan the link QR, whenever one is
-available. The code is ready regardless, the same way Telegram's "self"
-account was ready in code before anyone had actually linked it.
+Replaces the Baileys Node sidecar (owner's decision, 2026-11-24: for WhatsApp and Messenger the
+other ways of access are removed and this one takes their place). The person signs in ONCE, in
+a visible window of Caroline's own Chromium (the QR scan); from then on the same profile is
+opened HEADLESS (_chromium_app_browser.py: one profile folder, two modes) and Caroline reads,
+watches and answers through the page like a person at the keyboard would.
 
-Linking shows a QR code: rendered to a PNG under workspace_dir and opened
-in Caroline's own floating viewer window (the same "open_editor" WS
-message viewer_plugin.py's open_in_viewer sends, just pushed directly via
-session_context's register_send_for_tab/get_send_for_tab instead of
-get_send() -- this fires from the background sidecar loop, not from
-inside a turn). A refreshed QR (Baileys reissues one every 20-60s while
-unscanned) updates that SAME window instead of opening another one -- see
-MainWindow.xaml.cs's open_editor handler for the reuse-in-place fix this
-relies on (2026-10-11; a real incident, piling up one OS-viewer window per
-refresh before this).
+TWO accounts as before: "self" is Caroline's own WhatsApp (her own profile, label
+"whatsapp_self"); "owner" is the person's (label "whatsapp_owner"), sent from only when they ask
+for that specific message. The tools keep their names (whatsapp_*) and this module keeps the
+functions whatsapp_plugin.py calls.
 
-Baileys' own multi-file auth-state (created on first link) lives under
-workspace_dir/messengers/whatsapp/auth_<account>/ -- not individually
-DPAPI-encrypted like a single token (Baileys owns the shape of those
-files, not this module), but still under the same messengers/ root
-secret_store.py uses for everything else.
+How a chat is told apart: the chat list gives titles, unread counts and last messages, no jids.
+A message row carries a data-id ("true|false_<chat jid>_<message id>[_<sender>]"), so jids are
+learned from the messages that are read and remembered (chats.json). A chat whose jid is not
+known yet is addressed as "<title>@chat.name": whatsapp_list_chats returns those, and the same
+string works as `to`. A phone number opens its chat through WhatsApp's own deep link.
 
-Real risk, not hidden: Baileys is unofficial. A WhatsApp account used
-this way can be banned by WhatsApp at their own discretion -- this is
-inherent to there being no personal-account API at all, not a bug here.
-whatsapp_login's own result text says so.
+All selectors and the in-page scripts are in the table _SEL and the _JS_* constants below: when
+WhatsApp changes its page, that is the only place to change.
+
+Reading new messages opens the chat that has unread messages, so the messages are marked read
+(on the phone too) -- the cost of reading in a browser, as it is for a person.
 """
 
 from __future__ import annotations
 
 import asyncio
-import uuid
+import json
+import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from app.logging_setup import log_event
-from app.untrusted_text import third_party_label, third_party_text
+from app.plugins import _chromium_app_browser as browser
 from app.secret_store import messenger_secrets_dir
-from app.session_context import get_send_for_tab, get_tab_id
-from app.sidecar_process import SidecarProcess
 from app.task_supervisor import supervise
+from app.untrusted_text import third_party_label, third_party_text
 from app.workspace_dir import WORKSPACE_DIR
-
-import os
 
 ACCOUNTS = ("self", "owner")
 DEFAULT_ACCOUNT = "self"
 _ACCOUNT_LABEL = {"self": "your own", "owner": "the owner's"}
 
-NODE_EXE = os.environ.get("CAROLINE_NODE_PATH", "")
-SIDECAR_DIR = os.environ.get("CAROLINE_WHATSAPP_SIDECAR_DIR", "")
-SEND_TIMEOUT_S = 30.0
-
-# Opt-in heartbeat watchdog (task_supervisor.py's supervise(), 2026-10-11,
-# after a real Telegram incident of the same shape -- see telegram_
-# channel.py's own docstring). Deliberately more generous than Telegram's
-# own 60s: linking here involves a human scanning a QR code at their own
-# pace, which can legitimately run several minutes with little sidecar
-# traffic in between -- Telegram's heartbeat-covered path never has an
-# analogous human-paced wait (its own first-link flow is a separate code
-# path from the one this watches).
+WHATSAPP_URL = "https://web.whatsapp.com/"
+ACTION_TIMEOUT_S = 30.0
+DOWNLOAD_TIMEOUT_S = 60.0
+POLL_INTERVAL_S = 8.0
+LOADING_GIVE_UP_S = 180.0
 CHANNEL_HEARTBEAT_TIMEOUT_S = 300.0
-HEARTBEAT_PUMP_INTERVAL_S = 10.0
+SEEN_CAP = 2000
+NAME_JID_SUFFIX = "@chat.name"
+
+WHATSAPP_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "whatsapp_downloads"
+
+# Where things are on the page. Roles and aria-labels first (they change least), WhatsApp's own
+# data-* attributes second.
+_SEL = {
+    "pane": "#pane-side",
+    "qr": 'canvas[aria-label*="QR" i], div[data-ref] canvas, div[data-ref]',
+    "rows": '#pane-side [role="row"], #pane-side [role="listitem"]',
+    "search": '#side [contenteditable="true"][role="textbox"], #side [contenteditable="true"][data-tab="3"]',
+    "main": "#main",
+    "composer": '#main footer [contenteditable="true"], #main [contenteditable="true"][data-tab="10"]',
+    "messages": "#main [data-id]",
+    "attach": '#main footer [data-icon="plus-rounded"], #main footer [data-icon="attach-menu-plus"], #main footer [data-icon="clip"]',
+    "file_input": 'input[type="file"]',
+    "send": '#main footer [data-icon="send"], #main footer button[aria-label*="Send" i]',
+    "header": "#main header",
+}
+
+# Words of the page's own buttons (English and Russian interface), used where only text names them.
+_TXT = {
+    "new_chat": ["New chat", "Новый чат"],
+    "new_group": ["New group", "Новая группа"],
+    "block": ["Block", "Заблокировать"],
+    "unblock": ["Unblock", "Разблокировать"],
+    "confirm": ["Block", "Заблокировать", "Unblock", "Разблокировать", "Leave group", "Выйти из группы", "Exit group",
+                "Remove", "Удалить", "Add", "Добавить", "OK", "ОК"],
+    "exit_group": ["Exit group", "Leave group", "Выйти из группы"],
+    "add_participant": ["Add member", "Add participants", "Добавить участника", "Добавить участников"],
+    "make_admin": ["Make group admin", "Make admin", "Назначить администратором"],
+    "dismiss_admin": ["Dismiss as admin", "Remove admin", "Снять с должности администратора"],
+    "remove_member": ["Remove", "Удалить"],
+    "create": ["Create group", "Create", "Создать группу", "Создать"],
+    "invalid_number": ["invalid", "not on WhatsApp", "недействителен", "не зарегистрирован"],
+}
+
+# -- scripts run inside the page ----------------------------------------------------------------
+
+_JS_STATE = """(sel) => {
+  if (document.querySelector(sel.pane)) return 'ready';
+  if (document.querySelector(sel.qr)) return 'qr';
+  return 'loading';
+}"""
+
+_JS_CHAT_LIST = """(sel) => {
+  const out = [];
+  for (const row of document.querySelectorAll(sel.rows)) {
+    const titleEl = row.querySelector('span[title]');
+    const title = titleEl ? (titleEl.getAttribute('title') || titleEl.textContent || '').trim() : '';
+    if (!title) continue;
+    const badge = row.querySelector('span[aria-label*="unread" i], span[aria-label*="непрочит" i]');
+    let unread = 0;
+    if (badge) { const n = parseInt((badge.textContent || '').trim(), 10); unread = Number.isFinite(n) ? n : 1; }
+    const spans = Array.from(row.querySelectorAll('span[dir]')).map(s => (s.textContent || '').trim()).filter(Boolean);
+    out.push({ title, unread, last: spans.length > 1 ? spans[spans.length - 1] : '' });
+  }
+  return out;
+}"""
+
+_JS_MESSAGES = """(sel) => {
+  const out = [];
+  for (const el of document.querySelectorAll(sel.messages)) {
+    const id = el.getAttribute('data-id') || '';
+    if (!/^(true|false)_/.test(id)) continue;
+    const parts = id.split('_');
+    const copyable = el.querySelector('[data-pre-plain-text]');
+    const pre = copyable ? copyable.getAttribute('data-pre-plain-text') : '';
+    const textEl = el.querySelector('span.selectable-text, [data-testid="selectable-text"]');
+    const media = el.querySelector('img[src^="blob:"], video, [data-icon*="download"], [data-icon*="audio"], [data-icon*="document"]');
+    let kind = '';
+    if (el.querySelector('video')) kind = 'video';
+    else if (el.querySelector('img[src^="blob:"]')) kind = 'image';
+    else if (el.querySelector('[data-icon*="audio"]')) kind = 'audio';
+    else if (el.querySelector('[data-icon*="document"], [data-icon*="download"]')) kind = 'file';
+    const nameMatch = /\\]\\s*(.*?):\\s*$/.exec(pre || '');
+    out.push({
+      id, fromMe: parts[0] === 'true', chat: parts[1] || '', sender: parts.length > 3 ? parts.slice(3).join('_') : (parts[0] === 'true' ? '' : parts[1]),
+      senderName: nameMatch ? nameMatch[1] : '', time: pre ? pre.replace(/\\].*$/, '').replace('[', '') : '',
+      text: textEl ? textEl.innerText : '', media: media ? kind || 'media' : '',
+    });
+  }
+  return out;
+}"""
+
+_JS_HEADER = """(sel) => {
+  const h = document.querySelector(sel.header);
+  if (!h) return null;
+  const t = h.querySelector('span[title]');
+  return { title: t ? (t.getAttribute('title') || '').trim() : '', text: h.innerText || '' };
+}"""
+
+_JS_CLICK_TEXT = """(args) => {
+  const want = args.texts.map(s => s.toLowerCase());
+  const nodes = Array.from(document.querySelectorAll('[role="button"], button, [role="menuitem"], li, div[role="listitem"] span, span'));
+  for (const n of nodes) {
+    const label = ((n.getAttribute('aria-label') || '') + ' ' + (n.innerText || n.textContent || '')).trim().toLowerCase();
+    if (!label || label.length > 60) continue;
+    if (want.some(w => label === w || label.startsWith(w + '\\n'))) {
+      if (n.offsetParent === null) continue;
+      n.click(); return true;
+    }
+  }
+  return false;
+}"""
+
+_JS_DRAWER_TEXT = """() => {
+  const sections = Array.from(document.querySelectorAll('#app section, #app [role="dialog"]'));
+  const el = sections.length ? sections[sections.length - 1] : null;
+  return el ? el.innerText : '';
+}"""
 
 
 class WhatsAppError(Exception):
     pass
-
-
-def is_valid_account(account: str) -> bool:
-    return account in ACCOUNTS
-
-
-def _check_account(account: str) -> str:
-    if account not in ACCOUNTS:
-        raise WhatsAppError(f'"account" must be one of {", ".join(ACCOUNTS)}, not {account!r}.')
-    return account
-
-
-def _auth_dir(workspace_dir: str, account: str) -> Path:
-    d = messenger_secrets_dir(workspace_dir, "whatsapp") / f"auth_{account}"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _qr_image_path(workspace_dir: str, account: str) -> Path:
-    return messenger_secrets_dir(workspace_dir, "whatsapp") / f"link-qr-{account}.png"
 
 
 @dataclass
@@ -124,34 +180,82 @@ class WhatsAppChannelStatus:
     last_error: str | None = None
 
 
-_status: dict[str, WhatsAppChannelStatus] = {account: WhatsAppChannelStatus(account=account) for account in ACCOUNTS}
-_sidecar: dict[str, SidecarProcess | None] = {account: None for account in ACCOUNTS}
-_pending: dict[str, dict[str, asyncio.Future[Any]]] = {account: {} for account in ACCOUNTS}
-# Per explicit instruction (2026-10-06): never start an account's sidecar
-# (and so never pop a QR image open) until the user has actually asked to
-# connect it -- a fresh install must not auto-launch Node and show a QR
-# nobody requested. True for the rest of this process's life once set for
-# that account, same as "has credentials" gates Slack/Telegram/Discord's
-# own loops -- the difference here is WhatsApp's own "credential" (the
-# auth-state dir) doesn't exist yet on a first-ever link, so an explicit
-# flag covers that one case; every later reconnect (including across a
-# Caroline restart, once linked once) goes through the normal auth-dir
-# check. Independent per account, same as everything else here.
-_login_requested: dict[str, bool] = {account: False for account in ACCOUNTS}
-# Which tab's whatsapp_login call set _login_requested, per account -- the
-# tab whose own window should show that account's QR code (see
-# register_send_for_tab/get_send_for_tab, needed because _handle_qr fires
-# from the background sidecar loop, not from inside that tab's own turn).
-# Sticky like _login_requested itself; a later relink from a different tab
-# simply replaces it.
-_login_requested_tab_id: dict[str, str | None] = {account: None for account in ACCOUNTS}
+_status: dict[str, WhatsAppChannelStatus] = {a: WhatsAppChannelStatus(account=a) for a in ACCOUNTS}
+_login_requested: dict[str, bool] = {a: False for a in ACCOUNTS}
+_locks: dict[str, asyncio.Lock] = {}
+_names: dict[str, dict[str, str]] = {}      # account -> {jid: chat title}
+_lost_notified: dict[str, bool] = {a: False for a in ACCOUNTS}
+
+
+def is_valid_account(account: str) -> bool:
+    return account in ACCOUNTS
+
+
+def _check_account(account: str) -> str:
+    if account not in ACCOUNTS:
+        raise WhatsAppError(f'"account" must be one of {", ".join(ACCOUNTS)}, not {account!r}.')
+    return account
+
+
+def _label(account: str) -> str:
+    return f"whatsapp_{account}"
+
+
+def _state_dir() -> Path:
+    d = messenger_secrets_dir(WORKSPACE_DIR, "whatsapp")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _marker(account: str) -> Path:
+    return _state_dir() / f"browser_linked_{account}"
 
 
 def _has_prior_session(workspace_dir: str, account: str) -> bool:
+    return _marker(account).exists()
+
+
+def _names_file(account: str) -> Path:
+    return _state_dir() / f"chats_{account}.json"
+
+
+def _load_names(account: str) -> dict[str, str]:
+    if account not in _names:
+        try:
+            _names[account] = json.loads(_names_file(account).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _names[account] = {}
+    return _names[account]
+
+
+def _remember(account: str, jid: str, title: str) -> None:
+    if not jid or not title:
+        return
+    names = _load_names(account)
+    if names.get(jid) != title:
+        names[jid] = title
+        try:
+            _names_file(account).write_text(json.dumps(names, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _seen_file(account: str) -> Path:
+    return _state_dir() / f"seen_{account}.json"
+
+
+def _load_seen(account: str) -> list[str]:
     try:
-        return any(_auth_dir(workspace_dir, account).iterdir())
+        return list(json.loads(_seen_file(account).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return []
+
+
+def _save_seen(account: str, seen: list[str]) -> None:
+    try:
+        _seen_file(account).write_text(json.dumps(seen[-SEEN_CAP:]), encoding="utf-8")
     except OSError:
-        return False
+        pass
 
 
 def get_whatsapp_channel_status() -> dict[str, dict[str, Any]]:
@@ -159,352 +263,501 @@ def get_whatsapp_channel_status() -> dict[str, dict[str, Any]]:
 
 
 def is_connected(account: str) -> bool:
-    sidecar = _sidecar.get(account)
-    return sidecar is not None and not sidecar.closed and _status[account].connected
+    return _status[account].connected and browser.get_page(_label(account)) is not None
 
 
-async def _call(account: str, cmd: str, *, timeout: float = SEND_TIMEOUT_S, **fields: Any) -> dict[str, Any]:
-    """The request/response dance every sidecar command shares: send one
-    line with a fresh correlation id, wait for on_line (below) to resolve
-    the matching future from a "sendResult"/"chats" reply. Factored out
-    2026-10-11 once group/attachment/contact commands made send_message's
-    and list_chats' original copy of this dance a five-times-repeated
-    block."""
-    if not is_connected(account):
-        raise WhatsAppError(f'WhatsApp ("{account}") isn\'t connected yet -- use whatsapp_login(account="{account}") first.')
-    op_id = uuid.uuid4().hex
-    fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-    _pending[account][op_id] = fut
-    sidecar = _sidecar[account]
-    assert sidecar is not None
-    sidecar.send({"cmd": cmd, "id": op_id, **fields})
+def _lock(account: str) -> asyncio.Lock:
+    if account not in _locks:
+        _locks[account] = asyncio.Lock()
+    return _locks[account]
+
+
+async def _page_state(page: Any) -> str:
     try:
-        return await asyncio.wait_for(fut, timeout=timeout)
-    except asyncio.TimeoutError:
-        _pending[account].pop(op_id, None)
-        raise WhatsAppError(f"No response from WhatsApp within {int(timeout)}s.")
+        return await page.evaluate(_JS_STATE, _SEL)
+    except Exception:
+        return "loading"
 
 
-def _require_ok(result: dict[str, Any]) -> dict[str, Any]:
-    if not result.get("ok"):
-        raise WhatsAppError(result.get("error") or "unknown error")
-    return result
+async def _ready_page(account: str) -> Any:
+    """The account's page, in its chat view, or an error saying what to do."""
+    _check_account(account)
+    page = browser.get_page(_label(account))
+    if page is None:
+        raise WhatsAppError(f'WhatsApp ("{account}") isn\'t connected yet -- use whatsapp_login(account="{account}") first.')
+    state = await _page_state(page)
+    if state != "ready":
+        raise WhatsAppError(
+            f'WhatsApp ("{account}") is not signed in right now ({state}) -- use whatsapp_login(account="{account}") '
+            "and scan the code in the window that opens."
+        )
+    return page
 
+
+async def _click_text(page: Any, key: str) -> bool:
+    return bool(await page.evaluate(_JS_CLICK_TEXT, {"texts": _TXT[key]}))
+
+
+async def _wait_for(page: Any, selector: str, timeout_s: float = 10.0) -> bool:
+    try:
+        await page.wait_for_selector(selector, timeout=timeout_s * 1000)
+        return True
+    except Exception:
+        return False
+
+
+def _digits_of(jid: str) -> str:
+    return "".join(c for c in jid.split("@")[0] if c.isdigit())
+
+
+def _chat_list_id(account: str, title: str) -> str:
+    for jid, name in _load_names(account).items():
+        if name == title:
+            return jid
+    return f"{title}{NAME_JID_SUFFIX}"
+
+
+async def _open_chat(account: str, page: Any, to: str) -> str:
+    """Open the chat for a jid, a phone jid or "<title>@chat.name"; the chat's title."""
+    if to.endswith("@s.whatsapp.net") and not _load_names(account).get(to):
+        digits = _digits_of(to)
+        await page.goto(f"{WHATSAPP_URL}send?phone={digits}", wait_until="domcontentloaded")
+        if not await _wait_for(page, _SEL["composer"], 25.0):
+            raise WhatsAppError(f"{digits} could not be opened as a WhatsApp chat (not on WhatsApp?).")
+        head = await page.evaluate(_JS_HEADER, _SEL)
+        return (head or {}).get("title") or digits
+    title = to[: -len(NAME_JID_SUFFIX)] if to.endswith(NAME_JID_SUFFIX) else _load_names(account).get(to)
+    if not title:
+        raise WhatsAppError(f"The chat {to} is not known yet: run whatsapp_list_chats first, then use the id it gives.")
+    box = page.locator(_SEL["search"]).first
+    await box.click()
+    await page.keyboard.press("Control+A")
+    await page.keyboard.insert_text(title)
+    await page.wait_for_timeout(1500)
+    rows = await page.evaluate(_JS_CHAT_LIST, _SEL)
+    exact = [r for r in rows if r["title"] == title]
+    if not rows:
+        raise WhatsAppError(f'No chat named "{title}" found.')
+    target = (exact or rows)[0]["title"]
+    await page.locator(_SEL["rows"]).filter(has=page.locator(f'span[title="{target}"]')).first.click()
+    await page.keyboard.press("Escape")
+    if not await _wait_for(page, _SEL["composer"], 10.0):
+        raise WhatsAppError(f'The chat "{target}" did not open.')
+    return target
+
+
+async def _type_into_composer(page: Any, text: str) -> None:
+    composer = page.locator(_SEL["composer"]).first
+    await composer.click()
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            await page.keyboard.insert_text(line)
+        if i < len(lines) - 1:
+            await page.keyboard.press("Shift+Enter")
+
+
+async def _read_messages(page: Any) -> list[dict[str, Any]]:
+    return await page.evaluate(_JS_MESSAGES, _SEL)
+
+
+# -- the functions whatsapp_plugin.py calls --------------------------------------------------------
 
 async def send_message(account: str, to: str, text: str) -> None:
-    _require_ok(await _call(account, "sendMessage", to=to, text=text))
+    async with _lock(account):
+        page = await _ready_page(account)
+        await _open_chat(account, page, to)
+        before = {m["id"] for m in await _read_messages(page) if m["fromMe"]}
+        await _type_into_composer(page, text)
+        await page.keyboard.press("Enter")
+        deadline = time.monotonic() + ACTION_TIMEOUT_S
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(500)
+            if {m["id"] for m in await _read_messages(page) if m["fromMe"]} - before:
+                return
+        raise WhatsAppError("The message was typed but no new sent message appeared on the page within 30 s.")
 
 
 async def list_chats(account: str) -> list[dict[str, Any]]:
-    result = await _call(account, "listChats")
-    return result.get("chats") or []
+    async with _lock(account):
+        page = await _ready_page(account)
+        rows = await page.evaluate(_JS_CHAT_LIST, _SEL)
+    return [{"id": _chat_list_id(account, r["title"]), "name": r["title"], "unread": r["unread"], "lastMessage": r["last"]} for r in rows]
 
 
 async def check_number(account: str, phone: str) -> tuple[bool, str | None]:
-    """Whether a phone number is registered on WhatsApp at all -- unlike
-    Telegram, WhatsApp needs no "add contact first" step to message a
-    number cold (there is no server-side contact list to add to), so this
-    is purely an optional preflight, never required before send_message."""
-    result = _require_ok(await _call(account, "checkNumber", phone=phone))
-    return bool(result.get("exists")), result.get("jid")
+    """Whether a number has WhatsApp: its deep link opens a chat, or an "invalid" dialog."""
+    async with _lock(account):
+        page = await _ready_page(account)
+        await page.goto(f"{WHATSAPP_URL}send?phone={phone}", wait_until="domcontentloaded")
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            if await page.locator(_SEL["composer"]).count():
+                return True, f"{phone}@s.whatsapp.net"
+            dialog = await page.evaluate("() => { const d = document.querySelector('[role=\"dialog\"], [data-animate-modal-popup]'); return d ? d.innerText : ''; }")
+            if dialog and any(w.lower() in dialog.lower() for w in _TXT["invalid_number"]):
+                return False, None
+            await page.wait_for_timeout(500)
+    raise WhatsAppError("WhatsApp did not answer whether the number exists within 25 s.")
+
+
+async def _open_info(page: Any) -> str:
+    await page.locator(_SEL["header"]).first.click()
+    await page.wait_for_timeout(1200)
+    return await page.evaluate(_JS_DRAWER_TEXT)
 
 
 async def get_info(account: str, jid: str) -> dict[str, Any]:
-    """The sidecar's getInfo: a person's number, names, "about" text and
-    business profile, or a group's subject, description, owner and members."""
-    return _require_ok(await _call(account, "getInfo", jid=jid)).get("info") or {}
+    """What the chat's info panel shows: for a person their name, number and "about" text, for a
+    group its subject, description and members (the panel's own text, parsed no further)."""
+    async with _lock(account):
+        page = await _ready_page(account)
+        title = await _open_chat(account, page, jid)
+        panel = await _open_info(page)
+        await page.keyboard.press("Escape")
+    kind = "group" if jid.endswith("@g.us") or re.search(r"\b(participants|участник)", panel, re.I) else "person"
+    info: dict[str, Any] = {"kind": kind, "name": title, "id": jid, "panelText": panel}
+    if kind == "group":
+        members = [ln.strip() for ln in panel.splitlines() if ln.strip()]
+        info["participants"] = [{"id": m} for m in members]
+    return info
+
+
+async def _block_flow(account: str, jid: str, block: bool) -> None:
+    async with _lock(account):
+        page = await _ready_page(account)
+        await _open_chat(account, page, jid)
+        await _open_info(page)
+        key = "block" if block else "unblock"
+        if not await _click_text(page, key):
+            raise WhatsAppError(f"The {key} button was not found in the chat's info panel (already {'blocked' if block else 'unblocked'}?).")
+        await page.wait_for_timeout(800)
+        await _click_text(page, "confirm")
+        await page.wait_for_timeout(800)
+        await page.keyboard.press("Escape")
 
 
 async def set_block(account: str, jid: str, block: bool) -> None:
-    _require_ok(await _call(account, "setBlock", jid=jid, block=block))
-
-
-# Attachments (2026-10-11). Unlike Telegram, WhatsApp/Baileys gives no way
-# to re-fetch an arbitrary past message by id -- the sidecar keeps a short-
-# lived cache of recent media messages' raw envelopes (see index.js's
-# pendingMedia) keyed by a "ref" string it hands back in the proactive
-# notification; download_media just asks the sidecar for that ref.
-WHATSAPP_DOWNLOADS_DIR = Path(WORKSPACE_DIR) / "whatsapp_downloads"
-DOWNLOAD_TIMEOUT_S = 60.0
+    await _block_flow(account, jid, block)
 
 
 async def download_media(account: str, ref: str, save_path: str | None = None) -> str:
+    """ref is a message id (data-id) from a notification: the chat is opened, the message
+    found, and its download started; the file is saved to save_path."""
     if not save_path:
         WHATSAPP_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        # No file extension guessed here (unlike Telegram's default-path
-        # case) -- unlike Telethon's Message.file, nothing on the Python
-        # side knows this attachment's real type until the sidecar's own
-        # downloadMediaMessage call resolves it.
-        save_path = str(WHATSAPP_DOWNLOADS_DIR / ref.replace(":", "_").replace("@", "_"))
-    result = _require_ok(await _call(account, "downloadMedia", timeout=DOWNLOAD_TIMEOUT_S, ref=ref, savePath=save_path))
-    return result.get("path") or save_path
+        save_path = str(WHATSAPP_DOWNLOADS_DIR / re.sub(r"[^A-Za-z0-9_.-]", "_", ref))
+    chat = ref.split("_")[1] if "_" in ref else ""
+    async with _lock(account):
+        page = await _ready_page(account)
+        if chat:
+            await _open_chat(account, page, chat if "@" in chat else f"{chat}@s.whatsapp.net")
+        message = page.locator(f'#main [data-id="{ref}"]').first
+        if not await message.count():
+            raise WhatsAppError("That message is not on the page any more (scroll history is not kept): ask for the file to be sent again.")
+        await message.scroll_into_view_if_needed()
+        target = Path(save_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        icon = message.locator('[data-icon*="download"]').first
+        try:
+            async with page.expect_download(timeout=DOWNLOAD_TIMEOUT_S * 1000) as info:
+                if await icon.count():
+                    await icon.click()
+                else:
+                    await message.locator('img[src^="blob:"], video').first.click()
+                    await page.locator('[data-icon="download"]').first.click()
+            download = await info.value
+            await download.save_as(str(target))
+        except Exception as exc:
+            raise WhatsAppError(f"The attachment could not be downloaded: {exc}") from exc
+        finally:
+            await page.keyboard.press("Escape")
+    return str(target)
 
 
 async def send_file(account: str, to: str, path: str, caption: str | None = None) -> None:
     if not Path(path).is_file():
         raise WhatsAppError(f"No such local file: {path}")
-    _require_ok(await _call(account, "sendFile", timeout=DOWNLOAD_TIMEOUT_S, to=to, path=path, caption=caption))
+    async with _lock(account):
+        page = await _ready_page(account)
+        await _open_chat(account, page, to)
+        await page.locator(_SEL["attach"]).first.click()
+        await page.wait_for_timeout(500)
+        inputs = page.locator(_SEL["file_input"])
+        count = await inputs.count()
+        if not count:
+            raise WhatsAppError("The attach menu did not offer a file input.")
+        # The document input accepts anything; photos/videos use the one that accepts image/*.
+        chosen = inputs.first
+        for i in range(count):
+            accept = await inputs.nth(i).get_attribute("accept") or ""
+            if accept in ("*", ""):
+                chosen = inputs.nth(i)
+                break
+        await chosen.set_input_files(path)
+        await page.wait_for_timeout(1500)
+        if caption:
+            await page.keyboard.insert_text(caption)
+        if await page.locator(_SEL["send"]).count():
+            await page.locator(_SEL["send"]).first.click()
+        else:
+            await page.keyboard.press("Enter")
+        await page.wait_for_timeout(1500)
 
 
-# Groups (2026-10-11). WhatsApp has only one kind of group entity (unlike
-# Telegram's basic-group/channel split), and no true "delete" operation --
-# delete_group is a deliberate approximation (remove every other
-# participant, then leave), documented as such rather than overclaiming.
 async def create_group(account: str, subject: str, participants: list[str]) -> str:
-    result = _require_ok(await _call(account, "createGroup", subject=subject, participants=participants))
-    return result.get("jid") or ""
+    async with _lock(account):
+        page = await _ready_page(account)
+        names = _load_names(account)
+        if not await _click_text(page, "new_chat"):
+            await page.locator('[data-icon="new-chat-outline"], [data-icon="chat"]').first.click()
+        await page.wait_for_timeout(800)
+        if not await _click_text(page, "new_group"):
+            raise WhatsAppError("The New group entry was not found.")
+        await page.wait_for_timeout(800)
+        for who in participants:
+            label = names.get(who) or (who[: -len(NAME_JID_SUFFIX)] if who.endswith(NAME_JID_SUFFIX) else _digits_of(who))
+            await page.keyboard.insert_text(label)
+            await page.wait_for_timeout(1000)
+            await page.keyboard.press("Enter")
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+        await page.locator('[data-icon="arrow-forward"], [data-icon="forward"]').first.click()
+        await page.wait_for_timeout(600)
+        await page.keyboard.insert_text(subject)
+        if not await _click_text(page, "create"):
+            await page.locator('[data-icon="checkmark-medium"], [data-icon="checkmark"]').first.click()
+        await page.wait_for_timeout(2500)
+        await page.keyboard.press("Escape")
+        rows = await page.evaluate(_JS_CHAT_LIST, _SEL)
+        if not any(r["title"] == subject for r in rows):
+            raise WhatsAppError(f'The group "{subject}" did not appear in the chat list.')
+    return f"{subject}{NAME_JID_SUFFIX}"
 
 
 async def update_group_participants(account: str, jid: str, participants: list[str], action: str) -> None:
-    _require_ok(await _call(account, "groupParticipants", jid=jid, participants=participants, action=action))
+    async with _lock(account):
+        page = await _ready_page(account)
+        names = _load_names(account)
+        await _open_chat(account, page, jid)
+        await _open_info(page)
+        for who in participants:
+            label = names.get(who) or (who[: -len(NAME_JID_SUFFIX)] if who.endswith(NAME_JID_SUFFIX) else _digits_of(who))
+            if action == "add":
+                if not await _click_text(page, "add_participant"):
+                    raise WhatsAppError("The Add member entry was not found (are you an admin of this group?).")
+                await page.wait_for_timeout(600)
+                await page.keyboard.insert_text(label)
+                await page.wait_for_timeout(1000)
+                await page.keyboard.press("Enter")
+                await _click_text(page, "confirm")
+                await page.wait_for_timeout(800)
+                continue
+            row = page.locator('section [role="listitem"], section [role="button"]').filter(has_text=label).first
+            if not await row.count():
+                raise WhatsAppError(f"{label} was not found among the group's members.")
+            await row.hover()
+            await row.click(button="right")
+            await page.wait_for_timeout(500)
+            key = {"remove": "remove_member", "promote": "make_admin", "demote": "dismiss_admin"}[action]
+            if not await _click_text(page, key):
+                raise WhatsAppError(f"The '{action}' entry was not offered for {label} (are you an admin?).")
+            await page.wait_for_timeout(600)
+            await _click_text(page, "confirm")
+            await page.wait_for_timeout(800)
+        await page.keyboard.press("Escape")
 
 
 async def leave_group(account: str, jid: str) -> None:
-    _require_ok(await _call(account, "leaveGroup", jid=jid))
+    async with _lock(account):
+        page = await _ready_page(account)
+        await _open_chat(account, page, jid)
+        await _open_info(page)
+        if not await _click_text(page, "exit_group"):
+            raise WhatsAppError("The Exit group entry was not found.")
+        await page.wait_for_timeout(600)
+        await _click_text(page, "confirm")
+        await page.wait_for_timeout(800)
+        await page.keyboard.press("Escape")
 
 
 async def delete_group(account: str, jid: str) -> None:
-    """WhatsApp has no real "delete this group" call -- the sidecar's own
-    deleteGroup command removes every other participant it can, then
-    leaves, which empties the group and makes it inaccessible to everyone
-    including this account. Not a true delete; whatsapp_plugin.py's tool
-    description says so rather than letting the model overclaim it."""
-    _require_ok(await _call(account, "deleteGroup", jid=jid))
+    """WhatsApp has no real "delete this group": every other member is removed, then she leaves."""
+    info = await get_info(account, jid)
+    own = {"you", "вы"}
+    others = [p["id"] for p in info.get("participants", []) if p["id"].strip().lower() not in own]
+    if others:
+        await update_group_participants(account, jid, [_names_key(account, o) for o in others[:256]], "remove")
+    await leave_group(account, jid)
 
+
+def _names_key(account: str, label: str) -> str:
+    return f"{label}{NAME_JID_SUFFIX}"
+
+
+# -- sign-in and the watch ---------------------------------------------------------------------
 
 async def start_login(workspace_dir: str, account: str) -> str:
-    """Sets the flag that lets start_whatsapp_channel's loop actually spawn
-    that account's sidecar -- the QR itself appears (opened in Caroline's
-    own viewer window) once it connects and emits one, not synchronously
-    from this call. Doesn't wait inside the tool call for something that
-    can take a while and needs the user to act in between (scan the code).
-
-    Captures the calling tab's id (get_tab_id() is only valid here, inside
-    a real tool call -- not later, inside the background sidecar loop that
-    actually needs it) so the QR lands in the window of whichever tab
-    asked to connect, not an arbitrary one."""
+    """Open the account's profile in a VISIBLE window at web.whatsapp.com for the person to scan
+    the QR; the watch loop notices the chat list and then moves the profile to headless."""
     _check_account(account)
-    if not NODE_EXE or not Path(NODE_EXE).exists():
-        raise WhatsAppError("WhatsApp isn't set up in this build yet -- Node.js wasn't provisioned.")
     if is_connected(account):
-        return f'Already connected (as {_status[account].own_jid}, account="{account}").'
+        return f'Already connected (account="{account}").'
     _login_requested[account] = True
-    _login_requested_tab_id[account] = get_tab_id()
+    _lost_notified[account] = False
+    await browser.open_window(_label(account), WHATSAPP_URL, headless=False)
     return (
-        f'Starting WhatsApp ("{account}") -- a QR code image will open automatically in a moment. Scan it with '
-        "WhatsApp on the phone for that account (Linked Devices > Link a Device). Real risk, stated plainly: "
-        "WhatsApp has no official API for a personal account, so this uses an unofficial protocol library -- "
-        "WhatsApp could in principle flag or restrict the account for it, at their own discretion."
+        f'A WhatsApp window is open for the "{account}" account. Scan its QR code with WhatsApp on the phone for that '
+        "account (Settings > Linked devices > Link a device). Once the chats show, the window can be left alone: it "
+        "is closed and the account carries on quietly in the background -- you sign in only this once."
     )
 
 
-async def _run_sidecar(workspace_dir: str, account: str, inject_proactive: Callable[[str], None], touch: Callable[[], None] = lambda: None) -> None:
-    """`touch()` is supervise()'s heartbeat callback (2026-10-11, after a
-    real Telegram incident of the same shape -- see telegram_channel.py's
-    own docstring for the full story). Called on "ready" and pumped
-    periodically for as long as the sidecar is connected."""
-    if not NODE_EXE or not Path(NODE_EXE).exists():
-        raise WhatsAppError("Node.js runtime not found -- reinstall Caroline to provision it.")
-    if not SIDECAR_DIR or not (Path(SIDECAR_DIR) / "index.js").exists():
-        raise WhatsAppError("whatsapp-sidecar not found -- reinstall Caroline.")
+def _note_for(account: str, msg: dict[str, Any], chat_title: str) -> str:
+    frm = msg.get("chat") or _chat_list_id(account, chat_title)
+    name = third_party_label(chat_title or frm)
+    sender = msg.get("sender") or frm
+    who = f"sender={third_party_label(sender)}"
+    if msg.get("senderName"):
+        who += f', senderName="{third_party_label(msg["senderName"])}"'
+    text = (msg.get("text") or "").strip()
+    note = (
+        f'[New WhatsApp message in {_ACCOUNT_LABEL[account]} WhatsApp account, from "{name}" '
+        f'(jid={frm}, {who}, account="{account}"):\n'
+        f'{third_party_text(text, name) if text else "(no caption)"}'
+    )
+    if msg.get("media"):
+        note += (
+            f'\nAttached: {msg["media"]}. Use whatsapp_download_attachment(ref="{msg["id"]}", '
+            f'account="{account}") to save it locally first.'
+        )
+    if account == "self":
+        note += (
+            "\nThis is Caroline's own separate WhatsApp account, not the user's -- replying here is "
+            "Caroline's own correspondence, not something done on the user's behalf, and needs no extra "
+            f'permission. Reply with whatsapp_send_message(to="{frm}", text=..., account="self") if it needs a response.]'
+        )
+    else:
+        note += (
+            "\nThis is the OWNER'S OWN correspondence, not yours -- read it and tell the owner about it "
+            "if it matters, but do not reply as them unless they have explicitly asked you to send this "
+            f'specific reply (whatsapp_send_message(to="{frm}", text=..., account="owner")).]'
+        )
+    return note
 
-    closed_event = asyncio.Event()
 
-    def on_line(msg: dict[str, Any]) -> None:
-        # Any line at all -- including routine traffic -- proves the
-        # sidecar's own event loop is alive, which is the actual thing the
-        # heartbeat watchdog needs to know; QR-scan waits are human-paced
-        # and can legitimately run long with little traffic, so this (not
-        # only "ready") is what keeps that wait from false-positiving as
-        # a stall. See CHANNEL_HEARTBEAT_TIMEOUT_S's own comment.
-        touch()
-        msg_type = msg.get("type")
-        if msg_type == "qr":
-            _handle_qr(workspace_dir, account, str(msg.get("data") or ""))
-        elif msg_type == "ready":
-            _status[account].connected = True
-            _status[account].linked = True
-            _status[account].own_jid = msg.get("jid")
-            log_event("plugin:whatsapp", "connected", account=account, jid=_status[account].own_jid)
-            _close_qr_viewer(workspace_dir, account)
-        elif msg_type == "loggedOut":
-            _status[account].connected = False
-            _status[account].linked = False
-            log_event("plugin:whatsapp", "logged_out", account=account)
-        elif msg_type == "message":
-            if msg.get("fromMe"):
-                return
-            text = (msg.get("text") or "").strip()
-            media = msg.get("media")
-            # A media message without a caption is notified too (decision
-            # 2026-10-11, done in the sidecar but undone here until 2026-10-23).
-            if not text and not media:
-                return
-            frm = msg.get("from") or "unknown"
-            name = third_party_label(msg.get("chatName") or frm)
+async def _collect_new(account: str, page: Any, baseline: dict[str, int], inject: Callable[[str], None]) -> None:
+    """Open every chat whose unread count rose, read its new incoming messages, make notes."""
+    rows = await page.evaluate(_JS_CHAT_LIST, _SEL)
+    seen = _load_seen(account)
+    seen_set = set(seen)
+    for row in rows:
+        title, unread = row["title"], int(row["unread"])
+        before = baseline.get(title, 0)
+        baseline[title] = unread
+        if unread <= before:
+            continue
+        try:
+            await page.locator(_SEL["rows"]).filter(has=page.locator(f'span[title="{title}"]')).first.click()
+            if not await _wait_for(page, _SEL["messages"], 8.0):
+                continue
+            await page.wait_for_timeout(600)
+            messages = await _read_messages(page)
+        except Exception as exc:
+            log_event("plugin:whatsapp", "read_chat_failed", account=account, error=str(exc)[:200])
+            continue
+        incoming = [m for m in messages if not m["fromMe"]]
+        for m in incoming:
+            _remember(account, m["chat"], title)
+        fresh = [m for m in incoming if m["id"] not in seen_set][-(unread - before):]
+        for m in fresh:
+            if not (m.get("text") or "").strip() and not m.get("media"):
+                continue
+            seen_set.add(m["id"])
+            seen.append(m["id"])
             _status[account].last_event_at_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            log_event("plugin:whatsapp", "message_received", account=account, frm=frm)
-            # Who wrote it (2026-10-23): in a group `from` is the group's jid,
-            # and the author's own jid and number were never passed on.
-            sender = msg.get("sender") or frm
-            who = f"sender={third_party_label(sender)}"
-            if msg.get("senderName"):
-                who += f', senderName="{third_party_label(msg["senderName"])}"'
-            if msg.get("senderPhone"):
-                who += f', senderPhone={third_party_label(msg["senderPhone"])}'
-            note = (
-                f'[New WhatsApp message in {_ACCOUNT_LABEL[account]} WhatsApp account, from "{name}" '
-                f'(jid={frm}, {who}, account="{account}"):\n'
-                f'{third_party_text(text, name) if text else "(no caption)"}'
-            )
-            if media and msg.get("mediaRef"):
-                note += (
-                    f'\nAttached: {media}. Use whatsapp_download_attachment(ref="{msg["mediaRef"]}", '
-                    f'account="{account}") to save it locally first.'
+            log_event("plugin:whatsapp", "message_received", account=account, frm=m["chat"])
+            inject(_note_for(account, m, title))
+        baseline[title] = 0
+    _save_seen(account, seen)
+
+
+async def _watch(workspace_dir: str, account: str, inject: Callable[[str], None], touch: Callable[[], None]) -> None:
+    label = _label(account)
+    status = _status[account]
+    headless = not _login_requested[account]
+    await browser.open_window(label, WHATSAPP_URL, headless=headless)
+    loading_since = time.monotonic()
+    baseline: dict[str, int] | None = None
+    while True:
+        touch()
+        page = browser.get_page(label)
+        if page is None:
+            _login_requested[account] = False   # the person closed the sign-in window: it is not reopened by itself
+            raise WhatsAppError("the WhatsApp browser window was closed")
+        state = await _page_state(page)
+        if state == "ready":
+            loading_since = time.monotonic()
+            _lost_notified[account] = False
+            if not status.linked:
+                _marker(account).write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+                log_event("plugin:whatsapp", "connected", account=account)
+            status.linked = status.connected = True
+            status.last_error = None
+            if browser.is_headless(label) is False and _login_requested[account]:
+                _login_requested[account] = False
+                await browser.set_mode(label, True)   # signed in: the window goes, the session stays
+                baseline = None
+                await asyncio.sleep(3.0)
+                continue
+            async with _lock(account):
+                if baseline is None:
+                    baseline = {r["title"]: int(r["unread"]) for r in await page.evaluate(_JS_CHAT_LIST, _SEL)}
+                else:
+                    await _collect_new(account, page, baseline, inject)
+        elif state == "qr":
+            loading_since = time.monotonic()
+            status.connected = False
+            if browser.is_headless(label) and status.linked and not _lost_notified[account]:
+                status.linked = False
+                _lost_notified[account] = True
+                _marker(account).unlink(missing_ok=True)
+                log_event("plugin:whatsapp", "session_lost", account=account)
+                inject(
+                    f'[WhatsApp ("{account}", {_ACCOUNT_LABEL[account]} account) has signed out: the phone unlinked it or '
+                    f'the session expired. Tell the user once, and ask them to run whatsapp_login(account="{account}") '
+                    "and scan the code again.]"
                 )
-            if account == "self":
-                note += (
-                    "\nThis is Caroline's own separate WhatsApp account, not the user's -- replying here is "
-                    "Caroline's own correspondence, not something done on the user's behalf, and needs no extra "
-                    f'permission. Reply with whatsapp_send_message(to="{frm}", text=..., account="self") if it '
-                    "needs a response.]"
-                )
-            else:
-                note += (
-                    "\nThis is the OWNER'S OWN correspondence, not yours -- read it and tell the owner about it "
-                    "if it matters, but do not reply as them unless they have explicitly asked you to send this "
-                    f'specific reply (whatsapp_send_message(to="{frm}", text=..., account="owner")).]'
-                )
-            inject_proactive(note)
-        elif msg_type in ("sendResult", "chats"):
-            op_id = msg.get("id")
-            fut = _pending[account].pop(op_id, None) if op_id else None
-            if fut is not None and not fut.done():
-                fut.set_result(msg)
-        elif msg_type == "error":
-            log_event("plugin:whatsapp", "sidecar_reported_error", account=account, error=msg.get("message"))
-
-    def on_closed() -> None:
-        _status[account].connected = False
-        closed_event.set()
-
-    sidecar = SidecarProcess(
-        argv=[NODE_EXE, str(Path(SIDECAR_DIR) / "index.js")],
-        env={**_env_for_sidecar(), "WHATSAPP_AUTH_DIR": str(_auth_dir(workspace_dir, account))},
-        on_line=on_line,
-        on_closed=on_closed,
-        label=f"whatsapp_{account}",
-        cwd=SIDECAR_DIR,
-    )
-    sidecar.start()
-    _sidecar[account] = sidecar
-
-    async def _pump_heartbeat() -> None:
-        # Only touches once "ready" has actually fired (_status[account].
-        # connected) -- a sidecar that hangs before ever reaching "ready"
-        # must still be caught as stalled, the same failure shape the real
-        # Telegram incident had, not masked by a pump that started too
-        # early.
-        while True:
-            if _status[account].connected:
-                touch()
-            await asyncio.sleep(HEARTBEAT_PUMP_INTERVAL_S)
-
-    heartbeat_pump = asyncio.ensure_future(_pump_heartbeat())
-    try:
-        await closed_event.wait()
-    finally:
-        # Bug fix (2026-10-13), confirmed live: this used to only clear
-        # Python's own bookkeeping (_sidecar[account] = None) and never
-        # actually terminated the Node.js child process. closed_event is
-        # only ever set by on_closed (the sidecar's OWN stdout pipe
-        # closing) -- if THIS coroutine instead exits because it was
-        # CANCELLED from outside (e.g. task_supervisor.py's supervise()
-        # deciding the loop stalled and restarting it), closed_event never
-        # fires, so the Node process this function spawned was never asked
-        # to stop -- it kept running, orphaned, holding the exact same
-        # WhatsApp session the next _run_sidecar call immediately spawns a
-        # NEW process for. Confirmed live via `Get-CimInstance Win32_Process`:
-        # 4 whatsapp-sidecar/index.js processes running at once (2 per
-        # account instead of 1), all children of the same backend, each
-        # pair endlessly kicking the other off WhatsApp's servers
-        # (statusCode=440 "Stream Errored (conflict)", every ~5-10s,
-        # forever) -- not two separate incidents, the same orphan fighting
-        # its own replacement. sidecar.stop() is idempotent (checks
-        # poll() first), so calling it here even when on_closed already
-        # fired (the process is already gone) is a safe no-op.
-        sidecar.stop()
-        heartbeat_pump.cancel()
-        _sidecar[account] = None
-        _status[account].connected = False
-        for fut in _pending[account].values():
-            if not fut.done():
-                fut.set_exception(WhatsAppError("WhatsApp sidecar disconnected"))
-        _pending[account].clear()
-
-
-def _env_for_sidecar() -> dict[str, str]:
-    env = dict(os.environ)
-    return env
-
-
-def _handle_qr(workspace_dir: str, account: str, data: str) -> None:
-    if not data:
-        return
-    try:
-        import qrcode
-
-        img = qrcode.make(data)
-        path = _qr_image_path(workspace_dir, account)
-        img.save(path)
-        log_event("plugin:whatsapp", "qr_ready", account=account, path=str(path))
-    except Exception as exc:
-        log_event("plugin:whatsapp", "qr_render_failed", account=account, error=str(exc))
-        return
-    send = get_send_for_tab(_login_requested_tab_id[account])
-    if send is None:
-        log_event("plugin:whatsapp", "qr_no_tab_to_notify", account=account)
-        return
-    # Fixed path, same requestId reused isn't needed -- MainWindow.xaml.cs's
-    # open_editor handler keys its already-open-viewer check on PATH, not
-    # requestId, so a repeat send here (a refreshed, still-unscanned QR)
-    # updates the same window in place instead of opening another one.
-    asyncio.ensure_future(send({"type": "open_editor", "requestId": uuid.uuid4().hex, "path": str(path), "kind": "image"}))
-
-
-def _close_qr_viewer(workspace_dir: str, account: str) -> None:
-    send = get_send_for_tab(_login_requested_tab_id[account])
-    if send is None:
-        return
-    asyncio.ensure_future(send({"type": "close_editor", "path": str(_qr_image_path(workspace_dir, account))}))
+        else:
+            status.connected = False
+            if time.monotonic() - loading_since > LOADING_GIVE_UP_S:
+                raise WhatsAppError("web.whatsapp.com did not finish loading")
+        await asyncio.sleep(POLL_INTERVAL_S)
 
 
 def start_whatsapp_channel(workspace_dir: str, inject_proactive: Callable[[str], None]) -> list[asyncio.Task[None]]:
-    """Startup loop, one per account: if a session already exists (or
-    whatsapp_login was called), connect; otherwise re-check every 30s
-    (cheap file read) until one of those happens. The two accounts are
-    fully independent -- one can be linked and running while the other
-    has never logged in, same as telegram_channel.py's own two loops."""
+    """One supervised loop per account: with a kept sign-in (or after whatsapp_login) the profile
+    is opened and watched; otherwise it waits, cheaply, until one of those happens."""
     def _make_loop(account: str) -> Callable[[Callable[[], None]], Any]:
         async def _loop(touch: Callable[[], None]) -> None:
             while True:
                 if not (_login_requested[account] or _has_prior_session(workspace_dir, account)):
-                    # Idly waiting for whatsapp_login to ever be called for
-                    # this account is normal, indefinite, healthy -- not a stall.
                     touch()
                     await asyncio.sleep(30.0)
                     continue
                 try:
-                    await _run_sidecar(workspace_dir, account, inject_proactive, touch)
+                    await _watch(workspace_dir, account, inject_proactive, touch)
                 except WhatsAppError as exc:
                     _status[account].last_error = str(exc)
-                    log_event("plugin:whatsapp", "sidecar_unavailable", account=account, error=str(exc))
-                    touch()  # a deliberate backoff wait, not a stall
+                    _status[account].connected = False
+                    log_event("plugin:whatsapp", "watch_unavailable", account=account, error=str(exc))
+                    touch()
                     await asyncio.sleep(60.0)
                     continue
                 except Exception as exc:
                     _status[account].last_error = str(exc)
-                    log_event("plugin:whatsapp", "sidecar_failed", account=account, error=str(exc))
+                    _status[account].connected = False
+                    log_event("plugin:whatsapp", "watch_failed", account=account, error=str(exc)[:300])
                 touch()
                 await asyncio.sleep(5.0)
         return _loop

@@ -9,9 +9,8 @@ namespace Caroline.Native;
 
 /// <summary>
 /// Local HTTP control surface for Caroline.exe itself -- what's left of the
-/// old AppBrowserHost.cs after its browser-window endpoints moved to the new
-/// standalone Caroline.NativeHost process (2026-10-03, "Extract Caroline's
-/// embedded browser into a separate process"). Only two things remain, and
+/// old AppBrowserHost.cs after its browser-window endpoints left this process
+/// (the embedded browser now runs in the Python backend, 2026-11-25). Only two things remain, and
 /// both are genuinely about THIS process, not about browser windows:
 ///
 /// - /shutdown: asks Caroline to exit herself gracefully (CarolineInstaller's
@@ -22,7 +21,7 @@ namespace Caroline.Native;
 ///   (Caroline's avatar/TTS visual-mode window), isolated from the chat/TTS
 ///   pipeline for diagnosing a WebView2-init hang.
 ///
-/// Moved from port 8767 (now Caroline.NativeHost's own) to 8768 -- see
+/// Moved from port 8767 to 8768 -- see
 /// CarolineInstaller/Autostart.cs's own AppControlHostPort literal, which
 /// needed updating to match.
 /// </summary>

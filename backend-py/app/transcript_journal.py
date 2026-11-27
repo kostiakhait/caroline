@@ -27,9 +27,11 @@ SAME_ENTRY_WINDOW_MS = 10 * 60 * 1000
 # time stamp the backend puts in front of a user's text. None of it was ever a bubble in the window.
 _STAMP = re.compile(r"^\[(Sent: |(Sun|Mon|Tue|Wed|Thu|Fri|Sat), )[^\]]*\]\s*", re.IGNORECASE)
 _NOISE_PREFIXES = (
-    "<command-", "<local-command", "[Request interrupted", "No response requested", "You've hit your session limit",
+    "<command-", "<local-command", "[Request interrupted", "No response requested",
     "This session is being continued",
 )
+# The CLI's own usage-cap report (session, weekly, monthly ... limit) is a status, shown in the status bar, never a bubble.
+_LIMIT_REPORT = re.compile(r"hit your .{0,40}\blimit\b|monthly spend limit", re.IGNORECASE)
 _NOISE_MARKERS = ("[[NO_UPDATE]]", "PreCompact callback", "[[caroline-internal-turn]]", "[[caroline-attachment-note]]")
 
 _lock = threading.Lock()
@@ -63,7 +65,8 @@ def _usable(entry: Any) -> bool:
     if not (isinstance(entry, dict) and entry.get("role") in ("user", "assistant") and isinstance(entry.get("text"), str)):
         return False
     text = _clean(entry["text"])
-    return text != "" and not text.startswith(_NOISE_PREFIXES) and not any(m in text for m in _NOISE_MARKERS)
+    return (text != "" and not text.startswith(_NOISE_PREFIXES) and not any(m in text for m in _NOISE_MARKERS)
+            and not (len(text) < 300 and _LIMIT_REPORT.search(text)))
 
 
 def read_entries(workspace_dir: str, tab_id: str) -> list[dict[str, Any]]:

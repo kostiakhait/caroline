@@ -11,7 +11,7 @@
 # Corrected 2026-10-21 (Linux parity pass, messenger-integrations testing
 # plan): this file's own header used to ALSO claim playwright was a
 # Windows-only extra -- wrong, contradicted by live code.
-# app/plugins/app_browser_cdp.py and _linux_app_browser.py (Phase 3 of
+# app/plugins/app_browser_cdp.py and _chromium_app_browser.py (Phase 3 of
 # docs/LINUX_PORT_PLAN.md, done and verified 2026-10-05) both import
 # playwright directly and ARE the Linux embedded-browser path; it was
 # simply never added to this pin file, so every Linux provision has been

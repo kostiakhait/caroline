@@ -7,7 +7,7 @@ description: What to do when app_browser_* tools don't seem to work -- snapshot/
 
 `app_browser_snapshot`/`app_browser_find`/`app_browser_click`/`app_browser_type`/
 `app_browser_press_key`/`app_browser_evaluate` all go over a real CDP connection to the window's
-own WebView2 instance by default -- this already gets past page CSP (some sites, ChatGPT and
+own Chromium by default (the bundled one -- every window is a profile of it, and a profile can also run headless: open_app_browser with headless=true) -- this already gets past page CSP (some sites, ChatGPT and
 Facebook among them, silently block script injection entirely; CDP isn't subject to that the way
 injected `<script>`-equivalent code is), so CSP itself is rarely the problem anymore. Work through
 these in order:

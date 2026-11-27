@@ -24,7 +24,7 @@ def make_dist(root: Path, tag: str, extra: dict[str, str] | None = None) -> Path
         "backend-py/app/main.py": f"# main {tag}", "backend-py/app/plugins/new_{0}.py".format(tag): "x",
         "backend-py/run_server.py": f"run {tag}", "backend-py/VERSION": f"{tag}\n",
         "wwwroot/chat.html": f"chat {tag}", "linux-shell/caroline_shell.py": f"shell {tag}",
-        "whatsapp-sidecar/index.js": f"wa {tag}", **(extra or {}),
+        **(extra or {}),
     }
     for rel, text in files.items():
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -40,8 +40,8 @@ def test_build_then_apply_replaces_what_is_owned_and_keeps_the_rest(tmp_path):
     old = make_dist(tmp_path / "old", "1.0.0")
     (old / "runtime/python").mkdir(parents=True)
     (old / "runtime/python/python3").write_text("the runtime")
-    (old / "whatsapp-sidecar/node_modules").mkdir()
-    (old / "whatsapp-sidecar/node_modules/dep.js").write_text("dep")
+    (old / "runtime/python/lib").mkdir()
+    (old / "runtime/python/lib/dep.py").write_text("dep")
     new = make_dist(tmp_path / "new", "1.1.0")
     zip_path = tmp_path / "overlay.zip"
     oi.build_overlay(new, zip_path)
@@ -50,10 +50,10 @@ def test_build_then_apply_replaces_what_is_owned_and_keeps_the_rest(tmp_path):
 
     assert "backend-py/app" in replaced and "backend-py/VERSION" in replaced
     assert read(old, "backend-py/app/main.py") == "# main 1.1.0" and read(old, "backend-py/VERSION") == "1.1.0\n"
-    assert read(old, "wwwroot/chat.html") == "chat 1.1.0" and read(old, "whatsapp-sidecar/index.js") == "wa 1.1.0"
+    assert read(old, "wwwroot/chat.html") == "chat 1.1.0" and read(old, "backend-py/run_server.py") == "run 1.1.0"
     assert not (old / "backend-py/app/plugins/new_1.0.0.py").exists()  # a module the new version dropped is gone: plugins are found by listing the folder
     assert (old / "backend-py/app/plugins/new_1.1.0.py").exists()
-    assert read(old, "runtime/python/python3") == "the runtime" and read(old, "whatsapp-sidecar/node_modules/dep.js") == "dep"
+    assert read(old, "runtime/python/python3") == "the runtime" and read(old, "runtime/python/lib/dep.py") == "dep"
     assert not (old / ".update-staging").exists() and not (old / ".update-previous").exists()
 
 
@@ -113,7 +113,7 @@ def test_a_failure_in_the_middle_puts_everything_back(tmp_path, monkeypatch):
         oi.apply_overlay(zip_path, dist)
     monkeypatch.undo()
     for rel, text in {"backend-py/app/main.py": "# main 1.0.0", "wwwroot/chat.html": "chat 1.0.0", "linux-shell/caroline_shell.py": "shell 1.0.0",
-                      "backend-py/VERSION": "1.0.0\n", "whatsapp-sidecar/index.js": "wa 1.0.0"}.items():
+                      "backend-py/VERSION": "1.0.0\n", "backend-py/run_server.py": "run 1.0.0"}.items():
         assert read(dist, rel) == text, rel
     assert not (dist / ".update-previous").exists()
 

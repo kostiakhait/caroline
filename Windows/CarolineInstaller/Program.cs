@@ -15,7 +15,7 @@ namespace CarolineInstaller;
  * Downloads the latest Caroline.zip from the multi-portal downloader over
  * HTTPS, verifies it against its published SHA-256, installs it per-user
  * into %LocalAppData%\Caroline\app, provisions the isolated dependencies
- * Caroline's backend needs (Node.js, Python, Playwright's Chromium -- all
+ * Caroline's backend needs (Python, Playwright's Chromium -- all
  * idempotent, none touching anything the machine already has), wires up
  * autostart and a desktop shortcut, and launches it. No elevation required.
  * Re-run it to update.
@@ -175,7 +175,7 @@ internal static class Program
         // inside whichever step happened to run out of room. 6 GB covers
         // the base app (the downloaded zip and its extracted copy exist on
         // disk at the same time, briefly) plus the isolated runtimes
-        // (Node/Python/Git Bash/ffmpeg) plus Playwright's Chromium, with
+        // (Python/Git Bash/ffmpeg) plus Playwright's Chromium, with
         // real margin -- NOT the talking-head models, which are tens of GB
         // each and checked individually, per-file, right before each one
         // downloads (see ModelsInstaller.cs) since failing the whole
@@ -222,17 +222,6 @@ internal static class Program
         {
             zipPath = await ObtainZipAsync(downloader, info, window, ct);
             newDirName = await WithStepAsync(ErrorCodes.Extraction, "Installing Caroline", () => ExtractWithRetryAsync(window, zipPath, ct));
-            var newDir = Path.Combine(AppPaths.Root, newDirName);
-            try
-            {
-                await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct, newDir));
-                await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct, newDir));
-            }
-            catch
-            {
-                TryDeleteUnactivated(newDir);
-                throw;
-            }
         }
 
         // Only now the running Caroline stops (see the order above) -- and only for a new version, as before: already installed, she is left alone.
@@ -260,11 +249,6 @@ internal static class Program
         }
         // Put in place after the stop, from what was downloaded before it (never a download here): a newer speech model.
         await WhisperModelInstaller.FinishPreparedAsync(s => window.SetStatus(s), ct);
-
-        // The sidecars of the now active app folder. For a new version they were set up in that folder before the stop (Node is
-        // provisioned before it, PrepareDependenciesAsync) -- these find them in place and do nothing.
-        await WithStepAsync(ErrorCodes.WhatsappSidecarInstall, "Setting up WhatsApp support", () => WhatsappSidecarInstaller.InstallAsync(ct));
-        await WithStepAsync(ErrorCodes.MessengerSidecarInstall, "Setting up Messenger support", () => MessengerSidecarInstaller.InstallAsync(ct));
 
         window.SetStatus("Creating shortcut…");
         await WithStepAsync(ErrorCodes.ShortcutOrAutostart, "Creating the desktop shortcut", () => Task.Run(ShortcutManager.CreateDesktopShortcut, ct));
@@ -338,12 +322,6 @@ internal static class Program
     /// </summary>
     private static async Task PrepareDependenciesAsync(Downloader downloader, HttpClient http, ProgressWindow window, CancellationToken ct)
     {
-        // Node first -- the app folder's sidecars (npm) need it.
-        await WithStepAsync(ErrorCodes.NodeInstall, "Installing Node.js", () => NodeInstaller.InstallAsync(downloader,
-            s => window.SetStatus(s),
-            p => window.SetDownloadProgress("Downloading Node.js…", p),
-            ct));
-
         // Always called: PythonInstaller checks the runtime and its required packages separately, so a runtime that predates a
         // newly added package still gets it.
         await WithStepAsync(ErrorCodes.PythonInstall, "Installing Python", () => PythonInstaller.PrepareAsync(downloader,

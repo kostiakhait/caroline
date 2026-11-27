@@ -1,9 +1,5 @@
 # --- Build output --------------------------------------------------------
 companion-apps/*/node_modules/
-# fca-unofficial's own runtime cache DB (messenger-sidecar), auto-created in
-# its CWD on every start -- not config, nothing to ship or review, same
-# category as node_modules/ above.
-companion-apps/messenger-sidecar/Fca_Database/
 dist/
 dist_installer/
 
@@ -11,8 +7,6 @@ dist_installer/
 .vs/
 Windows/Caroline/bin/
 Windows/Caroline/obj/
-Windows/Caroline.NativeHost/bin/
-Windows/Caroline.NativeHost/obj/
 Windows/Caroline.Linux/bin/
 Windows/Caroline.Linux/obj/
 Windows/CarolineInstaller/bin/
