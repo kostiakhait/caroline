@@ -35,7 +35,6 @@ class SmallModelTurnMixin:
         # Mirrors submit()'s own is_real_user bookkeeping (see its comments for
         # why each field exists). Real-user-only state (silent-wait nudge, crash
         # recovery of a pending question) is skipped for internal turns.
-        self.classifier_refusal_retry_count = 0
         self.pending_user_text = text
         self.pending_is_real_user = is_real_user
         self._turn_last_visible_text = None

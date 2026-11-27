@@ -466,15 +466,14 @@ class PermissionGuardMixin:
         after it (app/own_identity_gate.py). Returns (reason or None, checked). Reads what really reached the window
         from the exact dialogue record; a yes before the text was shown never counts. Fail-closed: an error means
         'not checked', which the policy treats as blocked."""
-        from app import dialogue_log, own_identity_gate as gate
+        from app import action_ledger, dialogue_log, own_identity_gate as gate
         from app.plugins.voice_api import check_action_sanction
 
         try:
             body = gate.body_of(args)
             # A background session (a sub-agent, a reminder) sends on the strength of what was shown in the owner's tab.
             entries = dialogue_log.read_entries(self.workspace_dir, self.approval_bridge_tab_id or self.tab_id)
-            shown = gate.shown_entry(entries, body)
-            answers = gate.messages_after(entries, int(shown.get("ms") or 0)) if shown else []
+            shown, answers = gate.approval_window(entries, body, action_ledger.last_sent_ms(self.workspace_dir, body, gate.normalize))
             approved = False
             if shown and answers:
                 decisions = await check_action_sanction(

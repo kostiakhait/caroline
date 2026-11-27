@@ -126,6 +126,22 @@ def checker_note(workspace_dir: str, hours: float = 24.0, limit: int = 8) -> str
     )
 
 
+def last_sent_ms(workspace_dir: str, body: str, normalize: Any) -> int:
+    """When exactly this text last went out (0: never, as far as the log goes). The log keeps the start of a text, so the
+    comparison is on that start. Never raises."""
+    try:
+        wanted = normalize(body)
+        found = 0
+        for e in recent(workspace_dir, 24.0):
+            logged = normalize(str(e.get("text") or ""))
+            if logged and wanted.startswith(logged):
+                found = max(found, int(e.get("ms") or 0))
+        return found
+    except Exception as exc:  # noqa: BLE001
+        log_event("engine", "action_ledger_last_sent_failed", error=str(exc)[:200])
+        return 0
+
+
 _ADDRESS = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _SUBJECT_PREFIX = re.compile(r"^\s*((re|fw|fwd|aw|sv|ответ|пересл)\s*:\s*)+", re.IGNORECASE)
 

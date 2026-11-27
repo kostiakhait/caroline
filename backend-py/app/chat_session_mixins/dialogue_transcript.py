@@ -184,8 +184,13 @@ class DialogueTranscriptMixin:
         content_blocks = wire.get("message", {}).get("content") or []
         if not any(isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip() for b in content_blocks):
             return wire
+        from app.language_hint import already_in_language
         from app.plugins.voice_api import review_reply, translate_text
 
+        # The checks that do not depend on each other run side by side (2026-11-27, live: they ran one after another and
+        # a reply reached the window 50 seconds after the model had finished it). The permission guard reads the dialogue,
+        # not this text, so it starts now and is awaited before the message goes out.
+        guard = asyncio.ensure_future(self._check_permission_guard())
         language = current_language_name(self.tab_id)
         # Per explicit instruction (2026-10-12): _narration_task()
         # (last_real_user_question), not self.pending_user_text -- that goes
@@ -258,19 +263,18 @@ class DialogueTranscriptMixin:
                     # Quoted runs (the draft of an outgoing message) go out verbatim: see own_identity_gate.split_quoted.
                     from app.own_identity_gate import split_quoted
 
-                    parts = []
-                    for is_quote, chunk in split_quoted(text):
-                        if is_quote or not chunk.strip():
-                            parts.append(chunk)
-                            continue
+                    async def translated_chunk(is_quote: bool, chunk: str) -> str:
+                        if is_quote or not chunk.strip() or already_in_language(chunk, language):
+                            return chunk
                         lead = chunk[:len(chunk) - len(chunk.lstrip())]
                         tail = chunk[len(chunk.rstrip()):]
                         done = await translate_text(
                             chunk.strip(), language, gender=get_persona_gender(self.workspace_dir),
                             addressee_gender=get_owner_profile(self.workspace_dir).gender, context=task,
                         )
-                        parts.append(lead + (done or chunk.strip()) + tail)
-                    translated = "".join(parts)
+                        return lead + (done or chunk.strip()) + tail
+
+                    translated = "".join(await asyncio.gather(*(translated_chunk(q, c) for q, c in split_quoted(text))))
                 except Exception as exc:
                     log_event("engine", "wire_translate_failed", tab_id=self.tab_id, error=str(exc))
                     translated = None
@@ -295,16 +299,15 @@ class DialogueTranscriptMixin:
                     from app.plugins.voice_api import fix_gender
 
                     gender = get_persona_gender(self.workspace_dir)
-                    gparts = [c if (q or not c.strip()) else await fix_gender(c, gender) for q, c in split_quoted(block["text"])]
+                    async def gendered_chunk(is_quote: bool, chunk: str) -> str:
+                        return chunk if (is_quote or not chunk.strip()) else await fix_gender(chunk, gender)
+
+                    gparts = await asyncio.gather(*(gendered_chunk(q, c) for q, c in split_quoted(block["text"])))
                     gendered = "".join(gparts)
                     if gendered != block["text"]:
                         block["text"] = gendered
                 except Exception as exc:
                     log_event("engine", "gender_fix_error", tab_id=self.tab_id, error=str(exc))
-            # Per explicit instruction (2026-10-11): re-evaluate the permission
-            # guard on every outbound message -- see _check_permission_guard's
-            # own docstring for why this runs here too, not just in submit().
-            await self._check_permission_guard()
             # Per explicit instruction (2026-10-20), after a real incident:
             # a clarifying question the user already answered earlier in the
             # dialogue must never be asked again -- see
@@ -325,7 +328,8 @@ class DialogueTranscriptMixin:
             # Skipped for a silent/dropped block -- nothing is actually
             # reaching the user, so there is nothing to check.
             if not is_silent:
-                await self._check_delivery_completeness(text)
+                # It never blocks the send (it only corrects afterwards), so the message does not wait for it.
+                self._run_beside(self._check_delivery_completeness(text))
             if is_silent:
                 log_event("engine", "review_reply_produced_no_update", tab_id=self.tab_id, text=text)
                 if not self.headless:
@@ -335,6 +339,9 @@ class DialogueTranscriptMixin:
                 dropped.append(block)
             elif block["text"] != original_text:
                 transcript_patches.append((original_text, block["text"]))
+        # Per explicit instruction (2026-10-11): the permission guard is re-evaluated on every outbound message -- see
+        # _check_permission_guard's own docstring for why this runs here too, not just in submit().
+        await guard
         if transcript_patches:
             await self._patch_cli_transcript_text(transcript_patches)
         if dropped:
@@ -346,6 +353,18 @@ class DialogueTranscriptMixin:
         return wire
     # edition:end
     # edition:cut claude-session code no longer reached
+    def _run_beside(self, check: Any) -> None:
+        """A check the message does not wait for; held until done so it is not collected half-way, failures logged."""
+        tasks = self.__dict__.setdefault("_side_checks", set())
+        task = asyncio.ensure_future(check)
+        tasks.add(task)
+
+        def finished(done: Any) -> None:
+            tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                log_event("engine", "side_check_failed", tab_id=self.tab_id, error=str(done.exception())[:200])
+
+        task.add_done_callback(finished)
     async def _check_question_already_answered(self, final_text: str) -> str | None:
         """Per explicit instruction (2026-10-20), after a real incident:
         Caroline asked which Facebook account to connect, the user
@@ -375,8 +394,14 @@ class DialogueTranscriptMixin:
         Fail-open on any error: None (never already answered) -- an
         infrastructure hiccup must never itself suppress a real question
         the user hasn't actually answered yet."""
+        from app.claude_ladder import awaits_user
         from app.plugins.voice_api import check_question_already_answered
 
+        # Only a message with a question has one to cut. And a shown draft waiting for a yes is never "already answered":
+        # the send gate needs a yes AFTER the showing, so cutting the question and telling the model to proceed ran it
+        # straight into the gate (2026-11-27, live).
+        if not any(mark in final_text for mark in "?？") or awaits_user(final_text):
+            return None
         dialogue = self._gather_recent_dialogue_for_permission_guard()
         try:
             result = await check_question_already_answered(final_text, dialogue)

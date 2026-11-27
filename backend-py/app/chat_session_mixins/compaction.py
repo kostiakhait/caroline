@@ -374,6 +374,13 @@ class CompactionMixin:
         self.compaction_queued_turns = []
         log_event("engine", "compaction_queue_drained", tab_id=self.tab_id, count=len(queued))
         had_real_user_turn = any(item["is_real_user"] for item in queued)
+        if had_real_user_turn or self._held_user_messages:
+            # A state check queued before the user's new message is about an older request: run together with the new one
+            # it made the model report the old matter again (2026-11-27, live).
+            stale = [i for i in queued if not i["is_real_user"] and i["text"].startswith(CONTINUE_OR_SILENT_NUDGE_TEMPLATE[:12])]
+            if stale:
+                log_event("engine", "stale_state_check_dropped", tab_id=self.tab_id, count=len(stale))
+                queued = [i for i in queued if i not in stale]
         for item in queued:
             self.submit(item["text"], item["attachments"], item["is_real_user"], item["is_voice"], pending_text=item.get("pending_text"))
         if had_real_user_turn:

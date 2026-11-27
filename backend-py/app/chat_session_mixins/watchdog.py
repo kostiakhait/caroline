@@ -307,6 +307,12 @@ class WatchdogMixin:
             trace = [f"- {o.name} -> {'ERROR (' + o.result_preview + ')' if o.is_error else 'ok'}" for o in self.turn_tool_outcomes.values()]
         else:
             trace = []
+        from app.claude_ladder import awaits_user
+
+        if awaits_user(self._turn_last_visible_text or ""):
+            # A shown draft or question waits for the owner: nothing is unfinished, and asking showed it a second time.
+            log_event("engine", "post_turn_completion_check_skipped_awaits_user", tab_id=self.tab_id)
+            return
         asyncio.ensure_future(self._post_turn_microagent_verdict(
             nudge, (self.last_real_user_question or "").strip(), self._turn_last_visible_text or "", trace,
         ))
@@ -319,6 +325,10 @@ class WatchdogMixin:
             log_event("engine", "post_turn_microagent_check_failed", tab_id=self.tab_id, error=str(exc)[:200])
             return
         if self.ended or self._post_turn_checks_halted:
+            return
+        if self._held_user_messages or (self.last_real_user_question or "").strip() != task:
+            # The user has written since: what was judged is no longer their latest request.
+            log_event("engine", "post_turn_microagent_verdict_overtaken", tab_id=self.tab_id)
             return
         log_event("engine", "post_turn_microagent_verdict", tab_id=self.tab_id, action=action, note=note[:200])
         if action != "up":

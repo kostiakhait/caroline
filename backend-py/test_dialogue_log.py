@@ -130,6 +130,8 @@ def workspace(tmp_path, monkeypatch):
     from app import chat_session_shared as shared
 
     monkeypatch.setattr(shared, "WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setattr(shared, "_language_cache", {})          # kept per tab id: each test has its own workspace
+    monkeypatch.setattr(shared, "_language_guess_cache", {})
     return shared, str(tmp_path)
 
 
@@ -204,4 +206,7 @@ def test_the_reply_of_a_new_tab_is_not_translated_into_english(workspace, monkey
     dl.append(ws, "2", dl.USER, "Открой свой браузер чтобы я залогинился в линкедин")
     wire = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Открыла встроенный браузер на странице входа LinkedIn."}]}}
     result = asyncio.run(session._translate_wire_visible_text(wire))
-    assert asked == ["Russian"] and result is wire
+    assert asked == [] and result is wire                      # already in the user's language: no translation call
+    english = {"type": "assistant", "message": {"content": [{"type": "text", "text": "The sign-in page is open."}]}}
+    asyncio.run(session._translate_wire_visible_text(english))
+    assert asked == ["Russian"]

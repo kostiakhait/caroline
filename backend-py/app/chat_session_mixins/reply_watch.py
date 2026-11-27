@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
 
 
@@ -41,68 +44,101 @@ class ReplyWatchMixin:
         body = str(args.get("html") or args.get("text") or "").strip()
         return f"Subject: {subject}\n\n{body}" if subject else body
     async def _arm_reply_watch(self, args: dict[str, Any]) -> None:
-        """Captures the mailbox's current newest UID as the baseline and
-        starts the tapering tick schedule (REPLY_WATCH_SCHEDULE). Needs
-        real mailbox credentials (address/password/imapHost) --
-        email_send can also relay through the shared no_reply@ identity
-        with none of these given, which has no inbox of its own to watch,
-        so that case is skipped. A later qualifying send replaces
-        whatever watch was already running, same as _memory_replay_timer."""
-        if not (args.get("address") and args.get("password") and args.get("imapHost")):
+        """One watch per (mailbox, person written to): the newest UID of that person's mail is the baseline, then the
+        tapering tick schedule (REPLY_WATCH_SCHEDULE). A send names only the mailbox's address -- the saved credentials
+        are filled in here (until 2026-11-27 such a send, that is nearly every one, was silently left unwatched, and the
+        answer to a letter went unreported). A mailbox with nothing saved (the shared no_reply@ relay) has no inbox to
+        watch."""
+        from app import action_ledger
+
+        address = str(args.get("address") or "").strip()
+        if not address:
             return
+        try:
+            creds = await self._reply_watch_credentials(address, args)
+        except Exception as exc:
+            log_event("engine", "reply_watch_arm_failed", tab_id=self.tab_id, error=str(exc)[:200])
+            return
+        people = sorted(action_ledger._addresses(action_ledger._as_text(args.get("to") or "")) - {address.lower()})
+        for person in people:
+            try:
+                baseline = await self._reply_watch_latest_uid(creds, person)
+            except Exception as exc:
+                log_event("engine", "reply_watch_arm_failed", tab_id=self.tab_id, error=str(exc)[:200])
+                continue
+            watch = {"address": address, "from": person, "baseline_uid": baseline, "phase": 0, "tick": 0}
+            self._reply_watches()[f"{address}|{person}"] = watch
+            self._save_reply_watches()
+            log_event("engine", "reply_watch_armed", tab_id=self.tab_id, address=address, person=person, baseline_uid=baseline)
+            self._schedule_reply_watch_tick(f"{address}|{person}", REPLY_WATCH_SCHEDULE[0][0])
+    async def _reply_watch_credentials(self, address: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        from app.plugins import email_credentials
+
+        given = {k: v for k, v in (args or {}).items() if k in email_credentials.FIELDS}
+        return await email_credentials.fill({**given, "address": address})
+    async def _reply_watch_latest_uid(self, creds: dict[str, Any], person: str) -> int | None:
         from app.plugins.email_plugin import email_latest_uid
 
+        return await email_latest_uid(creds["address"], creds["password"], creds["imapHost"], query=person)
+    def _reply_watches(self) -> dict[str, dict[str, Any]]:
+        return self.__dict__.setdefault("_reply_watch_map", {})
+    def _reply_watch_timers(self) -> dict[str, Any]:
+        return self.__dict__.setdefault("_reply_watch_timer_map", {})
+    def _reply_watch_file(self) -> Path:
+        return Path(self.workspace_dir) / f"reply-watch-{_sanitize_tab_id(self.tab_id)}.json"
+    def _save_reply_watches(self) -> None:
+        """No password is kept here: each tick fills it in again from the saved credentials."""
         try:
-            baseline_uid = await email_latest_uid(args["address"], args["password"], args["imapHost"])
-        except Exception as exc:
-            log_event("engine", "reply_watch_arm_failed", tab_id=self.tab_id, error=str(exc))
+            self._reply_watch_file().write_text(json.dumps(self._reply_watches(), ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            log_event("engine", "reply_watch_save_failed", tab_id=self.tab_id, error=str(exc)[:200])
+    def _restore_reply_watches(self) -> None:
+        """Watches survive a restart of the app (a headless session keeps none)."""
+        if self.headless or self._reply_watches():
             return
-        self._cancel_reply_watch()
-        self._reply_watch = {
-            "address": args["address"], "password": args["password"], "imapHost": args["imapHost"],
-            "baseline_uid": baseline_uid, "phase": 0, "tick": 0,
-        }
-        log_event("engine", "reply_watch_armed", tab_id=self.tab_id, address=args["address"], baseline_uid=baseline_uid)
-        self._schedule_reply_watch_tick(REPLY_WATCH_SCHEDULE[0][0])
-    def _cancel_reply_watch(self) -> None:
-        self._reply_watch = None
-        if self._reply_watch_timer:
-            self._reply_watch_timer.cancel()
-            self._reply_watch_timer = None
-    def _schedule_reply_watch_tick(self, delay_s: float) -> None:
+        try:
+            kept = json.loads(self._reply_watch_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for key, watch in (kept if isinstance(kept, dict) else {}).items():
+            self._reply_watches()[key] = watch
+            self._schedule_reply_watch_tick(key, REPLY_WATCH_SCHEDULE[watch["phase"]][0])
+    def _schedule_reply_watch_tick(self, key: str, delay_s: float) -> None:
         """Flat interval per phase, forever until the schedule is spent --
         same re-arm-on-each-tick shape as _arm_memory_replay_timer."""
-        def _fire() -> None:
-            self._reply_watch_timer = None
-            if not self.ended and self._reply_watch:
-                asyncio.ensure_future(self._reply_watch_tick())
+        timers = self._reply_watch_timers()
+        if key in timers:
+            timers.pop(key).cancel()
 
-        self._reply_watch_timer = asyncio.get_event_loop().call_later(delay_s, _fire)
-    async def _reply_watch_tick(self) -> None:
-        """One tick: checks the mailbox's newest UID against the baseline
-        captured when the watch was armed (UIDs are monotonically
-        increasing per folder -- see email_latest_uid's own docstring). A
-        higher UID (or any UID at all, if the mailbox was empty at
-        arm-time) means a reply arrived: stop watching and tell the user
-        right away. Otherwise, advance through REPLY_WATCH_SCHEDULE's
-        phases; once every phase's ticks are spent with nothing new, the
-        window ends silently, no nudge."""
-        watch = self._reply_watch
+        def _fire() -> None:
+            timers.pop(key, None)
+            if not self.ended and key in self._reply_watches():
+                asyncio.ensure_future(self._reply_watch_tick(key))
+
+        timers[key] = asyncio.get_event_loop().call_later(delay_s, _fire)
+    async def _reply_watch_tick(self, key: str) -> None:
+        """One tick: the newest UID of the person's mail against the baseline (UIDs only grow within a folder). A higher
+        one means they wrote: the watch ends and the model reads the letter and tells the user. Otherwise on through
+        REPLY_WATCH_SCHEDULE; once it is spent, the watch ends silently."""
+        watch = self._reply_watches().get(key)
         if not watch or self.ended:
             return
-        from app.plugins.email_plugin import email_latest_uid
-
         try:
-            latest_uid = await email_latest_uid(watch["address"], watch["password"], watch["imapHost"])
+            creds = await self._reply_watch_credentials(watch["address"])
+            latest = await self._reply_watch_latest_uid(creds, watch["from"])
         except Exception as exc:
-            log_event("engine", "reply_watch_tick_failed", tab_id=self.tab_id, error=str(exc))
-            latest_uid = None
-        baseline_uid = watch["baseline_uid"]
-        is_new = latest_uid is not None and (baseline_uid is None or latest_uid > baseline_uid)
-        if is_new:
-            self._reply_watch = None
-            log_event("engine", "reply_watch_reply_detected", tab_id=self.tab_id, address=watch["address"])
-            self.inject_proactive(f"[В почтовом ящике {watch['address']} пришло новое письмо -- похоже на ответ, которого мы ждали.]")
+            log_event("engine", "reply_watch_tick_failed", tab_id=self.tab_id, error=str(exc)[:200])
+            latest = None
+        baseline = watch["baseline_uid"]
+        if latest is not None and (baseline is None or latest > baseline):
+            self._reply_watches().pop(key, None)
+            self._save_reply_watches()
+            log_event("engine", "reply_watch_reply_detected", tab_id=self.tab_id, address=watch["address"], uid=latest)
+            self.inject_proactive(
+                f"[A new letter that mentions {watch['from']} is in {watch['address']} (INBOX, uid {latest}), arrived after the "
+                "letter you sent them -- most likely the awaited answer. Read it now with email_get_message and tell the user "
+                f"who wrote and what it says, in {current_language_name(self.tab_id)}. Send nothing to anyone.]"
+            )
             return
         watch["tick"] += 1
         interval_s, max_ticks = REPLY_WATCH_SCHEDULE[watch["phase"]]
@@ -110,11 +146,13 @@ class ReplyWatchMixin:
             watch["phase"] += 1
             watch["tick"] = 0
             if watch["phase"] >= len(REPLY_WATCH_SCHEDULE):
-                self._reply_watch = None
+                self._reply_watches().pop(key, None)
+                self._save_reply_watches()
                 log_event("engine", "reply_watch_window_expired", tab_id=self.tab_id, address=watch["address"])
                 return
             interval_s = REPLY_WATCH_SCHEDULE[watch["phase"]][0]
-        self._schedule_reply_watch_tick(interval_s)
+        self._save_reply_watches()
+        self._schedule_reply_watch_tick(key, interval_s)
     # edition:cut claude-session code no longer reached
     async def _check_refusal_and_maybe_retry(self) -> None:
         """Per explicit instruction (2026-10-12): a separate concern from
