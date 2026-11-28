@@ -6,8 +6,10 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import pytest
 from claude_agent_sdk import AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
 
+from app import small_model_engine
 from app.chat_session_mixins import watchdog
 from app.chat_session_mixins.watchdog import WatchdogMixin
 
@@ -107,3 +109,40 @@ def test_the_reason_names_the_stopped_tool_call(monkeypatch):
     note = tab.injected[0]
     assert "past the 900s limit for one turn" in note
     assert "'PowerShell' had been running 600s and was stopped" in note
+
+
+def test_the_game_constructor_has_no_limit_for_one_turn(monkeypatch):
+    monkeypatch.setenv("CAROLINE_FERRET_EDITOR", "1")
+    tab = Tab(turn_age_s=3 * 3600)
+    tab._track_tool_outcomes(AssistantMessage(
+        content=[ToolUseBlock(id="t1", name="mcp__caroline-ferret-editor__viewer_restart", input={})], model="m",
+    ))
+    check(monkeypatch, tab)
+    assert tab.client.interrupts == 0 and tab.injected == []
+
+
+def test_the_game_constructor_still_interrupts_an_empty_turn(monkeypatch):
+    monkeypatch.setenv("CAROLINE_FERRET_EDITOR", "1")
+    tab = Tab(turn_age_s=95)
+    check(monkeypatch, tab)
+    assert tab.client.interrupts == 1
+
+
+@pytest.mark.parametrize("editor, finishes", [("1", True), ("0", False)])
+def test_the_sw_mode_limit_for_one_turn_is_off_only_in_the_game_constructor(monkeypatch, editor, finishes):
+    monkeypatch.setenv("CAROLINE_FERRET_EDITOR", editor)
+    monkeypatch.setattr(small_model_engine, "ABSOLUTE_TURN_TIMEOUT_S", 0)  # any turn is past it at the first look
+
+    class SlowAI:
+        def resolve_agentic(self):
+            time.sleep(6)  # longer than one 5 s look of the attempt's watchdog
+            return "done"
+
+    attempt = small_model_engine._resolve_agentic_with_watchdog(SlowAI(), small_model_engine._TurnTracker())
+    if finishes:
+        assert asyncio.run(attempt) == "done"
+    else:
+        with pytest.raises(small_model_engine._TurnStalled) as stalled:
+            asyncio.run(attempt)
+        assert stalled.value.kind == "absolute"
+

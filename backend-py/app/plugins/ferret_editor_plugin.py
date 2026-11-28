@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from app.logging_setup import log_event
+from app.operations import WAITS_FOR
 from app.plugins.loader import Plugin, PluginTool
 from app.session_context import get_send
 
@@ -54,7 +55,7 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
     ("project_delete", "Delete a file (ferret.json cannot be deleted). {path}", {"path": "string"}),
     ("project_move", "Rename or move a file. {from, to}", {"from": "string", "to": "string"}),
     ("api_docs", "The release's Ferret API docs and types. {topic?} lists the topics when omitted.", {"topic": "string?"}),
-    ("ferret_check", "Check the project as the compiler does (manifest, levels, code, engine sources refused). -> {ok, issues}", {}),
+    ("ferret_check", "Check the project as the compiler does (manifest, levels, code, engine sources refused) and read the game's logic (logic/*.fgl) without starting the game: errors at file:line:col. Run it before viewer_restart. -> {ok, issues, warnings}", {}),
     ("ferret_build", "Build the .fex of the project (a check that it builds). -> {ok, name, bytes, report, download} or the issues. `download` is the Markdown link [<name>.fex](ferret-build:fex) -- put it in your reply as it is: the person clicks it and the editor builds the game and downloads the .fex to their computer. Give that link whenever they ask for the game, the .fex or a build.", {"standalone": "boolean?"}),
     ("ferret_levels", "Build a level package (.ferret) of some levels without downloading it. {levels: [names]} -> {ok, name, bytes}",
      {"levels": "string[]"}),
@@ -364,6 +365,29 @@ _LOCAL = [
                "project's root; a path ending in / is a folder such as assets/ or levels/<name>/, the file keeps its name there). Replaces a file of that name. Up to 25 MB.",
                input_schema=_schema({"upload": "string", "to": "string?"}), handler=_project_import_upload),
 ]
+
+# What the person waits for while a slow tool runs: the progress narrator says it instead of "I am waiting" (2026-11-27).
+if ENABLED:
+    WAITS_FOR.update({
+        "viewer_restart": "the game being built again and started in the viewer, to run it with the latest changes",
+        "viewer_level": "a level loading in the viewer",
+        "viewer_command": "the running game answering a command (a test of it plays for as long as it takes)",
+        "viewer_screenshot": "a picture of what the player sees",
+        "ferret_check": "the check of the project and of the game's logic",
+        "ferret_build": "the game being built into its file",
+        "ferret_levels": "the level package being built",
+        "gpu_render_page": "a picture being rendered on the GPU",
+        "gpu_video": "a video being rendered on the GPU",
+        "gpu_blender": "a Blender job on the GPU",
+        "gpu_install": "a program being installed on the computer",
+        "machine_shell": "a command running on the computer",
+        "machine_python": "a program running on the computer",
+        "ue_import": "a map being imported from Unreal",
+        "ue_export": "the level being exported to Unreal",
+        "ue_build": "the Unreal project and the Windows game being built",
+        "project_import_url": "a file being downloaded into the project",
+        "library_add": "an item being packed and sent to the library",
+    })
 
 PLUGIN = Plugin(
     name="ferret-editor",

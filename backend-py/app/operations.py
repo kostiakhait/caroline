@@ -23,6 +23,7 @@ or cancel it.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -119,6 +120,8 @@ class Operation:
     result: Any | None = None
     error: str | None = None
     started_at: float = field(default_factory=time.monotonic)
+    # What the call was given, shortened: the progress narrator says from it WHAT is being waited for (2026-11-27).
+    args_preview: str = ""
     task: "asyncio.Task[Any] | None" = None
     # Per explicit instruction (2026-09-10): which tab's turn started this
     # operation (session_context.py's get_tab_id(), sampled once at
@@ -199,6 +202,9 @@ class OperationRegistry:
 
 
 REGISTRY = OperationRegistry()
+
+# tool name -> what a person waits for while it runs, in plain words; a plugin adds its slow tools (the progress narrator reads it)
+WAITS_FOR: dict[str, str] = {}
 
 
 def _notify_unless_collected(plugin_name: str, op: Operation) -> None:
@@ -308,6 +314,7 @@ async def dispatch(
             log_event(f"plugin:{plugin_name}", "operation_blocked_file_transfer", tool=tool_name, reason=file_blocked_reason)
             return {"operation_id": "", "status": "error", "error": f"Blocked: {file_blocked_reason}"}
     op = REGISTRY.create(tool_name, tab_id=tab_id)
+    op.args_preview = json.dumps(args, ensure_ascii=False, default=str)[:200] if args else ""
     memory_note = memory_nudge.note_tool_call(op.tab_id, tool_name)
 
     def report_progress(data: Any) -> None:

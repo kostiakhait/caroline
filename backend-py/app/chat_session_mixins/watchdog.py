@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
+from app.product_role import turn_ceiling_applies
 
 
 class WatchdogMixin:
@@ -424,8 +425,9 @@ class WatchdogMixin:
             and not self.turn_tool_outcomes and self.turn_pending_since is not None
             and not self.turn_joined_running
         )
+        turn_too_long = turn_ceiling_applies() and turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
         past_absolute_ceiling = (
-            turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
+            turn_too_long
             or connecting_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000
             or (turn_is_empty and turn_elapsed_s >= EMPTY_TURN_CEILING_MS / 1000)
         )
@@ -515,7 +517,7 @@ class WatchdogMixin:
         # automatic, and why -- see _hang_interrupt_note.
         if connecting_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000:
             reason = f"the engine had not finished starting after {round(connecting_elapsed_s)}s"
-        elif turn_elapsed_s >= HANG_ABSOLUTE_CEILING_MS / 1000:
+        elif turn_too_long:
             reason = f"the turn had run {round(turn_elapsed_s)}s, past the {HANG_ABSOLUTE_CEILING_MS // 1000}s limit for one turn"
         elif past_absolute_ceiling:
             reason = f"for {round(turn_elapsed_s)}s the turn produced no reply and no tool call"

@@ -614,7 +614,7 @@ async def _resolve_agentic_with_watchdog(
             if stalled_for > STALL_TIMEOUT_S:
                 attempt_cancel.set()
                 raise _TurnStalled(stalled_for, "stall")
-            if now - started > ABSOLUTE_TURN_TIMEOUT_S:
+            if now - started > ABSOLUTE_TURN_TIMEOUT_S and product_role.turn_ceiling_applies():
                 tracker.cancelled.set()
                 attempt_cancel.set()
                 raise _TurnStalled(now - started, "absolute")

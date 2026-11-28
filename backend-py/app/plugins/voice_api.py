@@ -463,6 +463,12 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
     if _answers_for_the_user(text, revised):
         log_event("plugin:voice", "review_reply_rejected_answers_for_user", original=text[:300], revised=revised[:300])
         return text
+    # A revision that is not a rewrite (2026-11-27, confirmed live): the reviewer answered a 59-character remark with a 298-character comment
+    # ABOUT it ("this text is not about the task ... I recommend replacing it with ...") and it was shown to the user as Caroline's own message.
+    # A rewrite stays about as long as what it rewrites; a much longer text is commentary, and the original goes out.
+    if is_commentary(text, revised):
+        log_event("plugin:voice", "review_reply_rejected_commentary", original=text[:300], revised=revised[:300])
+        return text
     # The reviewer's own sanitizer (2026-10-24): a revision that says something the
     # original did not is thrown away -- the user sees Caroline's own text instead of
     # words the reviewer made up. Nothing to check when the text is unchanged or the
@@ -475,18 +481,18 @@ async def review_reply(text: str, task: str, session: str | None = None, timeout
 
 async def _review_invented(original: str, revised: str, time_left_s: float) -> bool:
     """reply.review.check on the local microagent ladder (not an evolvable role):
-    True when the revision adds something the original does not say. Fail-open --
-    an error, a timeout or no time left keeps the revision as before (logged)."""
+    True when the revision adds something the original does not say, or cannot be checked (2026-11-27: a check that
+    timed out let a reviewer's comment through; a revision nobody verified is not shown, the original is)."""
     from app.microagent_client import build_local_runtime, new_budget
     from app.microagents import reply_review_check
 
     if time_left_s <= 0:
         log_event("plugin:voice", "review_check_skipped", reason="no_time_left")
-        return False
+        return True
     runtime = build_local_runtime()
     if runtime is None:
         log_event("plugin:voice", "review_check_skipped", reason="no_runtime")
-        return False
+        return True
     for agent in reply_review_check.llm_agents():
         runtime.register(agent)
     started = time.monotonic()
@@ -499,14 +505,19 @@ async def _review_invented(original: str, revised: str, time_left_s: float) -> b
     except Exception as exc:  # noqa: BLE001 -- fail-open
         log_event("plugin:voice", "review_check_failed", error=f"{type(exc).__name__}: {exc}"[:300],
                   ms=int((time.monotonic() - started) * 1000))
-        return False
+        return True
     output = (result or {}).get("output") or {}
     if (result or {}).get("status") != "ok" or reply_review_check.verify_review_check({}, output) is not None:
         log_event("plugin:voice", "review_check_failed", error=(result or {}).get("error"), ms=int((time.monotonic() - started) * 1000))
-        return False
+        return True
     log_event("plugin:voice", "review_check_done", invented=output["invented"], what=str(output.get("what") or "")[:300],
               ms=int((time.monotonic() - started) * 1000))
     return bool(output["invented"])
+
+
+def is_commentary(original: str, revised: str) -> bool:
+    """True when `revised` is not a rewrite of `original` but a text about it: more than twice as long plus 60 characters."""
+    return len(revised.strip()) > 2 * len(original.strip()) + 60
 
 
 def only_endings_changed(original: str, fixed: str) -> bool:
@@ -1800,7 +1811,12 @@ def _progress_comment_prompt(
         "tell them to do, check, choose, enter, confirm or wait for anything, never say what they \"need to\" "
         "do -- even if STATUS or a result mentions a login, a code, a confirmation or a question. Report only "
         "what YOU are doing or have found.\n"
-        "Never mention timed-out checks, waiting for a status, or saving notes.\n"
+        "Never mention timed-out checks or saving notes.\n"
+        "When STATUS shows something still running, say exactly WHAT is being waited for and what it is for: the concrete thing "
+        "(its \"awaited\" words, or what that call was given), tied to the step just before it (\"the game is being rebuilt with the "
+        "new start lights so I can check them\"). A bare \"I'm waiting\", \"it is running in the background\" or \"still in "
+        "progress\" names nothing and is never a remark. If it is the same thing as in your previous remark, name it again with how "
+        "long it has been running.\n"
         "Say the task is finished ONLY if STATUS explicitly says so. Completed steps alone mean it is still in "
         "progress -- describe it that way.\n"
         "STATUS may be a raw work log: step names, model names, \"tier\"/\"уровень\", verification, raw "
@@ -2024,8 +2040,13 @@ async def generate_progress_comment(
         "STATUS lists the actions of the task in the order they happened; its LAST lines are what is happening "
         "now. Say concretely what the last one or two actions are (what is being opened, filled, searched, "
         "written), never a vague \"still working\". Do not repeat or contradict what you already told the "
-        "user (the last STATUS line says what that was). Never mention timed-out checks, waiting for a "
-        "status, or saving notes. "
+        "user (the last STATUS line says what that was).\n"
+        "Never mention timed-out checks or saving notes.\n"
+        "When STATUS shows something still running, say exactly WHAT is being waited for and what it is for: the concrete thing "
+        "(its \"awaited\" words, or what that call was given), tied to the step just before it (\"the game is being rebuilt with the "
+        "new start lights so I can check them\"). A bare \"I'm waiting\", \"it is running in the background\" or \"still in "
+        "progress\" names nothing and is never a remark. If it is the same thing as in your previous remark, name it again with how "
+        "long it has been running.\n"
         "Match your tense/mood to what STATUS actually shows: a step STATUS marks done is described as done "
         "(past tense is fine -- \"I sent it\", \"I found it\"); a step STATUS shows is still running is "
         "described as ongoing (\"I'm still working on X\"); a step that hasn't started yet but STATUS shows is "

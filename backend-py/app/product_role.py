@@ -13,6 +13,14 @@ from pathlib import Path
 ENV = "CAROLINE_PRODUCT_ROLE_FILE"
 
 
+def turn_ceiling_applies() -> bool:
+    """The limits for one whole turn (15 minutes in Claude mode, chat_session_shared.HANG_ABSOLUTE_CEILING_MS; 30 minutes in SW mode,
+    small_model_engine.ABSOLUTE_TURN_TIMEOUT_S). Not in the Ferret game constructor (CAROLINE_FERRET_EDITOR=1, and only there; owner's
+    command 2026-11-27): making a game is one long turn, and the limit cut it -- the build she was waiting for was cancelled and she
+    started over with an empty head. A call that stalls and a process that goes silent are still caught."""
+    return os.environ.get("CAROLINE_FERRET_EDITOR") != "1"
+
+
 def role_text() -> str | None:
     path = os.environ.get(ENV)
     if not path:
