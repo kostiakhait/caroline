@@ -665,6 +665,10 @@ class EngineLifecycleMixin:
                 # reasoning as last_activity/last_visible_output_at just above.
                 self.hang_interrupt_result_pending = False
                 self.ignore_next_result_recovery = False
+                # The same for clear_tab: the old client's trailing result can only reach the old loop. Left set
+                # (an idle client leaves none), the flag discarded the new dialogue's first real reply: the turn
+                # stayed pending until the hang watchdog ended it, minutes later.
+                self.clear_tab_result_pending = False
                 self._ladder_reset()
                 self._dr_reset()
                 self._inflight_reset()
