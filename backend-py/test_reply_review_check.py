@@ -65,8 +65,9 @@ def test_nothing_to_check_when_unchanged_or_dropped(review, revised):
     assert review(revised, runtime) == revised and runtime.calls == []
 
 
-def test_a_failed_check_keeps_the_revision(review):
-    assert review(INVENTED, FakeRuntime(fail=True)) == INVENTED
+def test_a_failed_check_shows_the_original(review):
+    # 2026-11-27, confirmed live: the check timed out and the reviewer's own comment about the remark went to the user
+    assert review(INVENTED, FakeRuntime(fail=True)) == ORIGINAL
 
 
 def test_verify():

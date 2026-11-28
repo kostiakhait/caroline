@@ -62,3 +62,19 @@ def test_asks_user_filter():
                  "Нашла три письма от Анны, сверяю даты.", "Still searching the web for the prices.",
                  "Подтверждение от сайта уже получено, оформляю заказ."):
         assert not _ASKS_USER.search(good), good
+
+
+def test_a_running_operation_says_what_is_awaited(monkeypatch):
+    from app.operations import REGISTRY, WAITS_FOR
+
+    monkeypatch.setitem(WAITS_FOR, "viewer_restart", "the game being built again and started in the viewer")
+    op = REGISTRY.create("viewer_restart", tab_id=987654)
+    op.args_preview, op.started_at = '{"level": "main"}', op.started_at - 40
+    try:
+        text = _facts([("project_write", "path=logic/race.fgl", False, "ok")])
+    finally:
+        REGISTRY.forget(op.id)
+    last = text.splitlines()[-1]
+    assert "viewer_restart" in last and '{"level": "main"}' in last
+    assert "for 40 s now" in last and "awaited: the game being built again" in last
+

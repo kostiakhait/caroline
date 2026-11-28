@@ -4,11 +4,18 @@ import asyncio
 import re
 
 from app.chat_session_shared import *  # noqa: F401,F403 -- see that module's own header
+from app.operations import WAITS_FOR
 from app.plugins.voice_api import _ASKS_USER
 
 # Calls that say nothing about the task itself: waiting on an operation, looking up the tool catalogue. A remark built from
 # them reads as "a check timed out" or "I am reading the tool list".
 _BOOKKEEPING_CALLS = frozenset({"check_operation_status", "stop_operation", "describe_tool", "list_tools", "list_groups", "get_tool_instructions"})
+
+
+def _awaited(name: str) -> str:
+    """" -- awaited: ..." for a running call whose plugin said what a person waits for, else nothing."""
+    what = WAITS_FOR.get(name.rsplit("__", 1)[-1])
+    return f" -- awaited: {what}" if what else ""
 
 
 def _is_bookkeeping_call(name: str) -> bool:
@@ -60,9 +67,12 @@ class TextNarrationMixin:
             result = "ERROR: " + result_preview if is_error else result_preview
             lines.append(f"Tool call {name} (arguments: {args_preview}); result: {result}")
         for name, args_preview in running_calls:
-            lines.append(f"Tool call {name} started (arguments: {args_preview}).")
+            lines.append(f"Tool call {name} started (arguments: {args_preview}){_awaited(name)}.")
         for op in running_agents:
-            lines.append(f"Tool call {op.tool_name} is still running in the background.")
+            args = f" (arguments: {op.args_preview})" if op.args_preview else ""
+            lines.append(
+                f"Tool call {op.tool_name}{args} is still running, for {int(time.monotonic() - op.started_at)} s now{_awaited(op.tool_name)}."
+            )
         # Her last reply may end in a question or a request to the user; handed over as it is, the narrator copies that
         # shape and starts giving the user tasks. Only the sentences that state something are passed on.
         said = " ".join(
