@@ -71,19 +71,23 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
      {"path": "string", "uid": "string?", "description": "string?", "rubric": "string?"}),
     # ferret3d.com (PLAN-FERRET3D M4): public, under the person's own name -- only on their word
     ("publish_scene", "Publish the open project to ferret3d.com under the person's own SW account. It is public at once, with their name and the price, so ONLY when the "
-     "person asked for it, never on your own. {kind: 'scene' (a finished show or a game) | 'world' (a base for one's own scenes, with no script of events) | 'item' (one "
-     "thing -- a model, a character ... -- sold as its package; the open project is then its demo scene and package_path is the thing), title, description (both ENGLISH), "
-     "tags: 1 to 20 short English words, price in PIA (piastres; 0 = free to take; the person's choice: ask when they did not say), channel?: the name of their channel, "
+     "person asked for it, never on your own. What is published already is UPDATED: a world or a scene whose project id this project has, an item whose package id the "
+     "package has, gets a new version of the same publication (same address, kind and channel; buyers download the newest) -- publications marks it thisProject; say so "
+     "before you call. Anything else becomes a new publication, which needs title, description, tags and price; an update takes only what changes, the rest stays. "
+     "{kind: 'scene' (a finished show or a game) | 'world' (a base for one's own scenes, with no script of events) | 'item' (one "
+     "thing -- a model, a character ... -- sold as its package; the open project is then its demo scene and package_path is the thing), title?, description? (both ENGLISH), "
+     "tags?: 1 to 20 short English words, price? in PIA (piastres; 0 = free to take; the person's choice: ask when they did not say), channel?: the name of their channel, "
      "encrypt?: seal the packages, package_path?: an item's .fmdl or .ferret in the project (needed for 'item'), camera?: 'scene' (filmed by the project's own camera) | "
      "'orbit' (the camera flies round); without it an item is filmed by its demo scene's camera, a scene or a world is flown round}. The project is built, a 30 s preview "
-     "is recorded from the running viewer (viewer_restart first, and leave the viewer alone until the publication is done) and all is uploaded. Every call makes a NEW "
-     "publication; one already published is not changed by it. Waits up to ~3 minutes, then answers state 'running' with an id for publish_status. "
-     "-> {id, state: running|done|error, stage, key, url, price, error}",
-     {"kind": "string", "title": "string", "description": "string", "tags": "string[]", "price": "number", "channel": "string?", "encrypt": "boolean?",
+     "is recorded from the running viewer (viewer_restart first, and leave the viewer alone until the publication is done) and all is uploaded. "
+     "Waits up to ~3 minutes, then answers state 'running' with an id for publish_status. "
+     "-> {id, state: running|done|error, stage, status: published|updated, key, kind, title, version, url, price, error}",
+     {"kind": "string", "title": "string?", "description": "string?", "tags": "string[]?", "price": "number?", "channel": "string?", "encrypt": "boolean?",
       "package_path": "string?", "camera": "string?"}),
     ("publish_status", "A publication started by publish_scene: {id?} that one (waits up to ~3 minutes for it to finish), or all of this editor session. "
-     "-> {id, state: running|done|error, stage, key, url, price, error}", {"id": "string?"}),
-    ("publications", "The person's own publications on ferret3d.com, those taken off too: -> {publications: [{key, kind, title, price, state: live|removed, version, published, url}]}", {}),
+     "-> {id, state: running|done|error, stage, status, key, kind, title, version, url, price, error}", {"id": "string?"}),
+    ("publications", "The person's own publications on ferret3d.com, those taken off too: -> {publications: [{key, kind, title, description, tags, price, encrypted, "
+     "state: live|removed, version, published, url, uid, thisProject?: publishing the open project updates this one}]}", {}),
     ("unpublish", "Take one of the person's OWN publications off ferret3d.com: it leaves the feed, the search and viewing; those who bought it keep their download; "
      "it cannot be brought back from here (publishing again makes a new publication). ONLY when the person asked to take that publication down; when their words fit more "
      "than one, ask which. Another author's publication is refused. {key (as publications gives it), why?} -> {key, state: 'removed', title}",
