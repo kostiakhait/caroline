@@ -207,7 +207,7 @@ build: $(OUT)/Caroline.exe
 # itself. wwwroot is copied as a SIBLING of linux-shell/ (not left pointing
 # back into Windows/Caroline/), matching caroline_shell.py's own
 # _default_wwwroot() packaged-install lookup.
-$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(filter %/wwwroot/%,$(CAROLINE_SRC)) $(wildcard $(INSTALLER_DIR)/Assets/Banners/*.png) $(BACKEND_PY_SRC) $(SKILLS_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py $(SRC)/companion-apps/whatsapp-sidecar/package.json $(SRC)/companion-apps/whatsapp-sidecar/index.js $(SRC)/companion-apps/messenger-sidecar/package.json $(SRC)/companion-apps/messenger-sidecar/index.js $(SRC)/companion-apps/messenger-sidecar/fca-config.json
+$(OUT_LINUX)/linux-shell/caroline_shell.py: $(LINUX_SHELL_SRC) $(filter %/wwwroot/%,$(CAROLINE_SRC)) $(wildcard $(INSTALLER_DIR)/Assets/Banners/*.png) $(BACKEND_PY_SRC) $(SKILLS_SRC) $(CAMERLENGO_VENDOR_STUBS)/AI.py $(CAMERLENGO_VENDOR_STUBS)/Cache.py $(CAMERLENGO_VENDOR_STUBS)/Logger.py $(CAMERLENGO_VENDOR_STUBS)/JSONStorage.py $(CAMERLENGO_VENDOR_STUBS)/Microagent.py $(CAMERLENGO_VENDOR_STUBS)/Config.py
 	@echo "=== Caroline Linux shell package ==="
 	rm -rf "$(OUT_LINUX)"
 	mkdir -p "$(OUT_LINUX)/linux-shell"
