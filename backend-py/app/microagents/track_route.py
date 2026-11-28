@@ -29,7 +29,10 @@ _PROMPT = (
     "Decide which track the NEW message belongs to. Read it in the light of the conversation: a short message such "
     "as \"check that the reply went out\" or \"yes\" belongs to the matter the conversation was just about, not to "
     "whichever track looks most like its words. A message about a vacancy is not about a mailbox check; a letter to "
-    "a person is a track of that person's matter.\n"
+    "a person is a track of that person's matter. A bare go-ahead (\"do it\", \"go on\", \"Делаем\") belongs to the "
+    "matter of the OWNER'S OWN latest request that is not carried out yet (see his own messages below), or of the "
+    "question the secretary just put to him in answer to him -- never to a report about an incoming letter or message "
+    "that he did not react to.\n"
     "- track_id: the id of the existing track it belongs to; \"\" when it starts a NEW matter that none of the tracks "
     "covers (or when it is small talk that belongs to no matter).\n"
     "- matter: 2 to 6 words naming the matter in the language of the message, as a person would say it (\"the "
@@ -40,6 +43,7 @@ _PROMPT = (
     "- importance: for a NEW matter only (track_id empty), how important it is for the owner, 0..1 (money, health, "
     "family, legal, deadlines today = high; routine = low); otherwise 0.\n\n"
     "OPEN TRACKS:\n{tracks}\n\nLAST WORKED ON IN THIS TAB: {current}\n\n"
+    "THE OWNER'S OWN LATEST MESSAGES (latest last):\n{owner_messages}\n\n"
     "CONVERSATION (latest last):\n{dialogue}\n\nNEW MESSAGE:\n{message}\n\n"
     'Reply with a JSON object: {{"track_id": "<id or empty>", "matter": "...", "explicit": true|false, "importance": 0.0}}'
 )
@@ -55,6 +59,7 @@ def prompt_track_route(input: Any, context: Any) -> str:
     return _PROMPT.format(
         tracks="\n".join(lines) or "(none)", current=input.get("current_id") or "(none)",
         dialogue="\n".join(input.get("dialogue") or []) or "(none)", message=input.get("message") or "(empty)",
+        owner_messages="\n".join(input.get("owner_messages") or []) or "(none)",
     )
 
 
@@ -76,11 +81,12 @@ def verify_track_route(input: Any, output: Any) -> Optional[str]:
 def llm_agents() -> List["M.Agent"]:
     return [
         M.Agent(
-            TRACK_ROUTE, "1",
+            TRACK_ROUTE, "2",
             "Decides which open track (matter) the owner's new message belongs to, whether it is an explicit "
             "instruction about it, and rates a new matter's importance.",
             input_schema=_object(
                 {"message": _STRING, "dialogue": {"type": "array", "items": _STRING},
+                 "owner_messages": {"type": "array", "items": _STRING},
                  "tracks": {"type": "array", "items": {"type": "object"}}, "current_id": _STRING},
                 required=["message"],
             ),

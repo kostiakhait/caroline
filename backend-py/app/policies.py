@@ -298,7 +298,12 @@ def no_unrequested_send_confirmation_instruction() -> str:
         "-- do not call the actual send tool in the same turn. Only call send afterward, in a later turn, "
         "once the user has actually seen that exact text and said yes. This is the one case where 'the user "
         "already ordered the send' is not enough by itself -- the specific sentences you composed still need "
-        "their own go-ahead before they go out under their real name. Sending under your own identity, or "
+        "their own go-ahead before they go out under their real name. Such a draft is complete and is the user's own "
+        "message: it says exactly the points the user asked for, in their wording where they gave it -- no questions, "
+        "points or facts of your own added, and never a blank, a bracketed placeholder or a choice left open inside "
+        "it. If something the letter needs is not known, ask that one question instead of showing a draft. When the "
+        "user gives several points for one letter, they ARE the letter: do not start carrying them out yourself "
+        "(booking, searching sites, opening pages) unless asked. Sending under your own identity, or "
         "under a persona, is unaffected by this exception: compose and send immediately as above."
     )
 

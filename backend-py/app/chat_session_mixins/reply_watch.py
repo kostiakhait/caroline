@@ -131,14 +131,19 @@ class ReplyWatchMixin:
             latest = None
         baseline = watch["baseline_uid"]
         if latest is not None and (baseline is None or latest > baseline):
-            self._reply_watches().pop(key, None)
+            # The correspondence is alive: the watch goes on from this letter, its schedule started again (2026-11-27, tab 1:
+            # Oksana answered at 15:17, the watch ended there, and her next letter at 15:58 was never reported at all).
+            watch.update({"baseline_uid": latest, "phase": 0, "tick": 0})
             self._save_reply_watches()
             log_event("engine", "reply_watch_reply_detected", tab_id=self.tab_id, address=watch["address"], uid=latest)
             self.inject_proactive(
                 f"[A new letter that mentions {watch['from']} is in {watch['address']} (INBOX, uid {latest}), arrived after the "
-                "letter you sent them -- most likely the awaited answer. Read it now with email_get_message and tell the user "
-                f"who wrote and what it says, in {current_language_name(self.tab_id)}. Send nothing to anyone.]"
+                "letter you sent them -- most likely an answer. Read the whole correspondence now with email_get_thread("
+                f"address=\"{watch['address']}\", folder=\"INBOX\", uid={latest}) and tell the user, in "
+                f"{current_language_name(self.tab_id)}, who wrote and what it says, read in the light of the letters before it "
+                "(every letter the user has not seen yet). Send nothing to anyone.]"
             )
+            self._schedule_reply_watch_tick(key, REPLY_WATCH_SCHEDULE[0][0])
             return
         watch["tick"] += 1
         interval_s, max_ticks = REPLY_WATCH_SCHEDULE[watch["phase"]]

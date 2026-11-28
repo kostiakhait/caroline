@@ -164,6 +164,19 @@ def awaits_user(candidate: str) -> bool:
     return bool(_ASKS_FOR_A_WORD.search("\n".join(lines[quoted[-1] + 1:])))
 
 
+def blanks_note(candidate: str) -> str:
+    """What is wrong with a reply that shows a draft with blanks in it ("" when there are none): decided by code, no
+    model is asked (2026-11-27, tab 1)."""
+    from app.own_identity_gate import draft_placeholders
+
+    blanks = draft_placeholders(candidate or "")
+    if not blanks:
+        return ""
+    return (f"the draft shown to the user still has blanks in it ({', '.join(blanks[:5])}). Write the draft in the user's own "
+            "words, with only the points the user asked for; fill each blank from what the user said, or, if it is not "
+            "known, do not show a draft at all and ask that one question")
+
+
 def needs_verdict(turn: LadderTurn, candidate: str, is_error: bool) -> bool:
     """False for what has nothing to judge: the top rung (nobody is left to hand it to), an
     error result, a deliberately silent internal turn, and a draft that waits for the user's yes."""

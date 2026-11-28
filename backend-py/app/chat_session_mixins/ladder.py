@@ -244,7 +244,9 @@ class LadderMixin:
             candidate = claude_ladder.candidate_text(turn, getattr(message, "result", None))
             is_error = bool(getattr(message, "is_error", False))
             action, note = "done", ""
-            if claude_ladder.needs_verdict(turn, candidate, is_error):
+            if not turn.is_top and not is_error and (blanks := claude_ladder.blanks_note(candidate)):
+                action, note = "up", blanks
+            elif claude_ladder.needs_verdict(turn, candidate, is_error):
                 from app.small_model_engine import verify_claude_attempt
 
                 action, note = await verify_claude_attempt(

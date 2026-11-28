@@ -237,3 +237,13 @@ def test_ready_reaches_the_window_after_the_settle(session):
 
     run(go())
     assert states(session) == ["working", "ready"]
+
+
+def test_a_reminder_is_never_dropped_as_a_repeat_and_is_marked(session, monkeypatch):
+    """2026-11-27: a reminder's result and a scheduled mail report were dropped as repeats of an earlier message."""
+    _stub_the_pipeline(session, monkeypatch)
+    dl.append(session.workspace_dir, "2", dl.ASSISTANT, SHOWN, dl.SHOWN)
+    run(session.deliver_relayed_reply(REPEAT, task="mail report", always=True))
+    run(session.deliver_relayed_reply("", task="x", always=True, reminder="Pick up Michelle at 13:00"))
+    texts = [e["message"]["message"]["content"][0]["text"] for e in session.sent if e.get("type") == "sdk_message"]
+    assert len(texts) == 2 and texts[1].startswith("⏰") and "Michelle" in texts[1]

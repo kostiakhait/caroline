@@ -450,7 +450,7 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
             "Nobody prompted you for this -- it's a self-scheduled follow-up, acting on your own initiative. Act "
             "on it now. Don't narrate what you're doing while you work (no step-by-step \"now checking X\" "
             "commentary) -- when you're actually done, tell the user the outcome/result directly, in one clear "
-            "message. " + REMINDER_SCOPE_RULE
+            "message that begins by saying what you are reminding them of. " + REMINDER_SCOPE_RULE
         )
     # Nobody's message is behind this turn: for the memory service's money
     # rules it is a turn of its own (memory_turns.py).
@@ -460,6 +460,8 @@ def _on_reminder_due(reminder: dict[str, Any]) -> bool:
     pseudo_tab.set_pseudo_turn_task(pseudo.tab_id, reminder.get("note"))
     if event_type == "user":
         pseudo_tab.set_pseudo_turn_always_relay(pseudo.tab_id)
+        if not reminder.get("cron"):  # a recurring chore (the mail report) may rightly have nothing to say
+            pseudo_tab.set_pseudo_turn_reminder(pseudo.tab_id, str(reminder.get("note") or ""))
     # A firing resumed after a restart (scheduler_plugin.set_reminder_awaiting_retry):
     # its dueAtIso has already moved on to the next time, so it is named by
     # when the usage cap interrupted it instead.

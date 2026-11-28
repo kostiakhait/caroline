@@ -144,3 +144,32 @@ def test_a_normal_turn_is_disposed_as_before(session):
 
 def test_no_session_is_not_waiting():
     assert not pseudo_tab.is_waiting_on_retry("1", "no-such-reminder")
+
+
+# --- a one-off reminder is always seen --------------------------------------------------------------------------------
+
+def relay_with_reminder(monkeypatch, *events):
+    got = []
+
+    class Target:
+        async def deliver_relayed_reply(self, text, task=None, is_voice=False, always=False, reminder=None):
+            got.append((text, always, reminder))
+
+    pseudo_id = pseudo_tab.pseudo_tab_id("7", "reminder-2")
+    monkeypatch.setitem(pseudo_tab._pseudo_sessions, pseudo_id, FakeSession())
+    pseudo_tab.set_pseudo_turn_always_relay(pseudo_id)
+    pseudo_tab.set_pseudo_turn_reminder(pseudo_id, "Pick up Michelle at 13:00")
+    # Tab 7 is closed: the first tab is told.
+    send = pseudo_tab._make_pseudo_session_send("7", pseudo_id, lambda tab: Target() if tab == "1" else None)
+
+    async def run():
+        for event in events:
+            await send(event)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    return got
+
+
+def test_a_reminder_whose_turn_said_nothing_still_reaches_the_owner(monkeypatch):
+    assert relay_with_reminder(monkeypatch, RESULT) == [("", True, "Pick up Michelle at 13:00")]

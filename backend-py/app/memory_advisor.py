@@ -110,6 +110,20 @@ DETAIL_TEXT = {
 }
 
 
+OWNER_MESSAGES = 6
+OWNER_MESSAGE_CHARS = 400
+
+
+def _owner_messages(workspace_dir: str, tab_id: str | None) -> list[str]:
+    """The owner's own latest messages in this tab with their times, oldest first. The router's last dialogue lines can be
+    nothing but reports about incoming messages (2026-11-27: "Делаем" was filed under such a report and not under the
+    letter the owner had asked for)."""
+    from app import dialogue_log
+
+    entries = [e for e in dialogue_log.read_entries(workspace_dir, tab_id or "1") if e.get("role") == dialogue_log.USER]
+    return [f"{e.get('ts', '')}: {str(e.get('text'))[:OWNER_MESSAGE_CHARS]}" for e in entries[-OWNER_MESSAGES:]]
+
+
 async def route_block(message: str, dialogue: list[str], tab_id: str | None) -> str:
     """Track routing (2026-11-20): which matter the message belongs to; the matter's importance is raised by the
     mention (strongly by an explicit instruction); the block tells the engine to answer about THIS matter only and to
@@ -126,7 +140,8 @@ async def route_block(message: str, dialogue: list[str], tab_id: str | None) -> 
                    "importance": ti.get(WORKSPACE_DIR, t["id"])} for t in today + week if t.get("id")]
         current = get_current_topic(WORKSPACE_DIR, tab_id)
         result = await _run_local_microagent(TRACK_ROUTE, "app.microagents.track_route", {
-            "message": message, "dialogue": dialogue[-8:], "tracks": tracks, "current_id": current or ""})
+            "message": message, "dialogue": dialogue[-8:], "tracks": tracks, "current_id": current or "",
+            "owner_messages": _owner_messages(WORKSPACE_DIR, tab_id)})
         output = (result or {}).get("output") if (result or {}).get("status") == "ok" else None
         if not isinstance(output, dict) or not isinstance(output.get("matter"), str):
             log_event("engine", "track_route_undecided", tab_id=tab_id, error=(result or {}).get("error"))
@@ -153,7 +168,10 @@ async def route_block(message: str, dialogue: list[str], tab_id: str | None) -> 
             "Answer ONLY about this matter. If you have news on other matters, never weave it into this reply: give each "
             "as its own separate message that opens with a natural lead-in naming the matter, in the owner's language "
             "(for example \"Относительно вакансии…\", \"По переписке с Линет Дикерсон…\"). A short message of the "
-            "owner (\"check that it went out\", \"yes\") refers to this matter, not to another one.]"
+            "owner (\"check that it went out\", \"yes\") refers to this matter, not to another one. A bare go-ahead (\"do "
+            "it\", \"go on\", \"Делаем\") means the owner's OWN latest request that is not carried out yet, or the question "
+            "or draft you put to him just before in answer to him -- never an offer you made in a report about an incoming "
+            "letter or message that he did not answer. If you cannot tell which he means, ask in one line and do nothing.]"
         )
     except Exception as exc:  # noqa: BLE001 -- fail-open
         log_event("engine", "track_route_failed", tab_id=tab_id, error=str(exc)[:200], error_type=type(exc).__name__)

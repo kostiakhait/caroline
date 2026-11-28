@@ -146,6 +146,15 @@ def set_pseudo_turn_always_relay(pseudo_id: str) -> None:
     _pseudo_turn_always_relay.add(pseudo_id)
 
 
+# The note of the one-off reminder a pseudo turn runs (2026-11-27): its result reaches the owner marked as a reminder,
+# and the note itself does when the turn says nothing.
+_pseudo_turn_reminder: dict[str, str] = {}
+
+
+def set_pseudo_turn_reminder(pseudo_id: str, note: str) -> None:
+    _pseudo_turn_reminder[pseudo_id] = note
+
+
 _pseudo_sessions: "dict[str, ChatSession]" = {}
 _pseudo_sessions_starting: set[str] = set()
 # Per pseudo tab_id -- the in-progress pseudo-turn's own latest real visible
@@ -207,16 +216,22 @@ def _make_pseudo_session_send(real_tab_id: str, pseudo_id: str, get_target_sessi
             task = pop_pseudo_turn_task(pseudo_id)
             always_relay = pseudo_id in _pseudo_turn_always_relay
             _pseudo_turn_always_relay.discard(pseudo_id)
+            reminder = _pseudo_turn_reminder.pop(pseudo_id, None)
             _dispose_pseudo_session(pseudo_id)
-            if not text:
+            if not text and not reminder:
                 return
-            _remember_last_report(pseudo_id, text)
+            if text:
+                _remember_last_report(pseudo_id, text)
             target = get_target_session(real_tab_id)
+            if target is None and reminder:
+                target = get_target_session("1")  # its tab is closed: the first one still tells him
             if target is None:
-                log_event("engine", "pseudo_reply_dropped_no_real_tab", real_tab_id=real_tab_id, pseudo_id=pseudo_id, text_len=len(text))
+                log_event("engine", "pseudo_reply_dropped_no_real_tab", real_tab_id=real_tab_id, pseudo_id=pseudo_id, text_len=len(text or ""))
                 return
-            extra = {"always": True} if always_relay else {}
-            asyncio.create_task(target.deliver_relayed_reply(text, task=task, is_voice=bool(event.get("isVoice")), **extra))
+            extra: dict[str, Any] = {"always": True} if always_relay else {}
+            if reminder:
+                extra["reminder"] = reminder
+            asyncio.create_task(target.deliver_relayed_reply(text or "", task=task, is_voice=bool(event.get("isVoice")), **extra))
 
     return _send
 
