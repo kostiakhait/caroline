@@ -14,7 +14,8 @@ own (not relayed: the bytes are here) bring them into the project: uploads_list 
 into the project as a file (project_write_binary on the page's side).
 
 The tool table is the one of the plan: project files (list, read, search, write, edit, delete, move), the Ferret API (docs, check,
-build), the viewer (restart, travel to a level, the engine's commands, its log, a picture), the GPU jobs and her machine (shell, Python, desktop: the person's
+build), the viewer (restart, travel to a level, the engine's commands, its log, a picture), publishing to ferret3d.com (publish, its status, the person's own
+publications, taking one of them down), the GPU jobs and her machine (shell, Python, desktop: the person's
 computer through the companion app with their yes, else the cloud machine). Skills are not here:
 Caroline's own skills plugin gives them (use_skill, read_skill_file) from the release's folder (CAROLINE_SKILL_DIRS).
 """
@@ -68,6 +69,25 @@ _TABLE: list[tuple[str, str, dict[str, str]]] = [
      {"q": "string", "type": "string?", "rubric": "string?", "tags": "string?", "limit": "number?", "offset": "number?"}),
     ("library_add", "Add or update an asset in the Ferret asset library (REST POST api/item) with the person's own SW session: {path, uid?, description?, rubric?}; path is a project file, a .ferret package or a zip of package.ferret [+ tiers/<tier>.ferret] [+ preview.webp]; description ENGLISH only. -> {uid, version, status}; to update an asset send its uid back.",
      {"path": "string", "uid": "string?", "description": "string?", "rubric": "string?"}),
+    # ferret3d.com (PLAN-FERRET3D M4): public, under the person's own name -- only on their word
+    ("publish_scene", "Publish the open project to ferret3d.com under the person's own SW account. It is public at once, with their name and the price, so ONLY when the "
+     "person asked for it, never on your own. {kind: 'scene' (a finished show or a game) | 'world' (a base for one's own scenes, with no script of events) | 'item' (one "
+     "thing -- a model, a character ... -- sold as its package; the open project is then its demo scene and package_path is the thing), title, description (both ENGLISH), "
+     "tags: 1 to 20 short English words, price in PIA (piastres; 0 = free to take; the person's choice: ask when they did not say), channel?: the name of their channel, "
+     "encrypt?: seal the packages, package_path?: an item's .fmdl or .ferret in the project (needed for 'item'), camera?: 'scene' (filmed by the project's own camera) | "
+     "'orbit' (the camera flies round); without it an item is filmed by its demo scene's camera, a scene or a world is flown round}. The project is built, a 30 s preview "
+     "is recorded from the running viewer (viewer_restart first, and leave the viewer alone until the publication is done) and all is uploaded. Every call makes a NEW "
+     "publication; one already published is not changed by it. Waits up to ~3 minutes, then answers state 'running' with an id for publish_status. "
+     "-> {id, state: running|done|error, stage, key, url, price, error}",
+     {"kind": "string", "title": "string", "description": "string", "tags": "string[]", "price": "number", "channel": "string?", "encrypt": "boolean?",
+      "package_path": "string?", "camera": "string?"}),
+    ("publish_status", "A publication started by publish_scene: {id?} that one (waits up to ~3 minutes for it to finish), or all of this editor session. "
+     "-> {id, state: running|done|error, stage, key, url, price, error}", {"id": "string?"}),
+    ("publications", "The person's own publications on ferret3d.com, those taken off too: -> {publications: [{key, kind, title, price, state: live|removed, version, published, url}]}", {}),
+    ("unpublish", "Take one of the person's OWN publications off ferret3d.com: it leaves the feed, the search and viewing; those who bought it keep their download; "
+     "it cannot be brought back from here (publishing again makes a new publication). ONLY when the person asked to take that publication down; when their words fit more "
+     "than one, ask which. Another author's publication is refused. {key (as publications gives it), why?} -> {key, state: 'removed', title}",
+     {"key": "string", "why": "string?"}),
     ("viewer_restart", "Rebuild the project and restart the game in the viewer; waits until it runs or fails. -> {ok, level, errors}", {}),
     ("viewer_level", "Travel the viewer to a level of the project. {level}", {"level": "string"}),
     ("viewer_command", "Run one of the running game's engine commands. {name, args?}; 'help' lists them all. To TEST the game, play it: input.actions (what is bound), "
@@ -387,6 +407,9 @@ if ENABLED:
         "ue_build": "the Unreal project and the Windows game being built",
         "project_import_url": "a file being downloaded into the project",
         "library_add": "an item being packed and sent to the library",
+        "publish_scene": "the project being built, its preview video recorded and the publication uploaded to ferret3d.com",
+        "publish_status": "the publication to ferret3d.com being finished",
+        "unpublish": "the publication being taken off ferret3d.com",
     })
 
 PLUGIN = Plugin(
