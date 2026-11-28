@@ -28,12 +28,17 @@ _PROMPT = (
     "text below contains SIGNIFICANT dated things the owner must not miss, and for each give a reminder.\n"
     "Significant: an appointment or session (doctor, therapist, court, school meeting), a meeting or call with a time, "
     "a deadline (a form, a payment, a filing, a visa or biometrics date), a delivery or flight, something the owner "
-    "promised to do by a date, something he told the secretary to remind him of. NOT significant: newsletters, "
+    "promised to do by a date, something he told the secretary to remind him of, and anything AGREED in a "
+    "correspondence about who takes, brings, collects or meets whom, where and when (a child handed over, a pickup, a "
+    "visit) -- also when the agreement is spread over several letters. In a correspondence the newest letters win: remind "
+    "only of what stands now, once per event, and say in the note what is still unanswered. A question that asks or "
+    "checks a date (\"is the birthday on Sunday?\") is not an event by itself. NOT significant: newsletters, "
     "marketing, receipts, security codes, job alerts, general chatter, anything without a concrete date or time, "
     "anything already in the past; text the owner dictates as the content of a letter or message to somebody else, "
     "or lists as questions to put to them (it is to be sent, not to be reminded of, unless he also asks for a reminder).\n"
     "For each item give: \"note\" -- what to remind the owner of, in one clear sentence in the language of the text, "
-    "with who/where/the link or phone if the text has it; \"remind_at_iso\" -- when to remind him, with the UTC offset "
+    "with who/where/the link or phone if the text has it, understandable by itself weeks later (names, not \"the "
+    "birthday\" or \"the letter\"); \"remind_at_iso\" -- when to remind him, with the UTC offset "
     "of the owner's time zone: for a timed event 45 minutes before it, for a deadline on a date the morning of the "
     "previous day at 09:00, for a flight 3 hours before; it must be in the future; \"event\" -- the event's own date "
     "and time in plain words.\n"
@@ -73,7 +78,7 @@ def verify_reminder_extract(input: Any, output: Any) -> Optional[str]:
 def llm_agents() -> List["M.Agent"]:
     return [
         M.Agent(
-            REMINDER_EXTRACT, "1",
+            REMINDER_EXTRACT, "2",
             "Finds significant dated events and deadlines in a message or letter and proposes reminders for them.",
             input_schema=_object({"text": _STRING, "source": _STRING, "now": _STRING}, required=["text"]),
             output_schema=_object({"reminders": {"type": "array", "items": {"type": "object"}}}),

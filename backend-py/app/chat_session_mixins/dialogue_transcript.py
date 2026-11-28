@@ -558,7 +558,8 @@ class DialogueTranscriptMixin:
             return
         log_event("engine", "transcript_patch_empty_file", tab_id=self.tab_id)
     # edition:end
-    async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False, always: bool = False) -> None:
+    async def deliver_relayed_reply(self, text: str, task: str | None = None, is_voice: bool = False, always: bool = False,
+                                    reminder: str | None = None) -> None:
         """Per explicit instruction (2026-10-13), "Фоновые задачи... должны
         мержиться только на уровне вывода пользователю": delivers a reply that
         was generated and already reviewed inside a DIFFERENT (headless)
@@ -586,10 +587,17 @@ class DialogueTranscriptMixin:
         on-task, human-sounding text -- exactly what review_reply is
         supposed to let through). check_background_relay_worth is the
         separate, dedicated check for that; runs before translation so a
-        suppressed message costs nothing further."""
+        suppressed message costs nothing further.
+
+        `reminder` (2026-11-27): the note of a one-off reminder that came due. The message is marked as a reminder by code,
+        and when its turn produced no text the note itself is shown: a reminder that fires is always seen."""
         from app.plugins.voice_api import check_background_relay_worth, translate_text
 
-        if self._recent_repeat_of(text):
+        if reminder:
+            text = f"⏰ Reminder: {text}" if text else f"⏰ Reminder: {reminder}"
+        # `always` goes past BOTH filters (2026-11-27, live: a reminder's result and a scheduled mail report with a new
+        # letter in it were dropped here as "repeats", and the owner never saw either).
+        if not always and self._recent_repeat_of(text):
             log_event("engine", "relayed_reply_suppressed_as_repeat", tab_id=self.tab_id, text=text[:300])
             return
         # `always` (2026-11-20): a reminder for the owner is delivered whatever the filter would say.

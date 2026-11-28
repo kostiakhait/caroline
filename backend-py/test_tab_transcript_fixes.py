@@ -183,9 +183,42 @@ def test_a_send_is_watched_and_the_answer_is_reported(session, monkeypatch):
         assert key in session._reply_watches()
         uid["value"] = 6
         await session._reply_watch_tick(key)
+        # The correspondence goes on (2026-11-27: Oksana's second letter, 40 minutes after her first, was never reported):
+        # the watch stays, its baseline is the letter just reported, and the next letter is reported too.
+        assert session._reply_watches()[key]["baseline_uid"] == 6
+        await session._reply_watch_tick(key)
+        assert len(session.notes) == 1
+        uid["value"] = 7
+        await session._reply_watch_tick(key)
         for timer in session._reply_watch_timers().values():
             timer.cancel()
 
     run(scenario())
-    assert len(session.notes) == 1 and "oksana@y.org" in session.notes[0]
-    assert session._reply_watches() == {}
+    assert len(session.notes) == 2 and all("oksana@y.org" in n and "email_get_thread" in n for n in session.notes)
+    assert session._reply_watches()[key]["baseline_uid"] == 7
+
+
+# --- drafts with blanks, and a bare go-ahead ------------------------------------
+
+def test_a_draft_with_a_blank_is_neither_finished_nor_sendable():
+    from app import claude_ladder, own_identity_gate as gate
+
+    reply = "Вот письмо:\n\n> Оксана, здравствуйте.\n> Мне больше подходит [вариант].\n\nОтправляю после вашего «да»."
+    assert "[вариант]" in claude_ladder.blanks_note(reply)
+    assert "blanks" in gate.missing_reason("Мне больше подходит [вариант].", None, [], True)
+    clean = "> Оксана, здравствуйте. Сайт: [здесь](https://x.org), пункт [1].\n\nОтправить [да/нет]?"
+    assert claude_ladder.blanks_note(clean) == ""
+
+
+def test_the_router_is_given_the_owners_own_latest_messages(tmp_path):
+    from app import memory_advisor
+    from app.microagents.track_route import prompt_track_route
+
+    workspace = str(tmp_path)
+    dialogue_log.append(workspace, "1", dialogue_log.USER, "Отправь Линет письмо с видео")
+    for _ in range(10):
+        dialogue_log.append(workspace, "1", dialogue_log.ASSISTANT, "Лена прислала сценарии")
+    own = memory_advisor._owner_messages(workspace, "1")
+    assert len(own) == 1 and "Линет" in own[0]
+    prompt = prompt_track_route({"message": "Делаем", "tracks": [], "dialogue": [], "owner_messages": own}, None)
+    assert "Отправь Линет письмо" in prompt and "bare go-ahead" in prompt

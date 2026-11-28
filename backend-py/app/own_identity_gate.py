@@ -52,6 +52,21 @@ def split_quoted(text: str) -> list[tuple[bool, str]]:
     return [(q, "".join(lines)) for q, lines in runs]
 
 
+# A blank left in a draft: [вариант], [your name], {date}, ____ (2026-11-27, tab 1: a letter under the owner's name was
+# shown to him with "[вариант]" in it, among points he had not asked for). A markdown link and a bare number are not blanks.
+_PLACEHOLDER = re.compile(r"\[(?!\d+\])[^\[\]\n]{1,80}\](?!\()|\{[^{}\n]{1,60}\}|_{3,}")
+
+
+def placeholders_in(text: str) -> list[str]:
+    """The blanks left in a text that is about to go out, in the order they stand."""
+    return _PLACEHOLDER.findall(_TAGS.sub(" ", text or ""))
+
+
+def draft_placeholders(reply: str) -> list[str]:
+    """The blanks inside the quoted draft(s) of a reply."""
+    return [blank for quoted, chunk in split_quoted(reply) if quoted for blank in placeholders_in(chunk)]
+
+
 def body_of(args: dict[str, Any] | None) -> str:
     """The message body of a send call's arguments (the first body-like argument that is a non-empty string)."""
     for key in BODY_KEYS:
@@ -115,6 +130,10 @@ def missing_reason(body: str, shown: Optional[dict[str, Any]], answers: list[str
     """None when the send may go. Otherwise one sentence for the model, saying exactly what is missing."""
     if not body:
         return None  # nothing textual to compare (a file-only send is the file-transfer guard's business)
+    if blanks := placeholders_in(body):
+        return (f"the text still has blanks in it ({', '.join(blanks[:5])}). A letter with blanks never goes out: fill each "
+                "one with what the user actually said, or ask the user for it in one question, then show the complete final "
+                "text and wait for a yes.")
     if shown is None:
         return ("this goes out under the user's own identity and its exact final text has not been shown to the user yet. "
                 "Show the user the complete final text (recipient, subject, body) as a markdown blockquote (every line "

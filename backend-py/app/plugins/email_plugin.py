@@ -225,16 +225,88 @@ async def email_get_message(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
     asyncio.ensure_future(upsert_contacts_from_emails(pairs, exclude={args.get("address") or ""}))
     _truncate_body(data, int(args.get("bodyOffset") or 0))
     text = json.dumps(data, indent=2, ensure_ascii=False)
+    from app import email_thread
+    mailbox = str(args.get("address") or "").lower()
+    if mailbox and mailbox in email_thread.addresses(data.get("from")):
+        # A letter sent FROM this mailbox (2026-11-27: the owner's own answer, written on his phone, was taken for a letter
+        # "of unknown origin to investigate"): who wrote it, by code -- Caroline, or the owner himself without her.
+        ledger = action_ledger.recent(WORKSPACE_DIR, 24.0 * 365)
+        text += f"\n\n[Author of this letter: {email_thread.author_of(data, mailbox, ledger)}.]"
     # What Caroline herself wrote to this sender / in this thread, from the action log (2026-11-04): by code, at the moment of reading.
-    if note := action_ledger.note_for_mail(WORKSPACE_DIR, data.get("from"), data.get("subject")):
+    elif note := action_ledger.note_for_mail(WORKSPACE_DIR, data.get("from"), data.get("subject")):
         text += "\n\n" + note
+    if _SUBJECT_QUERY.match(str(data.get("subject") or "")) or action_ledger.sent_to(WORKSPACE_DIR, data.get("from"), data.get("subject")):
+        text += ("\n\n[This letter is part of a correspondence. Before you report on it or answer it, read the whole "
+                 f"correspondence: email_get_thread(address, folder=\"{args['folder']}\", uid={args['uid']}). The letters "
+                 "before it and after it change what it means.]")
     # Owner's order (2026-11-20): a significant date in a letter becomes a reminder by itself (app/auto_reminders.py).
     from app import auto_reminders
     from app.session_context import get_tab_id
+    # An HTML-only letter has no "text" (2026-11-27: only its subject and sender were judged, and the agreement in it
+    # set no reminder), so its own words are taken out of whatever form it came in.
     auto_reminders.consider_in_background(
-        f"Subject: {data.get('subject')}\nFrom: {data.get('from')}\n\n{data.get('body') or data.get('text') or ''}",
-        f"a letter in the mailbox {args.get('address') or ''}", get_tab_id())
+        email_thread.letter_for_reminders(data), f"a letter in the mailbox {args.get('address') or ''}", get_tab_id())
     return {"text": text}
+
+
+THREAD_PAGE_CHARS = EMAIL_BODY_MAX_CHARS
+_ALL_MATCHES = 100_000  # listMessages' own default is 20; a thread is read whole, so every match is asked for
+
+
+@_with_saved_credentials
+async def email_get_thread(args: dict[str, Any], _rp: Any) -> dict[str, Any]:
+    """The whole correspondence a letter belongs to (app/email_thread.py has the why): the inbox and Sent searched by the
+    subject, kept when the subject key and the other side match, read in full, oldest first, each with its author."""
+    from app import email_thread
+
+    mailbox = str(args.get("address") or "")
+
+    async def do(session: str) -> Any:
+        creds = _creds_kwargs(args)
+        start = await call_v2("email:getMessage", session=session, folder=args["folder"], uid=args["uid"], **creds)
+        key = email_thread.subject_key(start.get("subject"))
+        people = email_thread.addresses(start.get("from")) | email_thread.addresses(start.get("to")) | email_thread.addresses(start.get("cc"))
+        counterparts = {a for a in people if a != mailbox.lower()}
+        folders = await call_v2("email:listFolders", session=session, **creds)
+        names = [f for f in (folders.get("inbox") or "INBOX", folders.get("sent"), args["folder"]) if f]
+        query = _SUBJECT_QUERY.sub("", str(start.get("subject") or "")).strip() or str(start.get("subject") or "")
+        found: dict[tuple[str, str], dict[str, Any]] = {}
+        for folder in dict.fromkeys(names):
+            listed = await call_v2("email:listMessages", session=session, folder=folder, query=query, limit=_ALL_MATCHES, **creds)
+            for head in listed.get("messages") or []:
+                if email_thread.subject_key(head.get("subject")) != key:
+                    continue
+                uid = str(head.get("uid"))
+                if (folder, uid) in found:
+                    continue
+                full = await call_v2("email:getMessage", session=session, folder=folder, uid=uid, **creds)
+                full = {k: v for k, v in full.items() if k not in (".status", ".msgid")}
+                full.update({"folder": folder, "uid": uid})
+                if email_thread.same_thread(full, key, counterparts):
+                    found[(folder, uid)] = full
+        return list(found.values())
+
+    letters = await _sessions.with_session(do)
+    letters.sort(key=email_thread.message_ms)
+    ledger = action_ledger.recent(WORKSPACE_DIR, 24.0 * 365)
+    begin = max(0, int(args.get("fromLetter") or 1) - 1)
+    if not letters:
+        return {"text": "No letters of this correspondence were found (not even the one asked for)."}
+    body, next_index = email_thread.render(letters, mailbox, ledger, begin, THREAD_PAGE_CHARS)
+    # An agreement spans letters (who takes whom, where, when): the reminders are judged from the correspondence too.
+    from app import auto_reminders
+    from app.session_context import get_tab_id
+    auto_reminders.consider_in_background(
+        email_thread.thread_for_reminders(letters), f"a correspondence in the mailbox {mailbox}", get_tab_id())
+    head = (f"The correspondence \"{letters[-1].get('subject') or ''}\" in {mailbox}: {len(letters)} letters from the inbox "
+            "and Sent, oldest first. Each letter shows only its own text (the quoted earlier letters are cut). The LAST "
+            "letter is where the correspondence stands now: answer and report from it, read in the light of the ones before.\n\n")
+    tail = (f"\n\n[... letters {next_index + 1}-{len(letters)} are not shown yet -- call email_get_thread again with "
+            f"fromLetter={next_index + 1} to read them; the newest letters are at the end ...]") if next_index >= 0 else ""
+    return {"text": head + body + tail}
+
+
+_SUBJECT_QUERY = re.compile(r"^\s*((re|fw|fwd|aw|sv|antw|ответ|пересл)(\[\d+\])?\s*:\s*)+", re.IGNORECASE)
 
 
 @_with_saved_credentials
@@ -532,8 +604,23 @@ def _mark_discussed_emails_read_instruction() -> str:
     )
 
 
+def _read_correspondence_whole_instruction() -> str:
+    """Owner's complaint, 2026-11-27: "она начисто не хочет понимать, что письма взаимосвязаны"."""
+    return (
+        "Letters of one correspondence are connected: each one answers the ones before it. Whenever a letter belongs to a "
+        "correspondence (a reply, a thread you or the owner wrote in, a new letter from someone you are in the middle of an "
+        "exchange with), read the whole correspondence with email_get_thread before you report on it, draft an answer or "
+        "send one -- never judge a single letter on its own. Report where the correspondence stands NOW, from its latest "
+        "letter: what the other side last said or asked, what is settled, what is still open. If the owner answered "
+        "himself in that correspondence (a letter from his mailbox that you did not send), that answer is his and it is "
+        "part of where things stand: never treat it as a stranger's letter. Every letter of the correspondence that the "
+        "owner has not seen yet is reported, not only the one you happened to open."
+    )
+
+
 def _usage_instructions() -> str:
     return "\n\n".join((
+        _read_correspondence_whole_instruction(),
         _credentials_convention_instruction(),
         notes_folder_fallback_instruction(),
         read_content_not_headers_instruction(),
@@ -579,6 +666,16 @@ PLUGIN = Plugin(
             "comes back truncated with a note telling you how long it really is and what bodyOffset to "
             "call again with to keep reading -- never assume a truncated body IS the whole message." + _ACCOUNT_PARAM_NOTE,
             {**_CREDENTIAL_PARAMS, "folder": str, "uid": int, "bodyOffset": int | None}, email_get_message,
+        ),
+        PluginTool(
+            "email_get_thread",
+            "Reads the WHOLE correspondence a letter belongs to: every letter of that thread from the inbox and from Sent "
+            "(both sides, the owner's own answers too), oldest first, each with its own text only (quotes cut) and who "
+            "wrote it -- the other side, you on the owner's instruction, or the owner himself without you. Give folder + "
+            "uid of any one letter of the thread. Use it before you report on a letter that is part of a correspondence, "
+            "and before you draft or send an answer in it: the latest letter is where things stand, and earlier letters "
+            "change what it means. A long correspondence comes in pages: `fromLetter` (1-based) continues it." + _ACCOUNT_PARAM_NOTE,
+            {**_CREDENTIAL_PARAMS, "folder": str, "uid": int, "fromLetter": int | None}, email_get_thread,
         ),
         PluginTool(
             "email_mark",
